@@ -66,14 +66,24 @@ fn compare_accesses(case: &TestCase, log: &[Access]) -> Vec<String> {
 
     let mut diffs = Vec::new();
 
-    // Address-error transactions must never have reached the bus.
+    // Address-error transactions must never have reached the bus (AS never
+    // asserted).  The suite records the *aligned* address; the actual fault
+    // address is `recorded | 1` (odd).  A core that wrongly commits the access
+    // may do so at either address, so check both.  Also distinguish direction
+    // so a legitimate access of the opposite direction is not flagged.
     for t in &case.transactions {
         if matches!(t.kind, TxKind::ReadAddrErr | TxKind::WriteAddrErr) {
-            let addr = t.addr & 0x00FF_FFFF;
-            if log.iter().any(|a| a.addr == addr) {
+            let aligned = t.addr & 0x00FF_FFFF;
+            let odd = aligned | 1;
+            let want_write = matches!(t.kind, TxKind::WriteAddrErr);
+            if log
+                .iter()
+                .any(|a| (a.addr == aligned || a.addr == odd) && a.is_write == want_write)
+            {
                 diffs.push(format!(
-                    "access at {addr:06X} was committed, but the expected \
-                     transaction is an address error (AS never asserted)"
+                    "access at {:06X}/{:06X} was committed, but the expected \
+                     transaction is an address error (AS never asserted)",
+                    aligned, odd
                 ));
             }
         }
@@ -95,9 +105,40 @@ fn compare_accesses(case: &TestCase, log: &[Access]) -> Vec<String> {
 
     for (i, (t, a)) in expected.iter().zip(log.iter()).enumerate() {
         let want_write = matches!(t.kind, TxKind::Write);
-        let want_addr = t.addr & 0x00FF_FFFF;
+
+        // Byte accesses: the suite records a word-aligned address.
+        // UDS-only (uds=1, lds=0): the live byte is at `addr`      (upper half).
+        // LDS-only (uds=0, lds=1): the live byte is at `addr + 1`  (lower half).
+        // A correct core calls read8/write8 at the odd address for LDS; we must
+        // compare against that odd address rather than the recorded even one.
+        // For word accesses and UDS-byte accesses the recorded address is already
+        // correct (even), so both use `t.addr & MASK` directly.
+        let want_addr = if !t.is_word() && t.uds == 0 {
+            (t.addr | 1) & 0x00FF_FFFF // LDS: byte at odd address
+        } else {
+            t.addr & 0x00FF_FFFF // word or UDS: use the recorded (even) address
+        };
         let want_size = if t.is_word() { Size::Word } else { Size::Byte };
-        if a.is_write != want_write || a.addr != want_addr || a.size != want_size {
+
+        // Expected data value, strobe-adjusted:
+        // - Word:      full 16-bit value.
+        // - UDS byte:  upper byte of the data word, shifted into the low byte
+        //              position to match how read8/write8 return/accept bare bytes.
+        // - LDS byte:  lower byte of the data word.
+        let want_data: u16 = if t.is_word() {
+            (t.data & 0xFFFF) as u16
+        } else if t.uds != 0 {
+            ((t.data >> 8) & 0xFF) as u16 // UDS byte, bare
+        } else {
+            (t.data & 0xFF) as u16 // LDS byte, bare
+        };
+
+        let addr_ok = a.addr == want_addr;
+        let size_ok = a.size == want_size;
+        let dir_ok = a.is_write == want_write;
+        let data_ok = a.val == want_data;
+
+        if !dir_ok || !addr_ok || !size_ok {
             let dir = |w| if w { "write" } else { "read" };
             diffs.push(format!(
                 "access {i}: got {} {:?} at {:06X}, want {} {:?} at {:06X}",
@@ -107,6 +148,11 @@ fn compare_accesses(case: &TestCase, log: &[Access]) -> Vec<String> {
                 dir(want_write),
                 want_size,
                 want_addr
+            ));
+        } else if !data_ok {
+            diffs.push(format!(
+                "access {i}: data got {:04X} want {:04X} at {:06X}",
+                a.val, want_data, want_addr
             ));
         }
     }
@@ -278,6 +324,18 @@ mod tests {
         }
     }
 
+    fn tx_data(kind: TxKind, addr: u32, uds: u32, lds: u32, data: u32) -> Transaction {
+        Transaction {
+            kind,
+            cycles: 4,
+            fc: 2,
+            addr,
+            data,
+            uds,
+            lds,
+        }
+    }
+
     fn case_with(transactions: Vec<Transaction>) -> TestCase {
         TestCase {
             name: "synthetic".into(),
@@ -356,6 +414,59 @@ mod tests {
         assert!(
             diffs.iter().any(|d| d.contains("address error")),
             "got {diffs:?}"
+        );
+    }
+
+    /// A correct address/size/direction but wrong data value must be reported.
+    #[test]
+    fn wrong_data_value_is_reported() {
+        // Word write: expected 0xBEEF, core wrote 0xDEAD.
+        let case = case_with(vec![tx_data(TxKind::Write, 0x1000, 1, 1, 0xBEEF)]);
+        let log = vec![Access {
+            is_write: true,
+            addr: 0x1000,
+            size: Size::Word,
+            val: 0xDEAD,
+        }];
+        let diffs = compare_accesses(&case, &log);
+        assert!(
+            diffs.iter().any(|d| d.contains("data")),
+            "wrong data must be reported; got {diffs:?}"
+        );
+    }
+
+    /// UDS-only byte: expected upper half 0xAB, core read 0x00.
+    #[test]
+    fn wrong_data_uds_byte_is_reported() {
+        // UDS-only: data = 0xAB00 on the bus, live byte = 0xAB.
+        let case = case_with(vec![tx_data(TxKind::Read, 0x1000, 1, 0, 0xAB00)]);
+        let log = vec![Access {
+            is_write: false,
+            addr: 0x1000, // even address, UDS
+            size: Size::Byte,
+            val: 0x00, // wrong bare byte
+        }];
+        let diffs = compare_accesses(&case, &log);
+        assert!(
+            diffs.iter().any(|d| d.contains("data")),
+            "wrong UDS byte must be reported; got {diffs:?}"
+        );
+    }
+
+    /// LDS-only byte: expected lower half 0xCD, core read at correct odd address.
+    #[test]
+    fn correct_lds_byte_passes() {
+        // LDS-only: data = 0x00CD on the bus, live byte = 0xCD at addr+1.
+        let case = case_with(vec![tx_data(TxKind::Read, 0x1000, 0, 1, 0x00CD)]);
+        let log = vec![Access {
+            is_write: false,
+            addr: 0x1001, // odd address, LDS
+            size: Size::Byte,
+            val: 0xCD, // correct bare byte
+        }];
+        assert!(
+            compare_accesses(&case, &log).is_empty(),
+            "correct LDS byte must produce no diffs"
         );
     }
 }

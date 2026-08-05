@@ -111,19 +111,26 @@ impl M68k {
         self.sr = sr;
     }
 
-    /// Shifts the queue one word and refills slot 1 from PC.
+    /// Advances the pipeline by one word: promotes slot 1 to slot 0, reads the
+    /// next word from PC into slot 1, and increments PC by 2.
     ///
-    /// This is the first bus operation every normal instruction handler must
-    /// perform.  `step_with` only peeked at `prefetch[0]`; calling this
-    /// discards it (promotes slot 1, fetches the next word into slot 1 from PC,
-    /// and advances PC by 2), producing the pipeline-advance bus cycle that
-    /// hardware emits for every executing instruction.
+    /// This is the same bus operation as [`fetch_word_dyn`] — both bodies are
+    /// identical except that `fetch_word_dyn` also returns the consumed word.
+    /// Use whichever makes intent clearest: `consume_opcode` when the handler
+    /// already has the opcode from `step_with`'s peek and the advance is purely
+    /// for pipeline bookkeeping; `fetch_word` when the handler needs the value
+    /// of the word it is consuming (extension words, immediates, displacements).
     ///
-    /// **Use `fetch_word` instead when the handler needs an extension word.**
-    /// `fetch_word` returns the value of the word it consumes, which is what
-    /// a handler reading an immediate operand or displacement wants.
-    /// `consume_opcode` discards the return value and is only for the opcode
-    /// word itself, which the handler already has from `step_with`'s peek.
+    /// **Placement within a handler's bus sequence is per-instruction** and must
+    /// be derived from the vector data.  Many instructions read operands from
+    /// memory *before* the pipeline-advance read; calling this first would emit
+    /// the reads out of order.
+    ///
+    /// **Warning — OPCODE_PC_OFFSET:** calling this followed by `fetch_word` for
+    /// one extension word leaves `cpu.pc` 8 bytes past the opcode, not 4.
+    /// `exception::OPCODE_PC_OFFSET` is valid only for a handler that consumed
+    /// exactly the opcode word; multi-word handlers must capture `cpu.pc` before
+    /// any fetches and compute their own stacked-PC value.
     ///
     /// **Exception-aborting handlers must NOT call this.**  They return after
     /// `exception::take`, which refills both slots with `refill_prefetch_dyn`.
@@ -224,11 +231,12 @@ impl M68k {
             self.stopped = false;
         }
         // Peek at the opcode without touching the queue.
-        // Real instruction handlers call `consume_opcode` as their first act
-        // to shift the queue and refill slot 1 from PC; exception-aborting
-        // instructions (illegal opcode, Line-A, Line-F, …) never do, so the
-        // queue is left to be overwritten by `refill_prefetch_dyn` at vector
-        // dispatch.  This matches the 68000 pipeline-abort behavior.
+        // Instruction handlers call `consume_opcode` (or `fetch_word` for the
+        // same effect with a return value) at the point dictated by their bus
+        // sequence — not necessarily first.  Exception-aborting instructions
+        // (illegal opcode, Line-A, Line-F, …) never call it; they return after
+        // `exception::take`, which overwrites both slots via `refill_prefetch_dyn`.
+        // This matches the 68000 pipeline-abort behavior.
         let op = self.prefetch[0];
         dec.dispatch(op)(self, bus, op)
     }
@@ -243,12 +251,14 @@ impl M68k {
     }
 }
 
-/// A flat 64 KB `Bus` for unit tests, shared by every module's tests.
+/// Test buses and helpers shared by every module's unit tests.
 ///
-/// Lives in the crate rather than a `tests/` file because the modules that need
-/// it are testing crate-internal behavior.
+/// Lives in the crate (not `tests/`) because the modules that need it are
+/// testing crate-internal behavior.
 #[cfg(test)]
 pub(crate) mod tests_support {
+    /// Flat 64 KB memory bus.  No access log; use `RecordingBus` when the bus
+    /// sequence matters.
     pub struct FlatBus {
         pub mem: Vec<u8>,
     }
@@ -300,11 +310,89 @@ pub(crate) mod tests_support {
             self.mem[a + 1] = lo;
         }
     }
+
+    /// A `Bus` that records every word-level access in order, on top of a flat
+    /// memory image.  Used by tests that need to assert bus *sequence*, not just
+    /// final memory state.
+    pub struct RecordingBus {
+        pub mem: Vec<u8>,
+        /// Each entry is `(is_write, addr, val)`.
+        pub log: Vec<(bool, u32, u16)>,
+    }
+
+    impl RecordingBus {
+        pub fn new() -> Self {
+            Self {
+                mem: vec![0; 0x10000],
+                log: Vec::new(),
+            }
+        }
+
+        pub fn put16(&mut self, addr: u32, val: u16) {
+            let [hi, lo] = val.to_be_bytes();
+            let a = (addr & 0xFFFF) as usize;
+            self.mem[a] = hi;
+            self.mem[a + 1] = lo;
+        }
+
+        pub fn load(&mut self, addr: u32, words: &[u16]) {
+            for (i, w) in words.iter().enumerate() {
+                self.put16(addr + (i as u32) * 2, *w);
+            }
+        }
+
+        /// Returns the subsequence of write entries: `(addr, val)`.
+        pub fn writes(&self) -> Vec<(u32, u16)> {
+            self.log
+                .iter()
+                .filter(|(w, _, _)| *w)
+                .map(|(_, a, v)| (*a, *v))
+                .collect()
+        }
+
+        /// Returns the subsequence of read entries: `(addr, val)`.
+        // Used by bus-error frame tests in Task 11+.
+        #[allow(dead_code)]
+        pub fn reads(&self) -> Vec<(u32, u16)> {
+            self.log
+                .iter()
+                .filter(|(w, _, _)| !*w)
+                .map(|(_, a, v)| (*a, *v))
+                .collect()
+        }
+    }
+
+    impl crate::Bus for RecordingBus {
+        fn read8(&mut self, addr: u32) -> u8 {
+            let v = self.mem[(addr & 0xFFFF) as usize];
+            // Record as a word-level entry with just the byte; callers that
+            // care about byte vs word granularity should use the full log.
+            self.log.push((false, addr & 0xFFFF, v as u16));
+            v
+        }
+        fn read16(&mut self, addr: u32) -> u16 {
+            let a = (addr & 0xFFFE) as usize;
+            let v = u16::from_be_bytes([self.mem[a], self.mem[a + 1]]);
+            self.log.push((false, addr & 0xFFFF, v));
+            v
+        }
+        fn write8(&mut self, addr: u32, val: u8) {
+            self.mem[(addr & 0xFFFF) as usize] = val;
+            self.log.push((true, addr & 0xFFFF, val as u16));
+        }
+        fn write16(&mut self, addr: u32, val: u16) {
+            let [hi, lo] = val.to_be_bytes();
+            let a = (addr & 0xFFFE) as usize;
+            self.mem[a] = hi;
+            self.mem[a + 1] = lo;
+            self.log.push((true, addr & 0xFFFF, val));
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::tests_support::FlatBus;
+    use super::tests_support::{FlatBus, RecordingBus};
     use super::*;
 
     #[test]
@@ -380,12 +468,12 @@ mod tests {
         assert_eq!(cpu.pc, 0x1004, "pc sits 4 past the first instruction");
     }
 
-    /// `consume_opcode` shifts the queue and issues exactly one `read16` at
-    /// the pre-call PC, advancing PC by 2.  The opcode value itself is NOT
-    /// returned (the caller already has it from `step_with`'s peek).
+    /// `consume_opcode` shifts the queue, issues exactly one `read16` at the
+    /// pre-call PC, and advances PC by 2.  The opcode value is NOT returned;
+    /// the caller already has it from `step_with`'s peek.
     #[test]
     fn consume_opcode_shifts_queue_and_refills_slot_1() {
-        let mut bus = FlatBus::new();
+        let mut bus = RecordingBus::new();
         bus.put16(0x1004, 0x3333); // the word that will fill slot 1
 
         let mut cpu = M68k::new();
@@ -400,5 +488,12 @@ mod tests {
         assert_eq!(cpu.prefetch[1], 0x3333, "prefetch[1] must be refilled");
         // PC advanced by 2
         assert_eq!(cpu.pc, 0x1006, "PC must advance by 2");
+        // exactly one bus access: the read16 at the pre-call PC
+        assert_eq!(bus.log.len(), 1, "must issue exactly one bus access");
+        assert_eq!(
+            bus.log[0],
+            (false, 0x1004, 0x3333),
+            "must be read16 at pre-call PC"
+        );
     }
 }

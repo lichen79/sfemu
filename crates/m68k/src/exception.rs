@@ -110,7 +110,7 @@ pub fn illegal_instruction(cpu: &mut M68k, bus: &mut dyn Bus, op: u16) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cpu::tests_support::FlatBus;
+    use crate::cpu::tests_support::{FlatBus, RecordingBus};
     use crate::decode::Decoder;
 
     /// A Line-A opcode must vector through 10, stacking the address of the
@@ -200,5 +200,57 @@ mod tests {
         cpu.step_with(&dec, &mut bus);
 
         assert_eq!(cpu.sr & SR_T, 0);
+    }
+
+    /// The hardware writes the short frame in a non-sequential order:
+    ///   1. PC[15:0]  at old_SSP − 2
+    ///   2. SR        at old_SSP − 6
+    ///   3. PC[31:16] at old_SSP − 4
+    ///
+    /// Asserting final memory contents cannot catch a revert to sequential
+    /// push16 order (which produces identical contents with different bus
+    /// timing).  This test records every write in order and asserts the
+    /// sequence, so a regression is immediately visible.
+    #[test]
+    fn short_frame_write_order_is_pc_low_sr_pc_high() {
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0xA000, 0x4E71]);
+        bus.put16(0x0028, 0x0000); // vector 10 → 0x2000
+        bus.put16(0x002A, 0x2000);
+        bus.load(0x2000, &[0x4E71, 0x4E71]);
+
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S | 0x0700;
+        cpu.a[7] = 0x3000;
+        cpu.pc = 0x1000;
+        // prime_prefetch issues reads; clear the log before stepping so we
+        // only see the instruction's bus activity.
+        cpu.prime_prefetch(&mut bus);
+        bus.log.clear();
+
+        let dec = Decoder::new();
+        cpu.step_with(&dec, &mut bus);
+
+        let writes = bus.writes();
+        // The first three writes are the frame; the vector reads follow.
+        assert!(writes.len() >= 3, "expected at least 3 frame writes");
+        // Write 0: PC[15:0] at SP−2 = 0x2FFE
+        assert_eq!(
+            writes[0],
+            (0x2FFE, 0x1000),
+            "write 0 must be PC[15:0] at SP-2"
+        );
+        // Write 1: SR at SP−6 = 0x2FFA
+        assert_eq!(
+            writes[1],
+            (0x2FFA, SR_S | 0x0700),
+            "write 1 must be SR at SP-6"
+        );
+        // Write 2: PC[31:16] at SP−4 = 0x2FFC
+        assert_eq!(
+            writes[2],
+            (0x2FFC, 0x0000),
+            "write 2 must be PC[31:16] at SP-4"
+        );
     }
 }
