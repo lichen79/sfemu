@@ -31,15 +31,6 @@ pub(crate) fn push16(cpu: &mut M68k, bus: &mut dyn Bus, val: u16) {
     }
 }
 
-/// Pushes a long word onto the stack: low word first (descending), so the
-/// long reads back big-endian from memory (high word at lower address).
-// Used by future instruction handlers.
-#[allow(dead_code)]
-pub(crate) fn push32(cpu: &mut M68k, bus: &mut dyn Bus, val: u32) {
-    push16(cpu, bus, (val & 0xFFFF) as u16);
-    push16(cpu, bus, (val >> 16) as u16);
-}
-
 /// Takes a group 1/2 exception: save SR, enter supervisor mode, write the
 /// short frame, then vector.
 ///
@@ -89,9 +80,10 @@ pub fn take(cpu: &mut M68k, bus: &mut dyn Bus, vector: u8, pc_for_frame: u32) {
 /// Byte distance from `cpu.pc` at handler entry back to the opcode word.
 ///
 /// When `step_with` dispatches a handler, `cpu.pc` is 4 bytes ahead of the
-/// opcode that was just popped:
+/// opcode being executed:
 /// - 4 bytes: the prefetch queue holds two words beyond the instruction;
-///   `step_with` pops `prefetch[0]` without advancing `pc`.
+///   `step_with` peeks at `prefetch[0]` without shifting the queue or
+///   advancing `pc`.
 ///
 /// **This offset is only valid for a handler that has consumed exactly the
 /// opcode word and no extension words.** Any handler that calls `fetch_word`
@@ -109,7 +101,7 @@ pub fn illegal_instruction(cpu: &mut M68k, bus: &mut dyn Bus, op: u16) -> u32 {
         _ => VEC_ILLEGAL,
     };
     // Stack the address of the offending instruction. See OPCODE_PC_OFFSET for
-    // why this offset is 6 and why it must not be copied into other handlers.
+    // the rationale; do not copy this calculation into other handlers.
     let pc = cpu.pc.wrapping_sub(OPCODE_PC_OFFSET);
     take(cpu, bus, vector, pc);
     34

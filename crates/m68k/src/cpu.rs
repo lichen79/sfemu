@@ -111,6 +111,28 @@ impl M68k {
         self.sr = sr;
     }
 
+    /// Shifts the queue one word and refills slot 1 from PC.
+    ///
+    /// Called by instruction handlers as their first bus operation: the opcode
+    /// word at `prefetch[0]` was already peeked by `step_with`; this discards
+    /// it, promotes slot 1, then fetches the next word into slot 1 from the
+    /// current PC, advancing PC by 2.
+    ///
+    /// **Exception-aborting handlers must NOT call this.**  They return after
+    /// `exception::take`, which refills both slots with `refill_prefetch_dyn`.
+    pub(crate) fn consume_opcode_dyn(&mut self, bus: &mut dyn crate::Bus) {
+        self.prefetch[0] = self.prefetch[1];
+        self.prefetch[1] = bus.read16(self.pc & ADDR_MASK);
+        self.pc = self.pc.wrapping_add(2);
+    }
+
+    #[inline]
+    // Used by instruction handlers in Tasks 5+.
+    #[allow(dead_code)]
+    pub(crate) fn consume_opcode(&mut self, bus: &mut impl crate::Bus) {
+        self.consume_opcode_dyn(bus);
+    }
+
     /// Consumes the next word from the prefetch queue, refilling from PC.
     pub(crate) fn fetch_word_dyn(&mut self, bus: &mut dyn crate::Bus) -> u16 {
         let w = self.prefetch[0];
@@ -194,16 +216,13 @@ impl M68k {
             }
             self.stopped = false;
         }
-        // Pop the opcode from the prefetch queue WITHOUT issuing a bus cycle.
-        // The 68000 aborts the pending pipeline-refill fetch for
-        // exception-raising instructions (illegal opcodes, traps, etc.).
-        // Normal instruction handlers issue their own pipeline-advance reads as
-        // their first bus cycle; exception handlers call refill_prefetch_dyn
-        // after vectoring, which covers both slots at once.
+        // Peek at the opcode without touching the queue.
+        // Real instruction handlers call `consume_opcode` as their first act
+        // to shift the queue and refill slot 1 from PC; exception-aborting
+        // instructions (illegal opcode, Line-A, Line-F, …) never do, so the
+        // queue is left to be overwritten by `refill_prefetch_dyn` at vector
+        // dispatch.  This matches the 68000 pipeline-abort behavior.
         let op = self.prefetch[0];
-        self.prefetch[0] = self.prefetch[1];
-        // prefetch[1] is now stale and will be overwritten by the handler's
-        // first bus cycle (advance_pipeline or fetch_word or refill_prefetch_dyn).
         dec.dispatch(op)(self, bus, op)
     }
 
