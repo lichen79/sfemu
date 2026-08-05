@@ -113,10 +113,17 @@ impl M68k {
 
     /// Shifts the queue one word and refills slot 1 from PC.
     ///
-    /// Called by instruction handlers as their first bus operation: the opcode
-    /// word at `prefetch[0]` was already peeked by `step_with`; this discards
-    /// it, promotes slot 1, then fetches the next word into slot 1 from the
-    /// current PC, advancing PC by 2.
+    /// This is the first bus operation every normal instruction handler must
+    /// perform.  `step_with` only peeked at `prefetch[0]`; calling this
+    /// discards it (promotes slot 1, fetches the next word into slot 1 from PC,
+    /// and advances PC by 2), producing the pipeline-advance bus cycle that
+    /// hardware emits for every executing instruction.
+    ///
+    /// **Use `fetch_word` instead when the handler needs an extension word.**
+    /// `fetch_word` returns the value of the word it consumes, which is what
+    /// a handler reading an immediate operand or displacement wants.
+    /// `consume_opcode` discards the return value and is only for the opcode
+    /// word itself, which the handler already has from `step_with`'s peek.
     ///
     /// **Exception-aborting handlers must NOT call this.**  They return after
     /// `exception::take`, which refills both slots with `refill_prefetch_dyn`.
@@ -371,5 +378,27 @@ mod tests {
         assert!(cpu.sr_s(), "reset enters supervisor mode");
         assert_eq!(cpu.prefetch, [0x4E71, 0x4E71]);
         assert_eq!(cpu.pc, 0x1004, "pc sits 4 past the first instruction");
+    }
+
+    /// `consume_opcode` shifts the queue and issues exactly one `read16` at
+    /// the pre-call PC, advancing PC by 2.  The opcode value itself is NOT
+    /// returned (the caller already has it from `step_with`'s peek).
+    #[test]
+    fn consume_opcode_shifts_queue_and_refills_slot_1() {
+        let mut bus = FlatBus::new();
+        bus.put16(0x1004, 0x3333); // the word that will fill slot 1
+
+        let mut cpu = M68k::new();
+        cpu.pc = 0x1004;
+        cpu.prefetch = [0x1111, 0x2222];
+
+        cpu.consume_opcode(&mut bus);
+
+        // slot 0 takes the old slot 1
+        assert_eq!(cpu.prefetch[0], 0x2222, "prefetch[0] must be old slot 1");
+        // slot 1 refilled by read16 at the pre-call PC (0x1004)
+        assert_eq!(cpu.prefetch[1], 0x3333, "prefetch[1] must be refilled");
+        // PC advanced by 2
+        assert_eq!(cpu.pc, 0x1006, "PC must advance by 2");
     }
 }

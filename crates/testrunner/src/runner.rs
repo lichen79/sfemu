@@ -232,15 +232,25 @@ pub fn run_group(path: &Path) -> GroupResult {
 
 /// Asserts a group passes completely, printing a readable report if not.
 ///
-/// Skips with a message when the vectors are absent, so a fresh checkout does
-/// not fail before `fetch` has run.
+/// Fails immediately if the vector file is absent: a missing file is a host
+/// fault, not a skip.  Run `cargo run -p testrunner --bin fetch` to populate
+/// `testdata/` before running the suite.
+///
+/// Also fails if the file parsed to zero cases, which would otherwise yield a
+/// vacuous pass.
 pub fn assert_group(name: &str) {
     let path = testdata_dir().join(format!("{name}.json.bin"));
-    if !path.exists() {
-        eprintln!("skipping {name}: run `cargo run -p testrunner --bin fetch`");
-        return;
-    }
+    assert!(
+        path.exists(),
+        "missing {}: run `cargo run -p testrunner --bin fetch`",
+        path.display()
+    );
     let r = run_group(&path);
+    assert!(
+        r.total > 0,
+        "{}: parsed to zero cases — vector file may be corrupt",
+        r.group
+    );
     if !r.is_clean() {
         let mut msg = format!("{}: {}/{} passed\n", r.group, r.passed, r.total);
         for f in &r.failures {
