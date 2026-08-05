@@ -19,19 +19,40 @@ pub const VEC_TRAP_BASE: u8 = 32;
 pub const VEC_AUTOVECTOR_BASE: u8 = 24;
 
 /// Pushes a word onto the active stack.
+// Used by future instruction handlers (TRAP, bus-error frame, etc.).
+#[allow(dead_code)]
 pub(crate) fn push16(cpu: &mut M68k, bus: &mut dyn Bus, val: u16) {
     cpu.a[7] = cpu.a[7].wrapping_sub(2);
     bus.write16(cpu.a[7] & ADDR_MASK, val);
+    if cpu.sr_s() {
+        cpu.ssp = cpu.a[7];
+    } else {
+        cpu.usp = cpu.a[7];
+    }
 }
 
-/// Pushes a long, low word first, so the long reads back big-endian.
+/// Pushes a long word onto the stack: low word first (descending), so the
+/// long reads back big-endian from memory (high word at lower address).
+// Used by future instruction handlers.
+#[allow(dead_code)]
 pub(crate) fn push32(cpu: &mut M68k, bus: &mut dyn Bus, val: u32) {
     push16(cpu, bus, (val & 0xFFFF) as u16);
     push16(cpu, bus, (val >> 16) as u16);
 }
 
-/// Takes a group 1/2 exception: save SR, enter supervisor mode, push the short
-/// frame (PC then SR), then vector.
+/// Takes a group 1/2 exception: save SR, enter supervisor mode, write the
+/// short frame, then vector.
+///
+/// The 68000 writes the short frame in a non-sequential bus order that does
+/// not match three simple push16 operations.  From the Users Manual and
+/// confirmed by the SingleStepTests bus-transaction sequence:
+///
+///   1.  PC[15:0]  → old_SSP − 2   (highest address in the frame)
+///   2.  SR        → old_SSP − 6   (lowest address; new SSP lands here)
+///   3.  PC[31:16] → old_SSP − 4   (middle of the frame)
+///
+/// The result in memory (growing downward) is a canonical big-endian long PC
+/// followed by the SR word, with new_SSP pointing at the SR.
 ///
 /// `pc_for_frame` is the PC value to stack, which differs per exception type,
 /// so callers pass it explicitly rather than this function guessing from
@@ -42,8 +63,21 @@ pub fn take(cpu: &mut M68k, bus: &mut dyn Bus, vector: u8, pc_for_frame: u32) {
     // frame lands on the supervisor stack and the handler does not trace.
     cpu.set_sr((old_sr | SR_S) & !SR_T);
 
-    push32(cpu, bus, pc_for_frame);
-    push16(cpu, bus, old_sr);
+    // Hardware bus sequence: PC_low first, then SR, then PC_high.
+    // The stack pointer ends up 6 bytes below where it started.
+    let old_sp = cpu.a[7];
+    bus.write16(
+        (old_sp.wrapping_sub(2)) & ADDR_MASK,
+        (pc_for_frame & 0xFFFF) as u16,
+    );
+    bus.write16((old_sp.wrapping_sub(6)) & ADDR_MASK, old_sr);
+    bus.write16(
+        (old_sp.wrapping_sub(4)) & ADDR_MASK,
+        (pc_for_frame >> 16) as u16,
+    );
+    cpu.a[7] = old_sp.wrapping_sub(6);
+    // Keep ssp in sync (we are always in supervisor mode at this point).
+    cpu.ssp = cpu.a[7];
 
     let addr = (vector as u32) * 4;
     let hi = bus.read16(addr & ADDR_MASK) as u32;
@@ -54,17 +88,17 @@ pub fn take(cpu: &mut M68k, bus: &mut dyn Bus, vector: u8, pc_for_frame: u32) {
 
 /// Byte distance from `cpu.pc` at handler entry back to the opcode word.
 ///
-/// When `step_with` dispatches a handler, `cpu.pc` is 6 bytes ahead of the
-/// opcode that was just fetched:
-/// - 4 bytes: the prefetch queue holds two words beyond the instruction
-/// - 2 bytes: `fetch_word` advanced `pc` by one more word to consume the opcode
+/// When `step_with` dispatches a handler, `cpu.pc` is 4 bytes ahead of the
+/// opcode that was just popped:
+/// - 4 bytes: the prefetch queue holds two words beyond the instruction;
+///   `step_with` pops `prefetch[0]` without advancing `pc`.
 ///
 /// **This offset is only valid for a handler that has consumed exactly the
 /// opcode word and no extension words.** Any handler that calls `fetch_word`
 /// or `fetch_long` to consume extension words will have advanced `pc` further;
 /// those handlers must capture `cpu.pc` at entry (before any such fetch) and
 /// pass their own adjusted value to `take`.
-pub(crate) const OPCODE_PC_OFFSET: u32 = 6;
+pub(crate) const OPCODE_PC_OFFSET: u32 = 4;
 
 /// An unrecognised opcode. Line-A and Line-F opcodes have their own vectors,
 /// which some software uses deliberately as a trap mechanism.
@@ -107,10 +141,17 @@ mod tests {
         let dec = Decoder::new();
         cpu.step_with(&dec, &mut bus);
 
-        // Short frame: PC (long) then SR (word), so SP drops by 6.
+        // Short frame: SR (word) at new_SSP, PC_high above that, PC_low at top.
+        // SP drops by 6 total.
         assert_eq!(cpu.a[7], 0x2FFA);
-        assert_eq!(bus.read16(0x2FFC), 0x0000);
-        assert_eq!(bus.read16(0x2FFE), 0x1000, "stacked PC is the bad opcode");
+        // Memory layout (low addr → high addr): [SR][PC_hi][PC_lo]
+        //   0x2FFA: SR,      0x2FFC: PC[31:16] = 0x0000,  0x2FFE: PC[15:0] = 0x1000
+        assert_eq!(
+            bus.read16(0x2FFE),
+            0x1000,
+            "stacked PC[15:0] is the bad opcode"
+        );
+        assert_eq!(bus.read16(0x2FFC), 0x0000, "stacked PC[31:16]");
         assert_eq!(
             bus.read16(0x2FFA),
             SR_S | 0x0700,

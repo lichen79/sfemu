@@ -135,6 +135,8 @@ impl M68k {
     }
 
     #[inline]
+    // Used by instruction handlers in Tasks 5+.
+    #[allow(dead_code)]
     pub(crate) fn fetch_word(&mut self, bus: &mut impl crate::Bus) -> u16 {
         self.fetch_word_dyn(bus)
     }
@@ -192,7 +194,16 @@ impl M68k {
             }
             self.stopped = false;
         }
-        let op = self.fetch_word(bus);
+        // Pop the opcode from the prefetch queue WITHOUT issuing a bus cycle.
+        // The 68000 aborts the pending pipeline-refill fetch for
+        // exception-raising instructions (illegal opcodes, traps, etc.).
+        // Normal instruction handlers issue their own pipeline-advance reads as
+        // their first bus cycle; exception handlers call refill_prefetch_dyn
+        // after vectoring, which covers both slots at once.
+        let op = self.prefetch[0];
+        self.prefetch[0] = self.prefetch[1];
+        // prefetch[1] is now stale and will be overwritten by the handler's
+        // first bus cycle (advance_pipeline or fetch_word or refill_prefetch_dyn).
         dec.dispatch(op)(self, bus, op)
     }
 
