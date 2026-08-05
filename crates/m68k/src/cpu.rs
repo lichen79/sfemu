@@ -148,6 +148,13 @@ impl M68k {
         self.fetch_long_dyn(bus)
     }
 
+    #[inline]
+    // Used by branch/jump handlers in Task 3+; allow dead_code until then.
+    #[allow(dead_code)]
+    pub(crate) fn refill_prefetch(&mut self, bus: &mut impl crate::Bus) {
+        self.refill_prefetch_dyn(bus);
+    }
+
     /// Fills the prefetch queue from the current PC.
     ///
     /// Public because drivers and benchmarks that set PC directly, rather than
