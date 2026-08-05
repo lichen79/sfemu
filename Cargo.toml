@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/m68k"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.93"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+
+# testdata parsing in debug mode is slow; speed up deps for tests
+[profile.test]
+opt-level = 2

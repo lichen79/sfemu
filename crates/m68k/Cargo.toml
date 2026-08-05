@@ -1,0 +1,14 @@
+[package]
+name = "m68k"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Motorola 68000 CPU core"
+
+[dependencies]
+serde = { version = "1", optional = true, default-features = false, features = ["derive"] }
+
+[features]
+default = ["std"]
+std = []
+serde = ["dep:serde"]
