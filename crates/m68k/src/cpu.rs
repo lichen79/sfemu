@@ -112,8 +112,6 @@ impl M68k {
     }
 
     /// Consumes the next word from the prefetch queue, refilling from PC.
-    // Used by instruction handlers in Task 3+; allow dead_code until then.
-    #[allow(dead_code)]
     pub(crate) fn fetch_word_dyn(&mut self, bus: &mut dyn crate::Bus) -> u16 {
         let w = self.prefetch[0];
         self.prefetch[0] = self.prefetch[1];
@@ -137,7 +135,6 @@ impl M68k {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn fetch_word(&mut self, bus: &mut impl crate::Bus) -> u16 {
         self.fetch_word_dyn(bus)
     }
@@ -181,6 +178,31 @@ impl M68k {
     /// Raises an interrupt at `level` (0 clears, 1-7 are IPL).
     pub fn set_irq(&mut self, level: u8) {
         self.pending_irq = level & 7;
+    }
+
+    /// Executes one instruction, returning the cycles it consumed.
+    pub fn step_with(&mut self, dec: &crate::decode::Decoder, bus: &mut impl crate::Bus) -> u32 {
+        // A halted CPU is dead until reset, but still burns time.
+        if self.halted {
+            return 4;
+        }
+        if self.stopped {
+            if self.pending_irq == 0 {
+                return 4;
+            }
+            self.stopped = false;
+        }
+        let op = self.fetch_word(bus);
+        dec.dispatch(op)(self, bus, op)
+    }
+
+    /// Convenience wrapper owning a lazily-built decoder. Requires `std`;
+    /// `no_std` callers use [`M68k::step_with`] with their own `Decoder`.
+    #[cfg(feature = "std")]
+    pub fn step(&mut self, bus: &mut impl crate::Bus) -> u32 {
+        use std::sync::OnceLock;
+        static DEC: OnceLock<crate::decode::Decoder> = OnceLock::new();
+        self.step_with(DEC.get_or_init(crate::decode::Decoder::new), bus)
     }
 }
 

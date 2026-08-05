@@ -9,6 +9,8 @@
 
 pub mod bus;
 pub mod cpu;
+pub mod decode;
+pub mod exception;
 
 pub use bus::Bus;
 pub use cpu::M68k;
