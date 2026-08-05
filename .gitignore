@@ -2,3 +2,5 @@
 /testdata
 Cargo.lock
 .DS_Store
+/.worktrees
+/.superpowers
