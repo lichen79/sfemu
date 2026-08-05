@@ -24,23 +24,15 @@ fn unimplemented_op(cpu: &mut M68k, bus: &mut dyn Bus, op: u16) -> u32 {
 /// Built once and shared. Keeping it out of a global avoids `std`
 /// synchronisation primitives in a `no_std`-friendly crate and keeps the core
 /// free of hidden state.
-///
-/// The table is heap-allocated (`Box`) because 65536 function pointers (512 KB)
-/// would overflow the stack if constructed locally.
 pub struct Decoder {
-    table: Box<[Handler; 65536]>,
+    table: [Handler; 65536],
 }
 
 impl Decoder {
     pub fn new() -> Self {
-        // Allocate on the heap to avoid a 512 KB stack frame.
-        let mut v: Vec<Handler> = vec![unimplemented_op as Handler; 65536];
-        register_all(&mut v);
-        let boxed: Box<[Handler; 65536]> = v
-            .into_boxed_slice()
-            .try_into()
-            .expect("vec has exactly 65536 elements");
-        Self { table: boxed }
+        let mut table = [unimplemented_op as Handler; 65536];
+        register_all(&mut table);
+        Self { table }
     }
 
     #[inline]
@@ -56,6 +48,6 @@ impl Default for Decoder {
 }
 
 /// Each instruction module contributes its opcodes here. Later tasks extend it.
-fn register_all(_t: &mut [Handler]) {
+fn register_all(_t: &mut [Handler; 65536]) {
     // Task 5 onward fills this in.
 }

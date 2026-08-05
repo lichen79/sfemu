@@ -52,6 +52,20 @@ pub fn take(cpu: &mut M68k, bus: &mut dyn Bus, vector: u8, pc_for_frame: u32) {
     cpu.refill_prefetch_dyn(bus);
 }
 
+/// Byte distance from `cpu.pc` at handler entry back to the opcode word.
+///
+/// When `step_with` dispatches a handler, `cpu.pc` is 6 bytes ahead of the
+/// opcode that was just fetched:
+/// - 4 bytes: the prefetch queue holds two words beyond the instruction
+/// - 2 bytes: `fetch_word` advanced `pc` by one more word to consume the opcode
+///
+/// **This offset is only valid for a handler that has consumed exactly the
+/// opcode word and no extension words.** Any handler that calls `fetch_word`
+/// or `fetch_long` to consume extension words will have advanced `pc` further;
+/// those handlers must capture `cpu.pc` at entry (before any such fetch) and
+/// pass their own adjusted value to `take`.
+pub(crate) const OPCODE_PC_OFFSET: u32 = 6;
+
 /// An unrecognised opcode. Line-A and Line-F opcodes have their own vectors,
 /// which some software uses deliberately as a trap mechanism.
 pub fn illegal_instruction(cpu: &mut M68k, bus: &mut dyn Bus, op: u16) -> u32 {
@@ -60,11 +74,9 @@ pub fn illegal_instruction(cpu: &mut M68k, bus: &mut dyn Bus, op: u16) -> u32 {
         0xF => VEC_LINE_F,
         _ => VEC_ILLEGAL,
     };
-    // The stacked PC points at the offending instruction. After step_with
-    // calls fetch_word to consume the opcode, cpu.pc is 6 ahead of that
-    // instruction: 4 from the two-word prefetch queue, plus 2 from the
-    // fetch_word call that consumed the opcode itself.
-    let pc = cpu.pc.wrapping_sub(6);
+    // Stack the address of the offending instruction. See OPCODE_PC_OFFSET for
+    // why this offset is 6 and why it must not be copied into other handlers.
+    let pc = cpu.pc.wrapping_sub(OPCODE_PC_OFFSET);
     take(cpu, bus, vector, pc);
     34
 }
