@@ -77,6 +77,126 @@ pub fn take(cpu: &mut M68k, bus: &mut dyn Bus, vector: u8, pc_for_frame: u32) {
     cpu.refill_prefetch_dyn(bus);
 }
 
+/// Whether a faulting access was a read or a write. Selects bit 4 of the
+/// address-error status word.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FaultKind {
+    Read,
+    Write,
+}
+
+/// Address space the faulting access was in. Selects bits 0-1 of `fc`.
+///
+/// Program space means the access was an instruction fetch or a PC-relative
+/// operand read; everything else is data space. In the MOVE groups all 177
+/// program-space faults are PC-relative source reads (addendum §9.4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Space {
+    Data,
+    Program,
+}
+
+/// Fixed cycle cost of the address-error tail: the aborted access, the 7 frame
+/// writes, the 2 vector reads, the 2 prefetch refills, and 10 cycles of idle.
+///
+/// Under the timing law (`cycles = 4 * non-idle accesses + idle`) that is
+/// `4 * 12 + 10`. Measured at 58 in 4,661 of 4,661 cases (addendum §9.6). The
+/// caller adds the cost of whatever schedule ran before the fault.
+pub const ADDRESS_ERROR_TAIL_CYCLES: u32 = 58;
+
+/// Takes an address error: vector 3 with a 7-word frame.
+///
+/// Raised when a **word or long** access is attempted at an odd address. Byte
+/// accesses never raise it, and neither does `MOVEP`, which is byte-sized on the
+/// bus whatever its suffix says.
+///
+/// **The faulting access must not have happened.** Callers check alignment
+/// *before* touching the bus — the test harness asserts the access is absent
+/// from the bus log, so a read-then-fault would fail even though the CPU state
+/// came out right.
+///
+/// Arguments the caller must get right, each measured rather than guessed:
+///
+/// - `fault_addr` — the full **32-bit** un-masked address, odd bit included.
+///   Do not mask to 24 bits: the frame stores both halves and the top byte is
+///   frequently non-zero.
+/// - `ir` — the instruction register at fault time. This is the opcode in every
+///   case except a word-sized write fault into `-(An)`, where the pipeline has
+///   advanced one word further (addendum §9.5c).
+/// - `pc_for_frame` — see [`address_error_stacked_pc`]; it is not a fixed
+///   offset from the opcode.
+///
+/// Bus write order, continuing the short frame's "low half, then skip back,
+/// then fill in" pattern, verified 6,579/6,579:
+///
+/// | order | address     | contents      |
+/// |-------|-------------|---------------|
+/// | 1     | `base - 2`  | PC[15:0]      |
+/// | 2     | `base - 6`  | SR            |
+/// | 3     | `base - 4`  | PC[31:16]     |
+/// | 4     | `base - 8`  | IR            |
+/// | 5     | `base - 10` | fault[15:0]   |
+/// | 6     | `base - 14` | status word   |
+/// | 7     | `base - 12` | fault[31:16]  |
+///
+/// `base` is `cpu.a[7]` **as it stands now** — not the instruction's entry SP.
+/// A faulting `-(A7)` or `(A7)+` has already moved it, and the frame lands
+/// below the moved value in 31 of 4,661 cases (addendum §9.5b).
+pub fn address_error(
+    cpu: &mut M68k,
+    bus: &mut dyn Bus,
+    fault_addr: u32,
+    kind: FaultKind,
+    space: Space,
+    ir: u16,
+    pc_for_frame: u32,
+) {
+    // fc uses the S bit as it was BEFORE entry, and the space of the faulting
+    // access. Bits 0-2 of the SR are C/V/Z, not a function code — compute this
+    // from the access, never by reading the SR.
+    let fc = (if cpu.sr_s() { 4u16 } else { 0 })
+        | match space {
+            Space::Program => 2,
+            Space::Data => 1,
+        };
+    // The upper 11 bits are stale IR bits sharing the latch. That is real
+    // hardware behaviour; do not clean them. Bit 3 is always 0 — there is no
+    // "instruction/not" bit to set.
+    let status = (ir & 0xFFE0)
+        | match kind {
+            FaultKind::Read => 1 << 4,
+            FaultKind::Write => 0,
+        }
+        | fc;
+
+    // The stacked SR is the SR at fault time, including any CCR update the
+    // instruction already performed — not a pre-instruction snapshot
+    // (addendum §9.5a). Capture it before entering supervisor mode.
+    let old_sr = cpu.sr;
+    cpu.set_sr((old_sr | SR_S) & !SR_T);
+
+    let base = cpu.a[7];
+    let w = |bus: &mut dyn Bus, off: u32, val: u16| {
+        bus.write16(base.wrapping_sub(off) & ADDR_MASK, val);
+    };
+    w(bus, 2, pc_for_frame as u16);
+    w(bus, 6, old_sr);
+    w(bus, 4, (pc_for_frame >> 16) as u16);
+    w(bus, 8, ir);
+    w(bus, 10, fault_addr as u16);
+    w(bus, 14, status);
+    w(bus, 12, (fault_addr >> 16) as u16);
+
+    cpu.a[7] = base.wrapping_sub(14);
+    cpu.ssp = cpu.a[7];
+
+    let vaddr = (VEC_ADDRESS_ERROR as u32) * 4;
+    let hi = bus.read16(vaddr & ADDR_MASK) as u32;
+    let lo = bus.read16((vaddr + 2) & ADDR_MASK) as u32;
+    cpu.pc = (hi << 16) | lo;
+    cpu.refill_prefetch_dyn(bus);
+}
+
 /// Byte distance from `cpu.pc` at handler entry back to the opcode word.
 ///
 /// When `step_with` dispatches a handler, `cpu.pc` is 4 bytes ahead of the

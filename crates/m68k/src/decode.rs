@@ -48,6 +48,6 @@ impl Default for Decoder {
 }
 
 /// Each instruction module contributes its opcodes here. Later tasks extend it.
-fn register_all(_t: &mut [Handler; 65536]) {
-    // Task 5 onward fills this in.
+fn register_all(t: &mut [Handler; 65536]) {
+    crate::ops::register_all(t);
 }

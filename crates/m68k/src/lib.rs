@@ -10,7 +10,10 @@
 pub mod bus;
 pub mod cpu;
 pub mod decode;
+pub mod ea;
 pub mod exception;
+pub mod ops;
 
 pub use bus::Bus;
 pub use cpu::M68k;
+pub use ea::Size;
