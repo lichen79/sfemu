@@ -139,8 +139,11 @@ enum Claim {
     /// No 68000 instruction has this encoding — it must reach the illegal
     /// handler now and forever.
     Illegal,
-    /// A real instruction belonging to a later task. Unasserted, because it is
-    /// illegal today and must not be once that task lands.
+    /// Deferred by this classifier. The name is now a historical one: with every
+    /// task landed, **no** deferred opcode belongs to a later task. All 25,728 of
+    /// them are either classified by a sibling test in this file or nonexistent —
+    /// see [`deferred_opcodes_are_accounted_for`], which is what keeps the name
+    /// from quietly becoming a lie.
     Later,
 }
 
@@ -409,16 +412,16 @@ fn claim(op: u16) -> Claim {
                     // `<ea>` patterns, so this arm enumerates rather than
                     // consulting `modes::`.
                     match op {
-                        // 4E40-4E4F: TRAP #0-#15. Task 11.
-                        0x4E40..=0x4E4F => Claim::Later,
+                        // 4E40-4E4F: TRAP #0-#15.
+                        0x4E40..=0x4E4F => Claim::Mine,
                         // 4E50-4E57 LINK, 4E58-4E5F UNLK.
                         0x4E50..=0x4E5F => Claim::Mine,
                         // 4E60-4E67 MOVE An,USP; 4E68-4E6F MOVE USP,An.
                         0x4E60..=0x4E6F => Claim::Mine,
-                        0x4E70 => Claim::Mine,  // RESET
-                        0x4E72 => Claim::Mine,  // STOP
-                        0x4E73 => Claim::Later, // RTE, Task 11
-                        0x4E76 => Claim::Later, // TRAPV, Task 11
+                        0x4E70 => Claim::Mine, // RESET
+                        0x4E72 => Claim::Mine, // STOP
+                        0x4E73 => Claim::Mine, // RTE
+                        0x4E76 => Claim::Mine, // TRAPV
                         // 4E71 NOP and 4E75/4E77 RTS/RTR are handled above.
                         // 4E74 is RTD (68010) and 4E7A/4E7B are MOVEC (68010),
                         // so this row's remaining encodings do not exist here.
@@ -598,14 +601,18 @@ fn claim(op: u16) -> Claim {
 /// 2500 cases per group and a rare mode can be missing from the table without any
 /// group failing.
 ///
-/// Encodings belonging to later tasks are skipped rather than asserted illegal:
-/// they are illegal *today*, so asserting it would bake in a fact that Task 8
-/// through 11 must then unbake.
+/// Encodings this classifier defers are skipped rather than asserted illegal.
+/// Through Tasks 5-10 that was because they were illegal *today* and must not be
+/// once a later task landed. Every task has now landed and the skip remains, for
+/// a different reason: whole lines are classified by the sibling tests above
+/// rather than by `claim`, so asserting anything here would duplicate them. The
+/// count is asserted instead — see [`deferred_opcodes_are_accounted_for`].
 #[test]
 fn implemented_tasks_claim_exactly_the_legal_encodings() {
     let dec = Decoder::new();
     let mut mine = 0;
     let mut illegal = 0;
+    let mut later = 0;
     for op in 0..=0xFFFFu32 {
         let op = op as u16;
         let claimed = !is_illegal(&dec, op);
@@ -626,15 +633,32 @@ fn implemented_tasks_claim_exactly_the_legal_encodings() {
                 );
                 illegal += 1;
             }
-            Claim::Later => {}
+            Claim::Later => later += 1,
         }
     }
+    // The deferred count is asserted exactly, not as a floor. See
+    // `deferred_opcodes_are_accounted_for` for where each of these lands; the
+    // point here is that `mine`, `illegal` and `later` partition the space, so
+    // an encoding cannot silently move between the three.
+    assert_eq!(
+        mine + illegal + later,
+        0x10000,
+        "the three claims must partition the opcode space"
+    );
+    assert_eq!(later, 25_728, "deferred opcode census changed");
     // A guard against the classifier itself going vacuous: if a refactor made
     // `claim` return `Later` everywhere the assertions above would all pass.
     //
     // The thresholds are floors, not measurements. The history: Task 6 left them
     // at 20,177 / 3,632, Task 7 at 25,461 / 4,556, Task 8 at 30,543 / 4,724,
-    // Task 9 at 32,969 / 5,178, and Task 10 at **34,023 / 5,767**.
+    // Task 9 at 32,969 / 5,178, Task 10 at 34,023 / 5,767, and Task 11 at
+    // **34,041 / 5,767**.
+    //
+    // Task 11 moved `mine` by exactly 18 and `illegal` by 0, which is the whole
+    // of its opcode footprint: the sixteen `TRAP #n`, plus `RTE` and `TRAPV`.
+    // Those eighteen were `Claim::Later` before and are now `Claim::Mine`. No
+    // encoding changed legality, so `illegal` is unchanged at 5,767 — but its
+    // floor still sat at 5,700 from Task 9, so it is tightened here too.
     //
     // Task 9 raised both, having left them alone through two tasks: at 20,000 the
     // `mine` floor sat at 61% of the true count and the `illegal` one at 19%, and
@@ -649,10 +673,62 @@ fn implemented_tasks_claim_exactly_the_legal_encodings() {
     // the failure messages report the counts above, so the classifier really is
     // reaching the new lines and not returning `Later` across them.
     assert!(
-        mine > 34_000,
+        mine > 34_040,
         "only {mine} opcodes classified as implemented"
     );
-    assert!(illegal > 5_700, "only {illegal} classified as nonexistent");
+    assert!(illegal > 5_766, "only {illegal} classified as nonexistent");
+}
+
+/// Every deferred opcode is either classified elsewhere in this file or does not
+/// exist — no encoding is unaccounted for now that all fourteen tasks have landed.
+///
+/// `claim` returns [`Claim::Later`] for 25,728 opcodes, which through Task 10 was
+/// read as "a later task will own these". That reading is now retracted: nothing
+/// is left to land, so each of them must already be settled. Where:
+///
+/// | line | count | who settles it |
+/// |------|-------|----------------|
+/// | 0001, 0010, 0011 | 12,288 | `move_claims_exactly_the_legal_encodings` |
+/// | 0100 | 1,152 | nobody — 68020 encodings, asserted illegal below |
+/// | 0111 | 4,096 | `moveq_requires_bit_8_clear` |
+/// | 1010, 1111 | 8,192 | the `ILLEGAL_LINEA`/`ILLEGAL_LINEF` suite groups |
+///
+/// Line 0100's 1,152 are the only ones no other test touches, so they are the
+/// only ones this test executes. They decompose as 1,024 at the odd selectors
+/// (1, 3, 5, 7, 9, B, D, F) with opmode 4 or 5 — `MOVE from CCR` is selector 2
+/// and the odd selectors have no instruction at those opmodes at all — plus 128
+/// at selector C size bits 00 and 01, which is the 68020's 32-bit `MULU`/`DIVU`
+/// and nothing on a 68000.
+///
+/// The reason this is a separate test rather than more `Claim::Illegal` arms in
+/// `claim` is that `claim`'s line-0100 arm is already the longest in the file and
+/// these encodings share no structure with the instructions around them.
+#[test]
+fn deferred_opcodes_are_accounted_for() {
+    let dec = Decoder::new();
+    let mut checked = 0;
+    for op in 0x4000..0x5000u16 {
+        if claim(op) != Claim::Later {
+            continue;
+        }
+        let sel = (op >> 8) & 0xF;
+        let opmode = (op >> 6) & 7;
+        let size_bits = (op >> 6) & 3;
+        // The classification this test asserts, stated independently of `claim`.
+        let known = ((sel & 1) == 1 && matches!(opmode, 4 | 5))
+            || (sel == 0xC && matches!(size_bits, 0 | 1));
+        assert!(
+            known,
+            "opcode {op:04X} (selector {sel:X}, opmode {opmode}) is deferred by \
+             `claim` and matches no known 68020-only encoding"
+        );
+        assert!(
+            is_illegal(&dec, op),
+            "opcode {op:04X} does not exist on the 68000 but a handler claims it"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 1_152, "line 0100's deferred census changed");
 }
 
 /// The `to CCR` and `to SR` forms are six specific opcodes, and the long-sized
