@@ -201,12 +201,13 @@ fn bit_op(op: u16, dynamic: bool) -> Claim {
     }
 }
 
-/// Classifies every opcode in the lines Tasks 6 and 7 touch.
+/// Classifies every opcode in the lines Tasks 6, 7 and 8 touch.
 ///
 /// Written as one function over the whole space rather than per family, because
 /// the interesting cases are the collisions: `EOR` and `CMPM` sharing an opmode,
-/// `ADDQ`'s `An` destination appearing only above byte size, and the `to CCR` /
-/// `to SR` opcodes occupying an `<ea>` slot that is otherwise illegal.
+/// `ADDQ`'s `An` destination appearing only above byte size, the `to CCR` /
+/// `to SR` opcodes occupying an `<ea>` slot that is otherwise illegal, and
+/// `DBcc` taking the mode-`001` slot that `Scc` would otherwise fill.
 fn claim(op: u16) -> Claim {
     let mode = (op >> 3) & 7;
     let reg = op & 7;
@@ -276,6 +277,27 @@ fn claim(op: u16) -> Claim {
                 } else {
                     Claim::Illegal
                 }
+            } else if sel == 0xE {
+                // 0100 1110: the four Task 8 encodings among a crowd of later
+                // work. `JMP` (size 11) and `JSR` (size 10) take the *control*
+                // modes — memory operands whose address does not depend on the
+                // access, so neither `(An)+` nor `-(An)`, a jump having no
+                // operand size to step by.
+                if op == 0x4E75 || op == 0x4E77 {
+                    // RTS and RTR, two single opcodes rather than patterns.
+                    Claim::Mine
+                } else if size_bits >= 2 {
+                    let control = matches!(mode, 2 | 5 | 6) || (mode == 7 && reg <= 3);
+                    if control {
+                        Claim::Mine
+                    } else {
+                        Claim::Illegal
+                    }
+                } else {
+                    // The rest of 0100 1110 0xxx: TRAP, LINK/UNLK, MOVE USP,
+                    // RESET, STOP, RTE, SWAP — Tasks 10 and 11.
+                    Claim::Later
+                }
             } else if !matches!(sel, 0x0 | 0x2 | 0x4 | 0x6 | 0xA) || size_bits == 3 {
                 Claim::Later
             } else if data {
@@ -287,7 +309,17 @@ fn claim(op: u16) -> Claim {
         // 0101: ADDQ/SUBQ below size 11, Scc/DBcc/TRAPcc at it.
         0x5 => {
             if size_bits == 3 {
-                Claim::Later
+                // Size 11: `DBcc` at mode 001 — the one place in this line where
+                // a `001` mode field is not `An` — and `Scc` over the
+                // data-alterable set everywhere else. Mode 7 reg 2/3/4 would be
+                // `TRAPcc` on a 68020 and is nothing at all on a 68000; the
+                // vectors agree, with zero mode-7-above-reg-1 cases in `Scc`'s
+                // 2,500.
+                if mode == 1 || data {
+                    Claim::Mine
+                } else {
+                    Claim::Illegal
+                }
             } else if mode == 1 {
                 // ADDQ/SUBQ #d,An exists at word and long size, operating on all
                 // 32 bits; there is no byte form.
@@ -411,6 +443,11 @@ fn claim(op: u16) -> Claim {
                 Claim::Illegal
             }
         }
+        // 0110: Bcc, BRA and BSR. All 4,096 encodings exist — 16 conditions
+        // (condition 0 being BRA and condition 1 BSR, not "never") times 256
+        // displacements, with displacement 0x00 selecting the 16-bit form rather
+        // than being a hole. There is nothing to classify as illegal.
+        0x6 => Claim::Mine,
         _ => Claim::Later,
     }
 }
@@ -455,10 +492,15 @@ fn implemented_tasks_claim_exactly_the_legal_encodings() {
     // `claim` return `Later` everywhere the assertions above would all pass.
     //
     // The thresholds are floors, not measurements. Task 7 took `mine` from
-    // 20,177 to 25,461 and `illegal` from 3,632 to 4,556, so the first bound is
-    // no longer the 0.9% margin it was at Task 6 — but leave it where it is
-    // rather than tracking the count upward, since a guard that has to be
-    // adjusted every task is a guard nobody trusts.
+    // 20,177 to 25,461 and `illegal` from 3,632 to 4,556, and Task 8 took them to
+    // 30,543 and 4,724 — the whole of line 0110 plus size 11 of line 0101. So the
+    // first bound is no longer the 0.9% margin it was at Task 6, but leave it
+    // where it is rather than tracking the count upward, since a guard that has to
+    // be adjusted every task is a guard nobody trusts.
+    //
+    // Both floors were re-confirmed non-vacuous by raising them until they failed:
+    // the failure messages report the counts above, so the classifier really is
+    // reaching the new lines and not returning `Later` across them.
     assert!(
         mine > 20_000,
         "only {mine} opcodes classified as implemented"

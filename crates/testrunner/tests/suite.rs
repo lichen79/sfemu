@@ -132,6 +132,18 @@ group!(bset, "BSET");
 group!(bclr, "BCLR");
 group!(bchg, "BCHG");
 
+// Task 8: branches, jumps, subroutine calls, and conditional set/decrement.
+// `BRA` and `BSR` share the `Bcc` line's encoding but have their own groups; the
+// `Bcc` group covers conditions 2-15 only.
+group!(bcc, "Bcc");
+group!(bsr, "BSR");
+group!(dbcc, "DBcc");
+group!(scc, "Scc");
+group!(jmp, "JMP");
+group!(jsr, "JSR");
+group!(rts, "RTS");
+group!(rtr, "RTR");
+
 /// Known-bad upstream: `TAS`'s indivisible read-modify-write is not modelled by
 /// the vector generator. Asserted as *partially* failing so an upstream fix
 /// surfaces.
