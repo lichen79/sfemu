@@ -10,6 +10,7 @@ pub mod move_;
 pub mod muldiv;
 pub mod shift;
 pub mod system;
+pub mod trap;
 
 /// Installs every implemented handler into the dispatch table.
 ///
@@ -28,6 +29,10 @@ pub mod system;
 /// (`Scc`/`DBcc`) and [`arith`] takes the rest (`ADDQ`/`SUBQ`); and the `0100`
 /// line, where it takes only `4E75`, `4E77` and `4E80`-`4EFF`.
 ///
+/// [`trap`] takes the last three unclaimed rows of the `0100 1110` line —
+/// `4E40`-`4E4F` (`TRAP #n`), `4E73` (`RTE`) and `4E76` (`TRAPV`) — alongside
+/// [`system`]'s `4E70`/`4E72` and [`branch`]'s `4E75`/`4E77`/`4E80`-`4EFF`.
+///
 /// [`muldiv`] and [`bcd`] are the two remaining tenants of lines `1000` and
 /// `1100`, which [`logic`] shares: `OR`/`AND` take opmodes 0-2 and 4-6, the
 /// divides and multiplies take 3 and 7, and `SBCD`/`ABCD` take opmode 4 at modes
@@ -43,4 +48,5 @@ pub fn register_all(table: &mut [crate::decode::Handler; 65536]) {
     muldiv::register(table);
     bcd::register(table);
     system::register(table);
+    trap::register(table);
 }

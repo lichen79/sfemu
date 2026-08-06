@@ -41,6 +41,16 @@ pub struct M68k {
     /// True while an exception is being entered. A second fault raised during
     /// that window is a double fault, which halts the CPU.
     pub in_exception: bool,
+    /// The instruction that just completed left T set, so a trace exception is
+    /// owed at the next instruction boundary.
+    ///
+    /// The delay is the point: the trace fires *after* the traced instruction, so
+    /// [`M68k::step_with`] must return that instruction's own result first. The
+    /// suite runs one instruction per case and therefore never observes the
+    /// trace — 0 vector-9 fetches in 317,500 cases against 158,894 entering with
+    /// T=1 — which is why this is a separate flag and not a check inside the same
+    /// step.
+    pub trace_pending: bool,
 }
 
 impl M68k {
@@ -210,6 +220,7 @@ impl M68k {
         self.stopped = false;
         self.pending_irq = 0;
         self.in_exception = false;
+        self.trace_pending = false;
         self.refill_prefetch_dyn(bus);
     }
 
@@ -219,16 +230,44 @@ impl M68k {
     }
 
     /// Executes one instruction, returning the cycles it consumed.
+    ///
+    /// # The instruction boundary
+    ///
+    /// Two exceptions fire at a *boundary* rather than inside an instruction, and
+    /// both live here rather than in any handler:
+    ///
+    /// - **Trace**, owed by the instruction that just finished. It is taken as its
+    ///   own step at the *next* call, which is what "the boundary after the
+    ///   instruction" means and why the vector suite — one instruction per case —
+    ///   sees zero trace exceptions despite 158,894 cases entering with T=1.
+    ///   Taking it before returning from the same call would fail 38% of the
+    ///   suite. Trace outranks interrupts, so it is checked first.
+    /// - **Interrupts**, sampled before the instruction runs. This is also the
+    ///   only path out of `stopped`: [`crate::exception::check_interrupts`]
+    ///   re-primes the queue, because STOP leaves the PC and both queue words
+    ///   frozen with its own opcode still in slot 0. Clearing `stopped` here and
+    ///   dispatching would re-execute the STOP forever.
+    ///
+    /// Both are zero-coverage paths; see [`crate::exception::check_interrupts`]
+    /// and [`crate::exception::check_trace`].
     pub fn step_with(&mut self, dec: &crate::decode::Decoder, bus: &mut impl crate::Bus) -> u32 {
         // A halted CPU is dead until reset, but still burns time.
         if self.halted {
             return 4;
         }
-        if self.stopped {
-            if self.pending_irq == 0 {
-                return 4;
+        if self.trace_pending {
+            self.trace_pending = false;
+            if let Some(c) = crate::exception::check_trace(self, bus) {
+                return c;
             }
-            self.stopped = false;
+        }
+        if let Some(c) = crate::exception::check_interrupts(self, bus) {
+            return c;
+        }
+        // Still stopped means no interrupt outranked the mask: burn 4 cycles
+        // without touching the PC or the queue (STOP's own measured shape).
+        if self.stopped {
+            return 4;
         }
         // Peek at the opcode without touching the queue.
         // Instruction handlers call `consume_opcode` (or `fetch_word` for the
@@ -238,7 +277,16 @@ impl M68k {
         // `exception::take`, which overwrites both slots via `refill_prefetch_dyn`.
         // This matches the 68000 pipeline-abort behavior.
         let op = self.prefetch[0];
-        dec.dispatch(op)(self, bus, op)
+        let cycles = dec.dispatch(op)(self, bus, op);
+
+        // Owed only if T survived the instruction. An instruction that entered an
+        // exception has had T cleared by entry (38,542/38,542), and one that
+        // loaded the whole SR may have cleared it itself — `ANDItoSR`, `EORItoSR`,
+        // `STOP`, `MOVEtoSR` and `RTE` are exactly the 1,277 clean T=1 cases that
+        // end with T clear, with `ORItoSR` at 0/591 as the control. Reading the
+        // *final* T covers both without a case analysis.
+        self.trace_pending = !self.halted && self.sr & SR_T != 0;
+        cycles
     }
 
     /// Convenience wrapper owning a lazily-built decoder. Requires `std`;
