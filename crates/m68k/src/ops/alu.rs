@@ -126,6 +126,18 @@ pub(super) struct Ops {
     /// The `xxxI` immediate, already narrowed to the operand size; 0 when
     /// [`Plan::pre`] is 0.
     pub imm: u32,
+    /// The PC to stack if the closure raises an exception:
+    /// `opcode_addr + 2 * (1 + pre + ext_words)`, i.e. past the *whole*
+    /// instruction. Measured 1326/1326 over every trapping `CHK` case, with
+    /// each of the 11 addressing-mode buckets a singleton — the same rule Task 8
+    /// measured for `JSR`.
+    ///
+    /// Supplied rather than left to the closure because `cpu.pc - 2` *happens*
+    /// to equal this at the moment `compute` runs (the extension fetches are
+    /// done, the queue advance is not) and so would pass the suite while
+    /// encoding the wrong intent. A fixed `opcode_addr + 2` — which is what that
+    /// expression means anywhere else in a handler — scores 851/1326.
+    pub trap_pc: u32,
 }
 
 /// What a handler does once its operands are in hand.
@@ -136,6 +148,33 @@ pub(super) struct Ops {
 /// (`<ea> op Dn`, `ADDA`, `ADDQ #d,An`). The closure sets the CCR, because the
 /// flag rules are exactly what differs between families.
 pub(super) type Compute<'a> = &'a mut dyn FnMut(&mut M68k, Ops) -> Option<u32>;
+
+/// How an instruction finishes, once its operands are in hand.
+///
+/// [`Compute`] cannot express the third arm, so the instructions that may trap
+/// on their operand *value* — `CHK` and the divides — use [`ComputeTail`]
+/// instead. The distinction is observable on the bus: a trapping instruction
+/// never performs the queue advance, because the pipeline aborted before it.
+///
+/// A trapping `CHK Dn,Dn` logs exactly seven accesses — the three frame writes,
+/// the two vector reads and the two prefetch refills — with no eighth for a
+/// queue advance. Measured at `cycles - idle == 28` in all 305 of them.
+pub(super) enum Tail {
+    /// Write this value back to the `<ea>`, after the queue advance.
+    Write(u32),
+    /// Advance the queue and finish; nothing goes back to the `<ea>`.
+    Done,
+    /// The closure raised an exception itself, and has already run the frame's
+    /// bus cycles. [`run_tail`] skips the queue advance and charges
+    /// [`exception::SHORT_FRAME_ACCESSES`] for the frame.
+    Trapped,
+}
+
+/// [`Compute`] plus the bus, so the closure can raise an exception.
+///
+/// The bus is threaded through rather than captured because [`run_tail`] holds
+/// it for the duration of the schedule; a closure capturing it would alias.
+pub(super) type ComputeTail<'a> = &'a mut dyn FnMut(&mut M68k, &mut dyn Bus, Ops) -> Tail;
 
 /// One instruction's schedule, fixed before any bus cycle happens.
 pub(super) struct Plan {
@@ -238,6 +277,31 @@ fn first_access(addr: u32, size: Size, desc: bool) -> u32 {
 /// returns the cycle count. Raises an address error instead if an operand access
 /// would be misaligned.
 pub(super) fn run(cpu: &mut M68k, bus: &mut dyn Bus, plan: &Plan, compute: Compute) -> u32 {
+    run_tail(
+        cpu,
+        bus,
+        plan,
+        &mut |cpu, _bus, ops| match compute(cpu, ops) {
+            Some(v) => Tail::Write(v),
+            None => Tail::Done,
+        },
+    )
+}
+
+/// [`run`], but the closure may raise an exception instead of producing a value.
+///
+/// The only difference in the schedule is at the very end: a [`Tail::Trapped`]
+/// closure skips the queue advance, because the pipeline aborted before it, and
+/// is charged for the short frame's own seven accesses rather than for one
+/// fetch. Everything before `compute` — the extension fetches, the alignment
+/// check, the operand read — is byte-for-byte the same code, which is the point
+/// of routing `CHK` and the divides through here rather than hand-rolling them.
+pub(super) fn run_tail(
+    cpu: &mut M68k,
+    bus: &mut dyn Bus,
+    plan: &Plan,
+    compute: ComputeTail,
+) -> u32 {
     let size = plan.size;
     let opcode_addr = cpu.pc.wrapping_sub(exception::OPCODE_PC_OFFSET);
     let ir = cpu.prefetch[0];
@@ -361,12 +425,27 @@ pub(super) fn run(cpu: &mut M68k, bus: &mut dyn Bus, plan: &Plan, compute: Compu
     // --- Compute, advance the queue, write back. ---------------------------
     let result = compute(
         cpu,
+        bus,
         Ops {
             ea: ea_val,
             src: src_val,
             imm,
+            trap_pc: opcode_addr
+                .wrapping_add(2)
+                .wrapping_add(2 * plan.pre)
+                .wrapping_add(2 * de),
         },
     );
+
+    // A trap has already run the frame on the bus and left the queue alone. Its
+    // accesses are counted, not re-emitted.
+    let result = match result {
+        Tail::Trapped => {
+            return 4 * (acc + exception::SHORT_FRAME_ACCESSES) + idle_lead + plan.idle;
+        }
+        Tail::Write(v) => Some(v),
+        Tail::Done => None,
+    };
 
     let mut nw = 0;
     match (result, dst_ea) {

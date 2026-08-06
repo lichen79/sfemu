@@ -144,6 +144,27 @@ group!(jsr, "JSR");
 group!(rts, "RTS");
 group!(rtr, "RTR");
 
+// Task 9: multiply, divide, CHK, and BCD.
+//
+// The five `<ea>`-source groups carry 4,864 address errors between them, all of
+// them *read* faults — so `alu`'s read-only fault arm covers the whole task and
+// the write-fault arm stays unwritten rather than untested. `ABCD` and `SBCD`
+// have no address errors at all: both forms are byte-sized, and a byte access
+// never misaligns.
+//
+// `DIVU`/`DIVS` contain **no divide-by-zero case** — 0 of 1,546 and 0 of 1,518,
+// against a control recovering 1,525 and 1,502 distinct nonzero divisors. These
+// two going green says nothing about vector 5; `ops::muldiv`'s unit tests are its
+// only coverage.
+group!(mulu, "MULU");
+group!(muls, "MULS");
+group!(divu, "DIVU");
+group!(divs, "DIVS");
+group!(chk, "CHK");
+group!(abcd, "ABCD");
+group!(sbcd, "SBCD");
+group!(nbcd, "NBCD");
+
 /// Known-bad upstream: `TAS`'s indivisible read-modify-write is not modelled by
 /// the vector generator. Asserted as *partially* failing so an upstream fix
 /// surfaces.

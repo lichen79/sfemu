@@ -77,6 +77,21 @@ pub fn take(cpu: &mut M68k, bus: &mut dyn Bus, vector: u8, pc_for_frame: u32) {
     cpu.refill_prefetch_dyn(bus);
 }
 
+/// Bus accesses [`take`] performs: 3 frame writes, 2 vector reads, 2 prefetch
+/// refills.
+///
+/// Under the timing law (`cycles = 4 × non-idle accesses + idle`) a handler that
+/// ends in `take` owes `4 * SHORT_FRAME_ACCESSES` on top of whatever ran before
+/// it. Measured on `CHK`: `cycles - idle` buckets at 28 / 32 / 36 / 40 across the
+/// addressing modes (305 / 590 / 408 / 23 cases), and 28 is `4 * 7` for the
+/// register form, which performs no other access at all.
+///
+/// This is deliberately *not* the group-1/2 equivalent of
+/// [`ADDRESS_ERROR_TAIL_CYCLES`]: that constant folds in a fixed 10 cycles of
+/// idle and the aborted access, whereas a group-2 trap's idle is data-dependent
+/// (`CHK`'s is 6, 10 or 12) and belongs to the instruction, not the frame.
+pub const SHORT_FRAME_ACCESSES: u32 = 7;
+
 /// Whether a faulting access was a read or a write. Selects bit 4 of the
 /// address-error status word.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

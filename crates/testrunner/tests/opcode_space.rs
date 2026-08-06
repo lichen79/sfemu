@@ -201,13 +201,15 @@ fn bit_op(op: u16, dynamic: bool) -> Claim {
     }
 }
 
-/// Classifies every opcode in the lines Tasks 6, 7 and 8 touch.
+/// Classifies every opcode in the lines Tasks 6 through 9 touch.
 ///
 /// Written as one function over the whole space rather than per family, because
 /// the interesting cases are the collisions: `EOR` and `CMPM` sharing an opmode,
 /// `ADDQ`'s `An` destination appearing only above byte size, the `to CCR` /
-/// `to SR` opcodes occupying an `<ea>` slot that is otherwise illegal, and
-/// `DBcc` taking the mode-`001` slot that `Scc` would otherwise fill.
+/// `to SR` opcodes occupying an `<ea>` slot that is otherwise illegal, `DBcc`
+/// taking the mode-`001` slot that `Scc` would otherwise fill, and `CHK` cutting
+/// across all sixteen selectors of line `0100` because its `Dn` field sits where
+/// every other instruction in that line keeps its selector.
 fn claim(op: u16) -> Claim {
     let mode = (op >> 3) & 7;
     let reg = op & 7;
@@ -263,6 +265,23 @@ fn claim(op: u16) -> Claim {
                 return Claim::Mine;
             }
             let sel = (op >> 8) & 0xF;
+            // CHK cuts across every selector: it is opmode 6 (bits 8-6 = 110)
+            // with bits 11-9 naming the destination `Dn`, so it appears at all
+            // sixteen selector values and must be tested before any `sel` arm.
+            // A word-sized source `<ea>`, no `An`.
+            if opmode == 6 {
+                return if mode != 1 && modes::src(mode, reg, false) {
+                    Claim::Mine
+                } else {
+                    Claim::Illegal
+                };
+            }
+            // NBCD: selector 8 at size bits 00, over the data-alterable set. The
+            // rest of selector 8 is SWAP/PEA (01), MOVEM.w (10) and MOVEM.l (11),
+            // all Task 10.
+            if sel == 0x8 && size_bits == 0 {
+                return if data { Claim::Mine } else { Claim::Illegal };
+            }
             // Size 11 of selector A is TAS; of the others it is MOVE from SR /
             // to CCR / to SR, which belong to Task 10.
             if sel == 0xA && size_bits == 3 {
@@ -350,10 +369,22 @@ fn claim(op: u16) -> Claim {
                     Claim::Illegal
                 }
             }
-            3 | 7 => Claim::Later,
+            // MULU/MULS (line C) and DIVU/DIVS (line 8), all four `<ea>` sources
+            // to `Dn`. Word-sized, and with no `An` source: mode 001 in this
+            // opmode is nothing at all, the same exclusion `AND`/`OR` have above.
+            3 | 7 => {
+                if mode != 1 && modes::src(mode, reg, false) {
+                    Claim::Mine
+                } else {
+                    Claim::Illegal
+                }
+            }
             _ if mode <= 1 => match (op >> 12, opmode, mode) {
-                // SBCD and ABCD, both forms: Task 9.
-                (_, 4, _) => Claim::Later,
+                // SBCD and ABCD. Bit 3, not the mode field, picks the form: mode
+                // 000 is `Dy,Dx` and 001 is `-(Ay),-(Ax)`, so both values of
+                // `mode` here are legal and neither is an address-register
+                // operand. That is why this arm does not consult `modes::`.
+                (_, 4, _) => Claim::Mine,
                 // EXG Dx,Dy / Ax,Ay (opmode 5) and Dx,Ay (opmode 6 mode 1):
                 // Task 10.
                 (0xC, 5, _) | (0xC, 6, 1) => Claim::Later,
@@ -491,21 +522,27 @@ fn implemented_tasks_claim_exactly_the_legal_encodings() {
     // A guard against the classifier itself going vacuous: if a refactor made
     // `claim` return `Later` everywhere the assertions above would all pass.
     //
-    // The thresholds are floors, not measurements. Task 7 took `mine` from
-    // 20,177 to 25,461 and `illegal` from 3,632 to 4,556, and Task 8 took them to
-    // 30,543 and 4,724 — the whole of line 0110 plus size 11 of line 0101. So the
-    // first bound is no longer the 0.9% margin it was at Task 6, but leave it
-    // where it is rather than tracking the count upward, since a guard that has to
-    // be adjusted every task is a guard nobody trusts.
+    // The thresholds are floors, not measurements. The history: Task 6 left them
+    // at 20,177 / 3,632, Task 7 at 25,461 / 4,556, Task 8 at 30,543 / 4,724, and
+    // Task 9 at **32,969 / 5,178**.
     //
-    // Both floors were re-confirmed non-vacuous by raising them until they failed:
+    // Task 9 raised both, having left them alone through two tasks: at 20,000 the
+    // `mine` floor sat at 61% of the true count and the `illegal` one at 19%, and
+    // a floor that far below the value it guards would not notice a whole line
+    // reverting to `Later`. They are set just under the current counts, which
+    // costs one line of maintenance per task and buys a guard that actually
+    // bites — the earlier note's reasoning (a guard adjusted every task is one
+    // nobody trusts) is true of a floor tracked *upward for its own sake*, not of
+    // one that has drifted an order of magnitude loose.
+    //
+    // Both floors are re-confirmed non-vacuous by raising them until they fail:
     // the failure messages report the counts above, so the classifier really is
     // reaching the new lines and not returning `Later` across them.
     assert!(
-        mine > 20_000,
+        mine > 32_000,
         "only {mine} opcodes classified as implemented"
     );
-    assert!(illegal > 1_000, "only {illegal} classified as nonexistent");
+    assert!(illegal > 5_000, "only {illegal} classified as nonexistent");
 }
 
 /// The `to CCR` and `to SR` forms are six specific opcodes, and the long-sized
