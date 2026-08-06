@@ -105,6 +105,65 @@ pub fn mode_is_mem(mode: u16, reg: u16) -> bool {
     matches!(mode, 2..=6) || (mode == 7 && reg <= 3)
 }
 
+/// Addressing-mode category predicates from the 68000 PRM.
+///
+/// These are the canonical single-source definitions; both the disassembler
+/// (`m68k::disasm`) and the opcode-space exhaustive tests (`testrunner`) import
+/// from here so the two never drift apart. The predicates are thin — one
+/// `match` each — but the three that differ by exactly one mode are a common
+/// source of legality bugs.
+pub mod modes {
+    /// Any source operand of this size. `An` is not a byte-sized source (there
+    /// is no byte of an address register) and mode 7 stops at the immediate.
+    pub fn src(mode: u16, reg: u16, byte: bool) -> bool {
+        match mode {
+            1 => !byte,
+            7 => reg <= 4,
+            _ => true,
+        }
+    }
+
+    /// Alterable memory: no registers, no PC-relative, no immediate.
+    pub fn mem_alterable(mode: u16, reg: u16) -> bool {
+        match mode {
+            0 | 1 => false,
+            7 => reg <= 1,
+            _ => true,
+        }
+    }
+
+    /// Data-alterable: alterable memory plus a data register. This is the
+    /// destination set for most single-operand instructions and for
+    /// `ADDQ`/`SUBQ` at byte size.
+    pub fn data_alterable(mode: u16, reg: u16) -> bool {
+        mode == 0 || mem_alterable(mode, reg)
+    }
+
+    /// Control: memory whose address does not depend on the access — no
+    /// increment, no decrement, no immediate. `LEA`, `PEA`, `JMP`, and `JSR`
+    /// use this set.
+    pub fn control(mode: u16, reg: u16) -> bool {
+        matches!(mode, 2 | 5 | 6) || (mode == 7 && reg <= 3)
+    }
+
+    /// `BTST`'s operand set: data-alterable, plus the two PC-relative modes
+    /// because `BTST` does not write. The immediate operand `#data` is legal
+    /// for the **dynamic** form only; the static `BTST #n,#data` does not exist.
+    ///
+    /// Measured: across 2,500 `BTST` cases the dynamic form uses mode 7 reg 4
+    /// fifty-eight times; the static form never. The static form is well
+    /// represented at mode 5 (328 dynamic / 40 static), so the static-form
+    /// absence at mode 7 reg 4 is an encoding fact, not a thin sample.
+    pub fn btst_src(mode: u16, reg: u16, immediate_ok: bool) -> bool {
+        match mode {
+            0 => true,
+            1 => false,
+            7 => reg <= 3 || (reg == 4 && immediate_ok),
+            _ => true,
+        }
+    }
+}
+
 /// Number of extension words `(mode, reg)` consumes from the instruction
 /// stream.
 #[inline]

@@ -147,38 +147,10 @@ enum Claim {
     Later,
 }
 
-/// The addressing-mode categories from the 68000 manual, spelled out because
-/// three of them differ by exactly one mode and the difference is load-bearing.
-mod modes {
-    /// Any source operand of this size. `An` is not a byte-sized source (there
-    /// is no byte of an address register) and mode 7 stops at the immediate.
-    pub fn src(mode: u16, reg: u16, byte: bool) -> bool {
-        match mode {
-            1 => !byte,
-            7 => reg <= 4,
-            _ => true,
-        }
-    }
-    /// Alterable memory: no registers, no PC-relative, no immediate.
-    pub fn mem_alterable(mode: u16, reg: u16) -> bool {
-        match mode {
-            0 | 1 => false,
-            7 => reg <= 1,
-            _ => true,
-        }
-    }
-    /// Data-alterable: alterable memory plus a data register.
-    pub fn data_alterable(mode: u16, reg: u16) -> bool {
-        mode == 0 || mem_alterable(mode, reg)
-    }
-    /// Control: memory whose address does not depend on the access, so no
-    /// increment or decrement, and no immediate. `LEA`, `PEA` and `JMP`/`JSR`
-    /// share this set — an instruction that forms an address without accessing it
-    /// has nothing to step by.
-    pub fn control(mode: u16, reg: u16) -> bool {
-        matches!(mode, 2 | 5 | 6) || (mode == 7 && reg <= 3)
-    }
-}
+/// The addressing-mode categories from the 68000 manual. Canonical definitions
+/// live in `m68k::ea::modes`; this re-exports them so the rest of this file
+/// reads identically to before.
+use m68k::ea::modes;
 
 /// `MOVEM`'s `<ea>` rule, which is direction-dependent — the one addressing-mode
 /// set in the instruction set that is not symmetric.

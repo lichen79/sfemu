@@ -22,6 +22,15 @@
 //!
 //! Any word that does not match a known 68000 encoding renders as `dc.w $XXXX`.
 //! The function never panics regardless of the input.
+//!
+//! # Legality
+//!
+//! The decoder validates each instruction's addressing mode against the 68000
+//! PRM's category predicates (`data_alterable`, `control`, `src`, etc.) from
+//! [`crate::ea::modes`] — the same single-source definitions used by the
+//! opcode-space exhaustive tests in `testrunner`. An opcode with an illegal
+//! addressing mode renders as `dc.w $XXXX` rather than as a plausible but
+//! non-existent instruction.
 
 /// The result of disassembling one instruction.
 pub struct Insn {
@@ -55,6 +64,8 @@ pub fn disassemble(mut read: impl FnMut(u32) -> u16, addr: u32) -> Insn {
         len: d.words_read * 2,
     }
 }
+
+use crate::ea::modes;
 
 // ---------------------------------------------------------------------------
 // Internal decoder state
@@ -140,6 +151,17 @@ impl<'a> Dis<'a> {
         let bit_type = (op >> 6) & 3;
         let mode = (op >> 3) & 7;
         let reg = op & 7;
+        // BTST reads without writing, so it accepts any readable (src) mode plus
+        // the immediate in the dynamic form only. BCHG/BCLR/BSET write back, so
+        // they require the data-alterable set.
+        let ok = if bit_type == 0 {
+            modes::btst_src(mode, reg, dynamic)
+        } else {
+            modes::data_alterable(mode, reg)
+        };
+        if !ok {
+            return self.illegal_word(op);
+        }
         let mnemonic = match bit_type {
             0 => "btst",
             1 => "bchg",
@@ -196,6 +218,10 @@ impl<'a> Dis<'a> {
             6 => "cmpi",
             _ => return self.illegal_word(op),
         };
+        // All immediate ops require a data-alterable destination.
+        if !modes::data_alterable(mode, reg) {
+            return self.illegal_word(op);
+        }
         let size_suffix = size_suffix(sz);
         let imm = self.read_immediate(sz);
         let imm_str = format_imm(imm, sz);
@@ -236,9 +262,16 @@ impl<'a> Dis<'a> {
         let src_mode = (op >> 3) & 7;
         let src_reg = op & 7;
 
+        let byte = sz == EaSize::Byte;
+
         // MOVEA: destination mode 001 (address register).
         if dst_mode == 1 {
-            if sz == EaSize::Byte {
+            // MOVEA.b does not exist; only .w and .l.
+            if byte {
+                return self.illegal_word(op);
+            }
+            // Source: any mode at word/long size (An is a valid source above byte).
+            if !modes::src(src_mode, src_reg, false) {
                 return self.illegal_word(op);
             }
             let size_suffix = match sz {
@@ -248,6 +281,16 @@ impl<'a> Dis<'a> {
             };
             let src_str = self.format_ea(src_mode, src_reg, sz);
             return format!("movea.{size_suffix} {src_str},a{dst_reg}");
+        }
+
+        // Source validity.
+        if !modes::src(src_mode, src_reg, byte) {
+            return self.illegal_word(op);
+        }
+        // Destination: data-alterable (Dn or alterable memory; mode 7 up to reg 1).
+        // Note dst_mode == 1 is MOVEA and is handled above.
+        if !modes::data_alterable(dst_mode, dst_reg) {
+            return self.illegal_word(op);
         }
 
         let size_suffix = size_suffix(sz);
@@ -267,15 +310,21 @@ impl<'a> Dis<'a> {
         let opmode = (op >> 6) & 7;
         let size_bits = opmode & 3; // bits 7-6
 
-        // CHK: opmode 110, all selectors.
+        // CHK: opmode 110, all selectors. Word-sized source; no An source.
         if opmode == 6 {
+            if mode == 1 || !modes::src(mode, reg, false) {
+                return self.illegal_word(op);
+            }
             let dn = (op >> 9) & 7;
             let ea_str = self.format_ea(mode, reg, EaSize::Word);
             return format!("chk {ea_str},d{dn}");
         }
 
-        // LEA: opmode 111.
+        // LEA: opmode 111. Control modes only.
         if opmode == 7 {
+            if !modes::control(mode, reg) {
+                return self.illegal_word(op);
+            }
             let an = (op >> 9) & 7;
             let ea_str = self.format_ea(mode, reg, EaSize::Long);
             return format!("lea {ea_str},a{an}");
@@ -283,16 +332,22 @@ impl<'a> Dis<'a> {
 
         let sel = (op >> 8) & 0xF;
 
-        // NBCD: selector 8, size bits 00.
+        // NBCD: selector 8, size bits 00. Data-alterable.
         if sel == 0x8 && size_bits == 0 {
+            if !modes::data_alterable(mode, reg) {
+                return self.illegal_word(op);
+            }
             let ea_str = self.format_ea(mode, reg, EaSize::Byte);
             return format!("nbcd {ea_str}");
         }
 
-        // Selector 8, size bits 01: SWAP (mode 000) or PEA (control).
+        // Selector 8, size bits 01: SWAP (mode 000) or PEA (control modes only).
         if sel == 0x8 && size_bits == 1 {
             if mode == 0 {
                 return format!("swap d{reg}");
+            }
+            if !modes::control(mode, reg) {
+                return self.illegal_word(op);
             }
             let ea_str = self.format_ea(mode, reg, EaSize::Long);
             return format!("pea {ea_str}");
@@ -303,6 +358,9 @@ impl<'a> Dis<'a> {
             if mode == 0 {
                 return format!("ext.w d{reg}");
             }
+            if !movem_ea(mode, reg, false) {
+                return self.illegal_word(op);
+            }
             return self.decode_movem(op, false, EaSize::Word);
         }
 
@@ -311,34 +369,53 @@ impl<'a> Dis<'a> {
             if mode == 0 {
                 return format!("ext.l d{reg}");
             }
+            if !movem_ea(mode, reg, false) {
+                return self.illegal_word(op);
+            }
             return self.decode_movem(op, false, EaSize::Long);
         }
 
         // Selector C, size bits 10: MOVEM.w mem->reg.
         if sel == 0xC && size_bits == 2 {
+            if !movem_ea(mode, reg, true) {
+                return self.illegal_word(op);
+            }
             return self.decode_movem(op, true, EaSize::Word);
         }
 
         // Selector C, size bits 11: MOVEM.l mem->reg.
         if sel == 0xC && size_bits == 3 {
+            if !movem_ea(mode, reg, true) {
+                return self.illegal_word(op);
+            }
             return self.decode_movem(op, true, EaSize::Long);
         }
 
         // SR/CCR moves: size bits 11 at selectors 0, 4, 6.
+        // Selector 2 at size 11 would be MOVE from CCR, a 68010-only instruction.
         if size_bits == 3 {
             return match sel {
                 0x0 => {
-                    // MOVEfromSR: MOVE SR,<ea>
+                    // MOVEfromSR: MOVE SR,<ea> — data-alterable destination.
+                    if !modes::data_alterable(mode, reg) {
+                        return self.illegal_word(op);
+                    }
                     let ea_str = self.format_ea(mode, reg, EaSize::Word);
                     format!("move sr,{ea_str}")
                 }
                 0x4 => {
-                    // MOVEtoCCR: MOVE <ea>,ccr
+                    // MOVEtoCCR: MOVE <ea>,ccr — any source, no An.
+                    if mode == 1 || !modes::src(mode, reg, false) {
+                        return self.illegal_word(op);
+                    }
                     let ea_str = self.format_ea(mode, reg, EaSize::Word);
                     format!("move {ea_str},ccr")
                 }
                 0x6 => {
-                    // MOVEtoSR: MOVE <ea>,sr
+                    // MOVEtoSR: MOVE <ea>,sr — any source, no An.
+                    if mode == 1 || !modes::src(mode, reg, false) {
+                        return self.illegal_word(op);
+                    }
                     let ea_str = self.format_ea(mode, reg, EaSize::Word);
                     format!("move {ea_str},sr")
                 }
@@ -348,14 +425,20 @@ impl<'a> Dis<'a> {
                         // 0x4AFC is the ILLEGAL instruction encoding.
                         return self.illegal_word(op);
                     }
+                    if !modes::data_alterable(mode, reg) {
+                        return self.illegal_word(op);
+                    }
                     let ea_str = self.format_ea(mode, reg, EaSize::Byte);
                     format!("tas {ea_str}")
                 }
-                _ => self.decode_nibble4_4e(op),
+                0xE => self.decode_nibble4_4e(op), // 0x4Exx: JMP and others
+                // All other selectors at size 11 are 68010+ instructions (e.g.
+                // selector 2 = MOVE from CCR) or unassigned — all illegal on 68000.
+                _ => self.illegal_word(op),
             };
         }
 
-        // Selectors 0, 2, 4, 6 at size bits 00/01/10: NEGX/CLR/NEG/NOT/TST.
+        // Selectors 0, 2, 4, 6 at size bits 00/01/10: NEGX/CLR/NEG/NOT.
         if matches!(sel, 0x0 | 0x2 | 0x4 | 0x6) {
             let sz = match size_bits {
                 0 => EaSize::Byte,
@@ -363,6 +446,9 @@ impl<'a> Dis<'a> {
                 2 => EaSize::Long,
                 _ => return self.illegal_word(op),
             };
+            if !modes::data_alterable(mode, reg) {
+                return self.illegal_word(op);
+            }
             let mnemonic = match sel {
                 0x0 => "negx",
                 0x2 => "clr",
@@ -374,7 +460,7 @@ impl<'a> Dis<'a> {
             return format!("{mnemonic}.{} {ea_str}", size_suffix(sz));
         }
 
-        // Selector A at size 00/01/10: TST.
+        // Selector A at size 00/01/10: TST. Data-alterable.
         if sel == 0xA && size_bits < 3 {
             let sz = match size_bits {
                 0 => EaSize::Byte,
@@ -382,6 +468,9 @@ impl<'a> Dis<'a> {
                 2 => EaSize::Long,
                 _ => return self.illegal_word(op),
             };
+            if !modes::data_alterable(mode, reg) {
+                return self.illegal_word(op);
+            }
             let ea_str = self.format_ea(mode, reg, sz);
             return format!("tst.{} {ea_str}", size_suffix(sz));
         }
@@ -464,11 +553,17 @@ impl<'a> Dis<'a> {
             0x76 => "trapv".to_string(),
             0x77 => "rtr".to_string(),
             _ => {
-                // JSR and JMP: size bits 10 = JSR, 11 = JMP.
+                // JSR and JMP: size bits 10 = JSR, 11 = JMP. Control modes only.
                 if size_bits == 2 {
+                    if !modes::control(mode, reg) {
+                        return self.illegal_word(op);
+                    }
                     let ea_str = self.format_ea(mode, reg, EaSize::Long);
                     format!("jsr {ea_str}")
                 } else if size_bits == 3 {
+                    if !modes::control(mode, reg) {
+                        return self.illegal_word(op);
+                    }
                     let ea_str = self.format_ea(mode, reg, EaSize::Long);
                     format!("jmp {ea_str}")
                 } else {
@@ -497,7 +592,10 @@ impl<'a> Dis<'a> {
                 let cc = cc_name(cond, DbccStyle::Dbcc);
                 return format!("db{cc} d{reg},${target:X}");
             }
-            // Scc <ea>
+            // Scc <ea> — data-alterable (mode 7 reg 2/3/4 are illegal here).
+            if !modes::data_alterable(mode, reg) {
+                return self.illegal_word(op);
+            }
             let cc = cc_name(cond, DbccStyle::Scc);
             let ea_str = self.format_ea(mode, reg, EaSize::Byte);
             return format!("s{cc} {ea_str}");
@@ -510,6 +608,15 @@ impl<'a> Dis<'a> {
             2 => EaSize::Long,
             _ => unreachable!(),
         };
+        // ADDQ/SUBQ to An is only valid at word and long size (no byte form
+        // for address registers). All other destinations require data-alterable.
+        if mode == 1 {
+            if sz == EaSize::Byte {
+                return self.illegal_word(op);
+            }
+        } else if !modes::data_alterable(mode, reg) {
+            return self.illegal_word(op);
+        }
         let data = ((op >> 9) & 7) as u32;
         let data = if data == 0 { 8 } else { data };
         let mnemonic = if op & 0x0100 != 0 { "subq" } else { "addq" };
@@ -565,18 +672,25 @@ impl<'a> Dis<'a> {
         let mode = (op >> 3) & 7;
         let reg = op & 7;
 
-        // DIVU: opmode 011.
+        // DIVU: opmode 011. No An source.
         if opmode == 3 {
+            if mode == 1 || !modes::src(mode, reg, false) {
+                return self.illegal_word(op);
+            }
             let ea_str = self.format_ea(mode, reg, EaSize::Word);
             return format!("divu {ea_str},d{dn}");
         }
-        // DIVS: opmode 111.
+        // DIVS: opmode 111. No An source.
         if opmode == 7 {
+            if mode == 1 || !modes::src(mode, reg, false) {
+                return self.illegal_word(op);
+            }
             let ea_str = self.format_ea(mode, reg, EaSize::Word);
             return format!("divs {ea_str},d{dn}");
         }
-        // SBCD: opmode 4/5/6 at mode 000 or 001.
-        if matches!(opmode, 4..=6) && mode <= 1 {
+        // SBCD: opmode 4 only at mode 000 or 001 (form selector, not EA mode).
+        // Opmodes 5 and 6 with mode <= 1 are PACK/UNPK (68020) — illegal here.
+        if opmode == 4 && mode <= 1 {
             let rx = dn;
             let ry = reg;
             if mode == 0 {
@@ -586,6 +700,7 @@ impl<'a> Dis<'a> {
             }
         }
         // OR: opmodes 0-2 (ea->Dn) and 4-6 (Dn->ea).
+        // No An source or destination (OR has no address-register form).
         let sz = match opmode & 3 {
             0 => EaSize::Byte,
             1 => EaSize::Word,
@@ -593,6 +708,13 @@ impl<'a> Dis<'a> {
             _ => return self.illegal_word(op),
         };
         let to_dn = opmode < 4;
+        if to_dn {
+            if mode == 1 || !modes::src(mode, reg, sz == EaSize::Byte) {
+                return self.illegal_word(op);
+            }
+        } else if !modes::mem_alterable(mode, reg) {
+            return self.illegal_word(op);
+        }
         let ea_str = self.format_ea(mode, reg, sz);
         if to_dn {
             format!("or.{} {ea_str},d{dn}", size_suffix(sz))
@@ -611,16 +733,22 @@ impl<'a> Dis<'a> {
         let mode = (op >> 3) & 7;
         let reg = op & 7;
 
-        // SUBA: opmode 011 (word) or 111 (long).
+        // SUBA: opmode 011 (word) or 111 (long). Any source including An.
         if opmode == 3 {
+            if !modes::src(mode, reg, false) {
+                return self.illegal_word(op);
+            }
             let ea_str = self.format_ea(mode, reg, EaSize::Word);
             return format!("suba.w {ea_str},a{dn}");
         }
         if opmode == 7 {
+            if !modes::src(mode, reg, false) {
+                return self.illegal_word(op);
+            }
             let ea_str = self.format_ea(mode, reg, EaSize::Long);
             return format!("suba.l {ea_str},a{dn}");
         }
-        // SUBX: opmode 4/5/6 at mode 000 or 001.
+        // SUBX: opmode 4/5/6 at mode 000 or 001 (form selector, not EA mode).
         if matches!(opmode, 4..=6) && mode <= 1 {
             let sz = match opmode {
                 4 => EaSize::Byte,
@@ -643,6 +771,13 @@ impl<'a> Dis<'a> {
             _ => return self.illegal_word(op),
         };
         let to_dn = opmode < 4;
+        if to_dn {
+            if !modes::src(mode, reg, sz == EaSize::Byte) {
+                return self.illegal_word(op);
+            }
+        } else if !modes::mem_alterable(mode, reg) {
+            return self.illegal_word(op);
+        }
         let ea_str = self.format_ea(mode, reg, sz);
         if to_dn {
             format!("sub.{} {ea_str},d{dn}", size_suffix(sz))
@@ -661,22 +796,31 @@ impl<'a> Dis<'a> {
         let mode = (op >> 3) & 7;
         let reg = op & 7;
 
-        // CMPA: opmode 011 (word) or 111 (long).
+        // CMPA: opmode 011 (word) or 111 (long). Any source including An.
         if opmode == 3 {
+            if !modes::src(mode, reg, false) {
+                return self.illegal_word(op);
+            }
             let ea_str = self.format_ea(mode, reg, EaSize::Word);
             return format!("cmpa.w {ea_str},a{dn}");
         }
         if opmode == 7 {
+            if !modes::src(mode, reg, false) {
+                return self.illegal_word(op);
+            }
             let ea_str = self.format_ea(mode, reg, EaSize::Long);
             return format!("cmpa.l {ea_str},a{dn}");
         }
-        // CMP: opmodes 0-2 (ea->Dn, always CMP).
+        // CMP: opmodes 0-2 (ea->Dn, always CMP). Any source.
         if matches!(opmode, 0..=2) {
             let sz = match opmode {
                 0 => EaSize::Byte,
                 1 => EaSize::Word,
                 _ => EaSize::Long,
             };
+            if !modes::src(mode, reg, sz == EaSize::Byte) {
+                return self.illegal_word(op);
+            }
             let ea_str = self.format_ea(mode, reg, sz);
             return format!("cmp.{} {ea_str},d{dn}", size_suffix(sz));
         }
@@ -693,7 +837,10 @@ impl<'a> Dis<'a> {
                 let ay = reg;
                 return format!("cmpm.{} (a{ay})+,(a{ax})+", size_suffix(sz));
             }
-            // EOR Dn,<ea>
+            // EOR Dn,<ea> — data-alterable destination.
+            if !modes::data_alterable(mode, reg) {
+                return self.illegal_word(op);
+            }
             let ea_str = self.format_ea(mode, reg, sz);
             return format!("eor.{} d{dn},{ea_str}", size_suffix(sz));
         }
@@ -710,17 +857,24 @@ impl<'a> Dis<'a> {
         let mode = (op >> 3) & 7;
         let reg = op & 7;
 
-        // MULU: opmode 011.
+        // MULU: opmode 011. No An source.
         if opmode == 3 {
+            if mode == 1 || !modes::src(mode, reg, false) {
+                return self.illegal_word(op);
+            }
             let ea_str = self.format_ea(mode, reg, EaSize::Word);
             return format!("mulu {ea_str},d{dn}");
         }
-        // MULS: opmode 111.
+        // MULS: opmode 111. No An source.
         if opmode == 7 {
+            if mode == 1 || !modes::src(mode, reg, false) {
+                return self.illegal_word(op);
+            }
             let ea_str = self.format_ea(mode, reg, EaSize::Word);
             return format!("muls {ea_str},d{dn}");
         }
-        // ABCD: opmode 4 at mode 000 or 001.
+        // ABCD: opmode 4 only at mode 000 or 001 (form selector, not EA mode).
+        // Opmode 5 with mode <= 1 is also EXG (see below), handled there.
         if opmode == 4 && mode <= 1 {
             let rx = dn;
             let ry = reg;
@@ -732,9 +886,6 @@ impl<'a> Dis<'a> {
         }
         // EXG: opmode 5 (Dx,Dy or Ax,Ay) and opmode 6 at mode 001 (Dx,Ay).
         if opmode == 5 {
-            // bits 3-0 select the other register; bit 3 selects type if mode < 2.
-            // Actually: opmode 5 is EXG Dx,Dy (mode 000) or EXG Ax,Ay (mode 001).
-            // Both mode values here are used.
             if mode == 0 {
                 return format!("exg d{dn},d{reg}");
             }
@@ -746,6 +897,7 @@ impl<'a> Dis<'a> {
             return format!("exg d{dn},a{reg}");
         }
         // AND: opmodes 0-2 (ea->Dn) and 4-6 (Dn->ea, excluding BCD slots).
+        // No An source or destination (AND has no address-register form).
         let sz = match opmode & 3 {
             0 => EaSize::Byte,
             1 => EaSize::Word,
@@ -753,6 +905,13 @@ impl<'a> Dis<'a> {
             _ => return self.illegal_word(op),
         };
         let to_dn = opmode < 4;
+        if to_dn {
+            if mode == 1 || !modes::src(mode, reg, sz == EaSize::Byte) {
+                return self.illegal_word(op);
+            }
+        } else if !modes::mem_alterable(mode, reg) {
+            return self.illegal_word(op);
+        }
         let ea_str = self.format_ea(mode, reg, sz);
         if to_dn {
             format!("and.{} {ea_str},d{dn}", size_suffix(sz))
@@ -771,16 +930,22 @@ impl<'a> Dis<'a> {
         let mode = (op >> 3) & 7;
         let reg = op & 7;
 
-        // ADDA: opmode 011 (word) or 111 (long).
+        // ADDA: opmode 011 (word) or 111 (long). Any source including An.
         if opmode == 3 {
+            if !modes::src(mode, reg, false) {
+                return self.illegal_word(op);
+            }
             let ea_str = self.format_ea(mode, reg, EaSize::Word);
             return format!("adda.w {ea_str},a{dn}");
         }
         if opmode == 7 {
+            if !modes::src(mode, reg, false) {
+                return self.illegal_word(op);
+            }
             let ea_str = self.format_ea(mode, reg, EaSize::Long);
             return format!("adda.l {ea_str},a{dn}");
         }
-        // ADDX: opmode 4/5/6 at mode 000 or 001.
+        // ADDX: opmode 4/5/6 at mode 000 or 001 (form selector, not EA mode).
         if matches!(opmode, 4..=6) && mode <= 1 {
             let sz = match opmode {
                 4 => EaSize::Byte,
@@ -796,6 +961,7 @@ impl<'a> Dis<'a> {
             }
         }
         // ADD: opmodes 0-2 (ea->Dn) and 4-6 (Dn->ea).
+        // ADD source includes An (unlike OR/AND); destination is alterable memory.
         let sz = match opmode & 3 {
             0 => EaSize::Byte,
             1 => EaSize::Word,
@@ -803,6 +969,13 @@ impl<'a> Dis<'a> {
             _ => return self.illegal_word(op),
         };
         let to_dn = opmode < 4;
+        if to_dn {
+            if !modes::src(mode, reg, sz == EaSize::Byte) {
+                return self.illegal_word(op);
+            }
+        } else if !modes::mem_alterable(mode, reg) {
+            return self.illegal_word(op);
+        }
         let ea_str = self.format_ea(mode, reg, sz);
         if to_dn {
             format!("add.{} {ea_str},d{dn}", size_suffix(sz))
@@ -828,6 +1001,10 @@ impl<'a> Dis<'a> {
             let dir = (op >> 8) & 1;
             let mode = (op >> 3) & 7;
             let reg = op & 7;
+            // Memory shifts require an alterable memory destination.
+            if !modes::mem_alterable(mode, reg) {
+                return self.illegal_word(op);
+            }
             let mnemonic = shift_mnemonic(shift_type, dir);
             let ea_str = self.format_ea(mode, reg, EaSize::Word);
             return format!("{mnemonic}.w {ea_str}");
@@ -925,6 +1102,17 @@ impl<'a> Dis<'a> {
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
+
+/// MOVEM's EA rule, which is direction-dependent. See `opcode_space.rs` for
+/// the measured counts that justify the PC-relative load-only rule.
+fn movem_ea(mode: u16, reg: u16, to_regs: bool) -> bool {
+    match mode {
+        3 => to_regs,                           // (An)+ load only
+        4 => !to_regs,                          // -(An) store only
+        7 => reg <= 1 || (reg <= 3 && to_regs), // abs.W / abs.L always; PC-rel load only
+        _ => modes::control(mode, reg),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EaSize {
