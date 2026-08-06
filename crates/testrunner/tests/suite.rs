@@ -133,8 +133,16 @@ group!(bclr, "BCLR");
 group!(bchg, "BCHG");
 
 // Task 8: branches, jumps, subroutine calls, and conditional set/decrement.
-// `BRA` and `BSR` share the `Bcc` line's encoding but have their own groups; the
-// `Bcc` group covers conditions 2-15 only.
+//
+// `BRA` has NO group of its own -- there is no `BRA.json.bin`. Its coverage lives
+// inside the `Bcc` group, whose condition-nibble census over all 2,500 cases is
+// {0: 166, 2: 181, 3: 169, 4: 158, 5: 149, 6: 161, 7: 160, 8: 154, 9: 176,
+//  10: 169, 11: 189, 12: 184, 13: 177, 14: 141, 15: 166} -- i.e. 166 condition-0
+// (`BRA`) cases. An earlier version of this comment claimed `BRA` had its own
+// group and that `Bcc` covered "conditions 2-15 only"; both halves were wrong.
+// Only the `BSR` split holds: condition 1 is 0/2500 here and 2500/2500 in the
+// `BSR` group, since that encoding IS `BSR`.
+
 group!(bcc, "Bcc");
 group!(bsr, "BSR");
 group!(dbcc, "DBcc");

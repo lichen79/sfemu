@@ -762,11 +762,8 @@ mod tests {
             34 + 2 * 16,
             "Booth counts transitions, not set bits"
         );
-        assert_eq!(
-            muls_idle(0xFF00),
-            34 + 2 * 1,
-            "eight set bits, one transition"
-        );
+        // 34 + 2*1, written without the `* 1` to keep clippy::identity_op quiet.
+        assert_eq!(muls_idle(0xFF00), 34 + 2, "eight set bits, one transition");
 
         // |q| >> 1 == 0, so all 15 bits are clear: 116 + 30.
         assert_eq!(divs_idle(1, 1), 116 + 30);
@@ -775,13 +772,8 @@ mod tests {
         assert_eq!(divs_idle(0xFFFF_0000, 1), 14, "+2 for a negative dividend");
         assert_eq!(divu_idle(0x1_0000, 1), 6, "DIVU's overflow is one cost");
 
-        // DIVU's loop runs exactly 15 iterations, not 16 — pinned with a
-        // nonzero quotient so the loop is exercised. (-,+) and (+,-) sign
-        // pairs whose DIVS bases differ by 4 (120 vs 116).
-        //
-        // DIVU 100 / 7 = 14 rem 2: qq not zero, loop runs.
-        // DIVU 100 / 7 = 14 rem 2: loop runs, value is 126 (15 iterations,
-        // computed externally from the manual spec, not from divu_idle itself).
+        // DIVU 100 / 7 = 14 rem 2: nonzero quotient, loop exercises all 15
+        // iterations. 16 iterations would produce 130; 15 gives 126.
         assert_eq!(divu_idle(100, 7), 126);
 
         // DIVS (-,+) pair: base 116 + 6 (dvd_neg) = 122. Quotient -100/7 =>

@@ -600,6 +600,11 @@ mod tests {
         // SBCD V=1: 0x00 - 0x80 — binary 0x80 (bit 7 set after wrapping),
         // corrected 0x20 (the -0x60 byte-borrow correction drives bit 7 clear).
         // The fixup drove bit 7 from 1 to 0.
+        //
+        // The operands look arbitrary and are not: SBCD's V needs a byte borrow
+        // WITHOUT a low-nibble borrow. With both borrows the fixup is the full
+        // -0x66, and 0xFF - 0x66 = 0x99 still has bit 7 set — no transition. Here
+        // the low nibbles are both 0, so only -0x60 applies and bit 7 clears.
         let (sbcd_res, _) = sbcd(0x00, 0x80, false);
         let sbcd_bin = 0x00u8.wrapping_sub(0x80);
         assert_eq!(sbcd_bin, 0x80, "uncorrected bit 7 set");
