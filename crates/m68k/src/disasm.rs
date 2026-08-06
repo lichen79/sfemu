@@ -1371,9 +1371,22 @@ mod tests {
         assert_eq!(dis(&[0x48A7, 0x0001]), "movem.w a7,-(a7)");
     }
 
-    /// One assertion per EA rendering path and per notable operand form.
-    /// These are hand-verified against the 68000 encoding and confirmed correct
-    /// by the controller's probe (task-13-controller-findings.md §C2).
+    /// Thirteen EA and operand forms, hand-verified against the 68000 encoding
+    /// and confirmed correct by the controller's probe
+    /// (task-13-controller-findings.md §C2): the seven `An`-based and absolute
+    /// modes, immediate, `(d16,PC)`, and the LSL/SWAP/EXT/LINK/TRAP/CMPI
+    /// operand forms.
+    ///
+    /// **This is not one assertion per rendering path**, and the earlier
+    /// docstring saying so was never enumerated. Not covered here:
+    /// `format_index_pc_ea` (the `(d8,PC,Xn)` mode), MOVEM's
+    /// `(d16,An)` and absolute EAs, the `Scc`/`DBcc` condition names, the
+    /// `movem #0` empty-mask path, `movep`, `stop`, `move sr,`/`move ,ccr`/
+    /// `move ,sr`, `exg`, `abcd`/`sbcd`, `cmpm`, `chk`, and the shift/rotate
+    /// memory forms. Every one of those was probed correct at the time of
+    /// writing, so this is a gap in the *claim*, not a known defect — but a
+    /// reader deciding whether a path needs a new assertion must not trust
+    /// this test to have covered it.
     #[test]
     fn ea_and_operand_forms() {
         // Addressing modes.
