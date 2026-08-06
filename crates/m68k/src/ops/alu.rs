@@ -209,6 +209,15 @@ pub(super) struct Plan {
     pub pair: Option<(u16, u16)>,
     /// Read a long operand low word first. `ADDX`/`SUBX`'s memory form only.
     pub desc_reads: bool,
+    /// Advance the prefetch queue *after* the write-back, not before it.
+    ///
+    /// Every other memory-write form on this core fetches then writes
+    /// (`alu.rs`'s default arm). `TAS` is the sole exception: across all 2,108
+    /// memory-form cases a program read *follows* the write, and the control
+    /// "the write is the last non-idle transaction" scores 0/2108. The suite
+    /// does not model TAS's bus-locked RMW as indivisible — it emits an ordinary
+    /// read, idle, write — but it is unanimous about this ordering.
+    pub fetch_last: bool,
 }
 
 impl Plan {
@@ -223,11 +232,18 @@ impl Plan {
             idle: 0,
             pair: None,
             desc_reads: false,
+            fetch_last: false,
         }
     }
 
     pub fn writes(mut self) -> Self {
         self.writes = true;
+        self
+    }
+
+    /// See [`Plan::fetch_last`]. `TAS`'s memory form is the only user.
+    pub fn fetch_last(mut self) -> Self {
+        self.fetch_last = true;
         self
     }
 
@@ -459,12 +475,17 @@ pub(super) fn run_tail(
             nw = 2;
         }
         (Some(val), Ea::Mem(addr)) => {
-            fetch!(1);
+            if !plan.fetch_last {
+                fetch!(1);
+            }
             if size == Size::Long {
                 // Descending, in every mode — see the module docs.
                 ea::write_predec_long(bus, addr, val);
             } else {
                 ea::write(cpu, bus, dst_ea, size, val);
+            }
+            if plan.fetch_last {
+                fetch!(1);
             }
             nw = wper;
         }

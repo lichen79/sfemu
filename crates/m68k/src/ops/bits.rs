@@ -68,14 +68,18 @@
 //! exempt (176/176 against "`BTST` pays it too").
 //!
 //! `TAS`'s cost is `4` for a register destination and `4 * (de + 3) + 2` plus
-//! [`alu`]'s own address-computation lead otherwise — 2,500/2,500. Note the
-//! group is nonetheless a **known-bad** upstream group: the vectors' *ordered*
-//! transactions put an idle between `TAS`'s read and its write, which the
-//! harness cannot match, and the format's dedicated `Tas` transaction kind never
-//! appears in them at all (5,540 `Read`, 2,904 `Idle`, 2,108 `Write`). Every
-//! value this module computes for `TAS` is nevertheless confirmed against those
-//! same vectors, so the group failing is a statement about the sequence and not
-//! about the result.
+//! [`alu`]'s own address-computation lead otherwise — 2,500/2,500.
+//!
+//! `TAS` was labelled a **known-bad** upstream group here; that label is
+//! **retracted**. The measured facts behind it stand: the vectors put an idle
+//! between the read and the write, and the format's dedicated `Tas` transaction
+//! kind never appears in them at all (5,540 `Read`, 2,904 `Idle`, 2,108
+//! `Write`). The wrong inference was that this made them unmatchable. Their
+//! ordering is merely *unusual* — the queue advance follows the write instead of
+//! preceding it, alone among this core's memory-write forms — and it is
+//! unanimous. With [`alu::Plan::fetch_last`] the group is 2,500/2,500; before
+//! it, the 392 that passed were exactly the register-destination cases, which
+//! have no write transaction to misplace.
 
 use crate::cpu::M68k;
 use crate::decode::Handler;
@@ -200,14 +204,20 @@ fn bit_op(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16, op: Op, static_form: b
 
 /// `TAS <ea>` — test a byte, then unconditionally set its high bit.
 ///
-/// On real hardware this is an indivisible read-modify-write cycle, which is the
-/// whole point of the instruction and the reason its vectors are known-bad; here
-/// it is an ordinary byte RMW through [`alu::run`].
+/// On real hardware this is an indivisible read-modify-write cycle. The vectors
+/// do not model that indivisibility — they emit an ordinary read, idle, write —
+/// but they are consistent, so an ordinary byte RMW through [`alu::run`] matches
+/// them exactly once the queue advance moves *after* the write
+/// ([`Plan::fetch_last`]). An earlier version of this comment called the group
+/// unmatchable on that basis; it is 2,500/2,500.
 fn tas(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
     let (mode, reg) = ((opcode >> 3) & 7, opcode & 7);
 
     let idle = if mode_is_mem(mode, reg) { 2 } else { 0 };
-    let plan = Plan::new(Size::Byte, mode, reg).writes().idle(idle);
+    let plan = Plan::new(Size::Byte, mode, reg)
+        .writes()
+        .idle(idle)
+        .fetch_last();
 
     alu::run(cpu, bus, &plan, &mut |cpu, ops: Ops| {
         let v = ops.ea & 0xFF;
@@ -542,5 +552,46 @@ mod tests {
         assert_eq!(cpu.d[0], 0x1234_5681);
         assert!(!cpu.ccr_z() && !cpu.ccr_n());
         assert_eq!(cycles, 4);
+    }
+
+    /// An odd `TAS` destination is **not** an address error.
+    ///
+    /// The `TAS` group has no address-error case, which invites recording the
+    /// path as untested. It is not untested but *nonexistent*: `TAS` is byte-sized
+    /// and a byte access never misaligns, so no odd address can fault. The
+    /// assertion is that the odd byte is read-modify-written normally, at the odd
+    /// address, with the same cycle count as the even form.
+    ///
+    /// # Extrapolated
+    ///
+    /// Nothing here is extrapolated from `TAS` itself — the byte-access rule is
+    /// measured across every byte-sized group in the suite (4,661 `MOVE.b`-family
+    /// address-error cases, none of them byte accesses). The literal 14 is the
+    /// measured even-address count from the case above, asserted again at an odd
+    /// address to show alignment does not enter the schedule.
+    ///
+    /// The control is the case above: the same instruction at an even address, so
+    /// a fault appearing here and not there would be visible as a difference.
+    #[test]
+    fn an_odd_tas_destination_does_not_fault() {
+        let dec = Decoder::new();
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4AD0, 0x4E71, 0x4E71]); // TAS (A0)
+        bus.put16(0x2000, 0x0042); // low byte 0x42 lives at the odd 0x2001
+        let mut cpu = at(&mut bus);
+        cpu.a[0] = 0x2001;
+        bus.log.clear();
+        let cycles = cpu.step_with(&dec, &mut bus);
+        assert_eq!(
+            bus.writes(),
+            vec![(0x2001, 0xC2)],
+            "the odd byte is written in place: 0x42 | 0x80"
+        );
+        assert!(!cpu.ccr_n(), "0x42's high bit was clear before the set");
+        assert!(!cpu.ccr_z(), "0x42 is nonzero");
+        assert_eq!(cycles, 14, "identical to the even-address form");
+        // Priming leaves PC 4 ahead of the opcode word, and the single queue
+        // advance adds 2. A vector would have put PC at the handler instead.
+        assert_eq!(cpu.pc, 0x1006, "no vector taken");
     }
 }
