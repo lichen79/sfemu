@@ -72,6 +72,16 @@ use crate::Bus;
 /// select trapping cases by an SR supervisor transition: that drops every
 /// exception taken from supervisor mode (about half of each group) and admits
 /// address errors, which is how `CHK` stayed hidden behind this sentence.
+///
+/// ⚠️ **`final.ssp == initial.ssp - 6` is not a synonym for "took a short frame",
+/// and `CHK` is where the two predicates part.** 1,326 `CHK` cases fetch vector
+/// 6 but only 1,281 satisfy the SSP predicate. The missing **45** are all
+/// supervisor-mode cases whose `<ea>` names A7 with a side effect — 25 at
+/// `-(A7)` and 20 at `(A7)+` — so the EA's own adjustment composes with the
+/// frame's −6 and the net delta reads −8 or −4. They took the frame; the
+/// arithmetic just does not show it. Every other group is unaffected because
+/// none of the 34-cycle paths has an `<ea>` at all. Prefer the vector fetch:
+/// it survives an operand that touches the stack pointer.
 const GROUP2_CYCLES: u32 = 4 * SHORT_FRAME_ACCESSES + 6;
 
 /// `TRAP #n` — an unconditional trap through vectors 32-47.

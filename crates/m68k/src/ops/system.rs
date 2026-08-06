@@ -67,9 +67,14 @@ const PRIVILEGE_CYCLES: u32 = 4 * SHORT_FRAME_ACCESSES + 6;
 
 /// Traps to vector 8 if the CPU is in user mode, returning the cycle cost.
 ///
-/// The stacked PC is the opcode address itself — measured 6,260/6,260 with zero
-/// bump — and the prefetch queue is left alone, because the instruction never
-/// reached its own fetch.
+/// The stacked PC is the opcode address itself and the prefetch queue is left
+/// alone, because the instruction never reached its own fetch. Measured
+/// **11,276/11,276 with zero bump** across all nine vector-8 groups — not just
+/// the 6,260 this function serves, since [`exception::take`] stacks whatever PC
+/// it is handed and `logic.rs`'s three `to SR` forms and `trap.rs`'s `RTE` pass
+/// the same opcode address. 0 of 11,276 stack `+2`, so the rule is a whole
+/// bucket over every group that can reach it, not over this module's share of
+/// them.
 fn privilege_check(cpu: &mut M68k, bus: &mut dyn Bus) -> Option<u32> {
     if cpu.sr_s() {
         return None;
