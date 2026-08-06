@@ -14,16 +14,27 @@
 //!    They can only ever *clear* `Z`, never set it — that is what makes a chain
 //!    of `ADDX`s report "every limb was zero". [`accumulate_z`] applies it.
 //!    146 disagreeing cases, 146/146 for the accumulating rule and 0/146 for
-//!    the own-result rule, with a control group: `ADD.b` 2, `SUB.l` 10,
-//!    `AND.b` 110 and `NEG.b` 9 cases go `Z=0 -> Z=1`, against **0** for every
-//!    size of `ADDX`, `SUBX` and `NEGX`.
+//!    the own-result rule, with a control group: `ADD.b` 5, `SUB.l` 10,
+//!    `AND.b` 121 and `NEG.b` 9 cases go `Z=0 -> Z=1` — 145 in all — against
+//!    **0** for every size of `ADDX`, `SUBX` and `NEGX`.
+//!
+//!    Those control-group counts are over each group's whole non-fault
+//!    population, which is what makes them a control: a suite group holds more
+//!    than the encoding it is named after, so `ADD.b`'s 5 is `ADD` 2 + `ADDQ` 3
+//!    and `AND.b`'s 121 is `AND` 110 + `ANDI` 11. Counting only the base
+//!    encoding understates every row (it is how this comment first read 2 and
+//!    110), and understating a control group is the one direction that would
+//!    make the absence look stronger than it is.
 //! 2. **`X` is preserved, not derived**, by `CMP`, `CMPM`, `CMPA`, `AND`, `OR`,
 //!    `EOR`, `NOT`, `TST` and `CLR`. 20,755 disagreeing cases, 20,755/20,755.
 //! 3. **The logical ops clear `V` and `C`** rather than preserving them.
 //!    24,738 disagreeing cases, 24,738/24,738.
 //!
 //! `ADDA`/`SUBA` and `ADDQ`/`SUBQ` with an `An` destination touch no flag at
-//! all (6,906 disagreeing cases, 6,906/6,906), so they never come here.
+//! all (6,450 disagreeing cases, 6,450/6,450), so they never come here. Over the
+//! whole non-fault population of those forms — 7,137 cases — the CCR is
+//! unchanged; the 6,450 is the subset where a flag-setting rule would have
+//! produced a *different* CCR, which is the number that carries the evidence.
 
 use crate::ea::Size;
 

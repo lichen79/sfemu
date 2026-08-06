@@ -48,9 +48,10 @@
 //! every case the suite contains. The masking there is inherited from the
 //! `EORI`/`ORI` evidence, not independently confirmed.
 //!
-//! `to CCR` is **not privileged** — 1,237 user-mode cases execute it normally.
-//! `to SR` in user mode takes a privilege violation stacking the address of the
-//! opcode itself (1,404/1,404 at `opcode + 0`), without advancing the queue.
+//! `to CCR` is **not privileged** — 3,653 user-mode cases across the three
+//! `toCCR` groups execute it normally. `to SR` in user mode takes a privilege
+//! violation stacking the address of the opcode itself (3,730/3,730 at
+//! `opcode + 0`, over the three `toSR` groups), without advancing the queue.
 
 use crate::cpu::M68k;
 use crate::decode::Handler;
@@ -153,7 +154,9 @@ fn immediate(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16, op: Op, size: Size)
 /// advances past the immediate, then is refilled from the word *after the
 /// opcode* — so that word is read twice. Reproducing it means rewinding `pc` by
 /// one word before the refill, which looks wrong and is exactly what the vectors
-/// show (2,462 supervisor and 1,237 user cases, 20 cycles each).
+/// show (3,847 supervisor and 3,653 user cases across the three `toCCR` groups,
+/// 20 cycles each — 2,500/2,500 per group, so the split by mode does not matter
+/// to the shape).
 fn to_ccr_sr(cpu: &mut M68k, bus: &mut dyn Bus, op: Op, to_sr: bool) -> u32 {
     if to_sr && !cpu.sr_s() {
         // Privilege violation. The queue does not advance, so the stacked PC is

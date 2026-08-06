@@ -1,8 +1,10 @@
 //! `ADD`, `SUB`, `CMP` and their variants, plus `NEG`, `NEGX`, `CLR` and `TST`.
 //!
-//! Every handler here builds an [`alu::Plan`] and hands a closure to
-//! [`alu::run`], which owns the bus schedule (see its module docs). What is left
-//! in this file is the arithmetic and the flag rules.
+//! Every handler here builds an `alu::Plan` and hands a closure to `alu::run`,
+//! which owns the bus schedule (see that module's docs). What is left in this
+//! file is the arithmetic and the flag rules. (`alu` is `pub(super)`, so those
+//! names are deliberately not intra-doc links — rustdoc cannot resolve a link
+//! from a public module into a private one without `--document-private-items`.)
 //!
 //! # The encodings, censused from the vectors
 //!
@@ -131,11 +133,19 @@ fn alu_ea_dn(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16, op: Op, size: Size,
 /// Two rules here, both measured:
 ///
 /// - **`ADDA` and `SUBA` set no flags whatsoever.** Together with `ADDQ`/`SUBQ`
-///   into `An` that is 6,906 disagreeing cases, 6,906/6,906 for "no flags".
+///   into `An` that is 6,450 disagreeing cases, 6,450/6,450 for "no flags"
+///   (7,137 in the whole non-fault population, all CCR-unchanged).
 /// - **a word-sized source is sign-extended, then compared against all 32 bits.**
-///   842 cases distinguish this from truncating the destination to a word, and
-///   all 842 prefer sign extension. `CMPA.w #1,A0` with `A0 = 0xFFFF0000` is the
-///   shape that shows it.
+///   At `.w`, 1,212 cases distinguish this from truncating the destination to a
+///   word, and all 1,212 prefer sign extension. `CMPA.w #1,A0` with
+///   `A0 = 0xFFFF0000` is the shape that shows it.
+///
+///   At `.l` the question is **not tested and cannot be**: sign-extending a long
+///   source is the identity, so the two candidate rules predict the same result
+///   in every case. `CMPA.l` therefore has zero discriminating cases. Long-size
+///   sign extension here rests on `Size::sign_extend` being a no-op at `.l`
+///   rather than on evidence — which is fine, but it is not a measurement, and
+///   quoting one figure spanning both sizes would hide that.
 fn alu_a(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16, op: Op, size: Size) -> u32 {
     let (mode, reg) = ((opcode >> 3) & 7, opcode & 7);
     let an = ((opcode >> 9) & 7) as usize;
@@ -179,9 +189,11 @@ fn alu_a(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16, op: Op, size: Size) -> 
 ///
 /// The task brief states this backwards. 146 cases distinguish the two readings;
 /// the accumulating rule is 146/146 and the own-result rule 0/146. The control
-/// group is the other half of the argument: `ADD.b`, `SUB.w`, `AND.b` and `NEG.b`
-/// between them have 148 cases that go `Z=0 -> Z=1`, against **zero** such cases
-/// in any size of `ADDX`, `SUBX` or `NEGX`. See [`accumulate_z`].
+/// group is the other half of the argument: `ADD.b`, `SUB.l`, `AND.b` and `NEG.b`
+/// between them have 145 cases that go `Z=0 -> Z=1` (5, 10, 121 and 9), against
+/// **zero** such cases in any size of `ADDX`, `SUBX` or `NEGX`. See
+/// [`accumulate_z`] for why those counts are per-group populations, not
+/// per-encoding.
 fn addx_subx(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16, op: Op, size: Size) -> u32 {
     let (mode, reg) = ((opcode >> 3) & 7, opcode & 7);
     let x = ((opcode >> 9) & 7) as usize;
@@ -319,8 +331,10 @@ pub(super) enum Single {
 ///
 /// `CLR` sets `Z` and clears `N`, which sounds too obvious to measure until you
 /// consider that the alternative (deriving them from the pre-clear value) is what
-/// a naive "compute flags from the operand" path produces: 5,510 cases
-/// distinguish them, 5,510/5,510 for the constant rule.
+/// a naive "compute flags from the operand" path produces: 5,494 cases
+/// distinguish them, 5,494/5,494 for the constant rule. (`CLR`'s whole non-fault
+/// population is 5,510; the 16-case gap is operands that were already zero and
+/// non-negative, where the two rules agree and nothing is under test.)
 pub(super) fn single(
     cpu: &mut M68k,
     bus: &mut dyn Bus,
@@ -733,7 +747,10 @@ mod tests {
 
     /// `ADDX.w -(A3),-(A3)`: the source decrement commits before the
     /// destination address is formed, so the two operands come from different
-    /// addresses. 514 suite cases turn on this.
+    /// addresses. 526 suite cases carry this encoding — `ADDX`/`SUBX -(Ay),-(Ax)`
+    /// with `Ay == Ax`, non-faulting, excluding `A7` — but the bus log this test
+    /// asserts is the real evidence, since a population count says only that the
+    /// shape occurs, not that the addresses differ.
     #[test]
     fn addx_with_the_same_register_reads_two_addresses() {
         let mut bus = RecordingBus::new();
