@@ -237,9 +237,11 @@ fn divs_idle(dividend: u32, divisor: u16) -> u32 {
 ///   instruction, which is `CHK`'s rule (1326/1326) and `JSR`'s (2570/2570). A
 ///   fixed `opcode_addr + 2` is measured *wrong* for both.
 /// - the cycle count is the schedule so far plus the short frame's 7 accesses,
-///   which is `CHK`'s trapping rule, plus 10 idle. The real 68000 spends some
-///   idle deciding the divisor is zero; 10 is `CHK`'s trapping idle and is a
-///   guess. Nothing in the repo can currently confirm it.
+///   which is `CHK`'s trapping rule, plus 10 idle. `CHK`'s trapping idle is
+///   **measured, and it is not a single value**: 10 in 204 cases and 12 in 101,
+///   selected by [`chk_idle`]'s predicate on the operands. Borrowing 10 picks
+///   one of two measured arms with no evidence for which arm a zero divisor
+///   takes, so the uncertainty is 10-vs-12. Nothing in the repo can settle it.
 ///
 /// The destination register is left completely unchanged.
 fn divide_by_zero(cpu: &mut M68k, bus: &mut dyn Bus, ops: &Ops) -> Tail {
@@ -270,12 +272,23 @@ fn div(cpu: &mut M68k, bus: &mut dyn Bus, op: u16, signed: bool) -> u32 {
         let dividend = cpu.d[dn];
         if divisor == 0 {
             // EXTRAPOLATED, zero suite cases: the manual gives zero-divide 38
-            // cycles total, and 38 - 4 * SHORT_FRAME_ACCESSES = 10 idle. This
-            // is 4 MORE than the 6 idle measured on every other 7-access
-            // group-2 entry path (34 = 4*7 + 6, a singleton over 20,026 cases
-            // in twelve groups). The extra 4 is unexplained and unverifiable
-            // here — do not "simplify" it to 6 for family consistency without
-            // new evidence.
+            // cycles total, and 38 - 4 * SHORT_FRAME_ACCESSES = 10 idle.
+            //
+            // 10 is NOT an outlier — it is measured, on CHK. Of the 7-access
+            // short-frame cases (ssp -= 6), CHK contributes 204 at idle 10 and
+            // 101 at idle 12, i.e. exactly 38 and 40 cycles; the twelve groups
+            // that sit at idle 6 are the ones with no operand comparison to
+            // make (ANDItoSR, EORItoSR, ILLEGAL_LINEA/F, MOVEfromUSP,
+            // MOVEtoSR, MOVEtoUSP, ORItoSR, RESET, RTE, STOP, TRAP), 18,776
+            // cases. So the family is not uniform at 6, and 38 is a value the
+            // suite actually produces on the trap that DIV's rule is borrowed
+            // from.
+            //
+            // The real uncertainty is 10 vs 12, not 10 vs 6: chk_idle picks
+            // between them on a predicate about the operands, and nothing says
+            // a zero divisor lands on the 10 arm. Do not "simplify" this to 6
+            // for family consistency — that value belongs to the no-comparison
+            // groups, not to this one.
             own_idle = 10;
             return divide_by_zero(cpu, bus, &ops);
         }
