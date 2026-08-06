@@ -25,6 +25,7 @@ pub mod cpu;
 pub mod decode;
 pub mod ea;
 pub mod exception;
+pub mod flags;
 pub mod ops;
 
 pub use bus::Bus;
