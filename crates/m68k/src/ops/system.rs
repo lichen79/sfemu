@@ -16,12 +16,24 @@
 //!
 //! # Privilege
 //!
-//! Six instructions are privileged, and they cost **34 cycles** to trap — a
-//! singleton across all six (`MOVEtoSR` 1290, `MOVEtoUSP` 1226, `MOVEfromUSP`
-//! 1207, `STOP` 1270, `RESET` 1267, and `RTE`, which is Task 11's). That is
-//! `4 * SHORT_FRAME_ACCESSES + 6` idle. The stacked PC is the **opcode address**
-//! with no bump in all 6,260 cases, and the queue is not advanced: a privilege
-//! violation aborts the instruction before its own fetch.
+//! Privileged instructions cost **34 cycles** to trap, `4 * SHORT_FRAME_ACCESSES
+//! + 6` idle. The stacked PC is the **opcode address** with no bump, and the
+//! queue is not advanced: a privilege violation aborts the instruction before
+//! its own fetch. Measured 6,260/6,260 over the **five groups this module owns**
+//! — `MOVEtoSR` 1290, `MOVEtoUSP` 1226, `MOVEfromUSP` 1207, `STOP` 1270,
+//! `RESET` 1267.
+//!
+//! ⚠️ **6,260 is those five groups, not the whole privilege story.** An earlier
+//! version of this paragraph called 34 "a singleton across all six" while
+//! enumerating five and citing a count that covers exactly those five. Nine
+//! suite groups fetch vector 8, totalling **11,276** cases: the five above, plus
+//! `RTE` 1286 (Task 11's), plus `ORItoSR` 1301, `ANDItoSR` 1207 and `EORItoSR`
+//! 1222, which live in [`logic`](super::logic). All nine are 34 at 7 accesses
+//! + 6 idle, so the *cost* claim generalises — but the count does not, and "all
+//! six" was never a set anyone enumerated. Count privilege violations by the
+//! **vector-8 fetch** (a read at `0x20` or `0x22`), never by an SR supervisor
+//! transition: that predicate silently drops every violation raised while
+//! already in supervisor mode.
 //!
 //! ⚠️ **`MOVEfromSR` and `MOVEtoCCR` are NOT privileged on the 68000** (they are
 //! on the 68010). Measured: 0 of 747 user-mode `MOVEfromSR` cases and 0 of 756
@@ -49,7 +61,8 @@ use crate::Bus;
 
 /// Cycles a privilege violation costs: the short frame plus 6 idle.
 ///
-/// Singleton across all six privileged instructions, 6,260 cases.
+/// Singleton at 34 across all **nine** suite groups that fetch vector 8,
+/// 11,276 cases; 6,260 of those are this module's five. See the module docs.
 const PRIVILEGE_CYCLES: u32 = 4 * SHORT_FRAME_ACCESSES + 6;
 
 /// Traps to vector 8 if the CPU is in user mode, returning the cycle cost.

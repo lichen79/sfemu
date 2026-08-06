@@ -28,10 +28,17 @@
 //! `TRAP`'s shape opens `.` (idle, then straight into the frame writes);
 //! `TRAPV`'s opens `r`. So TRAPV performs one program read that TRAP does not,
 //! and pays 4 fewer idle cycles for it — `4×8 + 2` against `4×7 + 6`, both 34.
-//! Confirmed as the sole outlier across every group-2 path in the suite: TRAPV
+//! TRAPV is the only outlier **among the paths that cost 34**: TRAPV
 //! `Read at pc+0` 1250/1250, while TRAP, LINE-A, LINE-F and the STOP/RESET
 //! privilege violations all open `Idle(4)` unanimously (2500, 2500, 2500, 1270,
 //! 1267).
+//!
+//! ⚠️ It is **not** the only group-2 path that opens with a read. `CHK` opens
+//! `Read` in 645 of its 1,326 trapping cases and `Idle(2)`/`Idle(8)`/`Idle(10)`
+//! in the other 681 — and `CHK` costs 38-52, never 34. An earlier version of
+//! this paragraph said "the sole outlier across every group-2 path in the
+//! suite"; that quantifier ranges over a category containing `CHK`, which
+//! refutes it twice over. The measured claim is about the 34-cycle paths only.
 //!
 //! ⚠️ **No mechanical explanation for that survives contact with the data.** The
 //! attractive story — TRAPV must execute to know V, so its prefetch proceeds —
@@ -50,9 +57,21 @@ use crate::Bus;
 
 /// Cycles a group-2 trap costs: the short frame's 7 accesses plus 6 idle.
 ///
-/// A singleton at 34 across every group-2 path in the suite — `TRAP` 2500,
-/// LINE-A 2500, LINE-F 2500, the privilege violations 6,260, and `TRAPV` 1250.
-/// TRAPV reaches the same 34 by a different decomposition; see the module docs.
+/// A singleton at 34 across the **twelve groups that enter at 7 accesses and 6
+/// idle** — `TRAP` 2500, LINE-A 2500, LINE-F 2500, and the nine groups whose
+/// privilege violations total 11,276 — which is 18,776 cases. `TRAPV`'s 1,250
+/// reach the same 34 at `4×8 + 2`; see the module docs. So 20,026 cases sit at
+/// 34, in **two** decompositions, and a doc comment citing 20,026 against
+/// `4×7 + 6` would be describing only 18,776 of them.
+///
+/// ⚠️ **Not every group-2 path costs 34.** `CHK` is group 2 and never is: its
+/// 1,326 trapping cases run 38/40/42/44/46/48/50/52 across ten `(accesses,
+/// idle)` shapes, because it pays for an operand comparison these paths do not
+/// make. Selecting on **the vector address a case reads** is what makes that
+/// visible — vector `v` at `4v` and `4v+2`, `TRAP` at `0x80..=0xBF`. Do not
+/// select trapping cases by an SR supervisor transition: that drops every
+/// exception taken from supervisor mode (about half of each group) and admits
+/// address errors, which is how `CHK` stayed hidden behind this sentence.
 const GROUP2_CYCLES: u32 = 4 * SHORT_FRAME_ACCESSES + 6;
 
 /// `TRAP #n` — an unconditional trap through vectors 32-47.
