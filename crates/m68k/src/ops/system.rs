@@ -387,6 +387,14 @@ fn pea(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
         // stacked PC is extrapolated from the neighbouring measured groups:
         // UNLK stacks `opcode + 4` (1115/1115) and LINK's shape is identical.
         // Using the same offset here; label this if hardware evidence changes it.
+        //
+        // ⚠️ `sp = a[7] - 4` and 4 is even, so misaligned(sp) ⟺ odd `a[7]`.
+        // The exception frame base is `a[7]` at fault time (exception.rs:179),
+        // and we commit nothing before faulting, so the base is that same odd
+        // `a[7]`. On hardware this is therefore a **double bus fault** — the
+        // processor halts rather than stacking a frame. The frame written here
+        // is the general address-error path; Task 11 owns the halt. Both the
+        // stacked PC and this behaviour are extrapolated (0 faults in 2,500).
         exception::address_error(
             cpu,
             bus,
@@ -441,6 +449,14 @@ fn link(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
         // stacked PC is extrapolated from the neighbouring measured groups:
         // UNLK stacks `opcode + 4` (1115/1115), and LINK's shape is the same.
         // Label this if hardware evidence changes it.
+        //
+        // ⚠️ `sp = a[7] - 4` and 4 is even, so misaligned(sp) ⟺ odd `a[7]`.
+        // The exception frame base is `a[7]` at fault time (exception.rs:179),
+        // and we commit nothing before faulting, so the base is that same odd
+        // `a[7]`. On hardware this is therefore a **double bus fault** — the
+        // processor halts rather than stacking a frame. The frame written here
+        // is the general address-error path; Task 11 owns the halt. Both the
+        // stacked PC and this behaviour are extrapolated (0 faults in 2,500).
         exception::address_error(
             cpu,
             bus,
