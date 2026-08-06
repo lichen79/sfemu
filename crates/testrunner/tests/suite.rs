@@ -90,3 +90,58 @@ group!(eori_to_sr, "EORItoSR");
 group!(ori_to_ccr, "ORItoCCR");
 group!(ori_to_sr, "ORItoSR");
 group!(nop, "NOP");
+
+// Task 7: shifts, rotates, and bit operations.
+//
+// A group named for one shift type contains only that type — `ASL.b` is 2,500
+// `ASL` cases and no `LSL` — provided the type field is read from bits 4-3.
+// Read from 5-4 it appears to be a mixture, which is the symptom of that
+// off-by-one and not a property of the suite.
+//
+// The eight `.w` groups are the only ones with a memory form (size `11`), so
+// they carry every address error in the task: 2,248 read faults, and no write
+// faults anywhere in Task 7.
+group!(asl_b, "ASL.b");
+group!(asl_w, "ASL.w");
+group!(asl_l, "ASL.l");
+group!(asr_b, "ASR.b");
+group!(asr_w, "ASR.w");
+group!(asr_l, "ASR.l");
+group!(lsl_b, "LSL.b");
+group!(lsl_w, "LSL.w");
+group!(lsl_l, "LSL.l");
+group!(lsr_b, "LSR.b");
+group!(lsr_w, "LSR.w");
+group!(lsr_l, "LSR.l");
+group!(rol_b, "ROL.b");
+group!(rol_w, "ROL.w");
+group!(rol_l, "ROL.l");
+group!(ror_b, "ROR.b");
+group!(ror_w, "ROR.w");
+group!(ror_l, "ROR.l");
+group!(roxl_b, "ROXL.b");
+group!(roxl_w, "ROXL.w");
+group!(roxl_l, "ROXL.l");
+group!(roxr_b, "ROXR.b");
+group!(roxr_w, "ROXR.w");
+group!(roxr_l, "ROXR.l");
+// One group per bit instruction, each holding both bit-number forms: the static
+// form (bit number in an extension word) and the dynamic one (bit number in Dn).
+group!(btst, "BTST");
+group!(bset, "BSET");
+group!(bclr, "BCLR");
+group!(bchg, "BCHG");
+
+/// Known-bad upstream: `TAS`'s indivisible read-modify-write is not modelled by
+/// the vector generator. Asserted as failing so an upstream fix surfaces.
+///
+/// The failure is specifically in the *ordered* transactions — the vectors place
+/// an idle between the read and the write, and never use the format's dedicated
+/// `Tas` transaction kind at all. Every value the handler computes is confirmed
+/// against these same vectors: the timing law holds 2,500/2,500, and so do the
+/// predicted cycle count and the result-and-CCR prediction.
+#[test]
+#[should_panic(expected = "TAS")]
+fn tas_is_known_bad() {
+    assert_group("TAS");
+}

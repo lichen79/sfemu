@@ -28,7 +28,7 @@
 //! This is *not* MOVE's schedule ([`ops::move_`](super::move_)): there is only
 //! one `<ea>`, and the single queue advance always sits between the reads and
 //! the writes. The one structural exception is `ADDX.l`/`SUBX.l` into `-(Ax)`,
-//! which splits its two writes around that fetch — see [`Plan::pair`].
+//! which splits its two writes around that fetch — see `Plan::pair`.
 //!
 //! Idle cycles are **not** ordered against the accesses here, only totalled.
 //! The harness compares `Read`/`Write` transactions in sequence but matches
@@ -38,7 +38,7 @@
 //! # The trailing idle
 //!
 //! This is where the families diverge, and the divergence is not a function of
-//! the addressing mode. Each row is set by the handler that builds the [`Plan`];
+//! the addressing mode. Each row is set by the handler that builds the `Plan`;
 //! collected here because the pattern is only visible side by side:
 //!
 //! ```text
@@ -70,7 +70,7 @@
 //!
 //! - operand reads **ascend** (high word first) in every mode — the general case;
 //! - `ADDX`/`SUBX`'s `-(Ay),-(Ax)` reads **descend**, both operands, which is why
-//!   [`Plan::desc_reads`] exists. `CMPM`'s `(Ay)+,(Ax)+` reads ascend, so this is
+//!   `Plan::desc_reads` exists. `CMPM`'s `(Ay)+,(Ax)+` reads ascend, so this is
 //!   a property of the instruction and not of the memory-pair form;
 //! - **every** long read-modify-write destination writes **descending**
 //!   (low word first): 8,360/8,360 across all of `NEG`, `NEGX`, `NOT`, `CLR`,

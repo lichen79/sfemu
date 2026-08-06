@@ -134,7 +134,7 @@ fn moveq_requires_bit_8_clear() {
 /// future one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Claim {
-    /// A Task 6 handler must own it.
+    /// An implemented handler must own it.
     Mine,
     /// No 68000 instruction has this encoding — it must reach the illegal
     /// handler now and forever.
@@ -170,7 +170,38 @@ mod modes {
     }
 }
 
-/// Classifies every opcode in the eight lines Task 6 touches.
+/// The bit instructions' destination rule, which differs between `BTST` and the
+/// other three and again between the two bit-number forms.
+///
+/// `BTST` writes nothing, so its operand needs only to be *readable*: the two
+/// PC-relative modes are legal for it and not for `BCHG`/`BCLR`/`BSET`. The
+/// immediate operand `#data` is narrower still — legal in the **dynamic** form
+/// only, which the vectors show directly: across `BTST`'s 2,500 cases the dynamic
+/// form uses mode 7 reg 4 fifty-eight times and the static form never, while at
+/// mode 5 (a control both forms reach) the split is 328 dynamic to 40 static.
+fn bit_op(op: u16, dynamic: bool) -> Claim {
+    let mode = (op >> 3) & 7;
+    let reg = op & 7;
+    let btst = (op >> 6) & 3 == 0;
+    let ok = if btst {
+        match mode {
+            0 => true,
+            1 => false,
+            // Readable memory, plus the immediate in the dynamic form.
+            7 => reg <= 3 || (reg == 4 && dynamic),
+            _ => true,
+        }
+    } else {
+        modes::data_alterable(mode, reg)
+    };
+    if ok {
+        Claim::Mine
+    } else {
+        Claim::Illegal
+    }
+}
+
+/// Classifies every opcode in the lines Tasks 6 and 7 touch.
 ///
 /// Written as one function over the whole space rather than per family, because
 /// the interesting cases are the collisions: `EOR` and `CMPM` sharing an opmode,
@@ -189,12 +220,18 @@ fn claim(op: u16) -> Claim {
         // instructions.
         0x0 => {
             if op & 0x0100 != 0 {
-                // MOVEP (mode 001) and the dynamic bit instructions.
-                return Claim::Later;
+                // The dynamic bit instructions — and, at mode 001 only, MOVEP,
+                // which is Task 10. Every bit-op destination rule excludes mode
+                // 001 anyway, so the two do not overlap.
+                return if mode == 1 {
+                    Claim::Later
+                } else {
+                    bit_op(op, true)
+                };
             }
             match (op >> 9) & 7 {
                 // Static BTST/BCHG/BCLR/BSET.
-                4 => Claim::Later,
+                4 => bit_op(op, false),
                 // MOVES: a 68010 instruction, so illegal here.
                 7 => Claim::Illegal,
                 family => {
@@ -225,8 +262,21 @@ fn claim(op: u16) -> Claim {
                 return Claim::Mine;
             }
             let sel = (op >> 8) & 0xF;
-            // Size 11 of these selectors is MOVE from SR / to CCR / to SR / TAS.
-            if !matches!(sel, 0x0 | 0x2 | 0x4 | 0x6 | 0xA) || size_bits == 3 {
+            // Size 11 of selector A is TAS; of the others it is MOVE from SR /
+            // to CCR / to SR, which belong to Task 10.
+            if sel == 0xA && size_bits == 3 {
+                if mode == 7 && reg == 4 {
+                    // 0x4AFC is `ILLEGAL`, whose entire effect *is* the
+                    // illegal-instruction trap. Classifying it here is exact
+                    // behaviourally — a dedicated handler for it would land at
+                    // the same vector — even though the encoding exists.
+                    Claim::Illegal
+                } else if data {
+                    Claim::Mine
+                } else {
+                    Claim::Illegal
+                }
+            } else if !matches!(sel, 0x0 | 0x2 | 0x4 | 0x6 | 0xA) || size_bits == 3 {
                 Claim::Later
             } else if data {
                 Claim::Mine
@@ -342,19 +392,39 @@ fn claim(op: u16) -> Claim {
                 }
             }
         },
+        // 1110: the shifts and rotates. Two encodings in one line, split by the
+        // size field.
+        0xE => {
+            if size_bits != 3 {
+                // Register/immediate form: every combination of count, count
+                // source, direction, type and data register exists, so all 3,072
+                // of these are legal without further conditions.
+                Claim::Mine
+            } else if op & 0x0800 != 0 {
+                // Bit 11 is not part of the memory form's encoding. With it set
+                // these are the 68020's bit-field instructions — BFTST and its
+                // relatives — and nothing at all on a 68000.
+                Claim::Illegal
+            } else if mem {
+                Claim::Mine
+            } else {
+                Claim::Illegal
+            }
+        }
         _ => Claim::Later,
     }
 }
 
-/// Task 6 must claim every encoding that exists in its lines and none that does
-/// not — checked over all 65536 opcodes, because the suite samples 2500 cases per
-/// group and a rare mode can be missing from the table without any group failing.
+/// The implemented tasks must claim every encoding that exists in their lines and
+/// none that does not — checked over all 65536 opcodes, because the suite samples
+/// 2500 cases per group and a rare mode can be missing from the table without any
+/// group failing.
 ///
 /// Encodings belonging to later tasks are skipped rather than asserted illegal:
-/// they are illegal *today*, so asserting it would bake in a fact that Task 7
-/// through 10 must then unbake.
+/// they are illegal *today*, so asserting it would bake in a fact that Task 8
+/// through 11 must then unbake.
 #[test]
-fn task6_claims_exactly_the_legal_encodings() {
+fn implemented_tasks_claim_exactly_the_legal_encodings() {
     let dec = Decoder::new();
     let mut mine = 0;
     let mut illegal = 0;
@@ -365,8 +435,8 @@ fn task6_claims_exactly_the_legal_encodings() {
             Claim::Mine => {
                 assert!(
                     claimed,
-                    "opcode {op:04X} is a legal Task 6 encoding but reaches the \
-                     illegal handler"
+                    "opcode {op:04X} is a legal encoding of an implemented \
+                     instruction but reaches the illegal handler"
                 );
                 mine += 1;
             }
@@ -383,7 +453,10 @@ fn task6_claims_exactly_the_legal_encodings() {
     }
     // A guard against the classifier itself going vacuous: if a refactor made
     // `claim` return `Later` everywhere the assertions above would all pass.
-    assert!(mine > 20_000, "only {mine} opcodes classified as Task 6's");
+    assert!(
+        mine > 20_000,
+        "only {mine} opcodes classified as implemented"
+    );
     assert!(illegal > 1_000, "only {illegal} classified as nonexistent");
 }
 
