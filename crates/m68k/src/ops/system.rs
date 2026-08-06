@@ -28,9 +28,9 @@
 //! enumerating five and citing a count that covers exactly those five. Nine
 //! suite groups fetch vector 8, totalling **11,276** cases: the five above, plus
 //! `RTE` 1286 (Task 11's), plus `ORItoSR` 1301, `ANDItoSR` 1207 and `EORItoSR`
-//! 1222, which live in [`logic`](super::logic). All nine are 34 at 7 accesses
-//! + 6 idle, so the *cost* claim generalises — but the count does not, and "all
-//! six" was never a set anyone enumerated. Count privilege violations by the
+//! 1222, which live in [`logic`](super::logic). All nine cost 34 at 7 accesses
+//! and 6 idle, so the *cost* claim generalises — but the count does not, and
+//! "all six" was never a set anyone enumerated. Count privilege violations by the
 //! **vector-8 fetch** (a read at `0x20` or `0x22`), never by an SR supervisor
 //! transition: that predicate silently drops every violation raised while
 //! already in supervisor mode.
