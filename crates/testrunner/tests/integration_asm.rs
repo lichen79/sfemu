@@ -15,9 +15,12 @@
 //! - **STOP resume** — STOP's access shape is empty and no vector case runs a
 //!   second step.
 //!
-//! - **Trace exception** — T is clear in every initial state, and the trace
-//!   fires *after* the traced instruction, so a core that took it immediately
-//!   would still pass all 127 groups.
+//! - **Trace exception** — vector 9 is fetched **0** times in all 317,500 cases,
+//!   because each case runs exactly one instruction and stops at the boundary the
+//!   trace check lives on.  Note the *handler* is what is uncovered, not the
+//!   boundary: 158,894 of 317,500 initial states have T **set**, across all 127
+//!   groups, so a core that took the trace before the boundary would fail ~38% of
+//!   the suite rather than passing it.
 //!
 //! Encodings are hand-assembled and were verified against the measured layout in
 //! `task-12-addendum.md` and `task-12-addendum-supplement.md` (every displacement
@@ -203,6 +206,19 @@ fn trap_and_rte_resume_correctly() {
 /// re-entry; clearing the line here just ensures a second look after `rte` also
 /// does nothing.
 ///
+/// **Which assertion catches which class of bug.**  A masking bug and a nesting
+/// bug are indistinguishable from `d1` alone, so the two assertions split them:
+///
+/// | observation | what failed |
+/// |---|---|
+/// | `d1 > 1` | **masking**: entry did not raise the mask to the serviced level, so the interrupt was re-taken before the line was cleared |
+/// | `d1 == 0` | **recognition**: `check_interrupts` never fired at all |
+/// | `a7 != 0x8000` | **nesting**: the frame was not stacked or not fully popped, independent of how many times the handler ran |
+///
+/// The test is sensitive to all three: disabling interrupt recognition and
+/// removing the mask raise each fail it, on the `d1` and `a7` assertions
+/// respectively.  That is why both are asserted rather than `d1` alone.
+///
 /// Layout:
 /// ```text
 /// 1000  343C  move.w #100,d2   d1 counts handler entries
@@ -240,7 +256,10 @@ fn interrupt_mid_loop_resumes() {
 
     let mut steps = 0;
     let mut fired = false;
-    while steps < 100_000 && !cpu.stopped {
+    // `!cpu.halted` matches the shared `run()` helper: a double bus fault would
+    // otherwise spin to the step cap and fail on `stopped` with a misleading message
+    // instead of revealing the halt.
+    while steps < 100_000 && !cpu.stopped && !cpu.halted {
         // Raise the IRQ once, partway through the loop.
         if steps == 20 && !fired {
             cpu.set_irq(4);
