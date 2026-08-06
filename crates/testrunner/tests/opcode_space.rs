@@ -168,6 +168,29 @@ mod modes {
     pub fn data_alterable(mode: u16, reg: u16) -> bool {
         mode == 0 || mem_alterable(mode, reg)
     }
+    /// Control: memory whose address does not depend on the access, so no
+    /// increment or decrement, and no immediate. `LEA`, `PEA` and `JMP`/`JSR`
+    /// share this set — an instruction that forms an address without accessing it
+    /// has nothing to step by.
+    pub fn control(mode: u16, reg: u16) -> bool {
+        matches!(mode, 2 | 5 | 6) || (mode == 7 && reg <= 3)
+    }
+}
+
+/// `MOVEM`'s `<ea>` rule, which is direction-dependent — the one addressing-mode
+/// set in the instruction set that is not symmetric.
+///
+/// Control, plus whichever of the two stepping modes matches the transfer
+/// direction: `-(An)` stores only and `(An)+` loads only, each being the mode that
+/// walks *with* the transfer. PC-relative is likewise load-only, there being
+/// nothing to store into the instruction stream.
+fn movem_ea(mode: u16, reg: u16, to_regs: bool) -> bool {
+    match mode {
+        3 => to_regs,
+        4 => !to_regs,
+        7 => reg <= 1 || (reg <= 3 && to_regs),
+        _ => modes::control(mode, reg),
+    }
 }
 
 /// The bit instructions' destination rule, which differs between `BTST` and the
@@ -223,11 +246,15 @@ fn claim(op: u16) -> Claim {
         // instructions.
         0x0 => {
             if op & 0x0100 != 0 {
-                // The dynamic bit instructions — and, at mode 001 only, MOVEP,
-                // which is Task 10. Every bit-op destination rule excludes mode
-                // 001 anyway, so the two do not overlap.
+                // The dynamic bit instructions — and, at mode 001 only, MOVEP.
+                // Every bit-op destination rule excludes mode 001 anyway, so the
+                // two do not overlap.
+                //
+                // All four opmodes at mode 001 are MOVEP: bit 8 set means
+                // opmode 4-7, which are `.w` and `.l` in each direction. Nothing
+                // in this corner is illegal, so the whole of mode 001 is claimed.
                 return if mode == 1 {
-                    Claim::Later
+                    Claim::Mine
                 } else {
                     bit_op(op, true)
                 };
@@ -276,11 +303,75 @@ fn claim(op: u16) -> Claim {
                     Claim::Illegal
                 };
             }
-            // NBCD: selector 8 at size bits 00, over the data-alterable set. The
-            // rest of selector 8 is SWAP/PEA (01), MOVEM.w (10) and MOVEM.l (11),
-            // all Task 10.
+            // LEA has the same cross-cutting shape as CHK: opmode 7 with bits
+            // 11-9 naming the destination `An`, so it too appears at all sixteen
+            // selector values and must be tested before any `sel` arm. Nothing
+            // else in line 0100 uses opmode 7. Control modes only — an address
+            // with no operand access has no reason to step a register.
+            if opmode == 7 {
+                return if modes::control(mode, reg) {
+                    Claim::Mine
+                } else {
+                    Claim::Illegal
+                };
+            }
+            // NBCD: selector 8 at size bits 00, over the data-alterable set.
             if sel == 0x8 && size_bits == 0 {
                 return if data { Claim::Mine } else { Claim::Illegal };
+            }
+            // The rest of selector 8, and all of selector C, is Task 10's:
+            //
+            //   4840  01  SWAP (mode 000) and PEA (control modes)
+            //   4880  10  EXT.w (mode 000) and MOVEM.w reg->mem
+            //   48C0  11  EXT.l (mode 000) and MOVEM.l reg->mem
+            //   4C80  10  MOVEM.w mem->reg
+            //   4CC0  11  MOVEM.l mem->reg
+            //
+            // Mode 000 is a *different instruction* in selector 8 rather than an
+            // invalid MOVEM operand, which is why the mode-0 case is pulled out
+            // before the MOVEM mode test rather than being folded into it.
+            if sel == 0x8 && size_bits == 1 {
+                return if mode == 0 || modes::control(mode, reg) {
+                    Claim::Mine
+                } else {
+                    Claim::Illegal
+                };
+            }
+            if sel == 0x8 && size_bits >= 2 {
+                return if mode == 0 || movem_ea(mode, reg, false) {
+                    Claim::Mine
+                } else {
+                    Claim::Illegal
+                };
+            }
+            if sel == 0xC && size_bits >= 2 {
+                return if movem_ea(mode, reg, true) {
+                    Claim::Mine
+                } else {
+                    Claim::Illegal
+                };
+            }
+            // Selectors 0/4/6 at size bits 11: the three SR/CCR moves. Selector 2
+            // is `MOVE from CCR`, which arrived with the 68010 — the asymmetry is
+            // real, and the 68000 has a `MOVE to CCR` with no matching read.
+            if size_bits == 3 && matches!(sel, 0x0 | 0x2 | 0x4 | 0x6) {
+                return match sel {
+                    0x0 => {
+                        if data {
+                            Claim::Mine
+                        } else {
+                            Claim::Illegal
+                        }
+                    }
+                    0x4 | 0x6 => {
+                        if mode != 1 && modes::src(mode, reg, false) {
+                            Claim::Mine
+                        } else {
+                            Claim::Illegal
+                        }
+                    }
+                    _ => Claim::Illegal,
+                };
             }
             // Size 11 of selector A is TAS; of the others it is MOVE from SR /
             // to CCR / to SR, which belong to Task 10.
@@ -313,9 +404,27 @@ fn claim(op: u16) -> Claim {
                         Claim::Illegal
                     }
                 } else {
-                    // The rest of 0100 1110 0xxx: TRAP, LINK/UNLK, MOVE USP,
-                    // RESET, STOP, RTE, SWAP — Tasks 10 and 11.
-                    Claim::Later
+                    // The rest of 0100 1110 0xxx, one 16-opcode row at a time.
+                    // These are single opcodes and 8-opcode runs rather than
+                    // `<ea>` patterns, so this arm enumerates rather than
+                    // consulting `modes::`.
+                    match op {
+                        // 4E40-4E4F: TRAP #0-#15. Task 11.
+                        0x4E40..=0x4E4F => Claim::Later,
+                        // 4E50-4E57 LINK, 4E58-4E5F UNLK.
+                        0x4E50..=0x4E5F => Claim::Mine,
+                        // 4E60-4E67 MOVE An,USP; 4E68-4E6F MOVE USP,An.
+                        0x4E60..=0x4E6F => Claim::Mine,
+                        0x4E70 => Claim::Mine,  // RESET
+                        0x4E72 => Claim::Mine,  // STOP
+                        0x4E73 => Claim::Later, // RTE, Task 11
+                        0x4E76 => Claim::Later, // TRAPV, Task 11
+                        // 4E71 NOP and 4E75/4E77 RTS/RTR are handled above.
+                        // 4E74 is RTD (68010) and 4E7A/4E7B are MOVEC (68010),
+                        // so this row's remaining encodings do not exist here.
+                        0x4E71 | 0x4E75 | 0x4E77 => Claim::Mine,
+                        _ => Claim::Illegal,
+                    }
                 }
             } else if !matches!(sel, 0x0 | 0x2 | 0x4 | 0x6 | 0xA) || size_bits == 3 {
                 Claim::Later
@@ -385,9 +494,10 @@ fn claim(op: u16) -> Claim {
                 // `mode` here are legal and neither is an address-register
                 // operand. That is why this arm does not consult `modes::`.
                 (_, 4, _) => Claim::Mine,
-                // EXG Dx,Dy / Ax,Ay (opmode 5) and Dx,Ay (opmode 6 mode 1):
-                // Task 10.
-                (0xC, 5, _) | (0xC, 6, 1) => Claim::Later,
+                // EXG Dx,Dy / Ax,Ay (opmode 5) and Dx,Ay (opmode 6 mode 1).
+                // As with ABCD above, `mode` here is a form selector rather than
+                // an addressing mode, so `modes::` does not apply.
+                (0xC, 5, _) | (0xC, 6, 1) => Claim::Mine,
                 // Everything else in this corner is PACK/UNPK, which arrived with
                 // the 68020, or simply nothing at all.
                 _ => Claim::Illegal,
@@ -523,8 +633,8 @@ fn implemented_tasks_claim_exactly_the_legal_encodings() {
     // `claim` return `Later` everywhere the assertions above would all pass.
     //
     // The thresholds are floors, not measurements. The history: Task 6 left them
-    // at 20,177 / 3,632, Task 7 at 25,461 / 4,556, Task 8 at 30,543 / 4,724, and
-    // Task 9 at **32,969 / 5,178**.
+    // at 20,177 / 3,632, Task 7 at 25,461 / 4,556, Task 8 at 30,543 / 4,724,
+    // Task 9 at 32,969 / 5,178, and Task 10 at **34,023 / 5,767**.
     //
     // Task 9 raised both, having left them alone through two tasks: at 20,000 the
     // `mine` floor sat at 61% of the true count and the `illegal` one at 19%, and
@@ -539,10 +649,10 @@ fn implemented_tasks_claim_exactly_the_legal_encodings() {
     // the failure messages report the counts above, so the classifier really is
     // reaching the new lines and not returning `Later` across them.
     assert!(
-        mine > 32_000,
+        mine > 34_000,
         "only {mine} opcodes classified as implemented"
     );
-    assert!(illegal > 5_000, "only {illegal} classified as nonexistent");
+    assert!(illegal > 5_700, "only {illegal} classified as nonexistent");
 }
 
 /// The `to CCR` and `to SR` forms are six specific opcodes, and the long-sized

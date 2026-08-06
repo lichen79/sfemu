@@ -9,6 +9,7 @@ pub mod logic;
 pub mod move_;
 pub mod muldiv;
 pub mod shift;
+pub mod system;
 
 /// Installs every implemented handler into the dispatch table.
 ///
@@ -41,4 +42,5 @@ pub fn register_all(table: &mut [crate::decode::Handler; 65536]) {
     branch::register(table);
     muldiv::register(table);
     bcd::register(table);
+    system::register(table);
 }

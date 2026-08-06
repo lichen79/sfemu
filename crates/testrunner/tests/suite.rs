@@ -165,6 +165,49 @@ group!(abcd, "ABCD");
 group!(sbcd, "SBCD");
 group!(nbcd, "NBCD");
 
+// Task 10: system control and multi-register transfer.
+//
+// `MOVEM.w`/`MOVEM.l` are the only *write*-fault groups outside `MOVE` (595 and
+// 585), which is what finally exercises `alu`'s write arm. Every one of those
+// faults is on the first operand access: `MOVEM` steps its address by 2 or 4, so
+// parity is invariant and a mid-transfer fault cannot occur — 0 completed operand
+// accesses before the abort in all 2,378 faulting cases, with both off-diagonals
+// of the odd/even × faults/clean table exactly zero. So these two going green
+// says nothing about partial-transfer rollback, and there is deliberately no
+// rollback code to say anything about.
+//
+// Five groups here are *mostly* privilege traps rather than executions —
+// `MOVEtoSR` 1290, `MOVEtoUSP` 1226, `MOVEfromUSP` 1207, `STOP` 1270, `RESET`
+// 1267 user-mode cases. They would go green on the trap alone if the supervisor
+// path were wrong, so `ops::system`'s unit tests carry the supervisor semantics.
+// `STOP` in particular has an *empty* access shape, which no cycle count can
+// distinguish from a wrong one.
+//
+// `LINK`, `PEA`, `LEA`, `MOVEP.w` and `MOVEP.l` have **zero** address-error
+// cases: `MOVEP` is byte-sized on the bus whatever its suffix says, and the other
+// three touch memory only through A7, which the generator always starts even. For
+// those three the alignment check is therefore unverified by the suite — it is
+// reachable on hardware, just not sampled here.
+group!(movem_w, "MOVEM.w");
+group!(movem_l, "MOVEM.l");
+group!(movep_w, "MOVEP.w");
+group!(movep_l, "MOVEP.l");
+group!(link, "LINK");
+group!(unlink, "UNLINK");
+group!(exg, "EXG");
+group!(swap, "SWAP");
+group!(ext_w, "EXT.w");
+group!(ext_l, "EXT.l");
+group!(pea, "PEA");
+group!(lea, "LEA");
+group!(stop_op, "STOP");
+group!(reset_op, "RESET");
+group!(move_from_sr, "MOVEfromSR");
+group!(move_to_sr, "MOVEtoSR");
+group!(move_to_ccr, "MOVEtoCCR");
+group!(move_to_usp, "MOVEtoUSP");
+group!(move_from_usp, "MOVEfromUSP");
+
 /// Known-bad upstream: `TAS`'s indivisible read-modify-write is not modelled by
 /// the vector generator. Asserted as *partially* failing so an upstream fix
 /// surfaces.
