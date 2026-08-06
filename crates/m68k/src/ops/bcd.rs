@@ -362,6 +362,15 @@ mod tests {
         run_one(&mut cpu, &mut bus, &[0xC101, 0x4E71], 0x1000);
         assert_eq!(cpu.d[0], 0x70);
         assert!(!cpu.ccr_v());
+
+        // 0x45 + 0x35 = binary 0x7A (bit 7 clear), decimal 0x80 (bit 7 set):
+        // fixup drove bit 7 from 0 -> 1 => V must be set.
+        let mut cpu = cpu_at(SR_S);
+        cpu.d[0] = 0x45;
+        cpu.d[1] = 0x35;
+        run_one(&mut cpu, &mut bus, &[0xC101, 0x4E71], 0x1000);
+        assert_eq!(cpu.d[0], 0x80);
+        assert!(cpu.ccr_v(), "fixup drove bit 7 from 0 to 1: V must be set");
     }
 
     #[test]
@@ -560,23 +569,70 @@ mod tests {
 
     /// `V`'s direction is opposite between add and subtract; a
     /// direction-agnostic "MSB flipped" rule fits neither family.
+    ///
+    /// Both a positive (V=1) and negative (V=0) case for each family, so
+    /// replacing `finish`'s `v` with `false` or swapping the direction between
+    /// add and subtract will each break at least one assertion.
     #[test]
     fn v_is_directional_between_abcd_and_sbcd() {
-        // ABCD: uncorrected bit 7 clear, corrected set => V.
-        let (res, _) = abcd(0x79, 0x09, false);
-        let bin = 0x79u8.wrapping_add(0x09);
-        assert_eq!(res, 0x88);
-        assert_eq!(bin, 0x82);
+        // ABCD V=1: 0x45 + 0x35 — binary 0x7A (bit 7 clear), decimal 0x80
+        // (bit 7 set). The fixup drove bit 7 from 0 to 1.
+        let (res, _) = abcd(0x45, 0x35, false);
+        let bin = 0x45u8.wrapping_add(0x35);
+        assert_eq!(res, 0x80);
+        assert_eq!(bin, 0x7A, "uncorrected bit 7 clear");
         assert!(
-            (!bin & res) & 0x80 == 0,
+            (!bin & res) & 0x80 != 0,
+            "0 -> 1 transition: ABCD V must be set"
+        );
+
+        // ABCD V=0: 0x79 + 0x09 — both uncorrected (0x82) and corrected (0x88)
+        // have bit 7 set: no 0 -> 1 transition.
+        let (res2, _) = abcd(0x79, 0x09, false);
+        let bin2 = 0x79u8.wrapping_add(0x09);
+        assert_eq!(res2, 0x88);
+        assert_eq!(bin2, 0x82);
+        assert!(
+            (!bin2 & res2) & 0x80 == 0,
             "both have bit 7: not a 0 -> 1 transition"
         );
 
-        // SBCD: uncorrected bit 7 set, corrected clear => V.
+        // SBCD V=1: 0x00 - 0x80 — binary 0x80 (bit 7 set after wrapping),
+        // corrected 0x20 (the -0x60 byte-borrow correction drives bit 7 clear).
+        // The fixup drove bit 7 from 1 to 0.
+        let (sbcd_res, _) = sbcd(0x00, 0x80, false);
+        let sbcd_bin = 0x00u8.wrapping_sub(0x80);
+        assert_eq!(sbcd_bin, 0x80, "uncorrected bit 7 set");
+        assert_eq!(sbcd_res, 0x20, "fixup cleared bit 7");
+        assert!(
+            (sbcd_bin & !sbcd_res) & 0x80 != 0,
+            "1 -> 0 transition: SBCD V must be set"
+        );
+
+        // SBCD: 0x00 - 0x81 — binary 0x7F (bit 7 clear), corrected also clear.
+        // Uncorrected bit 7 is clear: no 1 -> 0 transition => V clear.
         let (res, _) = sbcd(0x00, 0x81, false);
         let bin = 0x00u8.wrapping_sub(0x81);
         assert_eq!(bin, 0x7F, "uncorrected bit 7 clear");
-        assert!((bin & !res) & 0x80 == 0);
+        assert!(
+            (bin & !res) & 0x80 == 0,
+            "no 1 -> 0 transition: V must be clear"
+        );
+    }
+
+    /// End-to-end pin for SBCD V=1 through the full CPU pipeline (i.e. through
+    /// `finish`). 0x00 - 0x80: binary 0x80 (bit 7 set), corrected 0x20 (bit 7
+    /// cleared by the -0x60 fixup) => V must be set.
+    #[test]
+    fn sbcd_sets_v_when_the_fixup_drives_bit_7_low() {
+        let mut bus = FlatBus::new();
+        let mut cpu = cpu_at(SR_S);
+        cpu.d[0] = 0x00;
+        cpu.d[1] = 0x80;
+        // SBCD D1,D0
+        run_one(&mut cpu, &mut bus, &[0x8101, 0x4E71], 0x1000);
+        assert_eq!(cpu.d[0] & 0xFF, 0x20, "0x00 - 0x80 decimal = 0x20");
+        assert!(cpu.ccr_v(), "fixup drove bit 7 from 1 to 0: V must be set");
     }
 
     /// The two models are not interchangeable: `sbcd` is byte-wise and the

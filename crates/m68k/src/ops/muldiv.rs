@@ -269,7 +269,14 @@ fn div(cpu: &mut M68k, bus: &mut dyn Bus, op: u16, signed: bool) -> u32 {
         let divisor = ops.ea as u16;
         let dividend = cpu.d[dn];
         if divisor == 0 {
-            // Before either timing formula: both would panic in debug.
+            // EXTRAPOLATED, zero suite cases: the manual gives zero-divide 38
+            // cycles total, and 38 - 4 * SHORT_FRAME_ACCESSES = 10 idle. This
+            // is 4 MORE than the 6 idle measured on every other 7-access
+            // group-2 entry path (34 = 4*7 + 6, a singleton over 20,026 cases
+            // in twelve groups). The extra 4 is unexplained and unverifiable
+            // here — do not "simplify" it to 6 for family consistency without
+            // new evidence.
+            own_idle = 10;
             return divide_by_zero(cpu, bus, &ops);
         }
         own_idle = if signed {
@@ -497,8 +504,9 @@ mod tests {
         let cycles = run_one(&mut cpu, &mut bus, &[0xC1FC, 0xFFFE, 0x4E71]);
         assert_eq!(cpu.d[0], 2);
         assert!(!cpu.ccr_n() && !cpu.ccr_z());
-        // src << 1 = 0x1FFFC; low 16 bits of the difference map has 2 set bits.
-        assert_eq!(cycles, 4 * 2 + muls_idle(0xFFFE));
+        // src << 1 = 0x1FFFC; difference map 0x1FFFC ^ 0xFFFE = 0x10002,
+        // & 0xFFFF = 0x0002 — has 1 set bit => idle = 34 + 2*1 = 36.
+        assert_eq!(cycles, 4 * 2 + 36);
     }
 
     #[test]
@@ -626,7 +634,7 @@ mod tests {
             bus.load(0x2000, &[0x4E71, 0x4E71]);
             let mut cpu = cpu_at(SR_S | SR_X);
             cpu.d[0] = 0x1234_5678;
-            run_one(&mut cpu, &mut bus, &[op, 0x0000, 0x4E71]);
+            let cycles = run_one(&mut cpu, &mut bus, &[op, 0x0000, 0x4E71]);
 
             assert_eq!(cpu.d[0], 0x1234_5678, "{op:04X}: destination untouched");
             assert_eq!(cpu.pc, 0x2004, "{op:04X}: vectored through 5");
@@ -635,6 +643,13 @@ mod tests {
             assert_eq!(bus.read16(0x2FFE), 0x1004, "{op:04X}: stacked PC low");
             assert_eq!(bus.read16(0x2FFC), 0x0000, "{op:04X}: stacked PC high");
             assert!(cpu.ccr_x(), "{op:04X}: X preserved into the handler");
+            // EXTRAPOLATED: manual gives zero-divide 38 cycles. 38 - 4*7 = 10 idle.
+            // The immediate-source form costs 1 extra access (the immediate fetch),
+            // so its total is 42 = 4*(1+7) + 10.
+            assert_eq!(
+                cycles, 42,
+                "{op:04X}: 4*(1+7) + 10 idle (manual, extrapolated)"
+            );
         }
     }
 
@@ -736,11 +751,48 @@ mod tests {
     fn timing_formula_polarities() {
         assert_eq!(mulu_idle(0), 34, "no set bits");
         assert_eq!(mulu_idle(0xFFFF), 34 + 32, "all 16 set");
+
+        // MULS counts Booth *transitions*, not set bits — the two formulas
+        // disagree on these two inputs. 0x5555 has popcount 8 (=> 50 under
+        // the wrong rule) but 16 transitions (=> 66 under the right one).
+        // 0xFF00 has popcount 8 (=> 50 under wrong rule) but only 1 transition
+        // (one contiguous run of set bits -- one rising edge in the <<1 window).
+        assert_eq!(
+            muls_idle(0x5555),
+            34 + 2 * 16,
+            "Booth counts transitions, not set bits"
+        );
+        assert_eq!(
+            muls_idle(0xFF00),
+            34 + 2 * 1,
+            "eight set bits, one transition"
+        );
+
         // |q| >> 1 == 0, so all 15 bits are clear: 116 + 30.
         assert_eq!(divs_idle(1, 1), 116 + 30);
         // Overflow shortcut, positive dividend.
         assert_eq!(divs_idle(0x1_0000, 1), 12);
         assert_eq!(divs_idle(0xFFFF_0000, 1), 14, "+2 for a negative dividend");
         assert_eq!(divu_idle(0x1_0000, 1), 6, "DIVU's overflow is one cost");
+
+        // DIVU's loop runs exactly 15 iterations, not 16 — pinned with a
+        // nonzero quotient so the loop is exercised. (-,+) and (+,-) sign
+        // pairs whose DIVS bases differ by 4 (120 vs 116).
+        //
+        // DIVU 100 / 7 = 14 rem 2: qq not zero, loop runs.
+        // DIVU 100 / 7 = 14 rem 2: loop runs, value is 126 (15 iterations,
+        // computed externally from the manual spec, not from divu_idle itself).
+        assert_eq!(divu_idle(100, 7), 126);
+
+        // DIVS (-,+) pair: base 116 + 6 (dvd_neg) = 122. Quotient -100/7 =>
+        // |q|=14, |q|>>1=7 (binary 0b111), 15 bits: 12 zero, 3 set => 12*2=24
+        // extra idle. Total: 122 + 24 = 146.
+        let neg_100 = (-100i32) as u32;
+        assert_eq!(divs_idle(neg_100, 7), 122 + 24, "(-,+) sign pair, base 122");
+
+        // DIVS (+,-) pair: base 116 + 2 (dvs_neg) = 118. Quotient 100/-7 =>
+        // |q|=14, same iteration term 24. Total: 118 + 24 = 142.
+        let neg_7 = (-7i16) as u16;
+        assert_eq!(divs_idle(100, neg_7), 118 + 24, "(+,-) sign pair, base 118");
     }
 }
