@@ -388,13 +388,13 @@ fn pea(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
         // UNLK stacks `opcode + 4` (1115/1115) and LINK's shape is identical.
         // Using the same offset here; label this if hardware evidence changes it.
         //
-        // ⚠️ `sp = a[7] - 4` and 4 is even, so misaligned(sp) ⟺ odd `a[7]`.
-        // The exception frame base is `a[7]` at fault time (exception.rs:179),
-        // and we commit nothing before faulting, so the base is that same odd
-        // `a[7]`. On hardware this is therefore a **double bus fault** — the
-        // processor halts rather than stacking a frame. The frame written here
-        // is the general address-error path; Task 11 owns the halt. Both the
-        // stacked PC and this behaviour are extrapolated (0 faults in 2,500).
+        // ⚠️ `sp = a[7] - 4` and 4 is even, so misaligned(sp) ⟺ odd `a[7]`. In
+        // supervisor mode that makes the frame's own base odd, which is a double
+        // bus fault: `exception::double_bus_fault` sees it and halts instead of
+        // stacking anything, so the stacked PC above is unreachable there. It is
+        // still reachable from user mode, where the frame goes to a possibly-even
+        // SSP. The consequence lives in one place; this check owns only the
+        // address. Both it and the stacked PC are extrapolated (0 of 2,500).
         exception::address_error(
             cpu,
             bus,
@@ -450,13 +450,11 @@ fn link(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
         // UNLK stacks `opcode + 4` (1115/1115), and LINK's shape is the same.
         // Label this if hardware evidence changes it.
         //
-        // ⚠️ `sp = a[7] - 4` and 4 is even, so misaligned(sp) ⟺ odd `a[7]`.
-        // The exception frame base is `a[7]` at fault time (exception.rs:179),
-        // and we commit nothing before faulting, so the base is that same odd
-        // `a[7]`. On hardware this is therefore a **double bus fault** — the
-        // processor halts rather than stacking a frame. The frame written here
-        // is the general address-error path; Task 11 owns the halt. Both the
-        // stacked PC and this behaviour are extrapolated (0 faults in 2,500).
+        // ⚠️ Same double-fault reasoning as `pea` above: `4` is even, so an
+        // odd `sp` means an odd `a[7]`, and in supervisor mode that is an odd
+        // frame base — `exception::double_bus_fault` halts instead of stacking.
+        // The check stays here because it owns the address; the consequence is
+        // central. Extrapolated (0 faults in 2,500).
         exception::address_error(
             cpu,
             bus,
@@ -1724,11 +1722,16 @@ mod tests {
         );
     }
 
-    /// `PEA` with an odd SP faults through vector 3 without writing the operand.
+    /// `PEA` with an odd SP halts without writing the operand.
     ///
     /// The stacked PC is not asserted here — there are 0 PEA address-error cases
     /// in the vector suite, so any expected offset is extrapolated rather than
-    /// measured.
+    /// measured. **Nor is a frame asserted:** an odd `a[7]` in supervisor mode is
+    /// an odd frame base, so `exception::double_bus_fault` halts instead of
+    /// stacking. This test originally expected vector 3; that expectation was
+    /// retracted, not the check that produces it. The check is what keeps the odd
+    /// write off the bus, and without it there is neither a halt nor a fault —
+    /// just a silently split word.
     ///
     /// The operand write being absent is asserted by value, not by address: `A0`
     /// is loaded with `0xABCD_0000`, whose halves (`0xABCD`, `0x0000`) cannot
@@ -1751,7 +1754,8 @@ mod tests {
         let dec = Decoder::new();
         cpu.step_with(&dec, &mut bus);
 
-        assert_eq!(cpu.pc, 0x5004, "vectored through 3");
+        assert!(cpu.halted, "an odd frame base is a double bus fault");
+        assert_eq!(bus.writes(), vec![], "no frame and no operand push");
         assert!(
             !bus.log.iter().any(|&(w, _, v)| w && v == 0xABCD),
             "the operand push must not have happened; 0xABCD appeared in writes: {:04X?}",
@@ -1759,11 +1763,12 @@ mod tests {
         );
     }
 
-    /// `LINK` with an odd SP faults through vector 3 without writing the operand.
+    /// `LINK` with an odd SP halts without writing the operand.
     ///
     /// The stacked PC is not asserted here — there are 0 LINK address-error cases
     /// in the vector suite, so any expected offset is extrapolated rather than
-    /// measured.
+    /// measured. See `pea_with_odd_sp_faults_without_writing` for why the outcome
+    /// is a halt rather than a vector-3 frame.
     ///
     /// Uses `LINK A0,#0` (not A7) so the pushed value is `A0` and is independent
     /// of SP. `A0` is loaded with `0xDEAD_0000`; the absence of `0xDEAD` in all
@@ -1784,7 +1789,8 @@ mod tests {
         let dec = Decoder::new();
         cpu.step_with(&dec, &mut bus);
 
-        assert_eq!(cpu.pc, 0x5004, "vectored through 3");
+        assert!(cpu.halted, "an odd frame base is a double bus fault");
+        assert_eq!(bus.writes(), vec![], "no frame and no operand push");
         assert!(
             !bus.log.iter().any(|&(w, _, v)| w && v == 0xDEAD),
             "the operand push must not have happened; 0xDEAD appeared in writes: {:04X?}",

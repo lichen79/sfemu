@@ -7,10 +7,6 @@ use m68k::decode::Decoder;
 use m68k::M68k;
 use std::path::{Path, PathBuf};
 
-/// Groups the suite itself documents as not-yet-correct. Asserted as failing
-/// rather than skipped, so an upstream fix surfaces instead of going unnoticed.
-pub const KNOWN_BAD: &[&str] = &["TAS", "TRAPV"];
-
 /// Where the fetched vectors live.
 pub fn testdata_dir() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata"))
@@ -306,51 +302,16 @@ pub fn assert_group(name: &str) {
     }
 }
 
-/// Asserts a group is *partially* green: some cases pass and some fail.
-///
-/// This is the assertion for a group whose vectors are known-bad upstream. It
-/// exists because `#[should_panic]` around [`assert_group`] is unsound for that
-/// purpose: `assert_group` names the group in **all** of its panic messages, so a
-/// deleted or truncated vector file also produces the expected panic and the test
-/// passes for entirely the wrong reason — inverting the project's "missing data
-/// fails loudly" rule.
-///
-/// This fails in three distinct ways instead, all of them informative:
-///
-/// * the file is missing or unparsable — the host is at fault, same as any group;
-/// * **zero** cases pass — the handler is broken, not merely the vectors;
-/// * **all** cases pass — upstream fixed the vectors, so this group should be
-///   promoted to [`assert_group`] and removed from the known-bad list.
-pub fn assert_known_bad(name: &str, why: &str) {
-    let path = testdata_dir().join(format!("{name}.json.bin"));
-    assert!(
-        path.exists(),
-        "missing {}: run `cargo run -p testrunner --bin fetch`",
-        path.display()
-    );
-    let r = run_group(&path);
-    assert!(
-        r.total > 0,
-        "{}: parsed to zero cases — vector file may be corrupt",
-        r.group
-    );
-    assert!(
-        r.passed > 0,
-        "{}: 0/{} passed — known-bad upstream ({why}), but a total failure means \
-         the handler is broken rather than the vectors",
-        r.group,
-        r.total
-    );
-    assert!(
-        !r.is_clean(),
-        "{}: {}/{} passed — this group is listed as known-bad upstream ({why}) but \
-         now passes completely. Upstream has likely been fixed: move it to \
-         assert_group and drop it from the known-bad list.",
-        r.group,
-        r.passed,
-        r.total
-    );
-}
+// A former `assert_known_bad` lived here, for groups whose vectors were believed
+// wrong upstream. Both groups it was ever used for — TAS and TRAPV — turned out
+// to be this core's bugs, and every one of the 127 groups now passes completely,
+// so the concept has no remaining inhabitant and asserting *partial* success
+// would only mask a regression. The reason it existed rather than a
+// `#[should_panic]` around `assert_group` is worth keeping in mind if the need
+// ever returns: `assert_group` names the group in **all** of its panic messages,
+// including the missing-file one, so `should_panic` also passes when `testdata/`
+// is empty — inverting the project's fail-loudly rule. The completeness test in
+// `tests/suite.rs` guards the same inversion from the other direction.
 
 #[cfg(test)]
 mod tests {
