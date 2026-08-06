@@ -3,6 +3,16 @@
 //! Decodes one instruction from a stream of 16-bit words and returns its
 //! text and length. The output format follows MAME-style lowercase mnemonics.
 //!
+//! # Output format
+//!
+//! - Mnemonics and register names are lowercase: `move.l`, `d0`, `a7`.
+//! - Addresses use `$` hex notation with no leading zeros: `$1234`.
+//! - Sized immediates use `$` hex notation padded to the operand width:
+//!   `#$42` (byte), `#$1234` (word), `#$12345678` (long). Small count
+//!   fields (shift counts, ADDQ/SUBQ data, TRAP vector, MOVEQ data) use
+//!   decimal since they are always small and a programmer thinks of them
+//!   that way.
+//!
 //! # Feature gate
 //!
 //! This module requires the `std` feature because [`Insn`] holds a [`String`].
@@ -16,6 +26,9 @@
 /// The result of disassembling one instruction.
 pub struct Insn {
     /// MAME-style lowercase mnemonic with operands, e.g. `"move.l $123456,d0"`.
+    ///
+    /// Addresses and sized immediates use `$` hex. Small count fields
+    /// (shift counts, MOVEQ data, TRAP vectors) use decimal.
     pub text: String,
     /// Byte length of the instruction, including extension words.
     pub len: u32,
@@ -160,17 +173,18 @@ impl<'a> Dis<'a> {
 
         // CCR/SR forms: mode 7 reg 4, byte and word only.
         if mode == 7 && reg == 4 {
-            let (mnemonic, dest_str) = match (family, size_bits) {
-                (0, 0) => ("ori", "#imm,ccr"),  // ORI to CCR
-                (0, 1) => ("ori", "#imm,sr"),   // ORI to SR
-                (1, 0) => ("andi", "#imm,ccr"), // ANDI to CCR
-                (1, 1) => ("andi", "#imm,sr"),  // ANDI to SR
-                (5, 0) => ("eori", "#imm,ccr"), // EORI to CCR
-                (5, 1) => ("eori", "#imm,sr"),  // EORI to SR
+            let (mnemonic, dest) = match (family, size_bits) {
+                (0, 0) => ("ori", "ccr"),  // ORI to CCR
+                (0, 1) => ("ori", "sr"),   // ORI to SR
+                (1, 0) => ("andi", "ccr"), // ANDI to CCR
+                (1, 1) => ("andi", "sr"),  // ANDI to SR
+                (5, 0) => ("eori", "ccr"), // EORI to CCR
+                (5, 1) => ("eori", "sr"),  // EORI to SR
                 _ => return self.illegal_word(op),
             };
             let imm = self.read_immediate(sz);
-            return format!("{mnemonic} #{imm},{}", &dest_str[5..]);
+            let imm_str = format_imm(imm, sz);
+            return format!("{mnemonic} {imm_str},{dest}");
         }
 
         let mnemonic = match family {
@@ -184,8 +198,9 @@ impl<'a> Dis<'a> {
         };
         let size_suffix = size_suffix(sz);
         let imm = self.read_immediate(sz);
+        let imm_str = format_imm(imm, sz);
         let ea_str = self.format_ea(mode, reg, sz);
-        format!("{mnemonic}.{size_suffix} #{imm},{ea_str}")
+        format!("{mnemonic}.{size_suffix} {imm_str},{ea_str}")
     }
 
     fn read_immediate(&mut self, sz: EaSize) -> u32 {
@@ -388,9 +403,11 @@ impl<'a> Dis<'a> {
             EaSize::Long => "l",
             _ => "?",
         };
-        let reg_list = if to_regs || mode == 4 {
-            // Pre-decrement (to memory) uses reversed mask.
-            format_movem_mask(mask)
+        // The predecrement form (mode 4, to memory) encodes the register list
+        // with a reversed bit order: bit 0 = A7, bit 15 = D0. All other forms
+        // use the normal order (bit 0 = D0, bit 15 = A7).
+        let reg_list = if !to_regs && mode == 4 {
+            format_movem_mask(mask.reverse_bits())
         } else {
             format_movem_mask(mask)
         };
@@ -892,10 +909,7 @@ impl<'a> Dis<'a> {
                 }
                 4 => {
                     let imm = self.read_immediate(sz);
-                    match sz {
-                        EaSize::Byte | EaSize::Word => format!("#{imm}"),
-                        EaSize::Long => format!("#{imm}"),
-                    }
+                    format_imm(imm, sz)
                 }
                 _ => "?".to_string(),
             },
@@ -924,6 +938,17 @@ fn size_suffix(sz: EaSize) -> &'static str {
         EaSize::Byte => "b",
         EaSize::Word => "w",
         EaSize::Long => "l",
+    }
+}
+
+/// Formats an immediate value as `#$XX`, `#$XXXX`, or `#$XXXXXXXX` depending
+/// on the operand size. MAME-style: immediates use `$` hex notation, sized to
+/// the operand so `#$FF` and `#$FFFF` are unambiguous.
+fn format_imm(val: u32, sz: EaSize) -> String {
+    match sz {
+        EaSize::Byte => format!("#${:02X}", val & 0xFF),
+        EaSize::Word => format!("#${:04X}", val & 0xFFFF),
+        EaSize::Long => format!("#${val:08X}"),
     }
 }
 
@@ -1084,6 +1109,20 @@ mod tests {
         disassemble(|a| w.get((a / 2) as usize).copied().unwrap_or(0), 0).text
     }
 
+    /// Disassemble at a non-zero address. `words[0]` lives at `addr`; extension
+    /// words follow at `addr+2`, etc. Used to verify branch-target arithmetic.
+    fn dis_at(words: &[u16], addr: u32) -> (String, u32) {
+        let w = words.to_vec();
+        let i = disassemble(
+            |a| {
+                let off = a.wrapping_sub(addr);
+                w.get((off / 2) as usize).copied().unwrap_or(0)
+            },
+            addr,
+        );
+        (i.text, i.len)
+    }
+
     #[test]
     fn disassembles_common_forms() {
         assert_eq!(dis(&[0x4E71]), "nop");
@@ -1112,5 +1151,78 @@ mod tests {
             assert!(!i.text.is_empty());
             assert!(i.len >= 2);
         }
+    }
+
+    /// MOVEM predecrement (`-(An)`) encodes the register list with the bit order
+    /// reversed: bit 0 = A7, bit 15 = D0. All other MOVEM forms use the normal
+    /// order (bit 0 = D0, bit 15 = A7).
+    ///
+    /// `48E7 FFFE` is the canonical "save all caller-saved registers" push. Its
+    /// mask `0xFFFE` means bit 0 is clear — A7 is excluded (you cannot push the
+    /// stack pointer you are pushing through) and bits 1-15 are set (D0-D7, A0-A6
+    /// all pushed). Confirmed correct by execution in Task 12.
+    #[test]
+    fn movem_predecrement_uses_the_reversed_mask() {
+        // 48E7 FFFE: MOVEM.l D0-D7/A0-A6,-(A7). Reversed mask, bit 0 = A7,
+        // so 0xFFFE (bit 0 clear) excludes A7 -- you cannot push the SP you
+        // push through. Confirmed by execution in
+        // testrunner/tests/integration_asm.rs::movem_roundtrip_preserves_all_registers.
+        assert_eq!(
+            dis(&[0x48E7, 0xFFFE]),
+            "movem.l d0/d1/d2/d3/d4/d5/d6/d7/a0/a1/a2/a3/a4/a5/a6,-(a7)"
+        );
+        // 4CDF 7FFF: MOVEM.l (A7)+,D0-D7/A0-A6. Normal mask, bit 0 = D0.
+        // The two masks are NOT bit-reversals of each other as written; each is
+        // correct for its own addressing mode. This pair is the regression guard.
+        assert_eq!(
+            dis(&[0x4CDF, 0x7FFF]),
+            "movem.l (a7)+,d0/d1/d2/d3/d4/d5/d6/d7/a0/a1/a2/a3/a4/a5/a6"
+        );
+        // Single-register forms make the mirroring unambiguous.
+        assert_eq!(dis(&[0x48E7, 0x8000]), "movem.l d0,-(a7)");
+        assert_eq!(dis(&[0x48A7, 0x0001]), "movem.w a7,-(a7)");
+    }
+
+    /// One assertion per EA rendering path and per notable operand form.
+    /// These are hand-verified against the 68000 encoding and confirmed correct
+    /// by the controller's probe (task-13-controller-findings.md §C2).
+    #[test]
+    fn ea_and_operand_forms() {
+        // Addressing modes.
+        assert_eq!(dis(&[0x1010]), "move.b (a0),d0");
+        assert_eq!(dis(&[0x1018]), "move.b (a0)+,d0");
+        assert_eq!(dis(&[0x1020]), "move.b -(a0),d0");
+        assert_eq!(dis(&[0x1028, 0x0010]), "move.b ($10,a0),d0");
+        assert_eq!(dis(&[0x1030, 0x1000]), "move.b ($00,a0,d1.w),d0");
+        assert_eq!(dis(&[0x1038, 0x1234]), "move.b $1234,d0");
+        // Immediate EA: sized hex formatting.
+        assert_eq!(dis(&[0x103C, 0x0042]), "move.b #$42,d0");
+        // PC-relative.
+        assert_eq!(dis(&[0x103A, 0x0010]), "move.b ($12,pc),d0");
+        // Instructions with other operand forms.
+        assert_eq!(dis(&[0xE388]), "lsl.l #1,d0");
+        assert_eq!(dis(&[0x4840]), "swap d0");
+        assert_eq!(dis(&[0x4880]), "ext.w d0");
+        assert_eq!(dis(&[0x4E50, 0x0008]), "link a0,#8");
+        assert_eq!(dis(&[0x4E40]), "trap #0");
+        // Sized immediate ops use hex.
+        assert_eq!(dis(&[0x0C40, 0x1234]), "cmpi.w #$1234,d0");
+    }
+
+    /// Branch targets use the `addr` argument of `disassemble`; asserting with
+    /// `addr=0` only is insufficient. Both encodings match Task 12's measured
+    /// displacements (task-13-controller-findings.md §C2).
+    #[test]
+    fn branch_targets_at_nonzero_address() {
+        // 66FC @ 0x1006: BNE with 8-bit displacement -4.
+        // base = 0x1006 + 2 = 0x1008; 0x1008 + (-4) = 0x1004.
+        let (text, len) = dis_at(&[0x66FC], 0x1006);
+        assert_eq!(text, "bne $1004");
+        assert_eq!(len, 2);
+        // 6100 0006 @ 0x1002: BSR with 16-bit displacement 6.
+        // base = 0x1002 + 2 = 0x1004; 0x1004 + 6 = 0x100A.
+        let (text, len) = dis_at(&[0x6100, 0x0006], 0x1002);
+        assert_eq!(text, "bsr $100A");
+        assert_eq!(len, 4);
     }
 }
