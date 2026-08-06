@@ -41,15 +41,51 @@ pub struct M68k {
     /// True while an exception is being entered. A second fault raised during
     /// that window is a double fault, which halts the CPU.
     pub in_exception: bool,
-    /// The instruction that just completed left T set, so a trace exception is
+    /// T was set when the last instruction **began**, so a trace exception is
     /// owed at the next instruction boundary.
     ///
-    /// The delay is the point: the trace fires *after* the traced instruction, so
-    /// [`M68k::step_with`] must return that instruction's own result first. The
-    /// suite runs one instruction per case and therefore never observes the
-    /// trace — 0 vector-9 fetches in 317,500 cases against 158,894 entering with
-    /// T=1 — which is why this is a separate flag and not a check inside the same
-    /// step.
+    /// Two independent facts are packed into this flag. They have different
+    /// evidence behind them, and conflating the two is a mistake this comment
+    /// previously made:
+    ///
+    /// - **Fired at the next boundary, not this one — measured.**
+    ///   [`M68k::step_with`] must return the traced instruction's own result first.
+    ///   The suite runs one instruction per case, so vector 9 is fetched 0 times in
+    ///   317,500 cases while 158,894 *enter* with T=1: a core that traced within the
+    ///   instruction's own step fails ~38% of the suite. That is what makes this a
+    ///   flag rather than a check inside the same step.
+    /// - **Sampled at instruction start — extrapolated.** Once latched, the trace is
+    ///   owed even if the instruction goes on to clear T itself. From the User's
+    ///   Manual's definition of T, and **not** measurable here: no case takes a
+    ///   trace, so no count can discriminate start-sampling from end-sampling.
+    ///
+    /// ⚠️ The suite census of which instructions can *clear* T — `ANDItoSR`,
+    /// `EORItoSR`, `STOP`, `MOVEtoSR` and `RTE`, the 1,277 clean T=1 cases that end
+    /// with T clear, with `ORItoSR` at 0/591 as the control since `OR` cannot clear
+    /// a bit — is accurate, and it is what identifies **where the two rules
+    /// disagree**. It cannot say which rule is right; it is a census of
+    /// instructions, not of sampling points. It was once cited as measured support
+    /// for reading the final T, which the number cannot reach.
+    ///
+    /// What settles it is behaviour rather than a count. The two discriminating
+    /// cases, asserted by
+    /// `exception::tests::t_is_sampled_at_instruction_start_not_at_its_end`:
+    ///
+    /// | case | owed? |
+    /// |---|---|
+    /// | `ANDI #$7FFF,SR` clears T, entered with T=1 | **yes** |
+    /// | `ORI #$8000,SR` sets T, entered with T=0 | **no** (the next one is) |
+    ///
+    /// End-sampling inverts both, and inverts the single-step mechanism with them: a
+    /// trace handler ends in `RTE`, whose popped SR restores T, so an end-sampling
+    /// core owes a trace for the `RTE` and re-enters the handler having executed
+    /// nothing —
+    /// `single_stepping_with_an_rte_handler_advances_one_instruction_per_trace`
+    /// measures 1 traced instruction in 200 steps that way, against 4 in 12 here.
+    ///
+    /// Nothing consults the live T bit once this is latched; see
+    /// [`crate::exception::take_trace`]. `ops::system::stop` may *raise* it after
+    /// the latch, for the manual's rule about a `STOP` immediate that sets T.
     pub trace_pending: bool,
 }
 
@@ -225,6 +261,29 @@ impl M68k {
     }
 
     /// Raises an interrupt at `level` (0 clears, 1-7 are IPL).
+    ///
+    /// # The caller owns deassertion
+    ///
+    /// [`M68k::pending_irq`] is a **level**, exactly like the 68000's IPL pins, and
+    /// nothing inside the core clears it. A device model must call this with `0`
+    /// once its handler has acknowledged the interrupt — see
+    /// `testrunner/tests/integration_asm.rs`, whose level-4 handler does — or the
+    /// core will keep taking the same interrupt.
+    ///
+    /// ⚠️ **Levels 1-6 are self-limiting; level 7 is not.** Exception entry raises
+    /// the SR's mask to the level being serviced, so a held level 1-6 is blocked
+    /// while its own handler runs. Level 7 is non-maskable, so **no mask value can
+    /// block it**: a level-7 line left asserted re-enters the handler at every
+    /// instruction boundary without the handler executing a single instruction,
+    /// pushing a 6-byte frame each time until the stack pointer wraps. That is a
+    /// livelock, not a modelling artefact of this core — real hardware makes level
+    /// 7 transition-sensitive for precisely this reason.
+    ///
+    /// This core does **not** model that transition sensitivity, deliberately: a
+    /// level-triggered `pending_irq` is the contract the existing integration tests
+    /// are written against, and edge sensitivity would silently change what
+    /// "assert the line and step" means for every caller. The requirement is
+    /// documented here instead. See [`crate::exception::check_interrupts`].
     pub fn set_irq(&mut self, level: u8) {
         self.pending_irq = level & 7;
     }
@@ -236,20 +295,37 @@ impl M68k {
     /// Two exceptions fire at a *boundary* rather than inside an instruction, and
     /// both live here rather than in any handler:
     ///
-    /// - **Trace**, owed by the instruction that just finished. It is taken as its
-    ///   own step at the *next* call, which is what "the boundary after the
-    ///   instruction" means and why the vector suite — one instruction per case —
-    ///   sees zero trace exceptions despite 158,894 cases entering with T=1.
-    ///   Taking it before returning from the same call would fail 38% of the
-    ///   suite. Trace outranks interrupts, so it is checked first.
-    /// - **Interrupts**, sampled before the instruction runs. This is also the
-    ///   only path out of `stopped`: [`crate::exception::check_interrupts`]
-    ///   re-primes the queue, because STOP leaves the PC and both queue words
-    ///   frozen with its own opcode still in slot 0. Clearing `stopped` here and
-    ///   dispatching would re-execute the STOP forever.
+    /// - **Trace**, owed by the instruction that just finished, because T was set
+    ///   when that instruction *began*. It is taken as its own step at the *next*
+    ///   call, which is what "the boundary after the instruction" means and why the
+    ///   vector suite — one instruction per case — sees zero trace exceptions
+    ///   despite 158,894 cases entering with T=1. Taking it before returning from
+    ///   the same call would fail 38% of the suite. Trace outranks interrupts, so
+    ///   it is checked first.
+    /// - **Interrupts**, sampled before the instruction runs. This is also a path
+    ///   out of `stopped`: [`crate::exception::check_interrupts`] re-primes the
+    ///   queue, because STOP leaves the PC and both queue words frozen with its
+    ///   own opcode still in slot 0. Clearing `stopped` here and dispatching would
+    ///   re-execute the STOP forever.
     ///
-    /// Both are zero-coverage paths; see [`crate::exception::check_interrupts`]
-    /// and [`crate::exception::check_trace`].
+    /// # `stopped` is checked after both, and both can clear it
+    ///
+    /// `STOP #$A700` loads an SR with T set, so it is stopped *and* owes a trace.
+    /// Hardware has no state corresponding to "inside a handler while stopped", so
+    /// the trace must win and must resume the CPU — which is why
+    /// [`crate::exception::take_trace`] clears `stopped` rather than this ordering
+    /// merely tolerating it. Leaving `stopped` set there wedges the CPU
+    /// permanently: every later step falls through to the `return 4` below with the
+    /// handler's first instruction never run, and only an interrupt escapes, into
+    /// that same un-started handler.
+    ///
+    /// So the order here is deliberate and each leg is load-bearing: trace (clears
+    /// `stopped`), then interrupts (clears `stopped`), then the `stopped` gate for
+    /// the case where neither fired.
+    ///
+    /// Both exceptions are zero-coverage paths; see
+    /// [`crate::exception::check_interrupts`] and
+    /// [`crate::exception::take_trace`].
     pub fn step_with(&mut self, dec: &crate::decode::Decoder, bus: &mut impl crate::Bus) -> u32 {
         // A halted CPU is dead until reset, but still burns time.
         if self.halted {
@@ -257,18 +333,46 @@ impl M68k {
         }
         if self.trace_pending {
             self.trace_pending = false;
-            if let Some(c) = crate::exception::check_trace(self, bus) {
-                return c;
-            }
+            return crate::exception::take_trace(self, bus);
         }
         if let Some(c) = crate::exception::check_interrupts(self, bus) {
             return c;
         }
-        // Still stopped means no interrupt outranked the mask: burn 4 cycles
-        // without touching the PC or the queue (STOP's own measured shape).
+        // Neither fired, so a stopped CPU stays stopped: burn 4 cycles without
+        // touching the PC or the queue (STOP's own measured shape).
         if self.stopped {
             return 4;
         }
+        // Latch T **now**, before the instruction runs, and do not re-read it
+        // afterwards. The 68000 samples T at instruction start, so the trace is
+        // owed on the strength of the entry SR even if the instruction goes on to
+        // change T itself.
+        //
+        // ⚠️ **The sampling point is extrapolated, not measured.** It comes from the
+        // User's Manual's definition of T; no suite case can reach it, since vector
+        // 9 is fetched 0 times in 317,500 cases (control: 158,894 of those cases
+        // *enter* with T=1, so T is well represented in the corpus — what is absent
+        // is any trace being taken, not the bit). The suite census of instructions
+        // that can *clear* T — `ANDItoSR`, `EORItoSR`, `STOP`, `MOVEtoSR` and `RTE`,
+        // the 1,277 clean cases that end with T clear, `ORItoSR` at 0/591 as the
+        // control since `OR` cannot clear a bit — identifies **where start-sampling
+        // and end-sampling disagree**, and nothing more; it is a census of
+        // instructions, not of sampling points, and it was previously mis-cited here
+        // as evidence for reading the final T. What actually rules end-sampling out
+        // is that it breaks single-stepping: the handler ends in an `RTE` whose
+        // popped SR restores T, so the `RTE` itself owes a trace and the handler
+        // re-enters having executed nothing. See `trace_pending` for the two
+        // discriminating cases, both asserted.
+        //
+        // ⚠️ Nothing below re-reads T, and in particular an instruction that
+        // *entered an exception* still owes the trace it latched here. The manual's
+        // priority table has trace processed after the instruction's own exception,
+        // so a traced `TRAP` stacks the trap frame and then the trace frame, and the
+        // trace handler's `RTE` returns into the trap handler. Zero suite coverage
+        // (0 vector-9 fetches in 317,500): extrapolated. The previous end-of-
+        // instruction read suppressed this case as a side effect of entry clearing
+        // T, which is not the same as deciding it.
+        self.trace_pending = self.sr & SR_T != 0;
         // Peek at the opcode without touching the queue.
         // Instruction handlers call `consume_opcode` (or `fetch_word` for the
         // same effect with a return value) at the point dictated by their bus
@@ -279,13 +383,12 @@ impl M68k {
         let op = self.prefetch[0];
         let cycles = dec.dispatch(op)(self, bus, op);
 
-        // Owed only if T survived the instruction. An instruction that entered an
-        // exception has had T cleared by entry (38,542/38,542), and one that
-        // loaded the whole SR may have cleared it itself — `ANDItoSR`, `EORItoSR`,
-        // `STOP`, `MOVEtoSR` and `RTE` are exactly the 1,277 clean T=1 cases that
-        // end with T clear, with `ORItoSR` at 0/591 as the control. Reading the
-        // *final* T covers both without a case analysis.
-        self.trace_pending = !self.halted && self.sr & SR_T != 0;
+        // A halted CPU owes nothing. The gate at the top of this function already
+        // makes the flag unreachable after a halt; clearing it keeps the state
+        // readable for a debugger or a save-state.
+        if self.halted {
+            self.trace_pending = false;
+        }
         cycles
     }
 

@@ -95,6 +95,68 @@ fn double_bus_fault(cpu: &mut M68k) -> bool {
     false
 }
 
+/// Idle cycles charged for the step in which the CPU double bus faults.
+///
+/// # Extrapolated: unmeasurable, not merely unmeasured
+///
+/// **0 of 317,500** cases halt — initial A7 is even in every one of them — so no
+/// vector says how long hardware drives the bus before it gives up. The control
+/// for that zero is the *stacked* fault address, odd in 55,606/55,606: odd
+/// addresses are visible to the query, and the zero is a fact about A7. Nothing
+/// measured can produce this number.
+///
+/// `4` is chosen rather than derived, for two statable reasons: it matches what
+/// [`crate::cpu::M68k::step_with`] already charges for every *subsequent* step of
+/// a halted CPU, and it keeps the halting step from returning 0, which would let a
+/// cycle-budgeted driver loop make no progress. Replace it if hardware evidence
+/// ever appears; the accompanying access count must not be replaced the same way,
+/// because that part *is* derived — see [`entry_cycles`].
+pub const HALTED_IDLE_CYCLES: u32 = 4;
+
+/// What a handler charges for an exception entry that may have double bus
+/// faulted.
+///
+/// Every constant in this crate that pays for an exception entry —
+/// [`crate::ops::trap`]'s group-2 `34`, [`ADDRESS_ERROR_TAIL_CYCLES`],
+/// [`INTERRUPT_CYCLES`] — is `4 × accesses + idle` for accesses that
+/// `double_bus_fault` never performs: no frame, no vector fetch, no refill.
+/// Returning one of them after a halt contradicts the core's own bus log, and the
+/// timing law is not optional. So the entry's cost collapses:
+///
+/// - `accesses_made` — accesses the handler **already put on the bus** before the
+///   entry, which are still owed because they really happened: `TRAPV`'s leading
+///   read, `RTE`'s three pops. This term is *derived*, by reading the core's own
+///   bus log on each path (`RTE`/odd-SSP logs 0; `PEA`/odd-SP logs 1).
+/// - [`HALTED_IDLE_CYCLES`] — the idle before the halt, which is extrapolated.
+///
+/// `framed` is the unchanged cost of the path where the frame *was* written.
+///
+/// ⚠️ **Pass 0 when the caller already adds its lead outside this call.** Several
+/// sites are written `4 * lead + idle + ADDRESS_ERROR_TAIL_CYCLES`, with the
+/// preceding accesses in the caller's own term; wrapping only the tail keeps that
+/// arithmetic visible and must not double-count. Sites that fold their lead into
+/// the constant instead — `TRAPV`'s `4 × (7 + 1)`, `RTE`'s `4 × 3 + tail` — pass
+/// the lead here. Either way the total obeys the law; what must not happen is
+/// counting a lead twice or not at all.
+///
+/// Taking `cpu` rather than a bare `bool` is deliberate: a site that has to spell
+/// out `cpu.halted` is a site that can forget to. The halt tests assert the
+/// cycle count precisely because its absence is how a stale constant survived
+/// here once already.
+///
+/// ⚠️ **Not yet a single chokepoint.** `ops::{alu, branch, move_, muldiv, logic}`
+/// have fault sites of the same shape that still return their framed constant
+/// unconditionally; they are reachable only with an odd A7, and routing them
+/// through here is a follow-up (their files are owned elsewhere this round).
+#[inline]
+pub fn entry_cycles(cpu: &M68k, accesses_made: u32, framed: u32) -> u32 {
+    if cpu.halted {
+        4 * accesses_made + HALTED_IDLE_CYCLES
+    } else {
+        framed
+    }
+}
+
 /// Takes a group 1/2 exception: save SR, enter supervisor mode, write the
 /// short frame, then vector.
 ///
@@ -320,17 +382,35 @@ pub fn address_error(
 /// `(4/7)` idle 10 for the 55,606 address errors, both split confirmed
 /// access-by-access suite-wide across 10,287 cases and both frame sizes.
 ///
-/// The manual's interrupt row is `44(5/3)`, which under the timing law
-/// (`4 × accesses + idle`) decomposes as the same seven accesses TRAP performs —
-/// 3 frame writes, 2 vector reads, 2 prefetch refills — **plus one more read,
-/// the interrupt-acknowledge cycle** — and `44 − 4 × 8 = 12` idle. The IACK
-/// access and the idle split are the two parts that remain genuinely
-/// unverifiable here.
+/// The manual's interrupt row is `44(5/3)`, whose eighth access is the
+/// interrupt-acknowledge cycle.
 ///
-/// ⚠️ Do not read TRAPV's `(5/3)` idle 2 as licence to infer this split from the
-/// total: two different decompositions reach 34 on measured paths, so a total
-/// never determines a split on this core.
-pub const INTERRUPT_CYCLES: u32 = 4 * (SHORT_FRAME_ACCESSES + 1) + 12;
+/// ⚠️ **This core does not emit an IACK access, and the constant is spelled to
+/// say so.** [`Bus`] carries no function code, so an IACK is not representable
+/// distinctly from an ordinary read; inventing one would add a transaction to a
+/// group shape that is otherwise measured access-for-access. So the decomposition
+/// this core actually produces is
+///
+/// ```text
+///   4 × 7 accesses + 16 idle = 44        <- what check_interrupts emits
+///   4 × 8 accesses + 12 idle = 44        <- the manual's, with the IACK modelled
+/// ```
+///
+/// — the IACK's 4 cycles are **spent as idle** rather than on the bus. The total
+/// is the manual's either way; the split is not, and a core that ever gains
+/// function codes should move those 4 cycles back onto the bus.
+///
+/// ⚠️ Do not read TRAPV's `(5/3)` idle 2 as licence to infer a split from a
+/// total: two different decompositions reach 34 on *measured* paths, so a total
+/// never determines a split on this core — and this constant is a third example.
+pub const INTERRUPT_CYCLES: u32 = 4 * SHORT_FRAME_ACCESSES + IACK_AS_IDLE_CYCLES + 12;
+
+/// The interrupt-acknowledge cycle's 4 cycles, spent as idle.
+///
+/// Named rather than folded into [`INTERRUPT_CYCLES`]'s idle term so that the one
+/// unmodelled access in the interrupt path is visible in the arithmetic instead of
+/// hiding inside a `16`. See [`INTERRUPT_CYCLES`] for why it is not a bus access.
+pub const IACK_AS_IDLE_CYCLES: u32 = 4;
 
 /// Takes a pending interrupt if one outranks the SR's mask, returning its cost.
 ///
@@ -347,6 +427,22 @@ pub const INTERRUPT_CYCLES: u32 = 4 * (SHORT_FRAME_ACCESSES + 1) + 12;
 /// vector-taking path *does* touch bits 10-8 — [`take`] deliberately leaves them
 /// alone (38,542/38,542), so the raise happens here, after the frame is stacked
 /// with the old mask.
+///
+/// # The caller owns deassertion — and level 7 has no substitute for it
+///
+/// [`M68k::pending_irq`] is a **level**, not an edge, and nothing in this core
+/// clears it. Entry raises the mask, which is what stops levels 1-6 from
+/// re-entering their own handler; **level 7 is non-maskable, so no mask value can
+/// block it.** A level-7 line left asserted therefore re-enters the handler at
+/// every boundary without the handler executing a single instruction, marching the
+/// stack pointer down 6 bytes per step until it wraps. That is a livelock, and it
+/// is the caller's to prevent: the device model must drop the line — [`M68k::set_irq`]
+/// with 0 — once the handler has acknowledged it, exactly as
+/// `testrunner/tests/integration_asm.rs` does for its level-4 handler.
+///
+/// This is documented rather than fixed by modelling level 7 as edge-triggered,
+/// because edge sensitivity would change the interrupt contract that existing
+/// integration tests are written against. See [`M68k::set_irq`].
 ///
 /// # Extrapolated: zero suite coverage
 ///
@@ -376,45 +472,95 @@ pub fn check_interrupts(cpu: &mut M68k, bus: &mut dyn Bus) -> Option<u32> {
     // the resumed instruction's. Two accesses (8 cycles) that no vector
     // confirms hardware pays on the resume path; the cost returned below does
     // not include them, which is itself extrapolated.
-    if cpu.stopped {
+    let resumed = cpu.stopped;
+    if resumed {
         cpu.stopped = false;
         cpu.refill_prefetch_dyn(bus);
     }
 
     let pc = cpu.pc.wrapping_sub(OPCODE_PC_OFFSET);
     take(cpu, bus, VEC_AUTOVECTOR_BASE + level, pc);
-    // Mask the level being serviced, after the old SR is safely on the stack.
-    cpu.set_sr((cpu.sr & !0x0700) | (u16::from(level) << 8));
-    Some(INTERRUPT_CYCLES)
+    if !cpu.halted {
+        // Mask the level being serviced, after the old SR is safely on the stack.
+        // Skipped on the halt path: no frame holds the old mask, and there is no
+        // handler to run at the new one — `take` leaves the SR alone there too.
+        cpu.set_sr((cpu.sr & !0x0700) | (u16::from(level) << 8));
+    }
+    // The resume refill is the only thing that precedes the entry, so a halted
+    // entry is charged for those 2 accesses and nothing else.
+    Some(entry_cycles(
+        cpu,
+        if resumed { 2 } else { 0 },
+        INTERRUPT_CYCLES,
+    ))
 }
 
-/// Takes the trace exception if the T bit is set, returning its cost.
+/// Takes the trace exception owed by the instruction that just finished,
+/// returning its cost.
 ///
-/// Called at the instruction boundary, **after** the instruction completes —
-/// that is what the T bit means, and it is why the vector suite never sees one:
-/// each case runs exactly one instruction and stops at the boundary this check
-/// lives on. `TRACE` (vector 9) is fetched **0** times in all 317,500 cases,
-/// against a control of 2,500 TRAP fetches recovered by the same code, while
-/// 158,894 cases *enter* with T=1 across all 127 groups. So an implementation
-/// that traces inside a handler, or before the boundary, fails 38% of the suite.
+/// Called only when [`M68k::trace_pending`] is set, which is where the decision
+/// lives: **T is sampled at the start of the instruction**, not read here at the
+/// end. This function does not consult `cpu.sr & SR_T` at all, and must not —
+/// exception entry has already cleared T by the time a forced exception reaches
+/// this boundary, and an instruction that loaded the whole SR has changed T
+/// arbitrarily. See [`M68k::trace_pending`] for the two cases that discriminate
+/// start-sampling from end-sampling and why end-sampling breaks single-stepping.
 ///
-/// The T bit read here is the SR the instruction *left behind*: an instruction
-/// that loads the whole SR changes its own trace state, which is the operand's
-/// doing rather than the CPU's (`ANDItoSR`, `EORItoSR`, `STOP`, `MOVEtoSR` and
-/// `RTE` account for all 1,277 clean cases that end with T cleared, with
-/// `ORItoSR` at 0/591 as the control — `OR` cannot clear a bit).
+/// # Fired at the boundary *after* the instruction — this part is measured
+///
+/// Each vector case runs exactly one instruction and stops at this boundary, so
+/// `TRACE` (vector 9) is fetched **0** times in all 317,500 cases, against a
+/// control of 2,500 TRAP fetches recovered by the same code, while 158,894 cases
+/// *enter* with T=1 across all 127 groups. An implementation that traced inside
+/// the instruction's own step would fail ~38% of the suite — that is what the
+/// measurement settles, and it settles nothing else. In particular it cannot
+/// discriminate *when T is sampled*, because no case ever reaches the second
+/// boundary; see the "Extrapolated" note below.
+///
+/// # A trace exits the stopped state
+///
+/// `STOP #$A700` loads an SR with T set, so it is stopped *and* owes a trace, and
+/// hardware has no state for "inside a handler while stopped": the trace is taken
+/// and the CPU resumes. Clearing `stopped` here is what makes that true — without
+/// it the CPU wedges permanently, with the handler's first instruction never run,
+/// and only an interrupt escapes (into that same un-started handler).
+///
+/// The resume is [`check_interrupts`]'s, verbatim and for the same reason: the
+/// stopped state froze `pc` and both queue words with the `STOP` opcode in slot 0,
+/// and `pc - OPCODE_PC_OFFSET` is the `STOP`'s **own** address until the refill
+/// moves `pc` on. Skipping the refill stacks the `STOP` and re-executes it after
+/// the handler returns. Those 2 accesses are not in the returned cost, which is the
+/// same extrapolation [`check_interrupts`] documents.
 ///
 /// # Extrapolated: zero suite coverage
 ///
-/// The cost is the group-2 short frame, i.e. the same `34` every other group-2
-/// path measures. Nothing verifies that for vector 9 specifically.
-pub fn check_trace(cpu: &mut M68k, bus: &mut dyn Bus) -> Option<u32> {
-    if cpu.sr & SR_T == 0 {
-        return None;
+/// Both the cost and the **sampling point** are extrapolated, for the same reason:
+/// no case takes a trace exception, so no measurement here can be a count.
+///
+/// - *Cost:* the group-2 short frame, the same `34` five other group-2 paths
+///   measure. Nothing verifies it for vector 9 specifically.
+/// - *Sampling point:* start-of-instruction, from the 68000 User's Manual's
+///   definition of T. ⚠️ The suite's census of which instructions can *clear* T
+///   (`ANDItoSR`, `EORItoSR`, `STOP`, `MOVEtoSR`, `RTE` — 1,277 clean cases, with
+///   `ORItoSR` at 0/591 as the control) is accurate and lives at
+///   [`M68k::trace_pending`], but it is a census of instructions, not of sampling
+///   points, and it cannot support this choice. It is named there as the set of
+///   cases where the two rules *differ*, which is what it can speak to.
+pub fn take_trace(cpu: &mut M68k, bus: &mut dyn Bus) -> u32 {
+    let resumed = cpu.stopped;
+    if resumed {
+        cpu.stopped = false;
+        cpu.refill_prefetch_dyn(bus);
     }
     let pc = cpu.pc.wrapping_sub(OPCODE_PC_OFFSET);
     take(cpu, bus, VEC_TRACE, pc);
-    Some(4 * SHORT_FRAME_ACCESSES + 6)
+    // Only the resume refill can precede the frame; without it a halt here logged
+    // nothing at all.
+    entry_cycles(
+        cpu,
+        if resumed { 2 } else { 0 },
+        4 * SHORT_FRAME_ACCESSES + 6,
+    )
 }
 
 /// Byte distance from `cpu.pc` at handler entry back to the opcode word.
@@ -444,7 +590,8 @@ pub fn illegal_instruction(cpu: &mut M68k, bus: &mut dyn Bus, op: u16) -> u32 {
     // the rationale; do not copy this calculation into other handlers.
     let pc = cpu.pc.wrapping_sub(OPCODE_PC_OFFSET);
     take(cpu, bus, vector, pc);
-    34
+    // No access precedes the frame — the queue is never advanced on this path.
+    entry_cycles(cpu, 0, 34)
 }
 
 #[cfg(test)]
@@ -625,9 +772,20 @@ mod tests {
 
         let cycles = cpu.step_with(&Decoder::new(), &mut bus);
 
+        // The access count is asserted alongside the total, because the total
+        // alone would pass for the manual's 8-access split too — and this core
+        // emits 7. Never assert one without the other on this path.
+        assert_eq!(
+            bus.log.len(),
+            SHORT_FRAME_ACCESSES as usize,
+            "3 frame writes + 2 vector reads + 2 refills, and NO IACK access: \
+             `Bus` carries no function code, so this core spends the IACK's 4 \
+             cycles as idle"
+        );
         assert_eq!(
             cycles, 44,
-            "3 writes + 2 vector + 2 refill + IACK + 12 idle"
+            "4 × 7 accesses + 4 (the IACK, as idle) + 12 idle — the manual's \
+             total, reached by this core's own decomposition and not by its"
         );
         assert_eq!(
             bus.writes(),
@@ -855,6 +1013,69 @@ mod tests {
         assert_eq!(cpu.a[7], 0x2FF2, "base - 14");
     }
 
+    /// The frame base in **user** mode is the SSP, not the active `a[7]`.
+    ///
+    /// This is the only test that can tell those two apart: `frame_base` is used
+    /// solely as a *parity* predicate, so a case where `a[7]` and `ssp` agree in
+    /// parity cannot discriminate — and every other test, plus all 317,500
+    /// vector cases, has them agreeing. Replacing the body with `cpu.a[7]`
+    /// passes the entire suite and every other unit test.
+    ///
+    /// # Extrapolated
+    ///
+    /// Zero suite coverage: initial A7 is even in 317,500/317,500 cases. The
+    /// rule is that entry sets S *before* pushing, so the frame lands on the
+    /// supervisor stack; measured 43,483/43,483 user-mode exception cases put
+    /// the frame on the SSP, with the USP form as a control at 0/43,483.
+    #[test]
+    fn in_user_mode_the_frame_base_is_the_ssp_not_the_active_sp() {
+        // An odd USP with an even SSP must NOT halt: the frame goes to the SSP.
+        let mut bus = RecordingBus::new();
+        bus.put16(0x000C, 0x0000); // vector 3, so a frame would be visible
+        bus.put16(0x000E, 0x2000);
+        bus.load(0x2000, &[0x4E71, 0x4E71]);
+
+        let mut cpu = M68k::new();
+        cpu.sr = 0x0000; // user mode
+        cpu.a[7] = 0x7FFF; // odd USP
+        cpu.ssp = 0x3000; // even SSP
+        cpu.pc = 0x1004;
+        bus.log.clear();
+
+        take(&mut cpu, &mut bus, VEC_ILLEGAL, 0x1000);
+
+        assert!(
+            !cpu.halted,
+            "an odd USP is irrelevant: the frame is on the SSP"
+        );
+        assert_eq!(bus.writes().len(), 3, "the short frame was written");
+        assert_eq!(
+            cpu.a[7], 0x2FFA,
+            "a[7] is now the supervisor stack, base - 6"
+        );
+        assert_eq!(cpu.usp, 0x7FFF, "the odd USP is preserved untouched");
+
+        // The converse: an even USP with an odd SSP must halt.
+        let mut bus = RecordingBus::new();
+        bus.put16(0x000C, 0x0000);
+        bus.put16(0x000E, 0x2000);
+
+        let mut cpu = M68k::new();
+        cpu.sr = 0x0000;
+        cpu.a[7] = 0x8000; // even USP
+        cpu.ssp = 0x2FFF; // odd SSP
+        cpu.pc = 0x1004;
+        bus.log.clear();
+
+        take(&mut cpu, &mut bus, VEC_ILLEGAL, 0x1000);
+
+        assert!(
+            cpu.halted,
+            "an odd SSP is the double bus fault, from user mode too"
+        );
+        assert_eq!(bus.log, vec![], "no frame, no vector fetch");
+    }
+
     /// A second fault raised while a frame is being written halts rather than
     /// recursing.
     ///
@@ -882,5 +1103,326 @@ mod tests {
         assert!(cpu.halted);
         assert_eq!(bus.log, vec![], "no second frame");
         assert_eq!(cpu.a[7], 0x3000, "nothing committed");
+    }
+
+    /// Single-stepping makes progress: a trace handler ending in `RTE` runs one
+    /// traced instruction per handler entry, forever.
+    ///
+    /// **This is the test for the sampling point**, and it is the whole reason T
+    /// must be latched at instruction *start*. The shape is the canonical debugger
+    /// one: T set in the traced program, handler = a bare `RTE`, and the popped SR
+    /// restores T. `RTE` is *entered* with T clear — exception entry cleared it —
+    /// so hardware owes no trace for the `RTE` itself; the resumed instruction runs
+    /// and then traces. A core that samples T at the *end* owes a trace for the
+    /// `RTE`, whose popped SR has T set, and so re-enters the handler having
+    /// executed nothing: measured at 1 traced instruction in 200 steps against the
+    /// 4 below, with the PC pinned and the SP walking down 6 bytes per pair.
+    ///
+    /// Four NOPs at `0x2000`, so a livelock is distinguishable from termination:
+    /// the assertion is on how many *distinct* traced-program PCs were reached, not
+    /// merely that the handler ran.
+    ///
+    /// # Extrapolated
+    ///
+    /// Zero suite coverage — vector 9 is fetched 0 times in 317,500 cases, against
+    /// 158,894 that enter with T=1 (the control showing T is present in the corpus
+    /// and only the *second boundary* is missing). So this asserts a mechanism, not
+    /// a measured literal: no cycle counts appear below.
+    #[test]
+    fn single_stepping_with_an_rte_handler_advances_one_instruction_per_trace() {
+        let mut bus = RecordingBus::new();
+        // The traced program: four NOPs at 0x2000.
+        bus.load(0x2000, &[0x4E71, 0x4E71, 0x4E71, 0x4E71]);
+        // Vector 9 -> the handler at 0x3000, which is a bare RTE.
+        bus.put16(0x0024, 0x0000);
+        bus.put16(0x0026, 0x3000);
+        bus.load(0x3000, &[0x4E73, 0x4E71]);
+
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S | SR_T | 0x0700;
+        cpu.a[7] = 0x4000;
+        cpu.pc = 0x2000;
+        cpu.prime_prefetch(&mut bus);
+
+        let dec = Decoder::new();
+        // Each traced instruction takes 3 steps: the instruction, the trace entry,
+        // the handler's RTE. 12 steps is exactly 4 NOPs' worth.
+        let mut reached = Vec::new();
+        for _ in 0..12 {
+            // Record the traced-program PCs, i.e. the ones outside the handler.
+            if cpu.pc < 0x3000 && !cpu.trace_pending {
+                reached.push(cpu.pc);
+            }
+            cpu.step_with(&dec, &mut bus);
+            assert!(!cpu.halted, "single-stepping must not halt");
+        }
+
+        assert_eq!(
+            reached,
+            vec![0x2004, 0x2006, 0x2008, 0x200A],
+            "one distinct traced instruction per handler entry: an \
+             end-of-instruction sample re-enters the handler forever and reaches \
+             only the first"
+        );
+        assert_eq!(
+            cpu.a[7], 0x4000,
+            "each RTE unwinds its own frame; the stack does not drift"
+        );
+    }
+
+    /// The two cases that discriminate start-sampling from end-sampling directly,
+    /// without the handler: an instruction that clears T is still traced, and one
+    /// that sets T is not.
+    ///
+    /// The control for the test above, and sharper: that one shows the *consequence*
+    /// (a livelock), this one shows the *rule* on the single instruction pair where
+    /// the two rules disagree. `ANDI #$7FFF,SR` and `ORI #$8000,SR` differ only in
+    /// which way they move T.
+    ///
+    /// # Extrapolated
+    ///
+    /// The sampling point is from the manual; the suite cannot reach it (0 vector-9
+    /// fetches in 317,500). What the suite *does* establish is that these are the
+    /// right instructions to test with: `ANDItoSR` is among the 1,277 clean cases
+    /// that end with T clear, with `ORItoSR` at 0/591 as the control.
+    ///
+    /// ⚠️ **This asserts the vector-9 frame, never `trace_pending`.** The sample
+    /// point is gated twice — once latching the flag in
+    /// [`crate::cpu::M68k::step_with`], once deciding whether to actually vector in
+    /// [`take_trace`] — and a flag assertion only sees the first. Restoring the
+    /// second gate's old `if cpu.sr & SR_T == 0 { return }`, with the latch left
+    /// correct, yields `trace_pending == true` and **still no trace**, because that
+    /// read sees the SR `ANDI` just cleared. Verified: that mutation passes all 195
+    /// tests when this test reads the flag, and fails here as written. The flag is
+    /// the code's own intermediate value; the frame is the behaviour.
+    #[test]
+    fn t_is_sampled_at_instruction_start_not_at_its_end() {
+        // Direction 1 — `ANDI #$7FFF,SR` clears T, entered with T=1: still traced.
+        // This is the direction end-sampling gets wrong, and 1,277 real suite cases.
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x027C, 0x7FFF, 0x4E71, 0x4E71, 0x4E71]);
+        bus.put16(0x0024, 0x0000); // vector 9 -> the handler at 0x2000
+        bus.put16(0x0026, 0x2000);
+        bus.load(0x2000, &[0x4E71, 0x4E71]);
+
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S | SR_T | 0x0700;
+        cpu.a[7] = 0x3000;
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+
+        let dec = Decoder::new();
+        bus.log.clear();
+        cpu.step_with(&dec, &mut bus);
+        assert_eq!(
+            bus.writes(),
+            vec![],
+            "no frame within the traced instruction"
+        );
+        assert_eq!(cpu.sr & SR_T, 0, "the ANDI really did clear T");
+
+        bus.log.clear();
+        cpu.step_with(&dec, &mut bus);
+        assert_eq!(
+            bus.writes(),
+            vec![(0x2FFE, 0x1004), (0x2FFA, SR_S | 0x0700), (0x2FFC, 0x0000)],
+            "T was set at entry, so the trace is owed even though the \
+             instruction cleared it; the stacked SR is the cleared one"
+        );
+        assert_eq!(cpu.pc, 0x2004, "vectored through 9");
+
+        // Direction 2 — `ORI #$8000,SR` sets T, entered with T=0: that instruction
+        // is NOT traced, and the one after it is. 1,286 real suite cases, and the
+        // control: without it, a core that always traces passes the block above.
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x007C, 0x8000, 0x4E71, 0x4E71, 0x4E71]);
+        bus.put16(0x0024, 0x0000);
+        bus.put16(0x0026, 0x2000);
+        bus.load(0x2000, &[0x4E71, 0x4E71]);
+
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S | 0x0700;
+        cpu.a[7] = 0x3000;
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+
+        bus.log.clear();
+        cpu.step_with(&dec, &mut bus);
+        assert_eq!(cpu.sr & SR_T, SR_T, "the ORI really did set T");
+        assert_eq!(
+            bus.writes(),
+            vec![],
+            "setting T does not trace the instruction that set it"
+        );
+
+        // The NOP after it: T was set at *its* start, so it is the traced one.
+        bus.log.clear();
+        cpu.step_with(&dec, &mut bus);
+        assert_eq!(bus.writes(), vec![], "still inside the traced instruction");
+
+        bus.log.clear();
+        cpu.step_with(&dec, &mut bus);
+        assert_eq!(
+            bus.writes(),
+            vec![
+                (0x2FFE, 0x1006),
+                (0x2FFA, SR_S | SR_T | 0x0700),
+                (0x2FFC, 0x0000)
+            ],
+            "tracing begins with the instruction after the one that set T"
+        );
+        assert_eq!(cpu.pc, 0x2004, "vectored through 9");
+    }
+
+    /// `STOP #$A700` — an immediate that sets T — traces and **resumes**, rather
+    /// than leaving the CPU both stopped and inside a handler.
+    ///
+    /// That combined state has no hardware counterpart, and a core that reaches it
+    /// is permanently wedged: every later step falls through the `stopped` gate and
+    /// returns 4 with no bus activity, the handler's first instruction never run.
+    /// Measured on the defect: `pc` pinned at the vector target and 0 accesses over
+    /// 20 further steps. The two assertions that bite are `!cpu.stopped` and the
+    /// handler's NOP actually executing.
+    ///
+    /// # Extrapolated
+    ///
+    /// Zero coverage twice over: no case runs a second step after `STOP` (its
+    /// access shape is empty), and vector 9 is fetched 0 times in 317,500. The
+    /// trace-on-a-T-setting-immediate rule is the manual's `STOP` entry.
+    #[test]
+    fn stop_with_t_set_traces_and_resumes_instead_of_wedging() {
+        let mut bus = RecordingBus::new();
+        // 0x1000: STOP #$A700, 0x1004: NOP
+        bus.load(0x1000, &[0x4E72, 0xA700, 0x4E71, 0x4E71]);
+        bus.put16(0x0024, 0x0000); // vector 9 -> 0x2000
+        bus.put16(0x0026, 0x2000);
+        // The handler: ADDQ #1,D0 then NOP, so "the handler ran" is observable.
+        bus.load(0x2000, &[0x5240, 0x4E71, 0x4E71]);
+
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S | 0x0700;
+        cpu.a[7] = 0x3000;
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+
+        let dec = Decoder::new();
+        assert_eq!(cpu.step_with(&dec, &mut bus), 4, "STOP still costs 4");
+        assert!(cpu.stopped);
+        assert!(cpu.trace_pending, "the immediate set T, so a trace is owed");
+
+        // The trace fires, and it must clear `stopped` on its way.
+        let trace_cycles = cpu.step_with(&dec, &mut bus);
+        assert_eq!(trace_cycles, 34, "the group-2 short frame");
+        assert!(
+            !cpu.stopped,
+            "the trace resumed the CPU: nothing is both stopped and in a handler"
+        );
+        assert_eq!(cpu.pc, 0x2004, "the handler was entered");
+        assert_eq!(
+            bus.writes(),
+            vec![(0x2FFE, 0x1004), (0x2FFA, SR_S | 0xA700), (0x2FFC, 0x0000)],
+            "the frame stacks the instruction after the STOP, and an SR with T set"
+        );
+
+        // And the handler makes progress, which is the half a wedged core fails.
+        cpu.step_with(&dec, &mut bus);
+        assert_eq!(cpu.d[0], 1, "the handler's first instruction executed");
+    }
+
+    /// The `stopped` state survives a step that neither traces nor takes an
+    /// interrupt — the control for the test above.
+    ///
+    /// Without this, clearing `stopped` unconditionally at the boundary would pass
+    /// that test while breaking `STOP` outright.
+    #[test]
+    fn stop_without_t_stays_stopped() {
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4E72, 0x2700, 0x4E71]);
+
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S | 0x0700;
+        cpu.a[7] = 0x3000;
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+
+        let dec = Decoder::new();
+        cpu.step_with(&dec, &mut bus);
+        assert!(cpu.stopped);
+        assert!(!cpu.trace_pending, "the immediate left T clear");
+
+        let pc = cpu.pc;
+        bus.log.clear();
+        for _ in 0..5 {
+            assert_eq!(cpu.step_with(&dec, &mut bus), 4);
+        }
+        assert!(cpu.stopped, "still stopped with no interrupt and no trace");
+        assert_eq!(cpu.pc, pc, "the PC stayed frozen");
+        assert_eq!(bus.log, vec![], "and nothing reached the bus");
+    }
+
+    /// A halted exception entry is charged for the accesses it actually made,
+    /// which on this path is none of them.
+    ///
+    /// The **cycle** assertion is the point. `an_odd_frame_base_halts_without_writing_a_frame`
+    /// above asserts state and an empty bus log but not the cost, which is how
+    /// `ADDRESS_ERROR_TAIL_CYCLES`'s 58 — `4 × 12 + 10`, paying for an aborted
+    /// access, 7 frame writes, 2 vector reads and 2 refills — survived onto a path
+    /// that performs zero accesses. Under the timing law that is a 58-cycle lie
+    /// about the core's own bus log.
+    ///
+    /// # Extrapolated
+    ///
+    /// The access count is *derived* from the bus log asserted alongside it, so it
+    /// is not extrapolated. [`HALTED_IDLE_CYCLES`] is: 0 of 317,500 cases halt, with
+    /// the stacked fault address (odd in 55,606/55,606) as the control for that
+    /// zero. If that constant changes, this literal changes with it — deliberately,
+    /// via `HALTED_IDLE_CYCLES` rather than a bare number.
+    #[test]
+    fn a_halted_entry_costs_only_the_accesses_it_made() {
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4AFC, 0x4E71]); // an illegal opcode
+        bus.put16(0x0010, 0x0000); // vector 4, so a frame would be visible
+        bus.put16(0x0012, 0x2000);
+
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S;
+        cpu.a[7] = 0x2FFF; // odd: the frame's own base, so entry halts
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+        bus.log.clear();
+
+        let cycles = cpu.step_with(&Decoder::new(), &mut bus);
+
+        assert!(cpu.halted);
+        assert_eq!(bus.log, vec![], "zero accesses: no frame, no vector fetch");
+        assert_eq!(
+            cycles, HALTED_IDLE_CYCLES,
+            "4 × 0 accesses + the extrapolated halt idle — not the framed 34"
+        );
+    }
+
+    /// The control for the test above: the same illegal opcode with an **even**
+    /// frame base pays the full framed cost, so the collapse is conditional rather
+    /// than a blanket reduction.
+    #[test]
+    fn an_unhalted_entry_still_costs_the_full_frame() {
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4AFC, 0x4E71]);
+        bus.put16(0x0010, 0x0000);
+        bus.put16(0x0012, 0x2000);
+        bus.load(0x2000, &[0x4E71, 0x4E71]);
+
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S;
+        cpu.a[7] = 0x3000; // even
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+        bus.log.clear();
+
+        let cycles = cpu.step_with(&Decoder::new(), &mut bus);
+
+        assert!(!cpu.halted);
+        assert_eq!(bus.log.len(), 7, "the full short-frame access count");
+        assert_eq!(cycles, 4 * SHORT_FRAME_ACCESSES + 6, "4 × 7 + 6 idle");
     }
 }

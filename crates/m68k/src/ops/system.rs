@@ -63,7 +63,9 @@ fn privilege_check(cpu: &mut M68k, bus: &mut dyn Bus) -> Option<u32> {
     }
     let pc = cpu.pc.wrapping_sub(exception::OPCODE_PC_OFFSET);
     exception::take(cpu, bus, VEC_PRIVILEGE, pc);
-    Some(PRIVILEGE_CYCLES)
+    // The queue is untouched before the frame, so a double bus fault here logged
+    // nothing at all: 0 accesses. See `exception::entry_cycles`.
+    Some(exception::entry_cycles(cpu, 0, PRIVILEGE_CYCLES))
 }
 
 /// Idle cycles spent forming the address, before any bus access.
@@ -259,12 +261,38 @@ fn move_from_usp(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
 ///
 /// The new SR is the immediate through `SR_MASK` (1230/1230), which `set_sr`
 /// applies — and which also performs the USP/SSP swap if the immediate clears S.
+///
+/// # An immediate that sets T traces instead of stopping
+///
+/// `STOP #$A700` is the one place a *loaded* SR can owe a trace that the
+/// start-of-instruction latch in [`M68k::step_with`] cannot have seen: T was clear
+/// when the `STOP` began. The manual's `STOP` entry makes the trace happen anyway,
+/// and [`crate::exception::take_trace`] clears `stopped`, so the CPU vectors and
+/// resumes rather than staying stopped.
+///
+/// This is raised here rather than by re-reading the final T at the boundary,
+/// because reading the final T is wrong for every *other* instruction — see
+/// [`M68k::trace_pending`]. It is an addition to the latch, never a replacement:
+/// `|=`, so a `STOP` entered with T=1 whose immediate clears T still traces.
+///
+/// ⚠️ Without this, `STOP #$A700` wedges permanently on a core that clears
+/// `stopped` only from the trace path: nothing owes the trace, so nothing resumes.
+/// With the *previous* end-of-instruction sampling it wedged for the opposite
+/// reason — the trace fired but left `stopped` set, leaving the CPU both in a
+/// handler and stopped, a state with no hardware counterpart.
+///
+/// # Extrapolated: zero suite coverage
+///
+/// All 1,230 supervisor cases run one instruction and stop there, so no case
+/// observes what the immediate's T bit does next; vector 9 is fetched 0 times in
+/// all 317,500. The rule is the manual's, not a measurement.
 fn stop(cpu: &mut M68k, bus: &mut dyn Bus, _opcode: u16) -> u32 {
     if let Some(c) = privilege_check(cpu, bus) {
         return c;
     }
     let imm = cpu.prefetch[1];
     cpu.set_sr(imm);
+    cpu.trace_pending |= cpu.sr & crate::cpu::SR_T != 0;
     cpu.stopped = true;
     4
 }
@@ -404,7 +432,14 @@ fn pea(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
             ir,
             opcode_addr.wrapping_add(4),
         );
-        return ADDRESS_ERROR_TAIL_CYCLES;
+        // On the halt path (supervisor, odd `a[7]`) the only accesses that reached
+        // the bus are the ones `resolve_address` and the queue advance already
+        // made: `de` extension fetches, plus the advance for the non-absolute
+        // modes. Measured against the core's own log — `PEA (A0)` with an odd SP
+        // logs exactly 1. The 58 accounts for a frame and vector fetch that this
+        // path skips entirely.
+        let made = de + u32::from(!absolute);
+        return exception::entry_cycles(cpu, made, ADDRESS_ERROR_TAIL_CYCLES);
     }
     cpu.a[7] = sp;
     sync_sp(cpu);
@@ -464,7 +499,10 @@ fn link(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
             ir,
             opcode_addr.wrapping_add(4),
         );
-        return ADDRESS_ERROR_TAIL_CYCLES;
+        // The displacement fetch above is the one access already on the bus when a
+        // halt aborts the rest; the frame and vector fetch the 58 pays for never
+        // happen. See `exception::entry_cycles`.
+        return exception::entry_cycles(cpu, 1, ADDRESS_ERROR_TAIL_CYCLES);
     }
     cpu.a[7] = sp;
     write_long_asc(bus, sp, pushed);
@@ -510,7 +548,9 @@ fn unlk(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
             cpu.prefetch[0],
             opcode_addr.wrapping_add(4),
         );
-        return ADDRESS_ERROR_TAIL_CYCLES;
+        // Nothing precedes the fault: the check is before the pop and before the
+        // queue advance, so a halt logs zero accesses.
+        return exception::entry_cycles(cpu, 0, ADDRESS_ERROR_TAIL_CYCLES);
     }
     let hi = bus.read16(addr & ADDR_MASK) as u32;
     let lo = bus.read16(addr.wrapping_add(2) & ADDR_MASK) as u32;
@@ -718,7 +758,11 @@ fn movem(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16, size: Size) -> u32 {
         // Only the fetches that actually happened: the mask word and the
         // extension words. The queue advance is charged on the clean path only,
         // because the fault aborts the instruction before reaching it.
-        return 4 * (1 + de) + idle + ADDRESS_ERROR_TAIL_CYCLES;
+        //
+        // Those same fetches are all a halted entry keeps — the frame and vector
+        // fetch inside the 58 never happen — so the tail collapses and the lead
+        // does not.
+        return 4 * (1 + de) + idle + exception::entry_cycles(cpu, 0, ADDRESS_ERROR_TAIL_CYCLES);
     }
 
     let mut extra = 0;
@@ -958,7 +1002,11 @@ fn move_to_sr_ccr(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16, to_sr: bool) -
                 ir,
                 opcode_addr.wrapping_add(bump),
             );
-            return 4 * de + idle_lead(mode, reg) + ADDRESS_ERROR_TAIL_CYCLES;
+            // The extension fetches happened; the frame and vector fetch inside the
+            // 58 do not, if the entry halted.
+            return 4 * de
+                + idle_lead(mode, reg)
+                + exception::entry_cycles(cpu, 0, ADDRESS_ERROR_TAIL_CYCLES);
         }
     }
     let val = ea::read(cpu, bus, ea, Size::Word) as u16;
@@ -1738,6 +1786,12 @@ mod tests {
     /// appear in the exception frame, so the absence of `0xABCD` in all write
     /// values confirms the push never happened — which is the contract at
     /// `exception.rs:148-151`.
+    ///
+    /// **The cycle count is asserted**, and its earlier absence is how this path
+    /// kept returning `ADDRESS_ERROR_TAIL_CYCLES` — 58, `4 × 12 + 10` for an
+    /// aborted access, 7 frame writes, 2 vector reads and 2 refills — on a step
+    /// whose bus log holds exactly one access. The count below is *derived* from
+    /// that log; only [`exception::HALTED_IDLE_CYCLES`] is extrapolated.
     #[test]
     fn pea_with_odd_sp_faults_without_writing() {
         let mut bus = RecordingBus::new();
@@ -1752,7 +1806,7 @@ mod tests {
         bus.log.clear();
 
         let dec = Decoder::new();
-        cpu.step_with(&dec, &mut bus);
+        let cycles = cpu.step_with(&dec, &mut bus);
 
         assert!(cpu.halted, "an odd frame base is a double bus fault");
         assert_eq!(bus.writes(), vec![], "no frame and no operand push");
@@ -1760,6 +1814,14 @@ mod tests {
             !bus.log.iter().any(|&(w, _, v)| w && v == 0xABCD),
             "the operand push must not have happened; 0xABCD appeared in writes: {:04X?}",
             bus.writes()
+        );
+        // `PEA (A0)` has no extension word, so the one access is the queue
+        // advance — and it really happened, so it is still owed.
+        assert_eq!(bus.log.len(), 1, "just the queue advance");
+        assert_eq!(
+            cycles,
+            4 + exception::HALTED_IDLE_CYCLES,
+            "4 × 1 access + the halt idle, not the framed 58"
         );
     }
 
@@ -1773,6 +1835,10 @@ mod tests {
     /// Uses `LINK A0,#0` (not A7) so the pushed value is `A0` and is independent
     /// of SP. `A0` is loaded with `0xDEAD_0000`; the absence of `0xDEAD` in all
     /// write values confirms the push never happened.
+    ///
+    /// The cycle count is asserted for the reason
+    /// `pea_with_odd_sp_faults_without_writing` gives: the framed 58 accounts for
+    /// twelve accesses this step does not make.
     #[test]
     fn link_with_odd_sp_faults_without_writing() {
         let mut bus = RecordingBus::new();
@@ -1787,7 +1853,7 @@ mod tests {
         bus.log.clear();
 
         let dec = Decoder::new();
-        cpu.step_with(&dec, &mut bus);
+        let cycles = cpu.step_with(&dec, &mut bus);
 
         assert!(cpu.halted, "an odd frame base is a double bus fault");
         assert_eq!(bus.writes(), vec![], "no frame and no operand push");
@@ -1795,6 +1861,13 @@ mod tests {
             !bus.log.iter().any(|&(w, _, v)| w && v == 0xDEAD),
             "the operand push must not have happened; 0xDEAD appeared in writes: {:04X?}",
             bus.writes()
+        );
+        // The displacement fetch is the one access that reached the bus.
+        assert_eq!(bus.log.len(), 1, "just the displacement fetch");
+        assert_eq!(
+            cycles,
+            4 + exception::HALTED_IDLE_CYCLES,
+            "4 × 1 access + the halt idle, not the framed 58"
         );
     }
 }

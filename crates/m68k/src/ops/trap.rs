@@ -88,7 +88,9 @@ fn trap(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
     let vector = VEC_TRAP_BASE + (opcode & 0xF) as u8;
     let opcode_addr = cpu.pc.wrapping_sub(exception::OPCODE_PC_OFFSET);
     exception::take(cpu, bus, vector, opcode_addr.wrapping_add(2));
-    GROUP2_CYCLES
+    // No queue advance precedes the frame (see above), so a halted entry logged
+    // nothing: 0 accesses.
+    exception::entry_cycles(cpu, 0, GROUP2_CYCLES)
 }
 
 /// `TRAPV` — trap through vector 7 if V is set, otherwise a no-op.
@@ -124,7 +126,10 @@ fn trapv(cpu: &mut M68k, bus: &mut dyn Bus, _opcode: u16) -> u32 {
     exception::take(cpu, bus, VEC_TRAPV, opcode_addr.wrapping_add(2));
     // One access more than the other group-2 paths, 4 idle cycles fewer:
     // 4*8 + 2 == 4*7 + 6 == 34. See the module docs.
-    4 * (SHORT_FRAME_ACCESSES + 1) + 2
+    //
+    // TRAPV is the one group-2 path with an access *before* the frame, so a halted
+    // entry still owes that leading read: 1 access, not 0.
+    exception::entry_cycles(cpu, 1, 4 * (SHORT_FRAME_ACCESSES + 1) + 2)
 }
 
 /// `RTE` — return from exception: pop the 3-word frame and resume.
@@ -199,7 +204,9 @@ fn rte(cpu: &mut M68k, bus: &mut dyn Bus, _opcode: u16) -> u32 {
     // with no bump (1286/1286, `+2` control 0/1286) — the instruction aborted.
     if !cpu.sr_s() {
         exception::take(cpu, bus, VEC_PRIVILEGE, opcode_addr);
-        return GROUP2_CYCLES;
+        // No access precedes the frame on this path, so an odd frame base leaves
+        // the bus log empty and the 34 collapses. See `exception::entry_cycles`.
+        return exception::entry_cycles(cpu, 0, GROUP2_CYCLES);
     }
 
     let sp = cpu.a[7];
@@ -218,7 +225,15 @@ fn rte(cpu: &mut M68k, bus: &mut dyn Bus, _opcode: u16) -> u32 {
             ir,
             opcode_addr.wrapping_add(2),
         );
-        return ADDRESS_ERROR_TAIL_CYCLES;
+        // An odd SSP is *always* a double bus fault in supervisor mode — this arm
+        // is unreachable with a written frame, since the frame base is this same
+        // odd `a[7]`. So the halt branch is the live one and it logs **zero**
+        // accesses: no pop happened (the check is before the bus), no frame, no
+        // vector fetch. Returning the full 58 here contradicted that log by 58
+        // cycles. `ADDRESS_ERROR_TAIL_CYCLES` is kept as the framed arm rather than
+        // deleted because it becomes reachable the moment `frame_base` can differ
+        // in parity from `sp`, which is exactly the user-mode case.
+        return exception::entry_cycles(cpu, 0, ADDRESS_ERROR_TAIL_CYCLES);
     }
 
     let new_sr = bus.read16(sp & crate::cpu::ADDR_MASK);
@@ -253,7 +268,12 @@ fn rte(cpu: &mut M68k, bus: &mut dyn Bus, _opcode: u16) -> u32 {
         // 70 = 4×15 + 10: the 3 pops, the aborted access, the 7 frame writes,
         // the 2 vector reads, the 2 refills, and 10 idle. The aborted access
         // counts — 614/614 under the timing law.
-        return 4 * 3 + ADDRESS_ERROR_TAIL_CYCLES;
+        //
+        // A halt here needs an odd frame base, which is the post-pop SSP: reachable
+        // only from user mode with an odd SSP, since supervisor entry with an odd
+        // SSP was already caught above. The 3 pops did reach the bus, so they are
+        // still owed.
+        return exception::entry_cycles(cpu, 3, 4 * 3 + ADDRESS_ERROR_TAIL_CYCLES);
     }
 
     cpu.refill_prefetch_dyn(bus);
@@ -328,6 +348,13 @@ mod tests {
     /// what the *contract* gives (`exception.rs`'s "the faulting access must not
     /// have happened", and "no frame"), not an extrapolated frame layout — there
     /// is no frame to have one.
+    ///
+    /// **The cycle count is part of the contract**, and its earlier absence here
+    /// is how this path kept returning `ADDRESS_ERROR_TAIL_CYCLES` — 58, `4 × 12 +
+    /// 10`, paying for an aborted access, 7 frame writes, 2 vector reads and 2
+    /// refills — while performing none of them. The access count below is derived
+    /// from the bus log asserted next to it; only the idle term is extrapolated,
+    /// via [`exception::HALTED_IDLE_CYCLES`].
     #[test]
     fn rte_with_an_odd_ssp_halts_and_writes_nothing() {
         let mut bus = RecordingBus::new();
@@ -342,11 +369,17 @@ mod tests {
         cpu.prime_prefetch(&mut bus);
         bus.log.clear();
 
-        cpu.step_with(&Decoder::new(), &mut bus);
+        let cycles = cpu.step_with(&Decoder::new(), &mut bus);
 
         assert!(cpu.halted, "an odd SSP is a double bus fault");
         assert_eq!(bus.writes(), vec![], "no frame was written");
         assert_eq!(bus.reads(), vec![], "the odd pop never reached the bus");
+        assert_eq!(
+            cycles,
+            exception::HALTED_IDLE_CYCLES,
+            "4 × 0 accesses + the halt idle. The full 58 would be a 58-cycle \
+             claim about a step with an empty bus log"
+        );
         assert_eq!(cpu.a[7], 0x3001, "nothing was committed");
         assert_eq!(cpu.sr, SR_S, "the SR is untouched");
         assert_eq!(cpu.pc, 0x1004, "the PC is untouched");
