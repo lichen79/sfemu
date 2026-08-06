@@ -1724,13 +1724,17 @@ mod tests {
         );
     }
 
-    /// `PEA` with an odd SP faults through vector 3.
+    /// `PEA` with an odd SP faults through vector 3 without writing the operand.
     ///
     /// The stacked PC is not asserted here — there are 0 PEA address-error cases
     /// in the vector suite, so any expected offset is extrapolated rather than
-    /// measured. The test asserts only the observable contract: vector 3 was
-    /// taken. The write-absent check cannot be applied cleanly for write faults
-    /// because the exception frame itself writes to `base - 4 = sp`.
+    /// measured.
+    ///
+    /// The operand write being absent is asserted by value, not by address: `A0`
+    /// is loaded with `0xABCD_0000`, whose halves (`0xABCD`, `0x0000`) cannot
+    /// appear in the exception frame, so the absence of `0xABCD` in all write
+    /// values confirms the push never happened — which is the contract at
+    /// `exception.rs:148-151`.
     #[test]
     fn pea_with_odd_sp_faults_without_writing() {
         let mut bus = RecordingBus::new();
@@ -1739,7 +1743,7 @@ mod tests {
         bus.put16(0x000E, 0x5000);
         bus.load(0x5000, &[0x4E71, 0x4E71]);
         let mut cpu = at(&mut bus);
-        cpu.a[0] = 0x1234;
+        cpu.a[0] = 0xABCD_0000; // distinctive high word; must not appear in writes
         cpu.a[7] = 0x2FFF; // odd: SP - 4 = 0x2FFB, also odd
         cpu.ssp = 0x2FFF;
         bus.log.clear();
@@ -1748,21 +1752,31 @@ mod tests {
         cpu.step_with(&dec, &mut bus);
 
         assert_eq!(cpu.pc, 0x5004, "vectored through 3");
+        assert!(
+            !bus.log.iter().any(|&(w, _, v)| w && v == 0xABCD),
+            "the operand push must not have happened; 0xABCD appeared in writes: {:04X?}",
+            bus.writes()
+        );
     }
 
-    /// `LINK` with an odd SP faults through vector 3.
+    /// `LINK` with an odd SP faults through vector 3 without writing the operand.
     ///
     /// The stacked PC is not asserted here — there are 0 LINK address-error cases
     /// in the vector suite, so any expected offset is extrapolated rather than
     /// measured.
+    ///
+    /// Uses `LINK A0,#0` (not A7) so the pushed value is `A0` and is independent
+    /// of SP. `A0` is loaded with `0xDEAD_0000`; the absence of `0xDEAD` in all
+    /// write values confirms the push never happened.
     #[test]
     fn link_with_odd_sp_faults_without_writing() {
         let mut bus = RecordingBus::new();
-        bus.load(0x1000, &[0x4E57, 0xFFF0, 0x4E71]); // LINK A7,#-16
+        bus.load(0x1000, &[0x4E50, 0x0000, 0x4E71]); // LINK A0,#0
         bus.put16(0x000C, 0x0000); // vector 3 -> 0x5000
         bus.put16(0x000E, 0x5000);
         bus.load(0x5000, &[0x4E71, 0x4E71]);
         let mut cpu = at(&mut bus);
+        cpu.a[0] = 0xDEAD_0000; // distinctive high word; must not appear in writes
         cpu.a[7] = 0x2FFF; // odd: SP - 4 = 0x2FFB, also odd
         cpu.ssp = 0x2FFF;
         bus.log.clear();
@@ -1771,5 +1785,10 @@ mod tests {
         cpu.step_with(&dec, &mut bus);
 
         assert_eq!(cpu.pc, 0x5004, "vectored through 3");
+        assert!(
+            !bus.log.iter().any(|&(w, _, v)| w && v == 0xDEAD),
+            "the operand push must not have happened; 0xDEAD appeared in writes: {:04X?}",
+            bus.writes()
+        );
     }
 }
