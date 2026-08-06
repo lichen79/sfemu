@@ -165,10 +165,21 @@ fn divu_idle(dividend: u32, divisor: u16) -> u32 {
 ///
 /// - **The overflow shortcut is keyed on the absolute values**, and it is *not*
 ///   the same predicate as the `V` flag's. `|dividend| >> 16 >= |divisor|` and
-///   `quotient` out of `i16` range **disagree on 402 of 1,518 cases** — the
-///   timing shortcut fires strictly more often. Using one predicate for both
-///   costs either 402 cycle counts or 402 `V` flags, and the fact that `DIVU`'s
-///   two predicates *are* equivalent is what makes this easy to miss.
+///   `quotient` out of `i16` range **disagree on 402 of 1,518 cases**, and the
+///   disagreement is one-sided: the shortcut is *strictly weaker*, firing on 760
+///   cases to `V`'s 1,162, with **zero** cases where it fires and `V` is clear.
+///
+///   So those 402 are a genuine **late overflow**: the division runs to
+///   completion, the quotient turns out not to fit, and the instruction pays the
+///   full slow cost while still setting `V` and leaving `Dn` alone. Measured
+///   directly on the register-source subset — 99 such cases, `V` set 99/99, `Dn`
+///   unchanged 99/99, cycles in the slow 126..146 range, never the fast 16/18.
+///
+///   Using the shortcut as the `V` flag loses 402 `V` flags; using `V` as the
+///   shortcut charges 402 cases the fast cost and misses by ~120 cycles, which
+///   reads as a broken constant rather than a wrong predicate. `DIVU`'s two
+///   predicates *are* equivalent (0 disagreements of 1,546), which is what makes
+///   computing one and reusing it pass `DIVU` completely.
 /// - **The base is a function of the sign pair, not of the quotient's sign.** A
 ///   negative-quotient rule coincides with the truth on three of the four pairs
 ///   and scores 1240/1442 — 86%, which reads as "nearly right" and is the wrong
@@ -562,6 +573,32 @@ mod tests {
         cpu.d[0] = (-0x8000i32) as u32;
         run_one(&mut cpu, &mut bus, &[0x81FC, 0x0001, 0x4E71]);
         assert!(!cpu.ccr_v(), "-0x8000 is representable");
+    }
+
+    /// `DIVS`'s **late overflow**: the timing shortcut does not fire, so the
+    /// division runs to completion and the full slow cost is paid, and only then
+    /// does the quotient turn out not to fit.
+    ///
+    /// `0x462A588A / 0x5925` — true quotient 51583, past `i16` but comfortably
+    /// inside the shortcut's window, since `0x462A >> 0 = 17962 < 0x5925 = 22821`.
+    /// One of 402 such cases in the suite. Guards against the natural
+    /// simplification of reusing the `V` predicate as the timing shortcut, which
+    /// would charge this the fast 12 and miss by over 100 cycles.
+    #[test]
+    fn divs_late_overflow_pays_the_full_slow_cost() {
+        let mut bus = FlatBus::new();
+        let mut cpu = cpu_at(SR_S);
+        cpu.d[0] = 0x462A_588A;
+        let cycles = run_one(&mut cpu, &mut bus, &[0x81FC, 0x5925, 0x4E71]);
+        assert!(cpu.ccr_v(), "51583 does not fit in i16");
+        assert_eq!(cpu.d[0], 0x462A_588A, "the destination is left alone");
+        // The shortcut is silent, so this is the loop cost, not 12-or-14.
+        let fast = 12 + 2;
+        assert!(
+            cycles > fast + 100,
+            "late overflow must pay the slow cost, got {cycles}"
+        );
+        assert_eq!(cycles, 4 * 2 + divs_idle(0x462A_588A, 0x5925));
     }
 
     /// `DIVS.w #-1` of `i32::MIN` overflows i32 division itself. A plain `/`

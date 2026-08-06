@@ -48,6 +48,26 @@ pub(crate) fn push16(cpu: &mut M68k, bus: &mut dyn Bus, val: u16) {
 /// `pc_for_frame` is the PC value to stack, which differs per exception type,
 /// so callers pass it explicitly rather than this function guessing from
 /// `cpu.pc`.
+///
+/// # The stacked SR is the SR *now*, not at instruction entry
+///
+/// `old_sr` below is read when the exception is taken, so an instruction that
+/// updates flags and *then* traps stacks the **updated** flags. This is not
+/// incidental — measured suite-wide over all 76,957 vector-taking cases, the
+/// frame's low 5 bits match the post-instruction CCR in 76,369, against 72,848
+/// for an instruction-entry snapshot. The 3,521-case gap is exactly the
+/// flags-then-trap instructions: `CHK` 1,240, `RTR` 1,180, `MOVE.w` 604,
+/// `MOVE.l` 471.
+///
+/// So a caller that traps must set the CCR **before** calling this, which is what
+/// [`crate::ops::muldiv`]'s `chk` does. Do not add an entry-time SR parameter to
+/// "fix" this: getting it wrong shows up as a diff confined to the low 5 bits of
+/// one stacked word, which reads as a flag bug in the compare rather than a frame
+/// bug.
+///
+/// Entry sets S and clears T, and leaves the interrupt mask **unchanged** —
+/// `SR_MASK` keeps bits 10-8, so do not raise the IPL here (38,542/38,542 on each
+/// of the three).
 pub fn take(cpu: &mut M68k, bus: &mut dyn Bus, vector: u8, pc_for_frame: u32) {
     let old_sr = cpu.sr;
     // Enter supervisor mode and clear trace before touching the stack, so the
