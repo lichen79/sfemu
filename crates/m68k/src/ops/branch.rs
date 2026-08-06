@@ -117,7 +117,7 @@
 //! DBcc     opcode + 4                632
 //! RTS      opcode + 2               1237
 //! RTR      opcode + 2               1215
-//! JMP      opcode + 2               1271       every addressing mode
+//! JMP      opcode + 2               1228       every addressing mode
 //! JSR      opcode + 2 * (1 + ext)   1159       i.e. its own return address
 //! BSR      the branch target itself 1271       <- the one that is not an opcode offset
 //! ```
@@ -168,12 +168,22 @@ const TAKEN_IDLE: u32 = 2;
 const NOT_TAKEN_IDLE: u32 = 4;
 /// Idle cycles of the `DBcc` counter-expiry fall-through.
 ///
-/// **Extrapolated, not measured.** The suite contains zero expiry cases (see
-/// [`dbcc`]), so this is the value that makes the total 14 cycles under the
-/// timing law given the two program fetches the fall-through must perform. The
-/// 14 itself is the 68000 manual's figure for the expired case, against a
-/// measured 12 for condition-true and 10 for taken, both of which the manual also
-/// gives and the vectors confirm.
+/// **Both this constant and the fetch count below are unverified — neither is
+/// backed by a suite case or a physical timing table.**
+///
+/// The 68000 manual's row for cc-false, counter-expired is `14(3/0)` — three
+/// read cycles, i.e. `4*3 + 2` — as reported by review; that table could not be
+/// verified against a physical copy. This implementation emits **2** fetches,
+/// not 3: a fall-through must advance the queue past the opcode and the
+/// displacement word, which is exactly two program reads, and three would leave
+/// the queue inconsistent. `EXPIRY_IDLE = 6` is then the value that makes the
+/// total agree with the manual's 14 (`4*2 + 6 = 14`). The suite confirms the
+/// total for the measured rows (12 and 10), but zero cases reach expiry, so
+/// neither the access count nor the idle split has any vector coverage.
+///
+/// **Consequence:** a future vector or hardware trace that reaches expiry may
+/// match on total cycles and still fail on access sequence. If that happens, the
+/// fetch count is the first thing to re-examine.
 const EXPIRY_IDLE: u32 = 6;
 
 /// Is the target of a jump or branch misaligned?
@@ -191,7 +201,7 @@ fn target_faults(target: u32) -> bool {
 /// `acc` and `idle` are what the instruction spent *before* the fault; the tail
 /// is fixed at [`ADDRESS_ERROR_TAIL_CYCLES`], which already accounts for the
 /// aborted access. The fault is always a program-space read — see the module
-/// docs' 6,295/6,295.
+/// docs' 7,412/7,412.
 fn target_error(
     cpu: &mut M68k,
     bus: &mut dyn Bus,
