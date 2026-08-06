@@ -17,8 +17,9 @@
 //! if src mode is -(An), (d8,An,Xn) or (d8,PC,Xn):  2 idle cycles
 //! b = src is memory ? min(de, 1) : de
 //! c = N - se - b
-//!   se + 1 program fetches          (the opcode leaving the queue, then the
-//!                                    source's extension words)
+//!   se program fetches              (the source's extension words; the
+//!                                    opcode's own queue advance is counted in
+//!                                    `c`, NOT here — `se`, not `se + 1`)
 //!   nr source reads
 //!   if dst mode is (d8,An,Xn):  2 idle cycles
 //!   b program fetches
@@ -74,14 +75,11 @@ impl Operands {
         }
     }
 
-    fn src_is_reg(&self) -> bool {
-        self.src_mode <= 1
-    }
-
     /// True when the source is not a memory operand — a register *or* an
-    /// immediate. The write-fault CCR table keys on this rather than on
-    /// `src_is_reg`: immediates follow the register rules in all four
-    /// destination modes where they occur alongside a long write fault.
+    /// immediate. The write-fault CCR table keys on this rather than on a
+    /// register-only test, because immediates follow the register rules in all
+    /// four destination modes where they occur alongside a long write fault
+    /// (counts in [`set_write_fault_flags`]).
     fn src_is_not_mem(&self) -> bool {
         self.src_mode <= 1 || (self.src_mode == 7 && self.src_reg == 4)
     }
@@ -125,7 +123,9 @@ fn operand_words(size: Size) -> u32 {
 /// - `-(An)` as a source splits on **size**: `.w` stacks `+4`, `.l` stacks `+2`.
 /// - Write faults **do** add `2 * src_ext` — the *source's* count. The
 ///   destination's extension words are fetched but do not move the stacked PC.
-/// - An `abs.L` destination adds a further `+2`, but only for register sources.
+/// - An `abs.L` destination adds a further `+2`, but only when the source
+///   performs no data-space read. See the note on the write arm: the immediate
+///   half of that condition is reasoned, not measured.
 fn stacked_pc(opcode_addr: u32, ops: &Operands, size: Size, kind: FaultKind, src_ext: u32) -> u32 {
     match kind {
         FaultKind::Read => {
@@ -144,8 +144,24 @@ fn stacked_pc(opcode_addr: u32, ops: &Operands, size: Size, kind: FaultKind, src
             opcode_addr.wrapping_add(2).wrapping_add(bump)
         }
         FaultKind::Write => {
+            // The `+2` keys on "the source performs no data-space read", which
+            // is `src_is_not_mem` — the same predicate `set_write_fault_flags`
+            // uses, and for the same reason: a register needs no fetch and an
+            // immediate arrives through *program* space, so neither issues the
+            // data read that a memory source does.
+            //
+            // UNMEASURED for immediates, and unmeasurable from this suite: a
+            // register source always has `src_ext == 0` and an immediate always
+            // has `src_ext >= 1`, so the two can never land in the same bucket.
+            // Measured buckets are `(se=0, de=2, reg) -> +2` (14 cases) and
+            // `(se=0..2, de=2, mem) -> +0` (13 cases); there is **no
+            // `abs.L`-destination immediate-source write fault anywhere in
+            // MOVE.w or MOVE.l**. Decided by analogy with §10.1, where
+            // immediates provably follow the register column in all four
+            // destination modes that do have cases. If a later group ever
+            // produces such a case, trust it over this comment.
             let dst_is_abs_long = ops.dst_mode == 7 && ops.dst_reg == 1;
-            let bonus = if dst_is_abs_long && ops.src_is_reg() {
+            let bonus = if dst_is_abs_long && ops.src_is_not_mem() {
                 2
             } else {
                 0
@@ -179,9 +195,10 @@ fn set_move_flags(cpu: &mut M68k, val: u32, size: Size) {
 
 /// CCR for a MOVE whose **destination write** faulted.
 ///
-/// A read fault leaves the CCR untouched (1,708/1,708), so this is only reached
-/// on a write fault — where the flag update has already happened even though the
-/// write never commits. Three rules appear, all preserving X:
+/// A read fault leaves the CCR untouched — exact in both measured buckets,
+/// 839/839 for `MOVE.w` and 869/869 for `MOVE.l` (addendum §7b) — so this is
+/// only reached on a write fault, where the flag update has already happened
+/// even though the write never commits. Three rules appear, all preserving X:
 ///
 /// ```text
 /// A = CCR fully preserved
@@ -193,9 +210,9 @@ fn set_move_flags(cpu: &mut M68k, val: u32, size: Size) {
 /// a faulting long reflect one 16-bit word, never the whole 32 bits: the write is
 /// two bus cycles and the CCR shows only the one that was in flight.
 ///
-/// `MOVE.w` is rule B on the operand, unconditionally, 616/616. `MOVE.l` needs a
-/// table keyed on the destination mode and on whether the source was a register
-/// — 596/596:
+/// `MOVE.w` is rule B on the operand, unconditionally — all 648 write-fault
+/// cases. `MOVE.l` needs a table keyed on the destination mode and on whether
+/// the source reads memory — all 618 write-fault cases:
 ///
 /// ```text
 ///   destination     register source    memory source
@@ -213,9 +230,32 @@ fn set_move_flags(cpu: &mut M68k, val: u32, size: Size) {
 /// describe the high one. Verified on the 250 long cases where the two words
 /// disagree in N or Z, so neither half is a coincidence.
 ///
-/// The rule-A rows rest on 89 cases and the `abs` rows on 12-20 each; every row
-/// is unanimous, but a future suite disagreement should be believed over this
-/// table.
+/// Row support, counted (the 618 `MOVE.l` write faults sum exactly across the
+/// 14 rows, so no row is silently unpopulated):
+///
+/// ```text
+///                   non-mem source   memory source
+///   (An)                        49              60
+///   (An)+                       45              61
+///   -(An)                       54              54
+///   d16(An)                     61              60
+///   (d8,An,Xn)                  54              88
+///   abs.W                        4              12
+///   abs.L                        8               8
+/// ```
+///
+/// The two rule-A rows together rest on 94 cases. **The `abs` rows rest on 4 to
+/// 12 cases each — `abs.W` with a non-memory source is the thinnest row in the
+/// table at 4.** Every row is unanimous, but these four rows are the ones a
+/// future suite disagreement is most likely to overturn, and it should be
+/// believed over this table.
+///
+/// Splitting the non-memory column into register and immediate shows the
+/// immediate sub-rows following the register column wherever they have cases:
+/// `(An)` 1/1 and `(An)+` 4/4 fully preserve the CCR (rule A), `d16(An)` 2/2
+/// never clear V or C (rule C), and `-(An)` 1/1 does clear them (rule B). Only
+/// `abs.W` and `abs.L` have no immediate-source case at all, which is why the
+/// predicate below is `src_is_not_mem` rather than a register-only test.
 fn set_write_fault_flags(cpu: &mut M68k, val: u32, size: Size, ops: &Operands) {
     if size != Size::Long {
         set_move_flags(cpu, val, size);
@@ -590,12 +630,13 @@ mod tests {
     use crate::decode::Decoder;
 
     /// Builds a CPU sitting at 0x1000 with the queue primed, in supervisor mode.
-    fn at(bus: &mut impl Bus, words: &[u16]) -> M68k {
+    /// The instruction words come from `bus.load` at the call site, so this only
+    /// primes the queue from whatever is already there.
+    fn at(bus: &mut impl Bus) -> M68k {
         let mut cpu = M68k::new();
         cpu.sr = crate::cpu::SR_S;
         cpu.a[7] = 0x3000;
         cpu.pc = 0x1000;
-        let _ = words;
         cpu.prime_prefetch(bus);
         cpu
     }
@@ -604,7 +645,7 @@ mod tests {
     fn moveq_sign_extends_and_sets_flags() {
         let mut bus = FlatBus::new();
         bus.load(0x1000, &[0x70FF, 0x4E71]); // MOVEQ #-1,D0
-        let mut cpu = at(&mut bus, &[]);
+        let mut cpu = at(&mut bus);
         let dec = Decoder::new();
         let cycles = cpu.step_with(&dec, &mut bus);
 
@@ -622,7 +663,7 @@ mod tests {
         let mut bus = RecordingBus::new();
         bus.load(0x1000, &[0x1290, 0x4E71, 0x4E71]); // MOVE.b (A0),(A1)
         bus.put16(0x2000, 0xAB00);
-        let mut cpu = at(&mut bus, &[]);
+        let mut cpu = at(&mut bus);
         cpu.a[0] = 0x2000;
         cpu.a[1] = 0x2100;
         bus.log.clear();
@@ -648,7 +689,7 @@ mod tests {
     fn predecrement_destination_writes_after_the_final_fetch() {
         let mut bus = RecordingBus::new();
         bus.load(0x1000, &[0x3300, 0x4E71, 0x4E71]); // MOVE.w D0,-(A1)
-        let mut cpu = at(&mut bus, &[]);
+        let mut cpu = at(&mut bus);
         cpu.d[0] = 0x1234;
         cpu.a[1] = 0x2100;
         bus.log.clear();
@@ -671,7 +712,7 @@ mod tests {
     fn move_long_into_predecrement_writes_low_word_first() {
         let mut bus = RecordingBus::new();
         bus.load(0x1000, &[0x2300, 0x4E71, 0x4E71]); // MOVE.l D0,-(A1)
-        let mut cpu = at(&mut bus, &[]);
+        let mut cpu = at(&mut bus);
         cpu.d[0] = 0xAAAA_BBBB;
         cpu.a[1] = 0x2100;
         bus.log.clear();
@@ -699,7 +740,7 @@ mod tests {
         bus.put16(0x000C, 0x0000); // vector 3
         bus.put16(0x000E, 0x4000);
         bus.load(0x4000, &[0x4E71, 0x4E71]); // the handler
-        let mut cpu = at(&mut bus, &[]);
+        let mut cpu = at(&mut bus);
         cpu.a[0] = 0x2001; // odd
         bus.log.clear();
 
@@ -732,7 +773,7 @@ mod tests {
         let mut bus = FlatBus::new();
         bus.load(0x1000, &[0x3010, 0x4E71]); // MOVE.w (A0),D0
         bus.put16(0x000E, 0x2000);
-        let mut cpu = at(&mut bus, &[]);
+        let mut cpu = at(&mut bus);
         cpu.a[0] = 0x2001;
         cpu.sr |= crate::cpu::SR_C | crate::cpu::SR_V;
         let before = cpu.sr & 0x1F;
@@ -747,7 +788,7 @@ mod tests {
     fn movea_word_sign_extends_and_leaves_flags_alone() {
         let mut bus = FlatBus::new();
         bus.load(0x1000, &[0x3240, 0x4E71]); // MOVEA.w D0,A1
-        let mut cpu = at(&mut bus, &[]);
+        let mut cpu = at(&mut bus);
         cpu.d[0] = 0x0000_8001;
         cpu.a[1] = 0x1111_1111;
         cpu.sr |= crate::cpu::SR_C;
@@ -769,7 +810,7 @@ mod tests {
         let mut bus = RecordingBus::new();
         bus.load(0x1000, &[0x13D0, 0x0000, 0x2100, 0x4E71, 0x4E71]); // MOVE.b (A0),$2100
         bus.put16(0x2000, 0xCD00);
-        let mut cpu = at(&mut bus, &[]);
+        let mut cpu = at(&mut bus);
         cpu.a[0] = 0x2000;
         bus.log.clear();
 

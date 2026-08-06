@@ -38,9 +38,9 @@ pub(crate) fn push16(cpu: &mut M68k, bus: &mut dyn Bus, val: u16) {
 /// not match three simple push16 operations.  From the Users Manual and
 /// confirmed by the SingleStepTests bus-transaction sequence:
 ///
-///   1.  PC[15:0]  → old_SSP − 2   (highest address in the frame)
+///   1.  `PC[15:0]`  → old_SSP − 2   (highest address in the frame)
 ///   2.  SR        → old_SSP − 6   (lowest address; new SSP lands here)
-///   3.  PC[31:16] → old_SSP − 4   (middle of the frame)
+///   3.  `PC[31:16]` → old_SSP − 4   (middle of the frame)
 ///
 /// The result in memory (growing downward) is a canonical big-endian long PC
 /// followed by the SR word, with new_SSP pointing at the SR.
@@ -123,21 +123,23 @@ pub const ADDRESS_ERROR_TAIL_CYCLES: u32 = 58;
 /// - `ir` — the instruction register at fault time. This is the opcode in every
 ///   case except a word-sized write fault into `-(An)`, where the pipeline has
 ///   advanced one word further (addendum §9.5c).
-/// - `pc_for_frame` — see [`address_error_stacked_pc`]; it is not a fixed
-///   offset from the opcode.
+/// - `pc_for_frame` — **not** a fixed offset from the opcode, and not
+///   `cpu.pc` at fault time either. It depends on the fault direction, the
+///   addressing mode and the operand size; `ops::move_::stacked_pc` derives it
+///   for the MOVE family and addendum §8 gives the general formula.
 ///
 /// Bus write order, continuing the short frame's "low half, then skip back,
 /// then fill in" pattern, verified 6,579/6,579:
 ///
 /// | order | address     | contents      |
 /// |-------|-------------|---------------|
-/// | 1     | `base - 2`  | PC[15:0]      |
+/// | 1     | `base - 2`  | `PC[15:0]`    |
 /// | 2     | `base - 6`  | SR            |
-/// | 3     | `base - 4`  | PC[31:16]     |
+/// | 3     | `base - 4`  | `PC[31:16]`   |
 /// | 4     | `base - 8`  | IR            |
-/// | 5     | `base - 10` | fault[15:0]   |
+/// | 5     | `base - 10` | `fault[15:0]` |
 /// | 6     | `base - 14` | status word   |
-/// | 7     | `base - 12` | fault[31:16]  |
+/// | 7     | `base - 12` | `fault[31:16]`|
 ///
 /// `base` is `cpu.a[7]` **as it stands now** — not the instruction's entry SP.
 /// A faulting `-(A7)` or `(A7)+` has already moved it, and the frame lands

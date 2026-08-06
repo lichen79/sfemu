@@ -93,19 +93,13 @@ pub enum Ea {
     Imm(u32),
 }
 
-impl Ea {
-    /// True for the memory modes — the ones that can raise an address error and
-    /// the ones that cost bus cycles.
-    #[inline]
-    pub fn is_mem(self) -> bool {
-        matches!(self, Ea::Mem(_))
-    }
-}
-
 /// True if `(mode, reg)` names a memory operand.
 ///
 /// Used by the schedule model, which must know this *before* resolving, to
-/// decide how many program fetches precede the operand access.
+/// decide how many program fetches precede the operand access. There is
+/// deliberately no `Ea::is_mem` counterpart: every caller so far needs the
+/// answer while planning the bus schedule, which is strictly earlier than
+/// having an [`Ea`] in hand, and a post-resolve variant went unused.
 #[inline]
 pub fn mode_is_mem(mode: u16, reg: u16) -> bool {
     matches!(mode, 2..=6) || (mode == 7 && reg <= 3)
@@ -180,6 +174,16 @@ fn indexed(cpu: &M68k, base: u32, ext: u16) -> u32 {
 /// resolution. That is deliberate and observable: when a later access faults,
 /// the adjustment is already committed, which is what the vectors record
 /// (addendum §9.3).
+///
+/// # Panics
+///
+/// `ext.len()` **must** be at least `ext_words(mode, reg, size)`. That is the
+/// contract: always size the slice with [`ext_words`] under the same
+/// `(mode, reg, size)` rather than counting words by hand, because the two
+/// functions are keyed identically and cannot then disagree. Passing a shorter
+/// slice — for instance `&[]` for `d16(An)` because the handler fetched the
+/// displacement into a local — panics on the index. A panic is a *host* bug;
+/// guest faults are emulated 68000 exceptions and never unwind.
 pub fn resolve(cpu: &mut M68k, mode: u16, reg: u16, size: Size, ext: &[u16], ext_base: u32) -> Ea {
     let r = reg as usize;
     match mode {
@@ -243,8 +247,12 @@ pub fn read(cpu: &M68k, bus: &mut dyn Bus, ea: Ea, size: Size) -> u32 {
 /// Writes a resolved operand.
 ///
 /// A `Size::Byte` or `Size::Word` write into a register leaves the register's
-/// upper bits alone; `AddrReg` writes always take the full 32 bits, because
-/// every instruction that writes an address register does so long-sized.
+/// upper bits alone. An `AddrReg` write instead takes the full 32 bits and
+/// **sign-extends** a word-sized value: every instruction that writes an address
+/// register affects all 32 bits, and the word-sized forms (`MOVEA.w`, `ADDA.w`,
+/// `SUBA.w`) get there by sign extension. Truncating instead would store
+/// `0x0000_8001` where `0xFFFF_8001` is required. The extension is a no-op for
+/// `Size::Long`, so the long-sized forms are unaffected.
 ///
 /// Long writes are two word accesses, **high word first**. The one exception —
 /// `-(An)`, which writes the low word first — is handled by
@@ -256,7 +264,7 @@ pub fn write(cpu: &mut M68k, bus: &mut dyn Bus, ea: Ea, size: Size, val: u32) {
             let m = size.mask();
             cpu.d[r] = (cpu.d[r] & !m) | (val & m);
         }
-        Ea::AddrReg(r) => cpu.a[r] = val,
+        Ea::AddrReg(r) => cpu.a[r] = size.sign_extend(val),
         Ea::Imm(_) => unreachable!("cannot write to an immediate operand"),
         Ea::Mem(addr) => {
             let a = addr & ADDR_MASK;
