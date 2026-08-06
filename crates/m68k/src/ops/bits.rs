@@ -149,6 +149,11 @@ fn bit_op(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16, op: Op, static_form: b
     if static_form {
         plan = plan.pre(1);
     }
+    // `Plan::writes` is dead state — it is assigned by every handler in the
+    // crate and read by none. What actually decides the write is whether the
+    // `compute` closure below returns `Some`, which for `BTST` it does not. Set
+    // here only for symmetry with the existing handlers; a fix that removes the
+    // field is queued separately.
     if op.writes() {
         plan = plan.writes();
     }

@@ -453,6 +453,12 @@ fn implemented_tasks_claim_exactly_the_legal_encodings() {
     }
     // A guard against the classifier itself going vacuous: if a refactor made
     // `claim` return `Later` everywhere the assertions above would all pass.
+    //
+    // The thresholds are floors, not measurements. Task 7 took `mine` from
+    // 20,177 to 25,461 and `illegal` from 3,632 to 4,556, so the first bound is
+    // no longer the 0.9% margin it was at Task 6 — but leave it where it is
+    // rather than tracking the count upward, since a guard that has to be
+    // adjusted every task is a guard nobody trusts.
     assert!(
         mine > 20_000,
         "only {mine} opcodes classified as implemented"
