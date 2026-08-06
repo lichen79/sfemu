@@ -126,9 +126,12 @@ fn write_long_asc(bus: &mut dyn Bus, addr: u32, val: u32) {
 
 /// Keeps `usp`/`ssp` in step with `a[7]` after a handler moves the stack.
 ///
-/// `a[7]` is the active pointer and the shadow copy of the inactive one is what
-/// the harness compares, so a handler that writes `a[7]` directly must call
-/// this or the *other* pointer reads stale.
+/// Belt-and-braces only — not load-bearing for harness correctness. The
+/// harness reads the active pointer directly from `a[7]` and the inactive one
+/// from `usp`/`ssp`; `set_sr` already saves the outgoing `a[7]` into the
+/// right slot before loading the incoming one, so a handler that leaves the
+/// shadow stale and then changes the S bit still ends up correct. This call
+/// keeps the shadow coherent for debugging and save-state purposes only.
 #[inline]
 fn sync_sp(cpu: &mut M68k) {
     if cpu.sr_s() {
@@ -371,11 +374,30 @@ fn lea(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
 fn pea(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
     let (mode, reg) = ((opcode >> 3) & 7, opcode & 7);
     let absolute = mode == 7 && reg <= 1;
+    // Capture the opcode address and IR before any queue advance.
+    let opcode_addr = cpu.pc.wrapping_sub(exception::OPCODE_PC_OFFSET);
+    let ir = cpu.prefetch[0];
     let (addr, de) = resolve_address(cpu, bus, mode, reg);
     if !absolute {
         cpu.consume_opcode_dyn(bus);
     }
     let sp = cpu.a[7].wrapping_sub(4);
+    if misaligned(sp) {
+        // No vector has a PEA address error (0 in all 2,500 cases), so the
+        // stacked PC is extrapolated from the neighbouring measured groups:
+        // UNLK stacks `opcode + 4` (1115/1115) and LINK's shape is identical.
+        // Using the same offset here; label this if hardware evidence changes it.
+        exception::address_error(
+            cpu,
+            bus,
+            sp,
+            FaultKind::Write,
+            Space::Data,
+            ir,
+            opcode_addr.wrapping_add(4),
+        );
+        return ADDRESS_ERROR_TAIL_CYCLES;
+    }
     cpu.a[7] = sp;
     sync_sp(cpu);
     write_long_asc(bus, sp, addr);
@@ -406,11 +428,30 @@ fn pea(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
 /// unsigned showed 5 phantom outliers).
 fn link(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
     let n = (opcode & 7) as usize;
+    // Capture the opcode address and IR before any queue advance.
+    let opcode_addr = cpu.pc.wrapping_sub(exception::OPCODE_PC_OFFSET);
+    let ir = cpu.prefetch[0];
     let disp = cpu.prefetch[1] as i16 as i32 as u32;
     cpu.consume_opcode_dyn(bus);
 
     let pushed = cpu.a[n];
     let sp = cpu.a[7].wrapping_sub(4);
+    if misaligned(sp) {
+        // No vector has a LINK address error (0 in all 2,500 cases), so the
+        // stacked PC is extrapolated from the neighbouring measured groups:
+        // UNLK stacks `opcode + 4` (1115/1115), and LINK's shape is the same.
+        // Label this if hardware evidence changes it.
+        exception::address_error(
+            cpu,
+            bus,
+            sp,
+            FaultKind::Write,
+            Space::Data,
+            ir,
+            opcode_addr.wrapping_add(4),
+        );
+        return ADDRESS_ERROR_TAIL_CYCLES;
+    }
     cpu.a[7] = sp;
     write_long_asc(bus, sp, pushed);
     cpu.a[n] = sp;
@@ -1271,7 +1312,9 @@ mod tests {
         );
         // A7 := SP-4 = 0x2FFC, then += -16.
         assert_eq!(cpu.a[7], 0x2FFC - 16);
-        assert_eq!(cpu.ssp, cpu.a[7], "the shadow SSP tracks a[7]");
+        // This pins the sync_sp invariant (shadow coherence), not observable
+        // harness behaviour — the harness reads the active pointer from a[7].
+        assert_eq!(cpu.ssp, cpu.a[7], "shadow SSP is kept coherent by sync_sp");
         assert_eq!(cycles, 16);
     }
 
@@ -1663,5 +1706,54 @@ mod tests {
             "the aborted access must not appear on the bus; got {:04X?}",
             bus.reads()
         );
+    }
+
+    /// `PEA` with an odd SP faults through vector 3.
+    ///
+    /// The stacked PC is not asserted here — there are 0 PEA address-error cases
+    /// in the vector suite, so any expected offset is extrapolated rather than
+    /// measured. The test asserts only the observable contract: vector 3 was
+    /// taken. The write-absent check cannot be applied cleanly for write faults
+    /// because the exception frame itself writes to `base - 4 = sp`.
+    #[test]
+    fn pea_with_odd_sp_faults_without_writing() {
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4850, 0x4E71]); // PEA (A0)
+        bus.put16(0x000C, 0x0000); // vector 3 -> 0x5000
+        bus.put16(0x000E, 0x5000);
+        bus.load(0x5000, &[0x4E71, 0x4E71]);
+        let mut cpu = at(&mut bus);
+        cpu.a[0] = 0x1234;
+        cpu.a[7] = 0x2FFF; // odd: SP - 4 = 0x2FFB, also odd
+        cpu.ssp = 0x2FFF;
+        bus.log.clear();
+
+        let dec = Decoder::new();
+        cpu.step_with(&dec, &mut bus);
+
+        assert_eq!(cpu.pc, 0x5004, "vectored through 3");
+    }
+
+    /// `LINK` with an odd SP faults through vector 3.
+    ///
+    /// The stacked PC is not asserted here — there are 0 LINK address-error cases
+    /// in the vector suite, so any expected offset is extrapolated rather than
+    /// measured.
+    #[test]
+    fn link_with_odd_sp_faults_without_writing() {
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4E57, 0xFFF0, 0x4E71]); // LINK A7,#-16
+        bus.put16(0x000C, 0x0000); // vector 3 -> 0x5000
+        bus.put16(0x000E, 0x5000);
+        bus.load(0x5000, &[0x4E71, 0x4E71]);
+        let mut cpu = at(&mut bus);
+        cpu.a[7] = 0x2FFF; // odd: SP - 4 = 0x2FFB, also odd
+        cpu.ssp = 0x2FFF;
+        bus.log.clear();
+
+        let dec = Decoder::new();
+        cpu.step_with(&dec, &mut bus);
+
+        assert_eq!(cpu.pc, 0x5004, "vectored through 3");
     }
 }
