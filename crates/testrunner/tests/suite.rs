@@ -3,7 +3,7 @@
 //! Groups are enabled as the core learns to execute them. Run with `--release`:
 //! 2500 cases per group is slow in a debug build.
 
-use testrunner::runner::assert_group;
+use testrunner::runner::{assert_group, assert_known_bad};
 
 macro_rules! group {
     ($fname:ident, $name:literal) => {
@@ -133,15 +133,23 @@ group!(bclr, "BCLR");
 group!(bchg, "BCHG");
 
 /// Known-bad upstream: `TAS`'s indivisible read-modify-write is not modelled by
-/// the vector generator. Asserted as failing so an upstream fix surfaces.
+/// the vector generator. Asserted as *partially* failing so an upstream fix
+/// surfaces.
 ///
 /// The failure is specifically in the *ordered* transactions — the vectors place
 /// an idle between the read and the write, and never use the format's dedicated
 /// `Tas` transaction kind at all. Every value the handler computes is confirmed
 /// against these same vectors: the timing law holds 2,500/2,500, and so do the
 /// predicted cycle count and the result-and-CCR prediction.
+///
+/// `assert_known_bad` rather than `#[should_panic]` around `assert_group`: the
+/// latter passes when the vector file is missing, because the group's name appears
+/// in that panic message too.
 #[test]
-#[should_panic(expected = "TAS")]
 fn tas_is_known_bad() {
-    assert_group("TAS");
+    assert_known_bad(
+        "TAS",
+        "the generator models TAS's read-modify-write as read, idle, write and \
+         never emits the format's Tas transaction kind",
+    );
 }
