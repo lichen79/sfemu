@@ -84,8 +84,17 @@ pub struct M68k {
     /// measures 1 traced instruction in 200 steps that way, against 4 in 12 here.
     ///
     /// Nothing consults the live T bit once this is latched; see
-    /// [`crate::exception::take_trace`]. `ops::system::stop` may *raise* it after
-    /// the latch, for the manual's rule about a `STOP` immediate that sets T.
+    /// [`crate::exception::take_trace`]. Two places move the flag afterwards, and
+    /// both are rules rather than conveniences:
+    ///
+    /// - `ops::system::stop` may *raise* it, for the manual's rule about a `STOP`
+    ///   immediate that sets T — the start-of-instruction latch cannot see that,
+    ///   because T was clear when the `STOP` began.
+    /// - [`crate::exception::address_error`] *withdraws* it. The PRM owes the trace
+    ///   only once the instruction has **completed**, and a group-0 fault aborts it.
+    ///   An instruction *trap* is a completion and keeps its trace, so the two kinds
+    ///   of exception are opposite here and a shared `!halted` test cannot express
+    ///   both.
     pub trace_pending: bool,
 }
 
@@ -364,14 +373,29 @@ impl M68k {
         // re-enters having executed nothing. See `trace_pending` for the two
         // discriminating cases, both asserted.
         //
-        // ⚠️ Nothing below re-reads T, and in particular an instruction that
-        // *entered an exception* still owes the trace it latched here. The manual's
-        // priority table has trace processed after the instruction's own exception,
-        // so a traced `TRAP` stacks the trap frame and then the trace frame, and the
-        // trace handler's `RTE` returns into the trap handler. Zero suite coverage
-        // (0 vector-9 fetches in 317,500): extrapolated. The previous end-of-
-        // instruction read suppressed this case as a side effect of entry clearing
-        // T, which is not the same as deciding it.
+        // ⚠️ Nothing below re-reads T, but the latch is not the whole rule: the PRM
+        // owes the trace only once the instruction has **completed**, and that splits
+        // the exception cases in two rather than treating them alike.
+        //
+        // - An instruction **trap** is a completion. `TRAP`, `TRAPV`, `CHK`,
+        //   divide-by-zero, illegal and privilege all did what they are defined to do,
+        //   so the trace is still owed: a traced `TRAP` stacks the trap frame and then
+        //   the trace frame, and the trace handler's `RTE` returns into the trap
+        //   handler. That is this line's business, and it is why nothing here
+        //   withdraws the latch.
+        // - An **address or bus error aborts**. The instruction stopped mid-way with
+        //   its operand unstored, so the PRM's condition is never met and no trace is
+        //   owed. `exception::address_error` withdraws the latch, because it is the
+        //   only place that knows an abort happened.
+        //
+        // Both directions are extrapolated (0 vector-9 fetches in 317,500) and both
+        // are asserted by
+        // `exception::tests::an_aborted_instruction_owes_no_trace_but_a_completed_trap_does`.
+        // ⚠️ The 38,542/38,542 "exception entry clears T" census cannot decide this
+        // and must not be cited for it: entry clears T on *both* paths, so it does not
+        // distinguish them. A coarse `!halted` test does not either — that form owed a
+        // trace after an aborted instruction, probed as a vector-9 entry on the step
+        // following a faulting `MOVE.W D0,(A0)`.
         self.trace_pending = self.sr & SR_T != 0;
         // Peek at the opcode without touching the queue.
         // Instruction handlers call `consume_opcode` (or `fetch_word` for the

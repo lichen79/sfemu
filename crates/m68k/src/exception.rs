@@ -368,6 +368,24 @@ pub fn address_error(
     cpu.pc = (hi << 16) | lo;
     cpu.refill_prefetch_dyn(bus);
     cpu.in_exception = false;
+    // An aborted instruction owes no trace, and this is the only place that knows an
+    // abort happened. The PRM conditions the trace on the instruction being
+    // *completed*; a group-0 fault stops it mid-way, with the operand unstored. So
+    // the trace latched at this instruction's start is withdrawn here.
+    //
+    // ⚠️ Deliberately **not** done in `take`, which is the group-1/2 path. An
+    // instruction trap is a completion — `TRAP`, `TRAPV`, `CHK`, divide-by-zero,
+    // illegal and privilege all did exactly what they are defined to do — so those
+    // still owe their trace, taken before the handler's first instruction. The two
+    // cases are opposite, which is why the withdrawal lives at the group-0
+    // chokepoint rather than at a shared `!halted` test.
+    //
+    // Both directions are asserted by
+    // `tests::an_aborted_instruction_owes_no_trace_but_a_completed_trap_does`, and
+    // both are extrapolated: vector 9 is fetched 0 times in 317,500 cases. The
+    // 38,542/38,542 "entry clears T" census cannot adjudicate this — entry clears T
+    // on both paths, so it does not distinguish them.
+    cpu.trace_pending = false;
 }
 
 /// Cycles an autovectored interrupt costs.
@@ -895,10 +913,21 @@ mod tests {
     /// Vector 9 is fetched **0** times in all 317,500 cases, against a control of
     /// 2,500 TRAP fetches recovered by the same code, while 158,894 cases enter
     /// with T=1. So the cost and the stacked PC below are extrapolated from the
-    /// other group-2 paths (34 cycles, `4 × 7 + 6`, a singleton across five
-    /// measured paths). The *timing* — after, not during — is the measured part:
-    /// any implementation that traced within the instruction's own step would
-    /// fail 38% of the suite.
+    /// group-2 paths that *are* measured at 34 cycles: the **twelve groups** at
+    /// `4 × 7 + 6` — TRAP 2500, LINE-A 2500, LINE-F 2500 and the nine privilege
+    /// groups' 11,276, so 18,776 cases — plus TRAPV's 1250 reaching 34 at
+    /// `4 × 8 + 2`. Borrowing the 7-access arm is a choice between those two
+    /// shapes, not a reading off a uniform family, and `CHK` shows the category
+    /// is not uniform at all: it is group 2 and costs 38-52, never 34.
+    ///
+    /// Vectors **4** (illegal instruction) and **5** (divide-by-zero) are also
+    /// fetched 0 times, so this is one of *three* unmeasured entry paths, not a
+    /// lone gap. `ILLEGAL_LINEA`/`ILLEGAL_LINEF` measure vectors 10 and 11 — the
+    /// group names say ILLEGAL but neither exercises vector 4.
+    ///
+    /// The *timing* — after, not during — is the measured part: any
+    /// implementation that traced within the instruction's own step would fail
+    /// 38% of the suite.
     #[test]
     fn trace_fires_on_the_boundary_after_the_instruction() {
         let mut bus = RecordingBus::new();
@@ -1272,6 +1301,115 @@ mod tests {
             "tracing begins with the instruction after the one that set T"
         );
         assert_eq!(cpu.pc, 0x2004, "vectored through 9");
+    }
+
+    /// An instruction that *aborts* on an address error owes **no** trace; one that
+    /// completes into an instruction trap still does.
+    ///
+    /// The PRM conditions the trace on the instruction being **completed**:
+    ///
+    /// > "If the T bit is set at the beginning of the execution of an instruction, a
+    /// > trace exception is generated after the instruction is completed."
+    ///
+    /// Group 0 faults (address error, bus error) abort mid-instruction — the write
+    /// never happens and the operand is never stored — so the condition is not met
+    /// and no trace is owed. Group 1/2 instruction traps (`TRAP`, `TRAPV`, `CHK`,
+    /// divide-by-zero, illegal, privilege) *are* completions: the instruction did
+    /// exactly what it is defined to do, so the trace is still owed and is taken
+    /// before the handler's first instruction.
+    ///
+    /// So the two are opposite, and a single `!halted` test cannot express both. This
+    /// distinction was previously implemented in the coarse form — every latched
+    /// trace survived any non-halting exception — which owed a trace after an
+    /// aborted instruction. Probed on that form: the faulting `MOVE.W D0,(A0)`
+    /// vectored to 3, and the *next* step fetched vector 9 and entered the trace
+    /// handler at `0x3004`.
+    ///
+    /// # Extrapolated
+    ///
+    /// Both halves. Vector 9 is fetched 0 times in 317,500 cases, so nothing here is
+    /// measured; the control for that zero is the 158,894 cases that enter with T set,
+    /// which shows T is well represented and only the second boundary is missing.
+    /// The 38,542/38,542 figure sometimes cited nearby says only that exception entry
+    /// clears T — it cannot distinguish these two cases, because entry clears T in
+    /// both.
+    #[test]
+    fn an_aborted_instruction_owes_no_trace_but_a_completed_trap_does() {
+        // Vectors and handlers shared by both halves: 3 -> 0x2000, 9 -> 0x3000,
+        // TRAP #0 (vector 32) -> 0x4000.
+        let vectors = |bus: &mut RecordingBus| {
+            bus.put16(0x000C, 0x0000);
+            bus.put16(0x000E, 0x2000);
+            bus.load(0x2000, &[0x4E71, 0x4E71]);
+            bus.put16(0x0024, 0x0000);
+            bus.put16(0x0026, 0x3000);
+            bus.load(0x3000, &[0x4E71, 0x4E71]);
+            bus.put16(0x0080, 0x0000);
+            bus.put16(0x0082, 0x4000);
+            bus.load(0x4000, &[0x4E71, 0x4E71]);
+        };
+
+        // Half 1 — `MOVE.W D0,(A0)` with A0 odd. The write aborts, so the
+        // instruction never completed and no trace is owed.
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x3080, 0x4E71, 0x4E71]);
+        vectors(&mut bus);
+
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S | SR_T | 0x0700;
+        cpu.a[7] = 0x5000;
+        cpu.a[0] = 0x6001; // odd: the destination faults
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+
+        let dec = Decoder::new();
+        cpu.step_with(&dec, &mut bus);
+        assert!(
+            !cpu.halted,
+            "an odd operand address faults, it does not halt"
+        );
+        assert_eq!(cpu.pc, 0x2004, "vectored through 3");
+
+        bus.log.clear();
+        cpu.step_with(&dec, &mut bus);
+        assert_eq!(
+            bus.writes(),
+            vec![],
+            "no trace frame: the aborted instruction never completed, so the PRM's \
+             condition was never met"
+        );
+        assert_eq!(
+            cpu.pc, 0x2006,
+            "execution continues in the vector-3 handler, not in a trace handler"
+        );
+
+        // Half 2 — the control, and the direction that must NOT change: `TRAP #0`
+        // completes, so its trace is still owed and is taken before the trap
+        // handler's first instruction.
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4E40, 0x4E71, 0x4E71]); // TRAP #0
+        vectors(&mut bus);
+
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S | SR_T | 0x0700;
+        cpu.a[7] = 0x5000;
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+
+        cpu.step_with(&dec, &mut bus);
+        assert_eq!(cpu.pc, 0x4004, "vectored through 32");
+
+        bus.log.clear();
+        cpu.step_with(&dec, &mut bus);
+        assert_eq!(
+            cpu.pc, 0x3004,
+            "the TRAP completed, so its trace fires before the trap handler runs"
+        );
+        assert_eq!(
+            bus.writes().len(),
+            3,
+            "and it is a real frame, stacked on top of the trap's"
+        );
     }
 
     /// `STOP #$A700` — an immediate that sets T — traces and **resumes**, rather
