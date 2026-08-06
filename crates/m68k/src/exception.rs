@@ -1399,6 +1399,22 @@ mod tests {
             cycles, HALTED_IDLE_CYCLES,
             "4 × 0 accesses + the extrapolated halt idle — not the framed 34"
         );
+
+        // The two *properties* [`HALTED_IDLE_CYCLES`]'s value was chosen for, as
+        // opposed to the value itself. Asserting `4` as a literal would claim a
+        // measurement nobody has; these two are consequences the choice is answerable
+        // for, and they are what a change to the constant has to preserve.
+        assert!(
+            cycles > 0,
+            "a halting step that costs nothing lets a cycle-budgeted driver loop \
+             forever without advancing its clock"
+        );
+        assert_eq!(
+            cycles,
+            cpu.step_with(&Decoder::new(), &mut bus),
+            "the halting step costs what every subsequent halted step costs: the \
+             halt is not a discontinuity in the cycle stream"
+        );
     }
 
     /// The control for the test above: the same illegal opcode with an **even**
@@ -1424,5 +1440,152 @@ mod tests {
         assert!(!cpu.halted);
         assert_eq!(bus.log.len(), 7, "the full short-frame access count");
         assert_eq!(cycles, 4 * SHORT_FRAME_ACCESSES + 6, "4 × 7 + 6 idle");
+    }
+
+    /// The same collapse at [`take_trace`]'s own site, in both of its shapes.
+    ///
+    /// This is a second site of the defect above rather than a repeat of it: the
+    /// trace entry is the one path whose access count on a halt is **not** zero, so
+    /// the halted cost is not a constant and a test asserting only
+    /// [`HALTED_IDLE_CYCLES`] elsewhere cannot reach it.
+    ///
+    /// | entered from | accesses before the halt | cost |
+    /// |---|---|---|
+    /// | a traced instruction | 0 | `HALTED_IDLE_CYCLES` |
+    /// | a `STOP` being resumed | 2, the resume refill | `4 × 2 + HALTED_IDLE_CYCLES` |
+    ///
+    /// The second row is what pins [`take_trace`]'s `resumed` term: it is the only
+    /// assertion in the crate that can tell `2` from `0` there, because on every
+    /// non-halting path the term is unobservable — the framed constant is returned
+    /// instead and the refill's 2 accesses are already inside it.
+    ///
+    /// # Extrapolated
+    ///
+    /// Both rows. Vector 9 is fetched 0 times in 317,500 cases and 0 cases halt; the
+    /// controls for those two zeros are the 158,894 cases that enter with T=1 and the
+    /// 55,606/55,606 odd stacked fault addresses respectively. The *access counts*
+    /// are derived from the asserted bus log; only the idle term is extrapolated.
+    #[test]
+    fn a_halted_trace_entry_is_charged_for_its_resume_refill_and_no_more() {
+        // Row 1: a NOP executed with T set, then the trace entry halts.
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4E71, 0x4E71]);
+        bus.put16(0x0024, 0x0000); // vector 9, so a frame would be visible
+        bus.put16(0x0026, 0x2000);
+
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S | SR_T | 0x0700;
+        cpu.a[7] = 0x2FFF; // odd: the frame base, so the trace entry halts
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+
+        let dec = Decoder::new();
+        cpu.step_with(&dec, &mut bus);
+        assert!(cpu.trace_pending, "the NOP ran with T set");
+        bus.log.clear();
+
+        let cycles = cpu.step_with(&dec, &mut bus);
+        assert!(cpu.halted);
+        assert_eq!(bus.log, vec![], "zero accesses: no frame, no vector fetch");
+        assert_eq!(
+            cycles, HALTED_IDLE_CYCLES,
+            "4 × 0 accesses + the halt idle — not the framed 34"
+        );
+
+        // Row 2: the same halt reached through a STOP resume, which does access the
+        // bus before the entry.
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4E72, 0xA700, 0x4E71]); // STOP #$A700: sets T
+        bus.put16(0x0024, 0x0000);
+        bus.put16(0x0026, 0x2000);
+
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S | 0x0700;
+        cpu.a[7] = 0x2FFF;
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+
+        cpu.step_with(&dec, &mut bus);
+        assert!(cpu.stopped && cpu.trace_pending);
+        bus.log.clear();
+
+        let cycles = cpu.step_with(&dec, &mut bus);
+        assert!(cpu.halted);
+        assert_eq!(
+            bus.log.len(),
+            2,
+            "the resume refill happened; the frame and vector did not"
+        );
+        assert!(
+            bus.writes().is_empty(),
+            "a halt writes no frame, so the refill is all of it"
+        );
+        assert_eq!(
+            cycles,
+            4 * 2 + HALTED_IDLE_CYCLES,
+            "the 2 refill accesses are charged and nothing else is"
+        );
+    }
+
+    /// [`check_interrupts`]'s halt path, the third site of the same defect — and the
+    /// one where the cost and the *state* both need pinning.
+    ///
+    /// The interrupt entry does two things `take` cannot undo: it clears `stopped`
+    /// and refills the queue (2 accesses) *before* the entry, and it raises the SR
+    /// mask *after*. On a halt the accesses have happened and must be charged; the
+    /// mask raise must not happen at all, because no frame holds the old mask and
+    /// there is no handler to run at the new one.
+    ///
+    /// # Extrapolated
+    ///
+    /// The halt itself: 0 of 317,500 cases halt, with the odd stacked fault address
+    /// (55,606/55,606) as the control for that zero. The access count is derived from
+    /// the asserted bus log; [`HALTED_IDLE_CYCLES`] is the extrapolated term.
+    #[test]
+    fn a_halted_interrupt_entry_charges_its_refill_and_leaves_the_mask_alone() {
+        let mut bus = RecordingBus::new();
+        // STOP #$2100: mask 1, deliberately *below* the level raised next, so that
+        // "raise the mask to the serviced level" is an observable change rather than
+        // a no-op. A mask of 7 would hide the mutant.
+        bus.load(0x1000, &[0x4E72, 0x2100, 0x4E71]);
+        bus.put16(0x0074, 0x0000); // vector 29 (level 5), so a frame would be visible
+        bus.put16(0x0076, 0x2000);
+
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S | 0x0700;
+        cpu.a[7] = 0x2FFF; // odd: the frame base, so the entry halts
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+
+        let dec = Decoder::new();
+        cpu.step_with(&dec, &mut bus);
+        assert!(cpu.stopped);
+        assert_eq!(
+            cpu.sr & 0x0700,
+            0x0100,
+            "the STOP immediate lowered the mask"
+        );
+        cpu.set_irq(5);
+        let sr_before = cpu.sr;
+        bus.log.clear();
+
+        let cycles = cpu.step_with(&dec, &mut bus);
+
+        assert!(cpu.halted);
+        assert_eq!(
+            bus.log.len(),
+            2,
+            "the resume refill happened; the frame and vector did not"
+        );
+        assert!(bus.writes().is_empty(), "a halt writes no frame");
+        assert_eq!(
+            cycles,
+            4 * 2 + HALTED_IDLE_CYCLES,
+            "the 2 refill accesses are charged — not the framed 44"
+        );
+        assert_eq!(
+            cpu.sr, sr_before,
+            "the serviced level is not masked on a halt: nothing stacked the old one"
+        );
     }
 }
