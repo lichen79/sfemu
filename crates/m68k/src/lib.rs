@@ -28,6 +28,9 @@ pub mod exception;
 pub mod flags;
 pub mod ops;
 
+#[cfg(feature = "std")]
+pub mod disasm;
+
 pub use bus::Bus;
 pub use cpu::M68k;
 pub use ea::Size;
