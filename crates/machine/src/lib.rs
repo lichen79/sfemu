@@ -1,0 +1,24 @@
+//! The CPS-1 arcade board: memory map, frame schedule, and vblank interrupt.
+//!
+//! Zero dependencies beyond [`m68k`]. No `std` requirement in the simulation
+//! path, no host I/O, no clock access — the same constraints sub-project A
+//! honoured, for the same reason: WASM and rollback netplay stay nearly free.
+//!
+//! # This crate holds no ROM
+//!
+//! [`Board::new`] takes a byte slice. Assembling that slice from a user-supplied
+//! ROM set is `romset`'s job, and `machine` does not depend on `romset`. No ROM is
+//! bundled, fetched, or committed — including as a test fixture. Every test here
+//! builds its program inline.
+//!
+//! Board facts are cited to MAME `master`,
+//! `src/mame/capcom/{cps1.h,cps1.cpp,cps1_v.cpp}` (BSD-3-Clause, Paul Leaman),
+//! read 2026-08-07.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+#![deny(rustdoc::private_intra_doc_links)]
+
+pub mod board;
+
+pub use board::Board;
