@@ -372,8 +372,11 @@ fn claim(op: u16) -> Claim {
                     // RTS and RTR, two single opcodes rather than patterns.
                     Claim::Mine
                 } else if size_bits >= 2 {
-                    let control = matches!(mode, 2 | 5 | 6) || (mode == 7 && reg <= 3);
-                    if control {
+                    // `modes::control`, not a hand-inlined copy of it. The LEA and
+                    // PEA arms above already consult it, so the copy that used to
+                    // sit here made one arm of this function disagree in form with
+                    // two others about the same rule.
+                    if modes::control(mode, reg) {
                         Claim::Mine
                     } else {
                         Claim::Illegal

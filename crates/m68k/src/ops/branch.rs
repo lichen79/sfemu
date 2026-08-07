@@ -396,6 +396,21 @@ fn scc(cpu: &mut M68k, bus: &mut dyn Bus, op: u16) -> u32 {
 ///
 /// `abs.L` idles 0 because it spends a real program fetch instead — its second
 /// extension word is the only one not already sitting in the prefetch queue.
+///
+/// The seven arms are exactly the control modes, so the fallthrough is
+/// unreachable: `register` installs these handlers only where
+/// [`ea::modes::control`] holds, and that predicate admits modes 2/5/6 and mode 7
+/// regs 0..=3 and nothing else.
+///
+/// ⚠️ **The fallthrough asserts rather than returning 0.** It previously returned
+/// 0, which is a *plausible* idle count — so if a future `register` widened the
+/// installed set, every newly reachable mode would be charged 4 accesses and no
+/// idle, and the suite would report a cycle count wrong by a small multiple of 2
+/// rather than an obviously broken one. Returning a defensible-looking number
+/// from an unreachable arm is how a dispatch-table change turns into a timing
+/// bug that reads as a constant being off. `debug_assert` keeps release builds
+/// free of the branch while making the debug-mode opcode-space sweep — which
+/// executes all 65,536 encodings — the thing that catches it.
 fn jump_idle(mode: u16, reg: u16) -> u32 {
     match (mode, reg) {
         (2, _) => 0, // (An)
@@ -405,7 +420,14 @@ fn jump_idle(mode: u16, reg: u16) -> u32 {
         (7, 1) => 0, // abs.L
         (7, 2) => 2, // d16(PC)
         (7, 3) => 6, // (d8,PC,Xn)
-        _ => 0,
+        _ => {
+            debug_assert!(
+                false,
+                "jump_idle reached a non-control mode {mode}/{reg}: JMP/JSR were \
+                 installed somewhere ea::modes::control does not hold"
+            );
+            0
+        }
     }
 }
 
@@ -546,17 +568,6 @@ fn rtr(cpu: &mut M68k, bus: &mut dyn Bus, op: u16) -> u32 {
 
 // --- Dispatch-table installation ------------------------------------------
 
-/// Control addressing: a memory operand whose address does not depend on the
-/// access itself. `JMP` and `JSR` take exactly this set — no register direct, and
-/// neither `(An)+` nor `-(An)`, because a jump has no operand size to step by.
-fn is_control(mode: u16, reg: u16) -> bool {
-    match mode {
-        2 | 5 | 6 => true,
-        7 => reg <= 3,
-        _ => false,
-    }
-}
-
 /// Installs the whole of line `0110`, the size-`11` half of line `0101`, and the
 /// four `0100 1110` encodings this task owns.
 pub fn register(table: &mut [Handler; 65536]) {
@@ -584,9 +595,18 @@ pub fn register(table: &mut [Handler; 65536]) {
     }
 
     // 0100 1110 10/11 mmmrrr: JSR and JMP, split by bit 6.
+    //
+    // The operand set is *control* addressing — a memory operand whose address
+    // does not depend on the access itself, so no register direct and neither
+    // `(An)+` nor `-(An)`, a jump having no operand size to step by. That rule
+    // comes from `ea::modes::control` rather than a local copy: a private
+    // `is_control` here duplicated it exactly (verified 64/64 over every
+    // `(mode, reg)` pair, against a control predicate that disagreed on 8), and a
+    // duplicate that currently agrees is the shape a future divergence takes.
+    // `jump_idle` below enumerates the same 28 pairs a third time; see its docs.
     for op in 0x4E80..=0x4EFFu16 {
         let (mode, reg) = ((op >> 3) & 7, op & 7);
-        if is_control(mode, reg) {
+        if ea::modes::control(mode, reg) {
             table[op as usize] = if op & 0x0040 != 0 { jmp } else { jsr };
         }
     }

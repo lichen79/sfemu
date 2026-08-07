@@ -357,6 +357,79 @@ mod tests {
     use super::*;
     use crate::cpu::tests_support::FlatBus;
 
+    /// `modes::control` enumerated over all 64 `(mode, reg)` pairs.
+    ///
+    /// Four sites used to state this rule: this function, a private `is_control`
+    /// in `ops/branch.rs`, a hand-inlined copy in `opcode_space.rs`'s JMP/JSR
+    /// arm, and `jump_idle`'s seven match arms. The first three were consolidated
+    /// onto this one in Task 14 after checking they agreed on 64/64 pairs.
+    ///
+    /// ⚠️ **That consolidation is why this test exists.** Before it, a wrong
+    /// `control` was caught by two copies disagreeing with it. Now every caller
+    /// asks the same function, so a wrong answer here is consistent everywhere
+    /// and nothing downstream contradicts it. This is the cost of removing
+    /// duplication: the accidental cross-check goes too, and it has to be
+    /// replaced by a deliberate one. Enumerating the set by hand — rather than
+    /// re-deriving it from `matches!` — is what makes this a check and not a
+    /// restatement.
+    ///
+    /// The set is the 68000 PRM's: `(An)`, `(d16,An)`, `(d8,An,Xn)`, `(xxx).W`,
+    /// `(xxx).L`, `(d16,PC)`, `(d8,PC,Xn)`. Not `Dn`, not `An`, not `(An)+` or
+    /// `-(An)` (no operand size to step by), not `#imm` (no address at all).
+    #[test]
+    fn control_modes_are_the_seven_addressable_without_stepping() {
+        // Hand-written truth table: (mode, reg) pairs that ARE control.
+        let want: &[(u16, u16)] = &[
+            (2, 0),
+            (2, 1),
+            (2, 2),
+            (2, 3),
+            (2, 4),
+            (2, 5),
+            (2, 6),
+            (2, 7), // (An)
+            (5, 0),
+            (5, 1),
+            (5, 2),
+            (5, 3),
+            (5, 4),
+            (5, 5),
+            (5, 6),
+            (5, 7), // (d16,An)
+            (6, 0),
+            (6, 1),
+            (6, 2),
+            (6, 3),
+            (6, 4),
+            (6, 5),
+            (6, 6),
+            (6, 7), // (d8,An,Xn)
+            (7, 0), // (xxx).W
+            (7, 1), // (xxx).L
+            (7, 2), // (d16,PC)
+            (7, 3), // (d8,PC,Xn)
+        ];
+        for mode in 0u16..8 {
+            for reg in 0u16..8 {
+                let expected = want.contains(&(mode, reg));
+                assert_eq!(
+                    modes::control(mode, reg),
+                    expected,
+                    "control({mode},{reg}) should be {expected}"
+                );
+            }
+        }
+        // The size of the set, stated separately so that a truth table edited to
+        // match a wrong implementation still fails.
+        assert_eq!(want.len(), 28);
+        // And the four exclusions most likely to be wrongly admitted, named:
+        assert!(!modes::control(0, 0), "Dn is not control");
+        assert!(!modes::control(1, 0), "An is not control");
+        assert!(!modes::control(3, 0), "(An)+ is not control");
+        assert!(!modes::control(4, 0), "-(An) is not control");
+        assert!(!modes::control(7, 4), "#imm is not control");
+    }
+
     #[test]
     fn byte_step_through_a7_is_two() {
         assert_eq!(Size::Byte.step(0), 1);
