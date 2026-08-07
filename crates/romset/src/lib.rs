@@ -12,10 +12,12 @@
 
 pub mod assemble;
 pub mod crc32;
+pub mod games;
 pub mod load;
 pub mod spec;
 pub mod zip;
 
+pub use games::SF2;
 pub use load::{load, RomSet};
 pub use spec::{GameSpec, LoadKind, RegionSpec, RomEntry};
 
