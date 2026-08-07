@@ -188,8 +188,18 @@ groups! {
     // Task 10: system control and multi-register transfer.
     //
     // `MOVEM.w`/`MOVEM.l` are the only *write*-fault groups outside `MOVE` (595 and
-    // 585), which is what finally exercises `alu`'s write arm. Every one of those
-    // faults is on the first operand access: `MOVEM` steps its address by 2 or 4, so
+    // 585).
+    //
+    // ⚠️ This comment used to add "which is what finally exercises `alu`'s write
+    // arm". That was false in the direction that costs coverage: it credited a code
+    // path with vectors it does not have. `movem` never routes through `alu::run` —
+    // it resolves its own base, issues its own `bus.write16`s, and calls
+    // `exception::address_error` directly. `ops/alu.rs` contains exactly one
+    // `FaultKind::` and it is `Read`; the write arm is deliberately absent, and
+    // *nothing* in the 317,500 cases exercises it. Grep both facts before believing
+    // any successor to this sentence.
+    //
+    // Every MOVEM fault is on the first operand access: it steps its address by 2 or 4, so
     // parity is invariant and a mid-transfer fault cannot occur — 0 completed operand
     // accesses before the abort in all 2,378 faulting cases, with both off-diagonals
     // of the odd/even × faults/clean table exactly zero. So these two going green

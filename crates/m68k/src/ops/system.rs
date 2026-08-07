@@ -295,6 +295,26 @@ fn move_to_usp(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
 }
 
 /// `MOVE USP,An` — privileged, 4 cycles, 1293/1293. Encoded at `4E68`-`4E6F`.
+///
+/// ⚠️ **The transfer is a full unmasked 32 bits, and the 1293/1293 is NOT evidence
+/// for that.** The suite cannot discriminate this *direction*: the value read is
+/// the USP, and **0 of the 1,293 supervisor cases start with a USP whose top byte
+/// is non-zero**, so `An := usp & ADDR_MASK` also scores 1293/1293. The
+/// justification is the project's rule — mask at the bus boundary, never in a
+/// register — plus the unit test that mutating this line kills.
+///
+/// The control that shows the query works: 1,124 of those same cases *do* start
+/// with a non-zero top byte in the destination `An`, so the corpus carries high
+/// bytes in address registers freely. It just never seeds one into the USP.
+///
+/// ⚠️ **The reverse direction is a different story, and the asymmetry is the
+/// point.** [`move_to_usp`] reads an `An` and writes the USP, so the
+/// discriminating field is the *source register*, where 1,126 of 1,274 supervisor
+/// cases have a non-zero top byte. Masking there is caught by the vectors:
+/// measured, `usp := An & ADDR_MASK` reddens `MOVEtoUSP` to **1374/2500** (first
+/// failure `002 MOVEtoUSP A6 4e66: usp: got 00808E4C want 91808E4C`). Same rule,
+/// same instruction pair, and only one half of it is suite-covered — do not
+/// generalise either half's coverage to the other.
 fn move_from_usp(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
     if let Some(c) = privilege_check(cpu, bus) {
         return c;
@@ -716,12 +736,22 @@ fn movem_write_reg(cpu: &mut M68k, i: usize, val: u32) {
 /// out of the transfer count rather than being added by hand.
 ///
 /// ⚠️ **The to-registers direction always performs one extra discarded word read
-/// at `base + count * size`** — 1,445/1,445 across every mode including the
+/// at `base + count * size`** — **1,362/1,362** across every mode including the
 /// PC-relative ones. It is the pipeline reading one word past the list and
 /// throwing it away. `(An)+` still advances by only `count * size`, so the extra
 /// read does *not* count toward the increment. Omitting it makes every
 /// to-registers case short by one access and 4 cycles, and the `(want - got) % 4
 /// == 0` diagnostic points at a missing access rather than a wrong constant.
+///
+/// ⚠️ The denominator here was **1,445**, which is not a population: it is
+/// 1,362 + the 83 PC-relative cases counted a second time. Measured, the clean
+/// to-registers population is 1,362 (`.w` 698 + `.l` 664), of which **1,279 have
+/// at least one data-space read and 83 have none** — the 83 are exactly the
+/// PC-relative cases (mode 7 reg 2/3), which read their operands in *program*
+/// space, and 0 non-PC-relative cases have zero data reads. The rule scores
+/// 1,362/1,362 only when both spaces are counted; scoring data space alone gives
+/// 1,279 and silently drops the other 83. An `N/N` whose `N` exceeds the
+/// population is the shape of a figure assembled from two overlapping queries.
 ///
 /// # `-(An)`
 ///
@@ -750,9 +780,18 @@ fn movem_write_reg(cpu: &mut M68k, i: usize, val: u32) {
 /// would go green with an arbitrary mid-transfer model.
 ///
 /// `MOVEM` is the only write-fault site outside `MOVE`: 595 (`.w`) + 585 (`.l`)
-/// register-to-memory faults. The stacked PC is `opcode + 2 * (2 + ext)` — past
-/// the whole instruction — in every bucket, for both directions, and the IR is
-/// the opcode.
+/// register-to-memory faults. The stacked PC is **`opcode + 6 + 2 * ext`** — past
+/// the whole instruction — in every bucket, for both directions, and the IR is the
+/// opcode.
+///
+/// ⚠️ This paragraph used to state the formula as `opcode + 2 * (2 + ext)`, which
+/// is what the code's own inline comment at the fault site warns against. Measured
+/// over all 2,378 faulting cases (frame PC read at `final_sp + 10`):
+/// `opcode + 6 + 2 * ext` scores **2,378/2,378** and `opcode + 2 * (2 + ext)`
+/// scores **0/2,378** — they differ by 2 on the extension-free modes, where the
+/// second gives `+4` and the frame's PC low word then reads 2 short. The code was
+/// always right; the doc comment was a trap, and it disagreed with a warning
+/// forty lines below it.
 fn movem(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16, size: Size) -> u32 {
     let (mode, reg) = ((opcode >> 3) & 7, opcode & 7);
     let to_regs = opcode & 0x0400 != 0;
@@ -1361,6 +1400,91 @@ mod tests {
         assert_eq!(
             cpu.a[0], 0x2006,
             "3 words = +6; the discarded read at 0x2006 does not advance A0"
+        );
+    }
+
+    /// `MOVEM.w (A0),<empty>` — an **unsampled** state: `mask == 0` occurs in 0 of
+    /// the 2,500 cases in each MOVEM group (minimum popcount seen: 1 in `.w`, 2 in
+    /// `.l`), so no vector reaches this path. Unlike the mid-transfer fault, which
+    /// is *structurally* impossible and therefore correctly has no code, an empty
+    /// mask is a real hardware state the corpus simply never seeds.
+    ///
+    /// What it pins: the trailing discarded read is unconditional, so with zero
+    /// transfers the instruction still reads exactly once, at `base + 0`, touches
+    /// no register, and costs `4 * (2 + 0 + 1)`. Making the extra read conditional
+    /// on `count > 0` — the natural-looking guard — leaves all 127 groups green and
+    /// only this test red.
+    #[test]
+    fn movem_w_with_an_empty_mask_still_reads_one_word_and_transfers_nothing() {
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4C90, 0x0000, 0x4E71]); // MOVEM.w (A0),<empty mask>
+        bus.load(0x2000, &[0xDEAD, 0xBEEF]);
+        let mut cpu = at(&mut bus);
+        cpu.a[0] = 0x2000;
+        for i in 0..8 {
+            cpu.d[i] = 0x1111_1111;
+        }
+        bus.log.clear();
+
+        let dec = Decoder::new();
+        let cycles = cpu.step_with(&dec, &mut bus);
+
+        let reads: Vec<u32> = bus.reads().iter().map(|r| r.0).collect();
+        assert_eq!(
+            reads.iter().filter(|a| **a == 0x2000).count(),
+            1,
+            "the trailing discarded read happens even with nothing to transfer, \
+             at base + 0; reads were {reads:02X?}"
+        );
+        assert!(
+            cpu.d.iter().all(|&v| v == 0x1111_1111),
+            "an empty mask must transfer into no register; d = {:08X?}",
+            cpu.d
+        );
+        assert_eq!(cpu.a[0], 0x2000, "no transfers, so no base change on (An)");
+        assert_eq!(
+            cycles, 12,
+            "4 * (2 program words + 0 transfers + 1 extra read)"
+        );
+    }
+
+    /// Both USP directions transfer all 32 bits, and **only one of them is pinned
+    /// by the vectors** — which is why the unpinned one needs this test.
+    ///
+    /// `MOVE An,USP` is suite-covered: 1,126 of 1,274 supervisor `MOVEtoUSP` cases
+    /// have a non-zero top byte in the source register, and masking there reddens
+    /// the group to 1374/2500 (measured).
+    ///
+    /// `MOVE USP,An` is **not**: 0 of 1,293 supervisor `MOVEfromUSP` cases start
+    /// with a non-zero top byte in the USP, so `usp & ADDR_MASK` also scores
+    /// 1293/1293. Its only guard is this assertion and the project's rule that
+    /// masking happens at the bus boundary, never in a register.
+    #[test]
+    fn both_usp_directions_transfer_all_32_bits_unmasked() {
+        let dec = Decoder::new();
+
+        // The suite-blind direction.
+        let mut bus = FlatBus::new();
+        bus.load(0x1000, &[0x4E68, 0x4E71]); // MOVE USP,A0
+        let mut cpu = at(&mut bus);
+        cpu.usp = 0xFF12_3456;
+        cpu.a[0] = 0;
+        cpu.step_with(&dec, &mut bus);
+        assert_eq!(
+            cpu.a[0], 0xFF12_3456,
+            "MOVE USP,An: the top byte must survive; a 24-bit mask gives 0x00123456"
+        );
+
+        // The direction the vectors also cover, asserted here so the pair reads as
+        // one rule rather than two.
+        let mut bus = FlatBus::new();
+        bus.load(0x1000, &[0x4E61, 0x4E71]); // MOVE A1,USP
+        let mut cpu = at(&mut bus);
+        cpu.a[1] = 0x91_80_8E_4C;
+        cpu.step_with(&dec, &mut bus);
+        assert_eq!(
+            cpu.usp, 0x91_80_8E_4C,
+            "MOVE An,USP: likewise unmasked; a 24-bit mask gives 0x00808E4C"
         );
     }
 
