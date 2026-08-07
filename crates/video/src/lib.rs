@@ -25,6 +25,7 @@
 #![warn(missing_docs)]
 #![deny(rustdoc::private_intra_doc_links)]
 
+pub mod bank;
 pub mod regs;
 pub mod tiles;
 
