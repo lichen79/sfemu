@@ -424,6 +424,28 @@ mod tests {
         gfxram[0x21] = 0x0080;
         assert_eq!(tile_info(&gfxram, 0, Layer::Scroll2, 1, 0).group, 1);
 
+        // Both masks are checked at their *upper* edge, because every other case
+        // here and every drawing fixture in this crate uses small values, and a
+        // mask only fails where it stops.
+        //
+        // Colour bit 4: scheme 0x1F is the top of `attr & 0x1f`
+        // (`cps1_v.cpp:2485`), and it is the only bit a 0x0F mask would drop.
+        gfxram[0x21] = 0x001F;
+        assert_eq!(
+            tile_info(&gfxram, 0, Layer::Scroll2, 1, 0).colour,
+            0x40 + 0x1F,
+            "the colour mask reaches bit 4, so 0x1F is not 0x0F"
+        );
+        // And bit 9 is *not* part of the group. The field is two bits, so group 3
+        // is the maximum; a mask widened to 0x0380 would read this as 7 and index
+        // past `hi_pens`, which is `[u16; 4]`.
+        gfxram[0x21] = 0x0380;
+        assert_eq!(
+            tile_info(&gfxram, 0, Layer::Scroll2, 1, 0).group,
+            3,
+            "the group is two bits (`attr & 0x0180`), so bit 9 is not in it"
+        );
+
         // Scroll3 masks its code; scroll2 does not.
         gfxram[0x20] = 0xFFFF;
         assert_eq!(tile_info(&gfxram, 0, Layer::Scroll2, 1, 0).code, 0xFFFF);

@@ -11,7 +11,7 @@
 //! Each index is written as the plain number rather than as `0x0A / 2`, because
 //! clippy rejects `0x00 / 2` (`erasing_op`) and `0x02 / 2` (`eq_op`). The byte
 //! offset lives in the doc comment, and
-//! [`tests::the_cps_a_indices_are_byte_offsets_divided_by_two`] pairs the two
+//! `tests::the_cps_a_indices_are_byte_offsets_divided_by_two` pairs the two
 //! sets of literals — which is the stronger arrangement anyway, since the test
 //! now compares two independently written tables rather than restating one
 //! expression.
@@ -78,12 +78,21 @@ const GFXRAM_WORDS: usize = 0x1_8000;
 /// # The result can point past gfxram
 ///
 /// `& 0x3FFFF` bounds the index to a 256 KB window and gfxram is 192 KB
-/// (`cps1.cpp:592`), so registers above 0xDFFF resolve to word indices from
-/// 0x18000 up to 0x1FE00 — outside the array. That is the hardware's arithmetic
+/// (`cps1.cpp:592`), so some registers resolve to word indices from 0x18000 up to
+/// 0x1FE00 — outside the array.
+///
+/// Which ones is less obvious than it looks: `* 256` then `& 0x3FFFF` keeps only
+/// bits 8-17 of the product, so **the index depends on nothing but `reg & 0x3FF`**,
+/// and it lands outside gfxram exactly when `(reg & 0x3FF) >= 0x300`. That is a
+/// quarter of all register values, and it includes small ones — 0x0300 resolves to
+/// 0x18000, the first word past the end, while 0xE000 resolves to 0. A reader who
+/// expects "only large registers overflow" has it backwards.
+/// `tests::cps_a_base_can_point_past_gfxram_so_callers_must_wrap` pins the
+/// predicate, not just the maximum. That is the hardware's arithmetic
 /// and MAME's too: `cps1_base` returns a pointer into a `required_shared_ptr`
 /// with no bounds check. Callers wrap with `% gfxram.len()`; clamping here would
 /// silently relocate a table the guest asked for, and
-/// [`tests::cps_a_base_can_point_past_gfxram_so_callers_must_wrap`] exists so a
+/// `tests::cps_a_base_can_point_past_gfxram_so_callers_must_wrap` exists so a
 /// later reader does not remove a wrap believing it redundant.
 pub fn cps_a_base(cps_a: &[u16], reg: usize, boundary: u32) -> usize {
     let base = u32::from(cps_a[reg]) * 256;
@@ -251,6 +260,34 @@ mod tests {
             worst >= GFXRAM_WORDS,
             "and it is outside gfxram, so wrapping is mandatory, not defensive"
         );
+
+        // *Which* registers overflow, not just that the maximum does. `* 256` then
+        // `& 0x3FFFF` keeps only bits 8-17 of the product, so the index depends on
+        // nothing but `reg & 0x3FF` — and it leaves gfxram exactly when that is
+        // 0x300 or more. A quarter of all values, small ones included: the smallest
+        // overflowing register is 0x0300, and 0xE000 resolves to 0.
+        //
+        // Stated as a predicate over every register rather than as a maximum,
+        // because the maximum alone is satisfied by an implementation that
+        // overflows for the wrong inputs — and the intuition it invites ("only
+        // large registers overflow") is the false one.
+        for boundary in [PALETTE_BOUNDARY, OBJ_BOUNDARY, SCROLL_BOUNDARY] {
+            for r in 0..=0xFFFFu16 {
+                let mut a = [0u16; 0x20];
+                a[SCROLL1_BASE] = r;
+                let outside = cps_a_base(&a, SCROLL1_BASE, boundary) >= GFXRAM_WORDS;
+                assert_eq!(
+                    outside,
+                    r & 0x3FF >= 0x300,
+                    "reg {r:#06x} at boundary {boundary:#x}"
+                );
+            }
+        }
+        let mut a = [0u16; 0x20];
+        a[SCROLL1_BASE] = 0x0300;
+        assert_eq!(cps_a_base(&a, SCROLL1_BASE, PALETTE_BOUNDARY), GFXRAM_WORDS);
+        a[SCROLL1_BASE] = 0xE000;
+        assert_eq!(cps_a_base(&a, SCROLL1_BASE, PALETTE_BOUNDARY), 0);
     }
 
     /// SF2's CPS-B layout, from `cps1_v.cpp:491`, as word indices.
