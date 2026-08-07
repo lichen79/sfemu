@@ -476,10 +476,18 @@ mod tests {
     /// mask copies them back out of `r` and lands on the same word. Every `ORI`
     /// operand behaves that way. Only the suite caught it, in 2 groups.
     ///
-    /// `ANDI` and `EORI` are the discriminating ops — both can *clear* a bit 5-7
-    /// in `r` that `cpu.sr` had set, which is precisely what the narrow mask must
-    /// preserve and the byte mask destroys. The `ORI` row is kept as the control
-    /// and labelled with the value both masks agree on.
+    /// **The two halves of the expression need different rows, and this is the
+    /// non-obvious part.** `(cpu.sr & 0xFFE0) | (r & 0x1F)` has two masks and a
+    /// row that pins one may leave the other free:
+    ///
+    /// - Widening the **SR** mask (`0xFFE0` → `0xFF00`) needs a row where the
+    ///   entry SR has a bit 5-7 **set** and `r` has it **clear**. Only `ANDI` and
+    ///   `EORI` can clear one, so those two rows carry this half.
+    /// - Widening the **result** mask (`0x1F` → `0x00FF`) needs the mirror image:
+    ///   entry SR bits 5-7 **clear** and `r` setting one. That is an `ORI` row
+    ///   with an immediate in bits 5-7 — and with `ENTRY` fixed at bits 5-7 set,
+    ///   as this test first had it, that mutant **survived**. Hence the per-row
+    ///   entry SR.
     ///
     /// Every expected `sr` below is a **written-out literal**, not a value
     /// recomputed from `0xFFE0`. Deriving it from the constant under test is what
@@ -490,30 +498,34 @@ mod tests {
     /// so the suite's kill comes from the operation's own result bits instead.
     #[test]
     fn to_ccr_touches_only_the_low_five_bits() {
-        // Entry SR: supervisor, mask 7, bits 5-7 all set, and N+V set in the CCR.
-        const ENTRY: u16 = 0x27EA;
-        // (name, opcode, immediate, expected sr, sr under the 0xFF00/0x00FF form)
-        for (name, opcode, imm, want, byte_form) in [
-            // ANDI #$001A: r = 0x27EA & 0x001A = 0x000A. The narrow mask keeps
-            // bits 5-7 from the SR; the byte mask takes the whole low byte of a
-            // result whose bits 5-7 are clear, and loses them.
+        // (name, entry sr, opcode, immediate, expected sr, the weaker form's sr)
+        for (name, entry, opcode, imm, want, wrong) in [
+            // Entry 0x27EA: supervisor, mask 7, bits 5-7 all set, N+V set.
+            // ANDI #$001A: r = 0x000A, bits 5-7 clear. A widened SR mask takes
+            // them from `r` and loses them.
             (
                 "ANDI #$001A,CCR",
+                0x27EAu16,
                 0x023Cu16,
                 0x001Au16,
                 0x27EAu16,
                 0x270Au16,
             ),
-            // EORI #$00FF: r = 0x27EA ^ 0x00FF = 0x2715.
-            ("EORI #$00FF,CCR", 0x0A3C, 0x00FF, 0x27F5, 0x2715),
-            // ORI #$001F: r = 0x27EA | 0x001F = 0x27FF. Both masks give 0x27FF —
-            // the control, and the reason an ORI-only test proves nothing here.
-            ("ORI #$001F,CCR", 0x003C, 0x001F, 0x27FF, 0x27FF),
+            // EORI #$00FF: r = 0x2715, bits 5-7 clear again.
+            ("EORI #$00FF,CCR", 0x27EA, 0x0A3C, 0x00FF, 0x27F5, 0x2715),
+            // Entry 0x2700, bits 5-7 **clear**. ORI #$00E0: r = 0x27E0, which
+            // sets them. A widened *result* mask lets them through — this is the
+            // row that kills the `0x1F` → `0x00FF` mutant, and no row with bits
+            // 5-7 already set can.
+            ("ORI #$00E0,CCR", 0x2700, 0x003C, 0x00E0, 0x2700, 0x27E0),
+            // ORI #$001F on the bits-set entry: both forms give 0x27FF. The
+            // control, and the reason an ORI-only test proves nothing by itself.
+            ("ORI #$001F,CCR", 0x27EA, 0x003C, 0x001F, 0x27FF, 0x27FF),
         ] {
             let mut bus = FlatBus::new();
             bus.load(0x1000, &[opcode, imm, 0x4E71, 0x4E71]);
             let mut cpu = at(&mut bus);
-            cpu.sr = ENTRY;
+            cpu.sr = entry;
 
             let dec = Decoder::new();
             let cycles = cpu.step_with(&dec, &mut bus);
@@ -524,14 +536,14 @@ mod tests {
                 cpu.pc, 0x1008,
                 "{name}: PC advances 4 from its primed value"
             );
-            // Stated per row so that a row which cannot discriminate is visible
-            // as such in the source rather than looking like two more that can.
-            if name.starts_with("ORI") {
-                assert_eq!(want, byte_form, "{name} is the non-discriminating control");
+            // Stated per row, so a row that cannot discriminate is visible as
+            // such in the source rather than looking like one more that can.
+            if name == "ORI #$001F,CCR" {
+                assert_eq!(want, wrong, "{name} is the non-discriminating control");
             } else {
                 assert_ne!(
-                    want, byte_form,
-                    "{name} must distinguish the narrow mask from the byte mask"
+                    want, wrong,
+                    "{name} must distinguish the narrow masks from the wide ones"
                 );
             }
         }
