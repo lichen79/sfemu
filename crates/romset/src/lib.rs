@@ -11,7 +11,9 @@
 #![warn(missing_docs)]
 
 pub mod assemble;
+pub mod crc32;
 pub mod spec;
+pub mod zip;
 
 pub use spec::{GameSpec, LoadKind, RegionSpec, RomEntry};
 
