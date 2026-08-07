@@ -12,9 +12,11 @@
 
 pub mod assemble;
 pub mod crc32;
+pub mod load;
 pub mod spec;
 pub mod zip;
 
+pub use load::{load, RomSet};
 pub use spec::{GameSpec, LoadKind, RegionSpec, RomEntry};
 
 /// A host fault: our setup is wrong, not the guest's.
