@@ -1,0 +1,10 @@
+[package]
+name = "testrunner"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Dev-only harness driving m68k against the SingleStepTests suite"
+
+[dependencies]
+m68k = { path = "../m68k" }
