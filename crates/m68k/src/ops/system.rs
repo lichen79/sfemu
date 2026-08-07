@@ -256,6 +256,21 @@ fn exg(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
         _ => {
             // 10001: Dx <-> Ay. Across two arrays, so `slice::swap` does not
             // apply and `mem::swap` would need two disjoint borrows.
+            //
+            // `_` rather than `0b10001` because only three opmodes are installed
+            // (see `install`: 0xC140, 0xC148, 0xC188), so no other value can arrive
+            // — but the arm asserts rather than trusting that, for the same reason
+            // as `branch::jump_idle`'s. A mis-installed opmode reaching here would
+            // perform a *plausible* register exchange instead of an obviously wrong
+            // one, turning a dispatch-table error into a silently corrupted
+            // register file that no cycle count or fault would flag.
+            debug_assert_eq!(
+                (opcode >> 3) & 0x1F,
+                0b10001,
+                "exg reached opmode {:05b} (opcode {opcode:04X}): only 01000, 01001 \
+                 and 10001 are installed, so the dispatch table is wrong",
+                (opcode >> 3) & 0x1F
+            );
             core::mem::swap(&mut cpu.d[rx], &mut cpu.a[ry]);
             sync_sp(cpu);
         }

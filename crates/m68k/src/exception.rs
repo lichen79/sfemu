@@ -775,6 +775,15 @@ mod tests {
     ///
     /// Keep the literals. A test that installs the handler wherever the constant
     /// points is checking self-consistency, never the vector number.
+    ///
+    /// The frame assertions were added in Task 14: this test read as an
+    /// end-to-end exception check while asserting **PC alone**, so changing the
+    /// frame size to 4 bytes left it green (measured — it fails 22 other tests, so
+    /// the delta is well covered elsewhere; the point is that *this* test did not
+    /// see it despite appearing to). PC is the one thing a wrong frame does not
+    /// disturb, because the vector fetch happens after the pushes and does not
+    /// depend on them. `0x4AFC` in particular is claimed by no vector group, so
+    /// this is the only place its behaviour is checked at all.
     #[test]
     fn line_f_and_plain_illegal_use_their_own_vectors() {
         for (opcode, vector) in [(0xF000u16, 11u32), (0x4AFC, 4u32)] {
@@ -797,6 +806,24 @@ mod tests {
             assert_eq!(
                 cpu.pc, 0x2004,
                 "opcode {opcode:04X} must use vector {vector}"
+            );
+            // The short frame: six bytes, and the three words in the order `take`
+            // documents. Without these the vector number is the only thing checked.
+            assert_eq!(
+                cpu.a[7],
+                0x3000 - 6,
+                "opcode {opcode:04X} must push a 6-byte short frame"
+            );
+            assert_eq!(
+                bus.read16(0x3000 - 6),
+                SR_S,
+                "opcode {opcode:04X} must stack the entry SR"
+            );
+            let stacked_pc =
+                ((bus.read16(0x3000 - 4) as u32) << 16) | bus.read16(0x3000 - 2) as u32;
+            assert_eq!(
+                stacked_pc, 0x1000,
+                "opcode {opcode:04X} must stack the address of the faulting opcode"
             );
         }
     }

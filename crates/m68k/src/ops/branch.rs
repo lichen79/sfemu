@@ -1141,7 +1141,12 @@ mod tests {
         let mut bus = FlatBus::new();
         bus.load(0x1000, &[0x6000, 0x8000]); // BRA.w -0x8000
         let mut cpu = at(&mut bus);
-        cpu.pc = 0x1004;
+        // Was `cpu.pc = 0x1004;`, a dead store: `at` primes the queue from
+        // 0x1000, which already leaves PC 4 ahead. Asserted instead, because the
+        // expected result below is computed from this value — a store cannot fail,
+        // and if `at` ever changed the test would silently start checking a
+        // different displacement.
+        assert_eq!(cpu.pc, 0x1004, "at() must leave PC one prefetch ahead");
 
         let dec = Decoder::new();
         cpu.step_with(&dec, &mut bus);
