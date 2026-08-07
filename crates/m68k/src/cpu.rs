@@ -529,6 +529,87 @@ pub(crate) mod tests_support {
         }
     }
 
+    /// A `Bus` that **enforces** [`super::ADDR_MASK`] instead of re-applying it.
+    ///
+    /// ⚠️ Every other bus in this workspace masks the incoming address a second
+    /// time — `FlatBus` and `RecordingBus` with `& 0xFFFF`/`& 0xFFFE`, and the
+    /// harness's `TestBus`, `integration_asm`, `opcode_space` and `throughput`
+    /// with `& 0x00FF_FFFF`. So none of them can observe whether the core
+    /// truncated to 24 bits at all: `ADDR_MASK` widened to `0xFFFF_FFFF`
+    /// survived the entire workspace, 366 tests and 317,500 suite cases, at 0
+    /// failed. The control is that narrowing it to `0x000F_FFFF` fails 127
+    /// tests, so the harness demonstrably *can* see the constant change; what it
+    /// cannot see is the core forgetting to apply it.
+    ///
+    /// This bus panics on an address the core should have masked, which is what
+    /// makes the widening mutant fail. `Bus`'s contract paragraph — "addresses
+    /// are already masked to 24 bits by the core" — is a promise to every
+    /// implementor, and a memory map decoded by address range would route an
+    /// unmasked address to a different device or to nothing.
+    ///
+    /// Leave the *other* buses' masks alone: a 24-bit bus is what the hardware
+    /// has, and modelling it is correct. They just must not be the only thing
+    /// enforcing the invariant.
+    pub struct StrictBus {
+        inner: FlatBus,
+        /// Every address exactly as the core presented it, in order. Tests
+        /// assert against written-out literals here rather than recomputing the
+        /// expected value from `ADDR_MASK`.
+        pub seen: Vec<u32>,
+    }
+
+    impl StrictBus {
+        pub fn new() -> Self {
+            Self {
+                inner: FlatBus::new(),
+                seen: Vec::new(),
+            }
+        }
+
+        pub fn put16(&mut self, addr: u32, val: u16) {
+            self.inner.put16(addr, val);
+        }
+
+        pub fn load(&mut self, addr: u32, words: &[u16]) {
+            self.inner.load(addr, words);
+        }
+
+        /// Reads memory back without going through the trait, so a test's own
+        /// assertions do not appear in [`Self::seen`].
+        pub fn peek16(&self, addr: u32) -> u16 {
+            let a = (addr & 0xFFFE) as usize;
+            u16::from_be_bytes([self.inner.mem[a], self.inner.mem[a + 1]])
+        }
+
+        fn check(&mut self, addr: u32) {
+            assert!(
+                addr <= super::ADDR_MASK,
+                "the core presented {addr:#010X} to the bus, above the 24-bit \
+                 address bus: `Bus`'s contract says the core has already masked"
+            );
+            self.seen.push(addr);
+        }
+    }
+
+    impl crate::Bus for StrictBus {
+        fn read8(&mut self, addr: u32) -> u8 {
+            self.check(addr);
+            self.inner.read8(addr)
+        }
+        fn read16(&mut self, addr: u32) -> u16 {
+            self.check(addr);
+            self.inner.read16(addr)
+        }
+        fn write8(&mut self, addr: u32, val: u8) {
+            self.check(addr);
+            self.inner.write8(addr, val);
+        }
+        fn write16(&mut self, addr: u32, val: u16) {
+            self.check(addr);
+            self.inner.write16(addr, val);
+        }
+    }
+
     /// A `Bus` that records every word-level access in order, on top of a flat
     /// memory image.  Used by tests that need to assert bus *sequence*, not just
     /// final memory state.
@@ -684,6 +765,157 @@ mod tests {
         assert!(cpu.sr_s(), "reset enters supervisor mode");
         assert_eq!(cpu.prefetch, [0x4E71, 0x4E71]);
         assert_eq!(cpu.pc, 0x1004, "pc sits 4 past the first instruction");
+    }
+
+    /// Every address-mode family presents a 24-bit address to the `Bus`.
+    ///
+    /// ⚠️ **This is the only test in the workspace that can see `ADDR_MASK` being
+    /// applied**, as opposed to seeing its value. Widening it to `0xFFFF_FFFF`
+    /// left all 366 workspace tests and all 317,500 suite cases green, because
+    /// every other bus masks the address a second time on the way in — see
+    /// [`tests_support::StrictBus`]. Each row below drives an `A0`, `PC` or `SP`
+    /// above `0x00FF_FFFF` through one family's `& ADDR_MASK` site.
+    ///
+    /// The expected addresses are **written out as literals**, never computed
+    /// from `ADDR_MASK`, so the assertions cannot follow the constant if it
+    /// moves. Verified per site by deleting each `& ADDR_MASK` individually,
+    /// not just by widening the constant: the four `wrapping_add(2) & ADDR_MASK`
+    /// sites in particular are only reachable from an `A0` at the *top* of the
+    /// bus, which is why the wrapping rows below exist as well as the high ones.
+    #[test]
+    fn every_address_mode_family_presents_a_24_bit_address() {
+        use super::tests_support::StrictBus;
+        use crate::decode::Decoder;
+
+        let dec = Decoder::new();
+
+        // A high address register through each memory destination mode. The
+        // program itself sits at a normal PC; only the operand address is high.
+        // `want` is the operand address the bus must see, written out.
+        let modes: &[(&str, &[u16], u32, u32)] = &[
+            ("(A0)", &[0x3080], 0xFF00_2000, 0x0000_2000),
+            ("(A0)+", &[0x30C0], 0xFF00_2000, 0x0000_2000),
+            ("-(A0)", &[0x3100], 0xFF00_2002, 0x0000_2000),
+            ("(d16,A0)", &[0x3140, 0x0010], 0xFF00_2000, 0x0000_2010),
+            ("(d8,A0,D1)", &[0x3180, 0x1004], 0xFF00_2000, 0x0000_2004),
+            ("(xxx).L", &[0x33C0, 0xFF00, 0x2000], 0, 0x0000_2000),
+        ];
+        for (name, prog, a0, want) in modes {
+            let mut bus = StrictBus::new();
+            bus.load(0x1000, prog);
+            let mut cpu = M68k::new();
+            cpu.sr = SR_S;
+            cpu.a[0] = *a0;
+            cpu.d[0] = 0xBEEF;
+            cpu.d[1] = 0; // index register for the (d8,An,Xn) row
+            cpu.pc = 0x1000;
+            cpu.prime_prefetch(&mut bus);
+            cpu.step_with(&dec, &mut bus);
+            assert!(
+                bus.seen.contains(want),
+                "{name}: expected the masked operand address {want:#010X} on the \
+                 bus, saw {:#010X?}",
+                bus.seen
+            );
+            assert_eq!(bus.peek16(*want), 0xBEEF, "{name}: wrote the wrong place");
+        }
+
+        // A high PC: the prefetch refill, the pipeline advance, and the
+        // PC-relative EA all mask.  `MOVE.W (d16,PC),D0` at 0xFF001000, with the
+        // displacement word at 0xFF001002 and d16 = +0x10.
+        let mut bus = StrictBus::new();
+        bus.load(0x1000, &[0x303A, 0x0010, 0x4E71]);
+        bus.put16(0x1012, 0xCAFE);
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S;
+        cpu.pc = 0xFF00_1000;
+        cpu.prime_prefetch(&mut bus);
+        cpu.step_with(&dec, &mut bus);
+        assert_eq!(cpu.d[0] & 0xFFFF, 0xCAFE, "d16(PC) read the wrong place");
+        assert!(
+            bus.seen.contains(&0x0000_1012),
+            "d16(PC): expected 0x00001012 on the bus, saw {:#010X?}",
+            bus.seen
+        );
+        // The queue advance issued by the handler's own `fetch_word`, at the PC
+        // *after* priming: 0xFF001004 masked.
+        assert!(
+            bus.seen.contains(&0x0000_1004),
+            "the pipeline advance must mask too, saw {:#010X?}",
+            bus.seen
+        );
+
+        // Long accesses whose *second* word crosses the top of the address bus.
+        // At A0 = 0x00FFFFFE the high word sits at 0x00FFFFFE and the low word
+        // wraps to 0 — the `a.wrapping_add(2) & ADDR_MASK` sites, which a merely
+        // *high* A0 cannot reach because masking the base already fixes them.
+        for (name, prog) in [
+            ("MOVE.L D0,(A0)", &[0x2080u16][..]),
+            ("MOVE.L (A0),D1", &[0x2210][..]),
+        ] {
+            let mut bus = StrictBus::new();
+            bus.load(0x1000, prog);
+            bus.put16(0x0000, 0x3344);
+            let mut cpu = M68k::new();
+            cpu.sr = SR_S;
+            cpu.a[0] = 0x00FF_FFFE;
+            cpu.d[0] = 0x1122_3344;
+            cpu.pc = 0x1000;
+            cpu.prime_prefetch(&mut bus);
+            cpu.step_with(&dec, &mut bus);
+            assert!(
+                bus.seen.contains(&0x0000_0000),
+                "{name}: the second word must wrap to 0x00000000, saw {:#010X?}",
+                bus.seen
+            );
+        }
+
+        // A high supervisor stack pointer: exception entry's frame pushes and
+        // the vector fetch both mask.  `TRAP #0` is vector 32 at 0x80.
+        let mut bus = StrictBus::new();
+        bus.load(0x1000, &[0x4E40]);
+        bus.load(0x0080, &[0x0000, 0x3000]);
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S;
+        cpu.a[7] = 0xFF00_2000;
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+        cpu.step_with(&dec, &mut bus);
+        assert!(
+            bus.seen.contains(&0x0000_1FFA),
+            "the frame's lowest push must land at 0x00001FFA, saw {:#010X?}",
+            bus.seen
+        );
+        assert!(
+            bus.seen.contains(&0x0000_0080),
+            "the vector fetch must land at 0x00000080, saw {:#010X?}",
+            bus.seen
+        );
+
+        // MOVEM and MOVEP carry their own masking sites, away from `ea`.
+        // `MOVEM.w (A0),D0-D3` and `MOVEP.w D0,(d16,A0)`.
+        for (name, prog, want) in [
+            (
+                "MOVEM.w (A0),D0-D3",
+                &[0x4C90u16, 0x000F][..],
+                0x0000_2000u32,
+            ),
+            ("MOVEP.w D0,(d16,A0)", &[0x0188, 0x0000][..], 0x0000_2000),
+        ] {
+            let mut bus = StrictBus::new();
+            bus.load(0x1000, prog);
+            let mut cpu = M68k::new();
+            cpu.sr = SR_S;
+            cpu.a[0] = 0xFF00_2000;
+            cpu.pc = 0x1000;
+            cpu.prime_prefetch(&mut bus);
+            cpu.step_with(&dec, &mut bus);
+            assert!(
+                bus.seen.contains(&want),
+                "{name}: expected {want:#010X} on the bus, saw {:#010X?}",
+                bus.seen
+            );
+        }
     }
 
     /// `consume_opcode` shifts the queue, issues exactly one `read16` at the
