@@ -36,6 +36,38 @@ pub fn clamp_ipl(level: u8) -> u8 {
     level.min(7)
 }
 
+/// The complete CPU state. Every field is public, deliberately: the debugger in
+/// sub-project E needs to read and present all of it.
+///
+/// Two of those fields have written traps rather than encapsulation — see
+/// [`Self::sr`], which must be written through [`Self::set_sr`], and [`Self::a`],
+/// whose `a[7]` is the only authoritative stack pointer.
+///
+/// # ⚠️ `PartialEq` is stricter than behavioural equivalence
+///
+/// The derive compares all fields, including the shadow slot belonging to the
+/// **active** stack pointer — the one [`Self::a`] documents as going stale, since
+/// `a[7]` holds the live value and most handlers do not write the shadow back. So
+/// two CPUs that step identically forever can compare unequal.
+///
+/// Measured: after `BSR` in supervisor mode, `a[7] = 0x2FFC` while `ssp` still
+/// reads `0x3000`. A save-state loader that writes `ssp = a[7]` on save — which is
+/// architecturally correct in supervisor mode, and the obvious thing to write —
+/// produces a `Q` differing from `P` in that field alone. `P == Q` is **false**,
+/// yet stepping both for eight instructions gives identical cycle counts and
+/// identical `a[7]` and `sr`, and after one mode switch through `set_sr` they
+/// compare **equal**, because the switch overwrites the shadow.
+///
+/// `README.md` advertises `PartialEq`, so this is a live trap for the two things
+/// that will use it: a rewind check and a netplay desync check both raise a false
+/// alarm here, on a difference no guest program can observe.
+///
+/// Equality is kept as-is rather than hand-written to normalise the inactive SP,
+/// because a save-state round-trip *should* be byte-exact and a stricter
+/// comparison is the safer default for that. **If you are comparing for
+/// behavioural equivalence, normalise first** — write each CPU's own `a[7]` into
+/// whichever shadow its S bit selects before comparing, or compare the fields you
+/// mean.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct M68k {
@@ -71,6 +103,31 @@ pub struct M68k {
     /// Always 4 bytes beyond the instruction word currently executing,
     /// because of the two-word prefetch queue.
     pub pc: u32,
+    /// The status register.
+    ///
+    /// ⚠️ **Writing this field is not the same as calling [`Self::set_sr`], and
+    /// the difference is two silent state corruptions.** `set_sr` has two jobs
+    /// besides storing the value, and a field write does neither:
+    ///
+    /// - **No stack-pointer swap.** From `a[7] = 0x3000`, `ssp = 0x3000`,
+    ///   `usp = 0x8000` in supervisor mode, `set_sr(0x0000)` leaves
+    ///   `a[7] = 0x8000` — it saved the outgoing SSP and loaded the USP. Writing
+    ///   `cpu.sr = 0x0000` leaves `a[7] = 0x3000`: a user-mode CPU still holding
+    ///   the supervisor stack pointer. (Measured, both directions.)
+    /// - **No masking.** `set_sr(0xFFFF)` stores `0xA71F`; `cpu.sr = 0xFFFF`
+    ///   stores `0xFFFF`, setting bits that do not exist on the part.
+    ///
+    /// Either one produces a state the core cannot reach on its own, which then
+    /// propagates. The concrete way this bites is a debugger's "edit SR" box
+    /// written against the field: the S bit is exactly the one a user of such a box
+    /// wants to toggle, and it is the one that must not be toggled this way.
+    ///
+    /// Reading the field is fine, and is what the whole codebase does. **Use
+    /// [`Self::set_sr`] for every write**, from a debugger, a save-state loader, or
+    /// a test — a test that sets up state by assigning `sr` and then asserts on
+    /// `a[7]` is asserting about an unreachable CPU. The field stays public because
+    /// the debugger needs read access to all state and carving out one field would
+    /// be a bigger surprise than this note.
     pub sr: u16,
     pub usp: u32,
     pub ssp: u32,
@@ -748,6 +805,100 @@ mod tests {
         let mut cpu = M68k::new();
         cpu.set_sr(0xFFFF);
         assert_eq!(cpu.sr, SR_MASK);
+    }
+
+    /// Writing the `sr` field skips **both** of `set_sr`'s jobs.
+    ///
+    /// This pins the trap documented on [`M68k::sr`] rather than a behaviour to
+    /// preserve: the field write is what a debugger's "edit SR" box does, and both
+    /// wrong outcomes here are states the core cannot reach on its own. Every
+    /// expected value is a literal, and the `assert_ne!`s are what make the two
+    /// paths distinguishable — without them this would pass even if the field write
+    /// somehow did swap.
+    #[test]
+    fn writing_the_sr_field_skips_the_sp_swap_and_the_mask() {
+        // Leg 1: the stack-pointer swap.
+        let mut via_setter = M68k::new();
+        via_setter.sr = SR_S;
+        via_setter.a[7] = 0x3000;
+        via_setter.ssp = 0x3000;
+        via_setter.usp = 0x8000;
+        let mut via_field = via_setter.clone();
+
+        via_setter.set_sr(0x0000);
+        via_field.sr = 0x0000;
+
+        assert_eq!(via_setter.a[7], 0x8000, "set_sr loads the USP");
+        assert_eq!(via_setter.ssp, 0x3000, "set_sr saves the outgoing SSP");
+        assert_eq!(
+            via_field.a[7], 0x3000,
+            "the field write leaves a user-mode CPU holding the supervisor SP"
+        );
+        assert_ne!(via_setter.a[7], via_field.a[7]);
+
+        // Leg 2: the mask.
+        let mut via_setter = M68k::new();
+        let mut via_field = via_setter.clone();
+        via_setter.set_sr(0xFFFF);
+        via_field.sr = 0xFFFF;
+        assert_eq!(via_setter.sr, 0xA71F, "set_sr drops absent bits");
+        assert_eq!(via_field.sr, 0xFFFF, "the field write keeps them");
+        assert_ne!(via_setter.sr, via_field.sr);
+    }
+
+    /// `PartialEq` compares the stale SP shadow, so it is stricter than
+    /// behavioural equivalence.
+    ///
+    /// The trap documented on [`M68k`]: a save-state loader writing `ssp = a[7]` on
+    /// save — correct in supervisor mode — makes two behaviourally identical CPUs
+    /// compare unequal. Both halves are asserted, because "unequal" alone would be
+    /// consistent with a genuine difference: the two step to identical `a[7]`, `sr`
+    /// and cycle counts, and converge to `==` after one mode switch.
+    #[test]
+    fn partial_eq_sees_the_stale_sp_shadow_that_stepping_does_not() {
+        let dec = crate::decode::Decoder::new();
+        let mut bus = FlatBus::new();
+        // BSR.w +4, then NOPs to step through.
+        bus.load(0x1000, &[0x6100, 0x0004, 0x4E71, 0x4E71, 0x4E71, 0x4E71]);
+
+        let mut p = M68k::new();
+        p.sr = SR_S;
+        p.a[7] = 0x3000;
+        p.ssp = 0x3000;
+        p.usp = 0x8000;
+        p.pc = 0x1000;
+        p.prime_prefetch(&mut bus);
+        p.step_with(&dec, &mut bus);
+
+        // BSR moved the stack and did not write the shadow back.
+        assert_eq!(p.a[7], 0x2FFC, "BSR pushed a long word");
+        assert_eq!(p.ssp, 0x3000, "the shadow is stale, as documented");
+
+        // What an obvious save-state loader writes.
+        let mut q = p.clone();
+        q.ssp = q.a[7];
+        assert_ne!(p, q, "equality sees a difference no guest can observe");
+
+        // They are nonetheless the same CPU behaviourally.
+        let mut bus_q = FlatBus::new();
+        bus_q.load(0x1000, &[0x6100, 0x0004, 0x4E71, 0x4E71, 0x4E71, 0x4E71]);
+        let (mut sp, mut sq) = (p.clone(), q.clone());
+        for _ in 0..8 {
+            assert_eq!(
+                sp.step_with(&dec, &mut bus),
+                sq.step_with(&dec, &mut bus_q),
+                "same cycle count"
+            );
+        }
+        assert_eq!(sp.a[7], sq.a[7]);
+        assert_eq!(sp.sr, sq.sr);
+        assert_eq!(sp.pc, sq.pc);
+
+        // And one mode switch overwrites the shadow, so they converge.
+        let (mut r1, mut r2) = (p.clone(), q.clone());
+        r1.set_sr(0x0000);
+        r2.set_sr(0x0000);
+        assert_eq!(r1, r2, "leaving supervisor mode writes the shadow");
     }
 
     /// `set_irq` saturates an out-of-range level to 7.
