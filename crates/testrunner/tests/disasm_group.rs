@@ -314,9 +314,22 @@ fn group_consistency() {
 
             let got_text = disassemble(
                 |a| {
-                    // Provide the full initial state's memory would be ideal, but
-                    // for the mnemonic check we only need the opcode word itself —
-                    // extension words don't affect the mnemonic.
+                    // Only the opcode word is supplied; every extension word
+                    // reads as 0.
+                    //
+                    // ⚠️ The comment this replaces said "extension words don't
+                    // affect the mnemonic", which is **false** — `MOVEM`'s
+                    // register mask and the `(d16,An)` displacement both live in
+                    // extension words, and a zero displacement renders `(d16,An)`
+                    // identically to `(An)`. The reason this test is still sound
+                    // is narrower: it asserts the **mnemonic only**, and no
+                    // extension word changes which instruction a word decodes to.
+                    //
+                    // That distinction matters because the false version stated
+                    // the blind spot as though it were absent. Anything keyed on
+                    // an extension word is unverified here, and the module docs
+                    // say so; do not widen the assertion to the full string
+                    // without supplying real memory.
                     match a {
                         0 => opcode,
                         _ => 0,

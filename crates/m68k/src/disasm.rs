@@ -12,6 +12,16 @@
 //!   fields (shift counts, ADDQ/SUBQ data, TRAP vector, MOVEQ data) use
 //!   decimal since they are always small and a programmer thinks of them
 //!   that way.
+//! - **Displacements are signed and unpadded**: `-$10`, not `$FFF0` and not
+//!   `$F0`. Every displacement goes through the private `signed_hex` helper for
+//!   this reason; see its docs for the bug that motivated it. (Not linked: it is
+//!   private, and `lib.rs` denies `rustdoc::private_intra_doc_links`.)
+//!
+//! None of these are measurements. The vector suite carries no text, so it can
+//! say which instruction a word decodes to but not how to spell it; the widths,
+//! the case, and the `$`/decimal split are house convention. Only the signed
+//! rendering is a correctness claim — `$FFF0` for −16 is wrong in any
+//! convention, because it reads as a different number.
 //!
 //! # Feature gate
 //!
@@ -1140,41 +1150,56 @@ fn format_imm(val: u32, sz: EaSize) -> String {
     }
 }
 
+/// A displacement in MAME's spelling: `$10` or `-$10`, never `$FFF0`.
+///
+/// ⚠️ **`format!("${:X}", d)` on a signed integer prints the two's-complement
+/// bit pattern**, so a displacement of −16 rendered as `$FFF0` and read as
+/// 65,520 *forward*. The sign was already correct at `link a0,#-16` and
+/// `moveq #-1,d0`, so the inconsistency was internal to this file.
+fn signed_hex(d: i32) -> String {
+    if d < 0 {
+        format!("-${:X}", d.unsigned_abs())
+    } else {
+        format!("${d:X}")
+    }
+}
+
+/// The index-register suffix shared by both indexed `<ea>` forms: `d3.w`,
+/// `a5.l`.
+///
+/// ⚠️ **Extracted because the two callers were 8-of-11 lines identical and
+/// disagreed on the sign** — the PC form wrote `ext as i8 as i32` (correct), the
+/// `An` form `ext as i8` printed unsigned. Sharing the lines is what makes that
+/// class of divergence unwritable rather than merely fixed: there is now one
+/// place for the rule to live.
+fn format_index_reg(ext: u16) -> String {
+    let ireg = (ext >> 12) & 7;
+    let bank = if ext & 0x8000 != 0 { 'a' } else { 'd' };
+    let isz = if ext & 0x0800 != 0 { ".l" } else { ".w" };
+    format!("{bank}{ireg}{isz}")
+}
+
 fn format_disp_an(disp: i16, an: u16) -> String {
     if disp == 0 {
+        // ⚠️ Renders identically to `(a{an})`, which is the *correct* operand
+        // spelling but loses the distinction between a 4-byte `(d16,An)` with a
+        // zero displacement and a 2-byte `(An)`. `len` is right in both cases, so
+        // a debugger stepping by `len` stays in sync; only the text is ambiguous.
         format!("(a{an})")
     } else {
-        format!("(${:X},a{an})", disp)
+        format!("({},a{an})", signed_hex(disp as i32))
     }
 }
 
 fn format_index_ea(ext: u16, an: usize) -> String {
-    let disp = ext as i8;
-    let ireg = (ext >> 12) & 7;
-    let ilong = ext & 0x0800 != 0;
-    let iaddr = ext & 0x8000 != 0;
-    let ireg_str = if iaddr {
-        format!("a{ireg}")
-    } else {
-        format!("d{ireg}")
-    };
-    let isz = if ilong { ".l" } else { ".w" };
-    format!("(${disp:02X},a{an},{ireg_str}{isz})")
+    let disp = ext as i8 as i32;
+    format!("({},a{an},{})", signed_hex(disp), format_index_reg(ext))
 }
 
 fn format_index_pc_ea(ext: u16, base: u32) -> String {
     let disp = ext as i8 as i32;
-    let ireg = (ext >> 12) & 7;
-    let ilong = ext & 0x0800 != 0;
-    let iaddr = ext & 0x8000 != 0;
-    let ireg_str = if iaddr {
-        format!("a{ireg}")
-    } else {
-        format!("d{ireg}")
-    };
-    let isz = if ilong { ".l" } else { ".w" };
     let target = (base as i64 + disp as i64) as u32;
-    format!("(${target:X},pc,{ireg_str}{isz})")
+    format!("(${target:X},pc,{})", format_index_reg(ext))
 }
 
 fn format_movem_mask(mask: u16) -> String {
@@ -1394,7 +1419,16 @@ mod tests {
         assert_eq!(dis(&[0x1018]), "move.b (a0)+,d0");
         assert_eq!(dis(&[0x1020]), "move.b -(a0),d0");
         assert_eq!(dis(&[0x1028, 0x0010]), "move.b ($10,a0),d0");
-        assert_eq!(dis(&[0x1030, 0x1000]), "move.b ($00,a0,d1.w),d0");
+        // Unpadded, matching every other displacement in this file. The old
+        // `$00` came from a `{:02X}` that only this one site used; the suite
+        // carries no text, so the width is a house convention, not a measurement.
+        assert_eq!(dis(&[0x1030, 0x1000]), "move.b ($0,a0,d1.w),d0");
+        // A negative index displacement is signed, not two's-complement hex.
+        // `0xF0` as an i8 is -16, so this must not read as `$F0` or `$FFF0`.
+        assert_eq!(dis(&[0x1030, 0x10F0]), "move.b (-$10,a0,d1.w),d0");
+        // And the (d16,An) form, which is where the unsigned print was worst:
+        // -16 previously rendered as `$FFF0` and read as 65,520 forward.
+        assert_eq!(dis(&[0x1028, 0xFFF0]), "move.b (-$10,a0),d0");
         assert_eq!(dis(&[0x1038, 0x1234]), "move.b $1234,d0");
         // Immediate EA: sized hex formatting.
         assert_eq!(dis(&[0x103C, 0x0042]), "move.b #$42,d0");
