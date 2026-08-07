@@ -664,3 +664,24 @@ rather than from a test, the check is **re-reading the cited line**. Every such
 claim on this page names its file and line for that reason. A claim citing
 `cps1.cpp:394-396` is checkable in ten seconds; a claim saying "MAME does X" is
 not, and is the shape this file avoids.
+
+### Getting the reference back
+
+The three files are **not in this repository** — MAME is BSD-3-Clause and vendoring
+someone else's tree into ours is not our call to make. They are read from a scratch
+directory, which means they will eventually vanish. Restoring them:
+
+```sh
+mkdir -p /tmp/mameref && cd /tmp/mameref
+for f in cps1.cpp cps1.h cps1_v.cpp; do
+  curl -sO "https://raw.githubusercontent.com/mamedev/mame/master/src/mame/capcom/$f"
+done
+```
+
+⚠️ **The line numbers on this page are pinned to `master` as of 2026-08-07, and
+`master` moves.** A citation that has drifted looks exactly like a citation that
+was always wrong. If a line does not say what this page claims, check whether the
+*content* still exists elsewhere in the file before concluding the claim is false —
+and if it moved, update the number here rather than leaving the next reader to
+rediscover it. Pinning to a commit hash instead of `master` would fix this and is
+worth doing the next time these files are fetched.
