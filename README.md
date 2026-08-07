@@ -54,7 +54,7 @@ cargo run -p testrunner --bin report --release
 cargo bench -p m68k
 ```
 
-`cargo test --workspace --release` is the real gate. It runs 205 `m68k` unit
+`cargo test --workspace --release` is the real gate. It runs 209 `m68k` unit
 tests and 128 harness tests — one per suite group, plus one that fails if a file
 appears in `testdata/` without a corresponding registered group, so adding a
 vector file cannot silently go unrun.
