@@ -223,11 +223,30 @@ fn shift(kind: Kind, left: bool, v0: u32, count: u32, size: Size, x0: bool) -> O
 /// turn, so V is set unless those top `count + 1` bits are all equal. Computed
 /// in `u64` because `count + 1` reaches 32 for a long operand, and `1u32 << 32`
 /// panics in a debug build.
+///
+/// Verified exhaustively against a step-by-step reference at byte and word size by
+/// `tests::asl_overflow_matches_a_step_by_step_reference`, which is what pins the
+/// `bits - k` shift amount and the all-ones mask; the suite alone does not (see
+/// below). (Not linked: the test module is `#[cfg(test)]`, so rustdoc cannot resolve
+/// a path into it even with `--document-private-items`.)
 #[inline]
 fn asl_overflow(v: u32, count: u32, bits: u32) -> bool {
     if count >= bits {
         // Everything is shifted out, so the sign passed through every bit of
         // the operand: V is set unless the operand was zero.
+        //
+        // The `v != 0` guard rests on THREE suite cases. Measured (Task 14):
+        // 1,285 of 2,500 ASL.b cases reach this branch and 3 of them carry a zero
+        // operand; ASL.w reaches it 706 times and ASL.l 624, with a zero operand
+        // neither time. So `return true` here fails ASL.b and leaves ASL.w and
+        // ASL.l green — the narrowest suite margin found in this audit.
+        //
+        // The two zeros are honest absences rather than oversights: a zero operand
+        // occurs 0/2,500 times anywhere in ASL.w and ASL.l regardless of count, so
+        // the expected count within the saturating subset is 0.00 and those zeros
+        // measure nothing about this branch. In ASL.b the rate is 6/2,500 and the
+        // expected overlap is 3.08 against 3 observed — the suite is not targeting
+        // this case, it is hitting it at exactly the rate chance predicts.
         return v != 0;
     }
     let k = count + 1;
@@ -510,6 +529,14 @@ mod tests {
     /// `ASL`'s V is set by a sign change *during* the shift, which endpoint
     /// comparison misses: 0x80 shifted left twice as a byte ends at 0x00, so
     /// both endpoints have a clear sign and V must still be set.
+    ///
+    /// ⚠️ **The five direct asserts below are examples and two mutants walk past
+    /// them** (measured, Task 14): dropping the `top == (1u64 << k) - 1` disjunct
+    /// entirely, and changing that mask to `1u64 << k`, both leave this test green.
+    /// Every operand here is non-negative, so the all-ones half of the predicate —
+    /// the half that handles a negative operand whose sign never changes — is never
+    /// reached. [`asl_overflow_matches_a_step_by_step_reference`] is what kills
+    /// those two; keep it if this test is ever rewritten.
     #[test]
     fn asl_overflow_is_a_mid_shift_predicate() {
         let dec = Decoder::new();
@@ -531,6 +558,96 @@ mod tests {
         // does not.
         assert!(asl_overflow(0x40, 1, 8));
         assert!(!asl_overflow(0x20, 1, 8));
+    }
+
+    /// [`asl_overflow`] against a brute-force reference, exhaustively at byte and
+    /// word size.
+    ///
+    /// ⚠️ **The five hand-written rows above are examples, not coverage.** They pin
+    /// the two branches and two boundary values; they say nothing about the
+    /// `bits - k` shift amount, the `(1u64 << k) - 1` mask, or the `count + 1`
+    /// off-by-one — the three places this function is most likely to be wrong, and
+    /// each of which a chosen example can easily miss. The closed form is an
+    /// optimisation of "watch the sign bit at every step", so the reference simply
+    /// does that, one shift at a time, and the two are compared over the whole
+    /// input space at 8 and 16 bits.
+    ///
+    /// The reference is deliberately written the slow, obvious way. A reference that
+    /// shared the closed form's algebra would agree with it by construction and
+    /// prove nothing — the same reason the control-modes truth table in `ea.rs` is
+    /// enumerated rather than re-derived.
+    #[test]
+    fn asl_overflow_matches_a_step_by_step_reference() {
+        /// Shifts left one bit at a time and reports whether the sign bit ever
+        /// differed from where it started. This is the definition; `asl_overflow`
+        /// is the fast form of it.
+        fn reference(v: u32, count: u32, bits: u32) -> bool {
+            let mask = if bits == 32 {
+                u32::MAX
+            } else {
+                (1u32 << bits) - 1
+            };
+            let sign = 1u32 << (bits - 1);
+            let start = v & sign;
+            let mut cur = v & mask;
+            for _ in 0..count {
+                cur = (cur << 1) & mask;
+                if cur & sign != start {
+                    return true;
+                }
+            }
+            false
+        }
+
+        // Byte: every operand against every count the encoding can produce,
+        // including the register-count range up to 63.
+        let mut checked = 0u32;
+        for v in 0u32..=0xFF {
+            for count in 0u32..=63 {
+                assert_eq!(
+                    asl_overflow(v, count, 8),
+                    reference(v, count, 8),
+                    "byte: v={v:#04X} count={count}"
+                );
+                checked += 1;
+            }
+        }
+        // Word: every operand, and counts through the interesting range plus the
+        // saturating one.
+        for v in 0u32..=0xFFFF {
+            for count in [0u32, 1, 2, 14, 15, 16, 17, 31, 32, 63] {
+                assert_eq!(
+                    asl_overflow(v, count, 16),
+                    reference(v, count, 16),
+                    "word: v={v:#06X} count={count}"
+                );
+                checked += 1;
+            }
+        }
+        // Long: the full space is too large, so exercise the values where the
+        // `count + 1 == 32` case (which is why the closed form uses u64 at all)
+        // and the sign boundaries live.
+        for v in [
+            0u32,
+            1,
+            0x7FFF_FFFF,
+            0x8000_0000,
+            0x8000_0001,
+            0xFFFF_FFFF,
+            0xC000_0000,
+            0x4000_0000,
+        ] {
+            for count in [0u32, 1, 30, 31, 32, 33, 63] {
+                assert_eq!(
+                    asl_overflow(v, count, 32),
+                    reference(v, count, 32),
+                    "long: v={v:#010X} count={count}"
+                );
+                checked += 1;
+            }
+        }
+        // Non-vacuity: the loops must actually have run.
+        assert_eq!(checked, 256 * 64 + 65536 * 10 + 8 * 7);
     }
 
     /// `ROXL` carries X through the operand: bit `bits` of the rotation.

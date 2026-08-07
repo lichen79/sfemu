@@ -194,7 +194,7 @@ impl M68k {
     /// Advances the pipeline by one word: promotes slot 1 to slot 0, reads the
     /// next word from PC into slot 1, and increments PC by 2.
     ///
-    /// This is the same bus operation as [`fetch_word_dyn`] — both bodies are
+    /// This is the same bus operation as `fetch_word_dyn` — both bodies are
     /// identical except that `fetch_word_dyn` also returns the consumed word.
     /// Use whichever makes intent clearest: `consume_opcode` when the handler
     /// already has the opcode from `step_with`'s peek and the advance is purely
