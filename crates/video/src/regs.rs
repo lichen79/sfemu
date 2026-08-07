@@ -117,7 +117,10 @@ impl VideoConfig {
     /// trailing entries of MAME's five-element layer-enable mask are the star
     /// layers, both 0 on this board — consistent with SF2's `ROM_START` having no
     /// `stars` region, and the reason this struct carries three.
-    pub fn sf2() -> Self {
+    /// `const` so a caller can embed this in its own `const fn` board table —
+    /// `machine`'s `BoardConfig::sf2` does — rather than having to give up
+    /// constness for a struct that is nothing but literals.
+    pub const fn sf2() -> Self {
         Self {
             layer_control: 0x26 / 2,
             priority: [

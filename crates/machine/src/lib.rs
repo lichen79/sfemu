@@ -1,8 +1,9 @@
 //! The CPS-1 arcade board: memory map, frame schedule, and vblank interrupt.
 //!
-//! Zero dependencies beyond [`m68k`]. No `std` requirement in the simulation
-//! path, no host I/O, no clock access — the same constraints sub-project A
-//! honoured, for the same reason: WASM and rollback netplay stay nearly free.
+//! Zero dependencies beyond [`m68k`] and [`video`], both dependency-free crates
+//! of this workspace. No `std` requirement in the simulation path, no host I/O,
+//! no clock access — the same constraints sub-project A honoured, for the same
+//! reason: WASM and rollback netplay stay nearly free.
 //!
 //! # This crate holds no ROM
 //!
@@ -25,6 +26,14 @@ pub mod cps1;
 pub mod inputs;
 pub mod timing;
 pub mod trace;
+
+/// The video subsystem, re-exported.
+///
+/// A host that drives a [`Cps1`] reads its framebuffer, and reading it means
+/// naming [`video::palette::BACKGROUND_PEN`] and [`video::WIDTH`]. Re-exporting is
+/// how `sfemu` does that without taking a second dependency edge on the same
+/// crate — the same reasoning that keeps `m68k` out of `sfemu`'s manifest.
+pub use video;
 
 pub use board::Board;
 pub use config::BoardConfig;

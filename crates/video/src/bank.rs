@@ -124,7 +124,10 @@ static STF29_RANGES: [BankRange; 6] = [
 
 impl BankMapper {
     /// SF2's `mapper_STF29` (`cps1_v.cpp:1109`).
-    pub fn stf29() -> Self {
+    ///
+    /// `const` for the same reason as [`crate::regs::VideoConfig::sf2`]: a board
+    /// table in another crate should not have to stop being `const` to name it.
+    pub const fn stf29() -> Self {
         Self {
             bank_sizes: [0x8000, 0x8000, 0x8000, 0],
             ranges: &STF29_RANGES,

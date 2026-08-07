@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
-# One dependency, ever. `machine` must not gain `romset`: that would drag in
-# miniz_oxide and std and forfeit the WASM posture sub-project A paid for.
+# `machine` must not gain `romset`: that would drag in miniz_oxide and std and
+# forfeit the WASM posture sub-project A paid for. Both dependencies here are
+# dependency-free `no_std`-shaped crates in this workspace, so the edge holds.
 [dependencies]
 m68k = { path = "../m68k" }
+video = { path = "../video" }

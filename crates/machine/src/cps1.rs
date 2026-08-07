@@ -4,6 +4,7 @@ use crate::board::Board;
 use crate::config::BoardConfig;
 use crate::timing::Timing;
 use m68k::{decode::Decoder, M68k};
+use video::compose::Video;
 
 /// A CPS-1 machine: 68000, board, and frame schedule.
 ///
@@ -39,14 +40,28 @@ pub struct Cps1 {
     /// animation over a match, with nothing ever looking broken enough to
     /// investigate.
     carry: i64,
+    /// The video subsystem: the graphics ROM, the object latch, and the frame.
+    pub video: Video,
     /// Built once. `Decoder::new` fills a 65,536-entry table, so constructing one
     /// per step would dominate the run time.
     dec: Decoder,
 }
 
 impl Cps1 {
-    /// A machine with `prog` in ROM space. Call [`Cps1::reset`] before stepping.
+    /// A machine with `prog` in ROM space and no graphics ROM.
+    ///
+    /// Call [`Cps1::reset`] before stepping. With no graphics every tile decodes as
+    /// absent, so [`Cps1::render`] produces a uniform background frame — which is
+    /// what every test in this crate that does not care about pixels wants.
     pub fn new(prog: &[u8], cfg: BoardConfig, timing: Timing) -> Self {
+        Self::with_gfx(prog, Vec::new(), cfg, timing)
+    }
+
+    /// A machine with `prog` in ROM space and `gfx` as its graphics ROM.
+    ///
+    /// `gfx` is the board's assembled graphics region, supplied by the caller. This
+    /// crate holds no ROM.
+    pub fn with_gfx(prog: &[u8], gfx: Vec<u8>, cfg: BoardConfig, timing: Timing) -> Self {
         Self {
             cpu: M68k::new(),
             board: Board::new(prog, cfg),
@@ -54,8 +69,18 @@ impl Cps1 {
             total_cycles: 0,
             line: 0,
             carry: 0,
+            video: Video::new(cfg.video, cfg.mapper, gfx),
             dec: Decoder::new(),
         }
+    }
+
+    /// Renders the current board state into [`Cps1::video`]'s framebuffer.
+    ///
+    /// Uses the object table as [`Cps1::run_scanline`] last latched it, which is a
+    /// frame behind — CPS-1 sprites are delayed one frame (`cps1_v.cpp:3067-3068`).
+    pub fn render(&mut self) {
+        self.video
+            .render(&self.board.gfxram[..], &self.board.cps_a, &self.board.cps_b);
     }
 
     /// Power-up: the CPU takes SSP and PC from vectors 0 and 1, and the schedule
@@ -79,6 +104,14 @@ impl Cps1 {
         // encoded priority.
         if self.line == self.timing.vblank_line {
             self.board.assert_vblank();
+            // The object table is latched here, once per frame, at the same instant
+            // vblank is asserted — `cps1_v.cpp:3060-3068`, where the memcpy sits in
+            // `screen_vblank_cps1` under "CPS1 sprites have to be delayed one
+            // frame". Taking it from the frame schedule rather than simulating a
+            // delay is what makes the delay exactly one frame for a caller driving
+            // scanlines by hand as much as for a `run_frame` caller.
+            self.video
+                .latch_objects(&self.board.gfxram[..], &self.board.cps_a);
         }
         let mut budget = i64::from(self.timing.cycles_per_line) + self.carry;
         let mut spent = 0u32;
@@ -364,6 +397,207 @@ mod tests {
             m.total_cycles
         );
         assert_eq!(m.line, 0);
+    }
+
+    // ------------------------------------------------------------------ video
+
+    /// The pen the video fixture's sprite tile is solid in.
+    const SOLID_PEN: u8 = 0x0A;
+    /// The colour scheme its record asks for.
+    const SPRITE_COLOUR: u16 = 3;
+    /// The pen that combination lands in the framebuffer: `colour * 16 + pen`.
+    const SPRITE_PEN: u16 = SPRITE_COLOUR * 16 + SOLID_PEN as u16;
+
+    /// Word index in gfxram of the object table the fixture uses.
+    ///
+    /// Not zero: at zero the table would sit on top of the tilemaps, and these
+    /// tests could not tell a sprite record from a map entry.
+    const OBJ_WORD: usize = 0x2000;
+    /// The object-base register value that resolves there — 0x40 × 256 = 0x4000
+    /// bytes, already aligned to the table's 0x800 boundary, which is word 0x2000.
+    const OBJ_BASE_REG: u16 = 0x40;
+
+    /// A 16×16 graphics tile every pixel of which is `pen`.
+    ///
+    /// Written from the plane *byte* structure and not from `tile_pen`'s within-byte
+    /// arithmetic: a solid tile's plane bytes are all 0x00 or all 0xFF, a group's
+    /// four bytes are pen bits 0-3 in memory order, and a 16×16 row is two such
+    /// groups. [`the_sprite_fixture_tile_is_solid`] decodes it back through
+    /// `video`'s own reader, so a wrong transcription here fails there rather than
+    /// quietly making a render test assert the wrong pen.
+    fn solid_sprite_tile(pen: u8) -> Vec<u8> {
+        let byte_for = |bit: u8| if pen & (1 << bit) != 0 { 0xFFu8 } else { 0x00 };
+        let group = [byte_for(0), byte_for(1), byte_for(2), byte_for(3)];
+        let mut rom = vec![0u8; 128];
+        for row in 0..16 {
+            for half in [0usize, 4] {
+                rom[row * 8 + half..][..4].copy_from_slice(&group);
+            }
+        }
+        rom
+    }
+
+    /// The fixture's tile really is solid in [`SOLID_PEN`].
+    #[test]
+    fn the_sprite_fixture_tile_is_solid() {
+        let rom = solid_sprite_tile(SOLID_PEN);
+        assert_eq!(rom.len(), 128, "a 16x16 4bpp tile is 128 bytes");
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(
+                    video::tiles::tile_pen(&rom, video::tiles::TileKind::Tile16x16, 0, x, y),
+                    SOLID_PEN,
+                    "({x}, {y})"
+                );
+            }
+        }
+    }
+
+    /// A machine whose graphics hold that one tile, with the object base set.
+    fn video_machine() -> Cps1 {
+        let mut m = Cps1::with_gfx(
+            &spin(),
+            solid_sprite_tile(SOLID_PEN),
+            BoardConfig::sf2(),
+            Timing::cps1_10mhz(),
+        );
+        m.reset();
+        m.board.cps_a[video::regs::OBJ_BASE] = OBJ_BASE_REG;
+        assert_eq!(
+            video::regs::cps_a_base(&m.board.cps_a, video::regs::OBJ_BASE, 0x800),
+            OBJ_WORD,
+            "the fixture's object table is where the tests write it"
+        );
+        // Every layer-control field left at zero puts the sprites at all four
+        // depths and enables no tilemap, so the sprites are the only thing drawn.
+        assert_eq!(m.board.cps_b[BoardConfig::sf2().video.layer_control], 0);
+        m
+    }
+
+    /// Writes sprite record 0 at visible (`x`, `y`), with an end marker behind it.
+    ///
+    /// The register holds a **raster** position, so the visible offset is added
+    /// here — `video`'s own tests pin that offset at (64, 16) against literals.
+    fn write_obj(m: &mut Cps1, x: i32, y: i32) {
+        let rec = [
+            (x + video::VISIBLE_X) as u16,
+            (y + video::VISIBLE_Y) as u16,
+            0, // code 0, the fixture's solid tile
+            SPRITE_COLOUR,
+        ];
+        for (i, w) in rec.into_iter().enumerate() {
+            m.board.gfxram[OBJ_WORD + i] = w;
+        }
+        m.board.gfxram[OBJ_WORD + 7] = 0xFF00;
+    }
+
+    /// The pen at visible (`x`, `y`), or [`None`] where the background shows.
+    fn px(m: &Cps1, x: usize, y: usize) -> Option<u16> {
+        match m.video.fb.pens[y * video::WIDTH + x] {
+            video::palette::BACKGROUND_PEN => None,
+            p => Some(p),
+        }
+    }
+
+    /// How many pixels of the frame are not the background.
+    fn drawn(m: &Cps1) -> usize {
+        m.video
+            .fb
+            .pens
+            .iter()
+            .filter(|&&p| p != video::palette::BACKGROUND_PEN)
+            .count()
+    }
+
+    /// `Cps1::new` still takes three arguments, and its frame is pure background.
+    ///
+    /// Every other test in this crate proves the signature by compiling. This one
+    /// exercises the empty-graphics path rather than merely linking it: with no
+    /// graphics ROM every tile decodes as absent, so a rendered frame must be
+    /// uniformly the background pen — which is also the premise the tests below
+    /// rest on when they assert that *something* drew.
+    #[test]
+    fn cps1_new_still_takes_three_arguments() {
+        let mut m = Cps1::new(&spin(), BoardConfig::sf2(), Timing::cps1_10mhz());
+        m.reset();
+        m.run_frame();
+        m.render();
+        assert_eq!(
+            m.video.fb.pens.len(),
+            video::WIDTH * video::HEIGHT,
+            "384 x 224"
+        );
+        assert_eq!(drawn(&m), 0, "no graphics, so nothing can be drawn");
+        assert_eq!(px(&m, 0, 0), None);
+    }
+
+    /// The graphics region handed to `with_gfx` is the one the renderer draws from.
+    #[test]
+    fn with_gfx_carries_the_region_into_the_renderer() {
+        let mut m = video_machine();
+        write_obj(&mut m, 0, 0);
+        m.run_frame();
+        m.render();
+        assert_eq!(px(&m, 0, 0), Some(SPRITE_PEN), "colour 3, pen 0x0A");
+        assert_eq!(
+            px(&m, 15, 15),
+            Some(SPRITE_PEN),
+            "and the tile's far corner"
+        );
+        assert_eq!(drawn(&m), 16 * 16, "one 16x16 tile and nothing else");
+        assert_eq!(px(&m, 16, 0), None, "the pixel past its right edge");
+    }
+
+    /// The object table is latched once per frame, at vblank.
+    ///
+    /// Three assertions, and each kills a different way of getting this wrong:
+    /// a frame's worth of scanlines latches (so the table reaches the renderer at
+    /// all); a change made mid-frame does *not* take effect (so the latch is not
+    /// run every scanline, and not at line 0); and the next vblank picks it up (so
+    /// it is a one-frame delay rather than a one-shot read).
+    ///
+    /// The delay is asserted through the drawn frame rather than by reading the
+    /// latch, which `video` keeps private: the frame is the artifact, and a test
+    /// that read the latch would pass on a renderer that ignored it.
+    #[test]
+    fn objects_are_latched_once_per_frame_at_vblank() {
+        let mut m = video_machine();
+        write_obj(&mut m, 0, 0);
+        m.run_frame();
+        m.render();
+        assert_eq!(px(&m, 0, 0), Some(SPRITE_PEN), "the first frame's table");
+
+        // Move the sprite, then run ten scanlines — lines 0 to 9, none of them the
+        // vblank line 240. The frame the renderer draws must still be the old one.
+        write_obj(&mut m, 32, 48);
+        for _ in 0..10 {
+            m.run_scanline();
+        }
+        assert!(m.line < m.timing.vblank_line, "the premise: no vblank yet");
+        m.render();
+        assert_eq!(
+            px(&m, 0, 0),
+            Some(SPRITE_PEN),
+            "a table written mid-frame must not appear until the next vblank"
+        );
+        assert_eq!(
+            px(&m, 32, 48),
+            None,
+            "and the new position must not be drawn"
+        );
+
+        // A full frame from here crosses line 240 exactly once.
+        for _ in 0..262 {
+            m.run_scanline();
+        }
+        m.render();
+        assert_eq!(
+            px(&m, 32, 48),
+            Some(SPRITE_PEN),
+            "the next vblank latched it"
+        );
+        assert_eq!(px(&m, 0, 0), None, "and the old position is gone");
+        assert_eq!(drawn(&m), 16 * 16, "still exactly one tile");
     }
 
     /// `reset` clears the schedule as well as the CPU.

@@ -18,6 +18,16 @@ pub struct BoardConfig {
     pub cpsb_value: u16,
     /// Byte offset of the extra-input port (`IN2`), or `None`.
     pub in2_addr: Option<u8>,
+    /// Which CPS-B registers the video subsystem reads on this board.
+    ///
+    /// The same MAME table row supplies this and the fields above — `{"sf2",
+    /// CPS_B_11, mapper_STF29, 0x36}` (`cps1_v.cpp:1838`) names the CPS-B variant
+    /// once, and both halves of this struct come out of it. Keeping them together
+    /// means a board cannot be configured with one game's registers and another's
+    /// wired reads.
+    pub video: video::regs::VideoConfig,
+    /// How this board's graphics codes map onto its ROM banks.
+    pub mapper: video::bank::BankMapper,
 }
 
 impl BoardConfig {
@@ -37,6 +47,8 @@ impl BoardConfig {
             cpsb_addr: Some(0x32),
             cpsb_value: 0x0401,
             in2_addr: Some(0x36),
+            video: video::regs::VideoConfig::sf2(),
+            mapper: video::bank::BankMapper::stf29(),
         }
     }
 
@@ -45,11 +57,18 @@ impl BoardConfig {
     /// Exists so a test can show that the wired-read behaviour comes from the
     /// config and not from the address: with this config 0x800172 is plain RAM.
     /// Without such a case, a hardcoded `0x32` would pass every `sf2()` test.
+    ///
+    /// The video half is still SF2's. There is no second CPS-B variant in this
+    /// workspace yet, and inventing a fake one here would put a register layout no
+    /// board ever had in front of the renderer; what this config exists to vary is
+    /// the wired reads above.
     pub const fn plain() -> Self {
         Self {
             cpsb_addr: None,
             cpsb_value: 0,
             in2_addr: None,
+            video: video::regs::VideoConfig::sf2(),
+            mapper: video::bank::BankMapper::stf29(),
         }
     }
 }
@@ -65,6 +84,40 @@ mod tests {
         assert_eq!(c.cpsb_addr, Some(0x32), "CPS_B_11, cps1_v.cpp:491");
         assert_eq!(c.cpsb_value, 0x0401, "what the boot self-test expects");
         assert_eq!(c.in2_addr, Some(0x36), "cps1_v.cpp:1838, the kick buttons");
+    }
+
+    /// The video half of the row, also as literals.
+    ///
+    /// Written out rather than compared against `VideoConfig::sf2()`, which would
+    /// be the same call this field already makes and so could not fail. Every test
+    /// that renders through this config indexes `cps_b` *through* these fields, so
+    /// a blanked video half moves the expectation with it and every one of them
+    /// still passes; this is the only place that says what the indices are.
+    ///
+    /// The byte offsets are `CPS_B_11` at `cps1_v.cpp:491`, halved to word indices.
+    #[test]
+    fn the_video_half_of_the_row_has_sf2s_register_indices() {
+        let v = BoardConfig::sf2().video;
+        assert_eq!(v.layer_control, 0x26 / 2);
+        assert_eq!(
+            v.priority,
+            [
+                Some(0x28 / 2),
+                Some(0x2A / 2),
+                Some(0x2C / 2),
+                Some(0x2E / 2)
+            ],
+        );
+        assert_eq!(v.palette_control, 0x30 / 2);
+        assert_eq!(v.layer_enable_mask, [0x08, 0x10, 0x20]);
+
+        // And the mapper, by the one fact that is visible without re-deriving its
+        // range table: three banks of 0x8000 8×8 units, and no fourth.
+        assert_eq!(
+            BoardConfig::sf2().mapper.bank_sizes,
+            [0x8000, 0x8000, 0x8000, 0]
+        );
+        assert!(!BoardConfig::sf2().mapper.ranges.is_empty());
     }
 
     /// The offsets are byte offsets, so both are even and both land inside the
