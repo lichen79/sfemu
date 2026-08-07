@@ -16,6 +16,26 @@ pub const SR_MASK: u16 = 0xA71F;
 /// The 68000's address bus is 24 bits wide.
 pub const ADDR_MASK: u32 = 0x00FF_FFFF;
 
+/// Reduces a value to a legal interrupt priority level by **saturating**, not
+/// masking.
+///
+/// The IPL pins encode 0..=7, so a larger value has no encoding. `& 7` would be
+/// the obvious reduction and is the wrong one: it maps 8 to **0**, turning a
+/// request for a level above the maximum into a *deassertion*, and 9 to 1,
+/// turning the highest priority into the lowest. Saturating maps both to 7,
+/// which is at least in the direction the caller asked for and is visible when
+/// wrong — see [`M68k::set_irq`].
+///
+/// Both [`M68k::set_irq`] and [`crate::exception::check_interrupts`] go through
+/// here, so a level written straight into [`M68k::pending_irq`] as a field — a
+/// debugger, a save-state loader — is reduced the same way as one passed to
+/// `set_irq`. Two independent `& 7`s on the same value is what this replaced,
+/// and neither of them was pinned by any test.
+#[inline]
+pub fn clamp_ipl(level: u8) -> u8 {
+    level.min(7)
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct M68k {
@@ -319,25 +339,41 @@ impl M68k {
     /// "assert the line and step" means for every caller. The requirement is
     /// documented here instead. See [`crate::exception::check_interrupts`].
     ///
+    /// # Out-of-range levels saturate to 7; they do not wrap
+    ///
+    /// The three IPL pins encode 0..=7 and nothing else, so `level > 7` is a caller
+    /// bug. It is handled in two independent layers, because the two failure modes
+    /// are not the same:
+    ///
+    /// - The `debug_assert` names the bug at its source, in tests.
+    /// - [`clamp_ipl`] **saturates**, in every profile, so release behaviour is
+    ///   defined and loud rather than defined and silent.
+    ///
+    /// ⚠️ **This used to be `level & 7`, and a mask is not a clamp.** `set_irq(8)`
+    /// masked to **0** — a *deassertion*. A caller computing a level arithmetically
+    /// and landing one over, say a scanline video timer, saw its interrupt vanish
+    /// entirely; `set_irq(9)` became level 1, the *lowest* priority, when 7 was
+    /// asked for. Neither reported anything, and release is how an emulator ships:
+    /// [`crate::exception::check_interrupts`] returns `None` for level 0, so the
+    /// wrong answer was total silence.
+    ///
+    /// Saturating is the right direction because it fails **loudly**. A held level 7
+    /// is non-maskable and re-enters its handler at every instruction boundary until
+    /// the stack wraps — see the warning above — so a caller that reaches this by
+    /// mistake gets a visible livelock rather than an emulator that quietly never
+    /// interrupts. Between a wrong answer you can see and a wrong answer you cannot,
+    /// take the one you can see.
+    ///
     /// # Panics
     ///
-    /// In debug builds, if `level > 7`. The three IPL pins encode 0..=7 and nothing
-    /// else, so a larger value is a caller bug rather than an input to clamp.
-    ///
-    /// ⚠️ **The `& 7` is a mask, not a clamp, and the difference is a silent wrong
-    /// answer.** `set_irq(8)` masks to **0** — a *deassertion* — so a caller that
-    /// computed a level off by one would silently disable interrupts rather than
-    /// request a high-priority one. `set_irq(9)` becomes level 1, the lowest priority.
-    /// Neither reports anything. The `debug_assert` turns both into a named failure in
-    /// tests while leaving release builds unchanged; the mask stays so release
-    /// behaviour is still defined.
+    /// In debug builds, if `level > 7`.
     pub fn set_irq(&mut self, level: u8) {
         debug_assert!(
             level <= 7,
-            "IRQ level {level} is out of range: the IPL pins encode 0..=7, and masking \
-             would turn 8 into a deassertion rather than a high-priority request"
+            "IRQ level {level} is out of range: the IPL pins encode 0..=7, and this \
+             will saturate to 7 rather than deliver the level asked for"
         );
-        self.pending_irq = level & 7;
+        self.pending_irq = clamp_ipl(level);
     }
 
     /// Executes one instruction, returning the cycles it consumed.
@@ -712,6 +748,43 @@ mod tests {
         let mut cpu = M68k::new();
         cpu.set_sr(0xFFFF);
         assert_eq!(cpu.sr, SR_MASK);
+    }
+
+    /// `set_irq` saturates an out-of-range level to 7.
+    ///
+    /// ⚠️ Two profiles, two behaviours, and both are the point of F5. In debug the
+    /// `debug_assert!` fires and names the caller bug; in release it does not
+    /// exist and the saturation is all that stands between the caller and a
+    /// silent wrong answer. So the release leg is the one that guards the
+    /// shipping build, and it is why this cannot be a plain `should_panic` test.
+    ///
+    /// The values are written out. `7` is what a clamp gives; a `& 7` mask gives
+    /// **0** for 8 — a deassertion — and 1 for 9, the lowest priority where the
+    /// highest was asked for.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn set_irq_saturates_an_out_of_range_level_in_release() {
+        let mut cpu = M68k::new();
+        cpu.set_irq(8);
+        assert_eq!(cpu.pending_irq, 7, "8 must saturate to 7, NOT mask to 0");
+        cpu.set_irq(9);
+        assert_eq!(cpu.pending_irq, 7, "9 must saturate to 7, NOT mask to 1");
+        cpu.set_irq(255);
+        assert_eq!(cpu.pending_irq, 7);
+        // The in-range values are unaffected, which is the control: a clamp that
+        // returned 7 unconditionally would pass every assertion above.
+        cpu.set_irq(3);
+        assert_eq!(cpu.pending_irq, 3);
+        cpu.set_irq(0);
+        assert_eq!(cpu.pending_irq, 0, "0 is a deassertion and must stay 0");
+    }
+
+    /// In debug, the same call is a named panic rather than a silent saturation.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "out of range")]
+    fn set_irq_panics_on_an_out_of_range_level_in_debug() {
+        M68k::new().set_irq(8);
     }
 
     #[test]

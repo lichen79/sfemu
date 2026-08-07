@@ -1,6 +1,6 @@
 //! Exception entry: vectors, stack frames, and interrupt dispatch.
 
-use crate::cpu::{M68k, ADDR_MASK, SR_S, SR_T};
+use crate::cpu::{clamp_ipl, M68k, ADDR_MASK, SR_S, SR_T};
 use crate::Bus;
 
 pub const VEC_BUS_ERROR: u8 = 2;
@@ -566,7 +566,13 @@ pub const IACK_AS_IDLE_CYCLES: u32 = 4;
 /// tests in this module are its only coverage, and a green suite says nothing
 /// about it.
 pub fn check_interrupts(cpu: &mut M68k, bus: &mut dyn Bus) -> Option<u32> {
-    let level = cpu.pending_irq & 7;
+    // `pending_irq` is a `pub` field, so a value that never went through
+    // `set_irq` can arrive here. Reduce it the same way `set_irq` does —
+    // saturating, not `& 7` — so an out-of-range field write does not become a
+    // deassertion. This used to be a second, independent `& 7`; both survived
+    // the whole workspace unpinned, and they disagreed about nothing only
+    // because they were identical.
+    let level = clamp_ipl(cpu.pending_irq);
     if level == 0 {
         return None;
     }
@@ -953,6 +959,88 @@ mod tests {
         );
         assert_eq!(cpu.sr, SR_S | 0x0500, "entry raises the mask to level 5");
         assert_eq!(cpu.pc, 0x2004, "vectored through 29, queue refilled");
+    }
+
+    /// An out-of-range IPL saturates to 7. It does **not** wrap to a low level,
+    /// and it does **not** become a deassertion.
+    ///
+    /// ⚠️ Both reductions of this value used to be `& 7` — `set_irq`'s and
+    /// `check_interrupts`' — and both mutants survived the entire workspace
+    /// unpinned. Under a mask, `set_irq(8)` set `pending_irq = 0`, so a caller
+    /// computing a level arithmetically and landing one over got *no interrupt
+    /// at all* in release, silently; `set_irq(9)` got level 1 where 7 was asked
+    /// for. See [`crate::cpu::clamp_ipl`] for why saturating is the right
+    /// direction.
+    ///
+    /// Two legs, because `pending_irq` is a `pub` field and the two paths in are
+    /// independent:
+    ///
+    /// - `set_irq(9)` must leave `pending_irq == 7`.
+    /// - `pending_irq = 9` written *through the field*, bypassing `set_irq`
+    ///   entirely, must still take **level 7's** autovector.
+    ///
+    /// The expected vector address is written out as `0x7C` — vector 31 — rather
+    /// than computed from `VEC_AUTOVECTOR_BASE`, so the assertion cannot follow
+    /// either the base or the clamp if one moves. `0x7C` is the value that makes
+    /// a mask visible: masking 9 would read `0x64` (vector 25, level 1).
+    #[test]
+    fn an_out_of_range_irq_level_saturates_to_seven_rather_than_wrapping() {
+        // Leg 1: through `set_irq`, in release as well as debug — so this runs
+        // only the values that do not trip the `debug_assert`, plus the clamp
+        // function itself, which has no assertion in front of it.
+        assert_eq!(crate::cpu::clamp_ipl(9), 7, "9 saturates, it does not wrap");
+        assert_eq!(crate::cpu::clamp_ipl(8), 7, "8 saturates, NOT to 0");
+        assert_eq!(crate::cpu::clamp_ipl(7), 7);
+        assert_eq!(crate::cpu::clamp_ipl(0), 0, "0 is a deassertion and stays");
+
+        // Leg 2: written through the `pub` field, which bypasses `set_irq` and
+        // its `debug_assert` both. The vector taken identifies the level.
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4E71, 0x4E71, 0x4E71]);
+        bus.put16(0x007C, 0x0000); // vector 31 = level 7
+        bus.put16(0x007E, 0x2000);
+        bus.load(0x2000, &[0x4E71, 0x4E71]);
+        // The level-1 vector, whose *absence* from the log is the real
+        // assertion: a masking core would fetch here instead.
+        bus.put16(0x0064, 0x0000);
+        bus.put16(0x0066, 0x9000);
+
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S | 0x0700; // mask everything maskable
+        cpu.a[7] = 0x3000;
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+        cpu.pending_irq = 9;
+        bus.log.clear();
+
+        cpu.step_with(&Decoder::new(), &mut bus);
+
+        let reads = cpu_reads(&bus);
+        assert!(
+            reads.contains(&0x007C),
+            "must fetch vector 31 at 0x7C (level 7), saw reads {reads:#06X?}"
+        );
+        assert!(
+            !reads.contains(&0x0064),
+            "must NOT fetch vector 25 at 0x64: that is 9 & 7 == 1, the mask bug"
+        );
+        assert_eq!(
+            cpu.pc, 0x2004,
+            "vectored through 31 and refilled, not through 25"
+        );
+        // Level 7 is taken against a full mask; level 1 would have been blocked
+        // by the 0x0700 above, so a masking core would take *nothing* here and
+        // the read assertions alone would not distinguish that from a crash.
+        assert!(
+            !bus.writes().is_empty(),
+            "the interrupt must be taken at all"
+        );
+    }
+
+    /// Addresses read, in order. `RecordingBus::reads` returns `(addr, val)`;
+    /// this drops the value so a test can assert on addresses alone.
+    fn cpu_reads(bus: &RecordingBus) -> Vec<u32> {
+        bus.reads().iter().map(|(a, _)| *a).collect()
     }
 
     /// An interrupt at or below the mask is not taken; level 7 always is.
