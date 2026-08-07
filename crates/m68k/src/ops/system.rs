@@ -2020,4 +2020,206 @@ mod tests {
             "4 × 1 access + the halt idle, not the framed 58"
         );
     }
+
+    /// `MOVEM`'s halt arm, in both a lead-free and a lead-bearing mode.
+    ///
+    /// ⚠️ **This arm had no test at all**, and the mutant setting its lead to
+    /// `4 * (1 + de) + idle` → `... + 1` survived. `MOVEM` is the highest-risk of
+    /// the four halt arms because its lead is a *computed* `4 * (1 + de) + idle`
+    /// rather than a constant — the shape that has already gone wrong twice on
+    /// this branch.
+    ///
+    /// ⚠️ `a_misaligned_movem_faults_before_transferring_anything` looks like this
+    /// test's control and is not: it uses an **even** `ssp = 0x3000`, so it
+    /// exercises the framed arm and cannot see the halt arm at all.
+    ///
+    /// Two modes, for the reason `pea_indexed_with_odd_sp_charges_its_lead_idle`
+    /// exists: `(A0)` has `idle_lead == 0`, so it scores the same whether the arm
+    /// charges the lead idle or drops it. `(d8,A0,D0)` is one of the three modes
+    /// where the term is nonzero, so it is the only shape that can see it. Both
+    /// cycle counts are written out as literals and decompose under the timing
+    /// law against the asserted access count.
+    #[test]
+    fn a_misaligned_movem_with_odd_sp_halts_and_charges_its_computed_lead() {
+        let dec = Decoder::new();
+        // (prog, accesses, cycles). `MOVEM.w (A0),D0-D3` and
+        // `MOVEM.w (0,A0,D0.w),D0-D3`: 1 access is the mask word, 2 adds the
+        // extension word, and the indexed mode adds 2 of lead idle on top.
+        for (name, prog, accesses, idle, cycles) in [
+            (
+                "MOVEM.w (A0),D0-D3",
+                &[0x4C90u16, 0x000F, 0x4E71][..],
+                1,
+                4,
+                8,
+            ),
+            (
+                "MOVEM.w (0,A0,D0.w),D0-D3",
+                &[0x4CB0, 0x000F, 0x0000, 0x4E71][..],
+                2,
+                6,
+                14,
+            ),
+        ] {
+            let mut bus = RecordingBus::new();
+            bus.load(0x1000, prog);
+            bus.put16(0x000C, 0x0000); // vector 3 -> 0x5000
+            bus.put16(0x000E, 0x5000);
+            bus.load(0x5000, &[0x4E71, 0x4E71]);
+            let mut cpu = at(&mut bus);
+            cpu.a[0] = 0x2001; // odd operand base
+            cpu.a[7] = 0x2FFF; // odd SSP: the frame base is odd, so this halts
+            cpu.ssp = 0x2FFF;
+            // Sentinels in the destination registers, so a transfer that did
+            // happen would be visible. `D0` is also the indexed row's index
+            // register, so it stays 0 — the fault has to come from the odd base.
+            cpu.d[0] = 0;
+            for i in 1..4 {
+                cpu.d[i] = 0x9999_9999;
+            }
+            bus.log.clear();
+
+            let got = cpu.step_with(&dec, &mut bus);
+
+            assert!(
+                cpu.halted,
+                "{name}: an odd frame base is a double bus fault"
+            );
+            assert_eq!(bus.writes(), vec![], "{name}: no frame and no transfer");
+            for i in 1..4 {
+                assert_eq!(
+                    cpu.d[i], 0x9999_9999,
+                    "{name}: D{i} was loaded despite the fault"
+                );
+            }
+            assert_eq!(bus.log.len(), accesses, "{name}: access count");
+            assert_eq!(got, cycles, "{name}: cycles");
+            // The timing law with **both** terms written out, so a wrong total
+            // cannot hide behind a compensating access count. The idle is the
+            // 4-cycle halt idle plus, for the indexed row only, 2 of address
+            // formation.
+            assert_eq!(
+                cycles,
+                4 * accesses as u32 + idle,
+                "{name}: 4 × accesses + idle"
+            );
+        }
+    }
+
+    /// `UNLK`'s halt arm: nothing precedes the fault, so zero accesses.
+    ///
+    /// The mutant changing this arm's `entry_cycles(cpu, 0, …)` lead from 0 to 1
+    /// survived — there was no test on the arm. `UNLK` checks alignment before
+    /// both the pop and the queue advance, so 0 is the whole claim, and a halt
+    /// here costs exactly [`exception::HALTED_IDLE_CYCLES`].
+    #[test]
+    fn unlk_with_odd_an_and_odd_sp_halts_having_logged_nothing() {
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4E58, 0x4E71]); // UNLK A0
+        bus.put16(0x000C, 0x0000); // vector 3 -> 0x5000
+        bus.put16(0x000E, 0x5000);
+        bus.load(0x5000, &[0x4E71, 0x4E71]);
+        let mut cpu = at(&mut bus);
+        cpu.a[0] = 0x2001; // odd: the pop address faults
+        cpu.a[7] = 0x2FFF; // odd SSP: the frame base is odd, so this halts
+        cpu.ssp = 0x2FFF;
+        bus.log.clear();
+
+        let dec = Decoder::new();
+        let cycles = cpu.step_with(&dec, &mut bus);
+
+        assert!(cpu.halted, "an odd frame base is a double bus fault");
+        assert_eq!(bus.writes(), vec![], "no frame is written");
+        assert_eq!(
+            bus.log.len(),
+            0,
+            "the check precedes the pop and the queue advance, so nothing \
+             reached the bus at all; got {:04X?}",
+            bus.log
+        );
+        assert_eq!(
+            cycles, 4,
+            "0 accesses, so the halt idle alone — not the framed 58"
+        );
+        assert_eq!(cycles, exception::HALTED_IDLE_CYCLES);
+    }
+
+    /// `MOVE to SR`/`to CCR`'s halt arm, in both a lead-free and a lead-bearing
+    /// mode, plus the privilege path's own halt.
+    ///
+    /// Three rows, and the third is a different arm from the first two:
+    ///
+    /// - `MOVE.w (A0),SR` — the operand fault, `4 * de + idle_lead` with `de == 0`
+    ///   and no lead, so 0 accesses.
+    /// - `MOVE.w (0,A0,D0.w),CCR` — the same arm at `de == 1` with 2 of lead idle,
+    ///   the only shape that can see either term.
+    /// - `MOVE.w (A0),SR` from **user mode** — [`privilege_check`]'s halt, which
+    ///   logs nothing because the queue is untouched before the frame.
+    #[test]
+    fn move_to_sr_ccr_halt_arms_charge_their_leads_and_nothing_else() {
+        let dec = Decoder::new();
+        // (name, prog, user_mode, accesses, idle, cycles)
+        for (name, prog, user, accesses, idle, cycles) in [
+            ("MOVE.w (A0),SR", &[0x46D0u16, 0x4E71][..], false, 0, 4, 4),
+            (
+                "MOVE.w (0,A0,D0.w),CCR",
+                &[0x44F0, 0x0000, 0x4E71][..],
+                false,
+                1,
+                6,
+                10,
+            ),
+            (
+                "MOVE.w (A0),SR in user mode",
+                &[0x46D0, 0x4E71][..],
+                true,
+                0,
+                4,
+                4,
+            ),
+        ] {
+            let mut bus = RecordingBus::new();
+            bus.load(0x1000, prog);
+            bus.put16(0x000C, 0x0000); // vector 3 -> 0x5000
+            bus.put16(0x000E, 0x5000);
+            bus.put16(0x0020, 0x0000); // vector 8 (privilege) -> 0x5000
+            bus.put16(0x0022, 0x5000);
+            bus.load(0x5000, &[0x4E71, 0x4E71]);
+            let mut cpu = at(&mut bus);
+            cpu.a[0] = 0x2001; // odd operand base
+            cpu.d[0] = 0;
+            // The SSP is the frame base in both modes — in user mode the frame
+            // still goes to the SSP — so an odd SSP halts either way.
+            cpu.ssp = 0x2FFF;
+            cpu.a[7] = 0x2FFF;
+            if user {
+                cpu.sr &= !SR_S;
+                // In user mode `a[7]` is the USP and is even, so only `ssp`
+                // carries the odd frame base. That is the case
+                // `double_bus_fault`'s docs single out.
+                cpu.a[7] = 0x4000;
+            }
+            bus.log.clear();
+
+            let got = cpu.step_with(&dec, &mut bus);
+
+            assert!(
+                cpu.halted,
+                "{name}: an odd frame base is a double bus fault"
+            );
+            assert_eq!(bus.writes(), vec![], "{name}: no frame is written");
+            assert_eq!(
+                bus.log.len(),
+                accesses,
+                "{name}: access count; got {:04X?}",
+                bus.log
+            );
+            assert_eq!(got, cycles, "{name}: cycles");
+            assert_eq!(
+                cycles,
+                4 * accesses as u32 + idle,
+                "{name}: 4 × accesses + idle"
+            );
+        }
+    }
 }
