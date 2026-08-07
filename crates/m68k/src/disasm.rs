@@ -649,6 +649,13 @@ impl<'a> Dis<'a> {
         // Base is opcode_addr + 2, regardless of displacement width.
         let base = self.addr.wrapping_add(2);
         let target = (base as i64 + disp as i64) as u32;
+        // `wide` is deliberately dropped: MOTOROLA syntax spells the width as a
+        // `.w`/`.s` suffix, but this disassembler prints the absolute target
+        // address instead, which is the same string either way. The flag is still
+        // computed because `next_word()` above has the side effect of consuming
+        // the extension word — the branch that sets `wide = true` is doing the
+        // real work, and binding the result keeps the two arms symmetrical rather
+        // than hiding a consuming call inside a discarded tuple element.
         let _ = wide;
 
         let mnemonic = match cond {
@@ -1057,6 +1064,17 @@ impl<'a> Dis<'a> {
         self.format_ea_inner(mode, reg, sz)
     }
 
+    /// The one EA formatter. Both wrappers above forward here unchanged.
+    ///
+    /// The two names are kept because they carry meaning at the ~40 call sites:
+    /// which operand is the destination is not recoverable from the argument list
+    /// (`mode`/`reg` look identical either way), and the pairing
+    /// `format_ea(src)` / `format_ea_write(dst)` is what makes an operand order
+    /// checkable by reading the call. They are *identical* here only because
+    /// disassembly never dereferences an EA — it prints `-(a7)` the same whether
+    /// that predecrement will be read or written. An emulator's read and write
+    /// paths differ sharply; a disassembler's do not, and collapsing the wrappers
+    /// would make the call sites stop saying which is which.
     fn format_ea_inner(&mut self, mode: u16, reg: u16, sz: EaSize) -> String {
         let r = reg as usize;
         match mode {

@@ -11,6 +11,17 @@ prefetch queue words, every touched RAM byte, the total cycle count, and the bus
 access sequence in order, with an address error's aborted access confirmed
 *absent* from the bus log.
 
+That list is not everything the vectors record. **One field is deliberately
+unchecked: each transaction's function code**, which the suite supplies with four
+distinct values over 1,450,409 non-idle transactions (user/supervisor ×
+data/program). The `Bus` trait takes an address and nothing else, so the core
+never states a function code and the harness has no value to compare — checking it
+means widening `Bus`, not adding an assertion. Concretely, a green suite does
+*not* establish that the core drives the right address space, so a vector fetch
+issued as user-data rather than supervisor-data would pass all 317,500 cases.
+Sub-project B is where that starts to matter, on a board deriving a chip select
+from FC.
+
 [sst]: https://github.com/SingleStepTests/m68000
 
 ## This project ships no ROMs, and never will

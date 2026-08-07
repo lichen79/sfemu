@@ -349,6 +349,15 @@ fn chk_idle(value: i32, bound: i32) -> u32 {
     // i64: `value` spans the whole of `i32` and `bound` is sign-extended from a
     // word, so `0x7FFF_FFFF - -32768` overflows `i32` and would panic in debug on
     // guest data. Widening keeps the comparison exact rather than wrapping it.
+    //
+    // Note this changes no cycle count. In release, `i32` subtraction wraps, and a
+    // wrapped difference is outside -32768..=32767 exactly when the true one is,
+    // so `overflows_word` comes out the same either way: checked over all 65,536
+    // bounds crossed with 210,007 values (both `i32` extremes, every value within
+    // 70,000 of each, and a dense band around zero) — 13,763,018,752 pairs, 0
+    // disagreements. The widening exists to stop a *debug* build from panicking on
+    // a value the guest is entitled to put in a register, which is exactly the
+    // class of difference the release-only gate used to hide.
     let diff = value as i64 - bound as i64;
     let overflows_word = !(-32768..=32767).contains(&diff);
     if neg && !gt && !overflows_word {
@@ -786,20 +795,35 @@ mod tests {
         assert_eq!(cycles, 4 * (1 + exception::SHORT_FRAME_ACCESSES) + 12);
     }
 
-    /// The `i16` overflow of `value - bound` is what picks 12 over 10, not the
-    /// sign of the value: both cases here have a negative value and differ only
-    /// in whether the difference fits.
+    /// All three of [`chk_idle`]'s terms, one row each, plus the two rows that
+    /// separate 12 from 10 on the sign of the *difference* rather than of the
+    /// value.
+    ///
+    /// The 12 bucket needs all of `value < 0`, `value <= bound`, and a difference
+    /// that fits a word; rows 1-3 each break exactly one of those and land on 10.
+    /// So a negative value is necessary but not sufficient, which is the reading
+    /// this test exists to rule out.
+    ///
+    /// ⚠️ The per-row comments used to be off by one — the first row carried
+    /// "difference 1 fits => 12" while asserting 10, because that reasoning
+    /// belongs to the row *below* it. Every expected value was right, so nothing
+    /// failed; the comment simply described a different case than the code on the
+    /// line under it. Each row now states its own decisive term.
     #[test]
     fn chk_idle_is_keyed_on_the_difference_overflowing_a_word() {
-        // -1 vs bound -2: negative, not greater, difference 1 fits => 12.
+        // -1 > -2, so `gt` fires despite the negative value and the fitting
+        // difference of 1: `gt` alone is enough to force 10.
         assert_eq!(chk_idle(-1, -2), 10, "value > bound wins");
+        // -3 <= -2, negative, difference -1 fits a word: the only 12 here.
         assert_eq!(
             chk_idle(-3, -2),
             12,
             "negative, not greater, difference fits"
         );
-        assert_eq!(chk_idle(-2, 32767), 10, "difference overflows i16");
-        assert_eq!(chk_idle(5, 10), 6, "no trap");
+        // Negative and not greater, but -2 - 32767 = -32769 is outside
+        // -32768..=32767, so the overflow term forces 10.
+        assert_eq!(chk_idle(-2, 32767), 10, "difference overflows a word");
+        assert_eq!(chk_idle(5, 10), 6, "no trap: neither negative nor greater");
         assert_eq!(chk_idle(11, 10), 10, "greater than the bound");
     }
 

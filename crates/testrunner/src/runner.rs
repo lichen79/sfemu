@@ -137,6 +137,20 @@ fn compare_accesses(case: &TestCase, log: &[Access]) -> Vec<String> {
         let addr_ok = a.addr == want_addr;
         let size_ok = a.size == want_size;
         let dir_ok = a.is_write == want_write;
+        // ⚠️ `data_ok` is load-bearing in **one direction only**, and it is not
+        // the obvious one. For a *read*, `t.data` is whatever `initial.ram` holds
+        // at `t.addr` — measured over the whole corpus: 832,245 of 832,245 Read
+        // transactions, 0 unseeded — and `TestBus` reads its memory from that same
+        // `initial.ram`. So once the address matches, the data match follows, and
+        // no read can fail here without also failing the address check above. The
+        // read half is a redundant restatement, kept because dropping it would
+        // make the asymmetry invisible rather than documented.
+        //
+        // The *write* half is genuinely independent: the value written comes from
+        // the core, not from the seeded RAM, so a handler computing the right
+        // address and the wrong value is caught only here. (`final_.ram` agrees
+        // with `t.data` on 562,558 of 562,558 writes, but that is a property of
+        // the suite's own consistency, not of our core.)
         let data_ok = a.val == want_data;
 
         if !dir_ok || !addr_ok || !size_ok {

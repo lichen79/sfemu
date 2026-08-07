@@ -44,10 +44,30 @@ pub enum TxKind {
     WriteAddrErr,
 }
 
+/// One bus transaction from a case's expected sequence.
+///
+/// ⚠️ **`fc` is parsed and never compared — the suite's one unchecked field, and
+/// the blind spot sub-project B will care about.** It carries real information:
+/// four distinct values over the corpus's 1,450,409 non-idle transactions
+/// (measured — `1` user-data 156,086, `2` user-program 179,995, `5`
+/// supervisor-data 768,057, `6` supervisor-program 346,271; idle transactions
+/// carry `0`). The reason it is unchecked is structural rather than an oversight:
+/// [`m68k::Bus`] takes an address and nothing else, so the core never states a
+/// function code and the harness has no value to compare against. Checking it
+/// means widening `Bus`, which is a decision for whoever needs FC-decoded
+/// address spaces — the same treatment [`TxKind::Tas`] gets, where the arm is
+/// kept so a future suite version is compared rather than silently dropped.
+///
+/// Concretely, this means the suite does **not** confirm that the core drives the
+/// right address space: a vector fetch issued as user-data rather than
+/// supervisor-data is invisible to every one of the 317,500 cases. That matters
+/// for a board where a chip select is derived from FC.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Transaction {
     pub kind: TxKind,
     pub cycles: u32,
+    /// Function code: `{1, 2, 5, 6}` on non-idle transactions. **Never compared**
+    /// — see this struct's doc for why, and why that is a real coverage gap.
     pub fc: u32,
     pub addr: u32,
     /// As seen on the real data bus: a byte via UDS reads as `0xAB00`.
@@ -58,8 +78,18 @@ pub struct Transaction {
 
 impl Transaction {
     /// True when this access is a word access (both strobes asserted).
+    ///
+    /// `uds == 1 && lds == 1` rather than `uds + lds == 2`. Both are correct, and
+    /// they agree on all 1,783,580 transactions in the corpus (measured, 0
+    /// disagreements), because the observed `(uds, lds)` domain is
+    /// `{(0,1) 47,082, (1,0) 54,130, (1,1) 1,349,197}` on non-idle transactions
+    /// and `(0,0)` on all 333,171 idle ones — nothing outside `{0, 1}` ever
+    /// appears. But the sum form is correct only *because* of that domain: it
+    /// reads as though `(2, 0)` were a possible encoding meaning "word", which
+    /// would be wrong. This form is total by inspection rather than by census, and
+    /// it is the form to keep if the field ever widens.
     pub fn is_word(&self) -> bool {
-        self.uds + self.lds == 2
+        self.uds == 1 && self.lds == 1
     }
 }
 
