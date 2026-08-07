@@ -4,8 +4,14 @@
 //!
 //! # The `assert!` below is a liveness smoke test, not a performance gate
 //!
-//! It passes at a ~70x margin, so it will not catch a 5x regression, or a 20x
-//! one. What it catches is "the core stopped executing" — and, with the
+//! It passes at a 72x-82x margin (719-820 MHz over nine runs; the spread is host
+//! load and the low end is reproducibly the first run after a build), so it will
+//! not catch a 5x regression, or a 20x one. Quote the range rather than one
+//! sample — and note that of the three figures printed below, only
+//! `cycles/instruction` is stable, since it comes from the cycle model and not
+//! from the wall clock.
+//!
+//! What it catches is "the core stopped executing" — and, with the
 //! non-degeneracy census in [`assert_workload_is_mixed`], "the core is still
 //! executing but no longer executing *this*". A throughput figure is
 //! meaningless until the workload is known non-degenerate: the same MHz prints

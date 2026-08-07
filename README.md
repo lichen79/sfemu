@@ -63,10 +63,14 @@ vector file cannot silently go unrun.
 
 `cargo bench -p m68k` measures a mixed workload — register ops, two memory
 accesses, a shift, and a taken branch — and reports simulated MHz. CPS-1 clocks
-its 68000 at 10 MHz; the core runs it at roughly **80x that margin** (~800 MHz
-simulated on the author's machine, at 9.33 cycles per instruction).
+its 68000 at 10 MHz; the core runs it at a **72x-82x margin** (719-820 MHz
+simulated over nine runs on the author's machine, at 9.33 cycles per
+instruction). The spread is host load, and the low end is reproducibly the first
+run after a build — quote the range, not one sample. Of the three numbers the
+bench prints, only the 9.33 cycles/instruction is stable across runs, because it
+comes from the cycle model rather than the wall clock.
 
-An 80x margin will not catch a 5x regression, or a 20x one. What the assertion
+A 72x margin will not catch a 5x regression, or a 20x one. What the assertion
 catches is "the core stopped executing", and — via a non-degeneracy census the
 bench prints before measuring — "the core is still executing, but no longer
 executing *this*". A throughput figure is meaningless until the workload is known
