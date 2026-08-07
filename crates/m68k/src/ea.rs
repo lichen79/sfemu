@@ -346,6 +346,15 @@ pub fn write(cpu: &mut M68k, bus: &mut dyn Bus, ea: Ea, size: Size, val: u32) {
 /// measured 147/147, against high-word-first in every other mode (addendum
 /// §9.2). The core now has four distinct 32-bit write orders and no shared
 /// helper can express all of them; this is the second.
+///
+/// ⚠️ **This does not decrement anything.** `addr` is the *already-decremented*
+/// destination — the low end of the long, `An - 4` — and the caller owns the
+/// register update. The name describes which addressing mode's write order this is,
+/// not what it does to `An`, and the distinction matters because the plausible
+/// misreading ("it handles the predecrement") would leave `An` unmodified while the
+/// write still lands in the right place, so memory contents would be correct and
+/// only the register wrong. Both callers (`ops::alu` and `ops::move_`) compute the
+/// address themselves; see them before adding a third.
 pub fn write_predec_long(bus: &mut dyn Bus, addr: u32, val: u32) {
     let a = addr & ADDR_MASK;
     bus.write16(a.wrapping_add(2) & ADDR_MASK, val as u16);
