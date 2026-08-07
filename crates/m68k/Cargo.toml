@@ -12,3 +12,9 @@ serde = { version = "1", optional = true, default-features = false, features = [
 default = ["std"]
 std = []
 serde = ["dep:serde"]
+
+# No criterion: `harness = false` plus `std::time::Instant` is enough for a
+# liveness gate, and it keeps the dependency tree empty.
+[[bench]]
+name = "throughput"
+harness = false
