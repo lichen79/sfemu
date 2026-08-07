@@ -343,11 +343,23 @@ Two facts a naive reimplementation misses:
   out of gfxram at vblank (`cps1_v.cpp:3063-3070`, "CPS1 sprites have to be delayed
   one frame"). Rendering live objram puts every sprite one frame ahead of its
   layers, which reads as jitter rather than as a bug.
-- **The table is scanned to an end marker, backwards.** `find_last_sprite` walks
-  forward for an attribute word with `(attr & 0xFF00) == 0xFF00` and sets the last
-  offset to **four words before** it; the render loop then walks *downward* from
-  there, so later table entries draw first and earlier ones on top. With no marker
-  found, the whole 0x800-byte table is used.
+- **The table is scanned to an end marker, then drawn forwards.**
+  `find_last_sprite` walks forward for an attribute word with
+  `(attr & 0xFF00) == 0xFF00` and sets the last offset to **four words before**
+  it. With no marker found, the whole 0x800-byte table is used.
+
+  The render loop then draws records in **table order**, so a later entry lands on
+  top of an earlier one. `cps1_v.cpp:2754` reads
+  `for (int i = m_last_sprite_offset; i >= 0; i -= 4)`, which looks like a
+  backwards walk and is not: the record pointer is a separate variable advancing
+  `base += baseadd` with `baseadd = +4` (`:2751`), and `i` is only a counter for
+  how many records remain. The *downward* variant — `base` starting at
+  `m_last_sprite_offset` with `baseadd = -4` (`:2746`) — is reached only under
+  `bootleg_kludge` bit 6, which MAME's comment attributes to "some sf2 hacks".
+  A real board draws forwards.
+
+  The distinction is visible whenever two sprites overlap, and the sprite the
+  wrong order puts on top is the one the game meant to be behind.
 
   Two consequences of that `offset - 4` that are easy to get wrong. A marker in
   record 2 leaves records **1 and 0** drawable, not records 0-1 plus the record
