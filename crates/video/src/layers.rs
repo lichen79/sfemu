@@ -30,7 +30,7 @@
 use crate::bank::{BankMapper, GfxType};
 use crate::regs::{cps_a_base, OBJ_BOUNDARY, OTHER_BASE, ROWSCROLL_OFFS};
 use crate::tiles::{tile_pen, TileKind, TRANSPARENT_PEN};
-use crate::{HEIGHT, WIDTH};
+use crate::{HEIGHT, VISIBLE_X, VISIBLE_Y, WIDTH};
 
 /// Tiles along each edge of a layer's map (`cps1_v.cpp:2545`: `64, 64`).
 pub const MAP_TILES: u32 = 64;
@@ -176,9 +176,10 @@ impl ScrollRows {
 
     /// Per-row horizontal scroll read from the row-scroll table in gfxram.
     ///
-    /// `x[y] = scroll_x + other[(y + ROWSCROLL_OFFS) & 0x3FF]`, with **no
-    /// `scroll_y` term**. The derivation — and why the obvious reading of MAME's
-    /// line is wrong — is on
+    /// `x[y] = scroll_x + other[(y + VISIBLE_Y + ROWSCROLL_OFFS) & 0x3FF]`, with
+    /// **no `scroll_y` term**: the table is indexed by raster row, and visible
+    /// row `y` is raster row `y + VISIBLE_Y`. The derivation — and why the obvious
+    /// reading of MAME's line is wrong — is on
     /// `tests::row_scroll_reads_a_per_line_offset_independent_of_the_vertical_scroll`.
     pub fn row_scrolled(gfxram: &[u16], cps_a: &[u16], scroll_x: i32, scroll_y: i32) -> Self {
         let base = cps_a_base(cps_a, OTHER_BASE, OBJ_BOUNDARY);
@@ -186,7 +187,10 @@ impl ScrollRows {
         let n = gfxram.len();
         let mut x = [scroll_x; HEIGHT];
         for (y, slot) in x.iter_mut().enumerate() {
-            let entry = (y + offs) & (ROWSCROLL_WORDS - 1);
+            // Indexed by **raster** row: visible row `y` is raster row
+            // `y + VISIBLE_Y`. See the derivation on
+            // `tests::row_scroll_reads_a_per_line_offset_independent_of_the_vertical_scroll`.
+            let entry = (y + VISIBLE_Y as usize + offs) & (ROWSCROLL_WORDS - 1);
             *slot = scroll_x + i32::from(gfxram[(base + entry) % n]);
         }
         Self { scroll_y, x }
@@ -246,14 +250,16 @@ pub fn draw_tilemap(
         // are the mathematical remainder — negatives included. They stay because
         // they make `col` and `row` the in-range values their names claim, rather
         // than leaving that to a mask two functions away.
-        let map_y = y as i32 + rows.scroll_y;
+        // Visible row `y` is raster row `y + VISIBLE_Y`, and the scroll
+        // registers are raster-space — see the crate documentation.
+        let map_y = y as i32 + VISIBLE_Y + rows.scroll_y;
         let row = map_y.div_euclid(step).rem_euclid(tiles) as u32;
         let ty = map_y.rem_euclid(step) as u32;
         let scroll_x = rows.x[y];
 
         let mut x = 0i32;
         while x < screen_w {
-            let map_x = x + scroll_x;
+            let map_x = x + VISIBLE_X + scroll_x;
             let col = map_x.div_euclid(step).rem_euclid(tiles) as u32;
             let tx0 = map_x.rem_euclid(step);
             // The pixels of this tile still on screen: the rest of the tile, or
@@ -443,10 +449,10 @@ mod tests {
 
     /// One 16×16 tile lands where the scroll registers put it, right way up.
     ///
-    /// A single solid tile with `scroll = 0` must occupy pixels (0,0)-(15,15) and
-    /// nothing else, and with `scroll_x = 5` must appear shifted **left**,
-    /// because the scroll register is the coordinate of the screen's left edge
-    /// within the map.
+    /// A single solid tile with the scroll placing map (0, 0) at the visible
+    /// origin must occupy visible pixels (0,0)-(15,15) and nothing else, and a
+    /// scroll of 5 further right must shift it **left**, because the scroll
+    /// register is the coordinate of the screen's left edge within the map.
     #[test]
     fn a_tile_lands_where_the_scroll_registers_put_it() {
         let f = Fixture::one_solid_tile(Layer::Scroll2, 0x0A);
@@ -466,6 +472,48 @@ mod tests {
         let r = f.render(0, 3);
         assert_eq!(r.px(0, 12), Some(want), "bottom edge moved up 3");
         assert_eq!(r.px(0, 13), None);
+
+        // With the raw register values the hardware holds, a zero scroll puts map
+        // (0, 0) at the raster origin — inside blanking, so nothing is visible.
+        assert!(
+            f.render_raw(0, 0).is_blank(),
+            "map (0,0) at a zero scroll is behind the blanking region"
+        );
+    }
+
+    /// The visible window is the raster sub-rectangle at (64, 16).
+    ///
+    /// This is the assertion that fixes the offset, stated against literals
+    /// rather than against [`VISIBLE_X`]/[`VISIBLE_Y`] themselves — so changing
+    /// those constants fails here instead of silently moving every layer. A tile
+    /// placed at map pixel (64, 16) must land at visible (0, 0) with no scroll
+    /// at all.
+    #[test]
+    fn a_layers_origin_is_the_visible_window_not_the_raster_origin() {
+        assert_eq!((VISIBLE_X, VISIBLE_Y), (64, 16), "cps1.h:42, :46");
+
+        let mut f = Fixture::with_gfx(Layer::Scroll2, frame_bytes(Layer::Scroll2, 0x0A));
+        for e in f.gfxram.chunks_mut(2) {
+            e[0] = BLANK_CODE;
+        }
+        // Map tile (4, 1) covers map pixels x 64..79, y 16..31 — exactly the
+        // visible window's first 16x16 cell.
+        let i = 2 * Layer::Scroll2.scan(4, 1);
+        f.gfxram[i] = SOLID_CODE;
+        f.gfxram[i + 1] = 0;
+
+        // The raw registers, zeroed: map (0, 0) sits at the raster origin.
+        let r = f.render_raw(0, 0);
+        let want = 0x40 * PEN_GRANULARITY + 0x0A;
+        assert_eq!(r.px(0, 0), Some(want), "map (64,16) is visible (0,0)");
+        assert_eq!(r.px(15, 15), Some(want));
+        assert_eq!(r.px(16, 15), None, "and only that one tile");
+        assert_eq!(r.px(15, 16), None);
+        assert_eq!(
+            r.opaque(),
+            16 * 16,
+            "exactly one tile drew, so the offset is (64,16) and not a near miss"
+        );
     }
 
     /// A transparent pen leaves the framebuffer alone.
@@ -651,38 +699,50 @@ mod tests {
     /// ```
     ///
     /// where `scrly = -scrolly[1]`, and `set_scrollx`'s row index is a **tilemap**
-    /// row, not a screen row. A tilemap scrolled down by `scrolly` shows tilemap
-    /// row `y + scrolly` at screen row `y`. So screen row `y` reads scroll row
-    /// `t = y + scrolly`, which the loop set from entry `i` where
-    /// `t = i - scrly = i + scrolly` — giving `i = y` and
+    /// row, not a raster row. A tilemap scrolled down by `scrolly` shows tilemap
+    /// row `r + scrolly` at raster row `r`. So raster row `r` reads scroll row
+    /// `t = r + scrolly`, which the loop set from entry `i` where
+    /// `t = i - scrly = i + scrolly` — giving `i = r` and
     ///
     /// ```text
-    /// x[y] = scrollx[1] + other[(y + otheroffs) & 0x3ff]
+    /// x[r] = scrollx[1] + other[(r + otheroffs) & 0x3ff]
     /// ```
     ///
     /// The `- scrly` exists precisely to cancel the tilemap's own vertical
-    /// scroll. Writing `(y + scroll_y + otheroffs)` here — the obvious reading of
+    /// scroll. Writing `(r + scroll_y + otheroffs)` here — the obvious reading of
     /// MAME's line — would make every row-scrolled layer shear as it scrolled
-    /// vertically. The 256-iteration bound also covers all 224 visible rows, so
-    /// there are no unwritten rows to model.
+    /// vertically.
+    ///
+    /// `r` is a **raster** row, so this array's index `y` — a visible row —
+    /// reads entry `y + VISIBLE_Y`. MAME's loop runs `i` over `0..256`, which
+    /// covers the visible band 16..=239 exactly; indexing from `y` instead would
+    /// read the 16 entries belonging to vertical blanking.
     #[test]
     fn row_scroll_reads_a_per_line_offset_independent_of_the_vertical_scroll() {
         let mut gfxram = vec![0u16; GFXRAM_WORDS];
         let mut cps_a = [0u16; 0x20];
         cps_a[OTHER_BASE] = 0; // table at word 0
         cps_a[ROWSCROLL_OFFS] = 0;
-        gfxram[0] = 1;
-        gfxram[1] = 2;
+
+        // Visible row 0 is raster row VISIBLE_Y, so with a zero offset it reads
+        // table entry VISIBLE_Y — not entry 0, which belongs to a blanking line.
+        // The entries are written at their raster indices and the expected values
+        // are literals, so an implementation indexing from the visible row reads
+        // the zeroes below and fails.
+        const FIRST: usize = VISIBLE_Y as usize;
+        assert_eq!(FIRST, 16, "cps1.h:46");
+        gfxram[FIRST] = 1;
+        gfxram[FIRST + 1] = 2;
         let r = ScrollRows::row_scrolled(&gfxram, &cps_a, 100, 0);
-        assert_eq!(r.x[0], 101);
+        assert_eq!(r.x[0], 101, "visible row 0 reads entry 16");
         assert_eq!(r.x[1], 102);
         assert_eq!(r.x[2], 100, "the rest of the table is zero");
 
         // ROWSCROLL_OFFS shifts which table entry a row reads.
         cps_a[ROWSCROLL_OFFS] = 1;
         let r = ScrollRows::row_scrolled(&gfxram, &cps_a, 100, 0);
-        assert_eq!(r.x[0], 102, "row 0 reads table entry 1");
-        assert_eq!(r.x[1], 100, "row 1 reads entry 2, which is zero");
+        assert_eq!(r.x[0], 102, "row 0 reads one entry further on");
+        assert_eq!(r.x[1], 100, "the entry after that is zero");
 
         // The vertical scroll does not. This is the load-bearing assertion: a
         // `(y + scroll_y + offs)` implementation gives 102 for row 0 at
@@ -695,22 +755,25 @@ mod tests {
             assert_eq!(r.x[1], 102, "scroll_y {sy}");
         }
 
-        // The table index wraps at 0x400 words, not 0x200: entry 0x3FF is the
-        // last one, and offs 0x400 comes back to entry 0.
+        // The table index wraps at 0x400 words, not 0x200: the entry visible row
+        // 0 reads is `VISIBLE_Y + offs`, so an offset of 0x3FF - VISIBLE_Y puts it
+        // on the last entry and the row below wraps to entry 0.
         gfxram[0x3FF] = 9;
-        cps_a[ROWSCROLL_OFFS] = 0x3FF;
+        gfxram[0] = 8;
+        cps_a[ROWSCROLL_OFFS] = (0x3FF - FIRST) as u16;
         let r = ScrollRows::row_scrolled(&gfxram, &cps_a, 0, 0);
         assert_eq!(r.x[0], 9, "row 0 reads entry 0x3FF");
-        assert_eq!(r.x[1], 1, "row 1 wraps to entry 0");
-        cps_a[ROWSCROLL_OFFS] = 0x400;
+        assert_eq!(r.x[1], 8, "row 1 wraps to entry 0");
+        cps_a[ROWSCROLL_OFFS] = (0x400 - FIRST) as u16;
         let r = ScrollRows::row_scrolled(&gfxram, &cps_a, 0, 0);
-        assert_eq!(r.x[0], 1, "offs 0x400 is entry 0 again");
+        assert_eq!(r.x[0], 8, "a whole table further on is entry 0 again");
+        gfxram[0] = 0;
 
         // The table honours its base register, aligned to 0x800 bytes.
         cps_a[ROWSCROLL_OFFS] = 0;
         cps_a[OTHER_BASE] = 0x0040; // 0x40 * 256 = 0x4000 -> word 0x2000
         assert_eq!(cps_a_base(&cps_a, OTHER_BASE, OBJ_BOUNDARY), 0x2000);
-        gfxram[0x2000] = 5;
+        gfxram[0x2000 + FIRST] = 5;
         let r = ScrollRows::row_scrolled(&gfxram, &cps_a, 0, 0);
         assert_eq!(r.x[0], 5);
 
@@ -732,9 +795,10 @@ mod tests {
     fn draw_tilemap_uses_each_rows_own_scroll() {
         let f = Fixture::one_solid_tile(Layer::Scroll2, 0x0A);
         let want = 0x40 * PEN_GRANULARITY + 0x0A;
-        let mut rows = ScrollRows::flat(0, 0);
-        // Row 3 alone scrolls left by 100, pushing the tile 100 pixels right.
-        rows.x[3] = -100;
+        let mut rows = Fixture::flat_rows(0, 0);
+        // Row 3 alone scrolls left by 100 further, pushing the tile 100 pixels
+        // right of where the other rows put it.
+        rows.x[3] -= 100;
         let r = f.render_rows(&rows);
         assert_eq!(r.px(0, 2), Some(want), "row 2 is unscrolled");
         assert_eq!(r.px(0, 3), None, "row 3's tile moved off the left edge");
@@ -751,7 +815,7 @@ mod tests {
     #[test]
     fn a_high_pen_bit_marks_the_pixel_in_the_priority_buffer() {
         let mut f = Fixture::one_solid_tile(Layer::Scroll2, 0x0A);
-        let rows = ScrollRows::flat(0, 0);
+        let rows = Fixture::flat_rows(0, 0);
 
         let r = f.render_with(&rows, &[0; 4]);
         assert_eq!(r.prio[0], 0, "no bits set, nothing occludes");
@@ -1011,12 +1075,32 @@ mod tests {
             self.gfxram[i] = attr;
         }
 
+        /// Renders with the scroll expressed so that map pixel (0, 0) lands at
+        /// **visible** (`-scroll_x`, `-scroll_y`).
+        ///
+        /// The registers are raster-space, so this adds the window offset back in.
+        /// Most tests here are about a tile's own pixels — flip, transparency,
+        /// wrapping — and would only be obscured by carrying (64, 16) through
+        /// every expected coordinate. The offset itself is pinned against literals
+        /// by [`a_layers_origin_is_the_visible_window_not_the_raster_origin`], so
+        /// routing these through here cannot hide it.
         fn render(&self, scroll_x: i32, scroll_y: i32) -> Rendered {
+            self.render_raw(scroll_x - VISIBLE_X, scroll_y - VISIBLE_Y)
+        }
+
+        /// Renders with the scroll values the hardware registers hold.
+        fn render_raw(&self, scroll_x: i32, scroll_y: i32) -> Rendered {
             self.render_rows(&ScrollRows::flat(scroll_x, scroll_y))
         }
 
         fn render_rows(&self, rows: &ScrollRows) -> Rendered {
             self.render_with(rows, &[0; 4])
+        }
+
+        /// [`ScrollRows::flat`] in the visible-frame convention [`Self::render`]
+        /// uses, for the tests that then adjust individual rows.
+        fn flat_rows(scroll_x: i32, scroll_y: i32) -> ScrollRows {
+            ScrollRows::flat(scroll_x - VISIBLE_X, scroll_y - VISIBLE_Y)
         }
 
         fn render_with(&self, rows: &ScrollRows, hi_pens: &[u16; 4]) -> Rendered {
@@ -1057,6 +1141,16 @@ mod tests {
                 UNTOUCHED => None,
                 p => Some(p),
             }
+        }
+
+        /// How many pixels the layer wrote.
+        fn opaque(&self) -> usize {
+            self.pens.iter().filter(|&&p| p != UNTOUCHED).count()
+        }
+
+        /// Nothing was drawn anywhere.
+        fn is_blank(&self) -> bool {
+            self.opaque() == 0
         }
     }
 }

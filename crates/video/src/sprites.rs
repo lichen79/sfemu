@@ -20,7 +20,7 @@ use crate::bank::{BankMapper, GfxType};
 use crate::layers::PEN_GRANULARITY;
 use crate::regs::{cps_a_base, OBJ_BASE, OBJ_BOUNDARY};
 use crate::tiles::{tile_pen, TileKind, TRANSPARENT_PEN};
-use crate::{HEIGHT, WIDTH};
+use crate::{HEIGHT, VISIBLE_X, VISIBLE_Y, WIDTH};
 
 /// Words in the object table — `m_obj_size` is 0x800 bytes (`cps1_v.cpp:2537`).
 pub const OBJ_WORDS: usize = 0x400;
@@ -198,13 +198,14 @@ fn blit(
     sy: i32,
 ) {
     for ty in 0..SPRITE_EDGE {
-        let py = sy + ty as i32;
+        // `sy` is a raster row; the visible frame starts at VISIBLE_Y.
+        let py = sy + ty as i32 - VISIBLE_Y;
         if py < 0 || py >= HEIGHT as i32 {
             continue;
         }
         let ty_eff = if flip_y { SPRITE_EDGE - 1 - ty } else { ty };
         for tx in 0..SPRITE_EDGE {
-            let px = sx + tx as i32;
+            let px = sx + tx as i32 - VISIBLE_X;
             if px < 0 || px >= WIDTH as i32 {
                 continue;
             }
@@ -442,12 +443,60 @@ mod tests {
         assert_eq!(r.px(39, 30), None);
         assert_eq!(r.px(56, 45), None);
 
-        // 0x201 & 0x1FF = 1, so a position past 511 wraps into the frame. Under a
-        // 0x3FF mask it would sit at 513 instead, off the right edge, and the
-        // sprite would vanish rather than wrap.
+        // A raster position past 511 wraps: 0x201 & 0x1FF = 1. Under a 0x3FF mask
+        // it would stay at 513, off the right edge of the raster, and the sprite
+        // would vanish instead of reappearing at raster column 1.
         assert_eq!(0x201 & POS_MASK, 1);
-        f.put(0, 0x201, 0x202, SOLID_CODE, 0x0001);
-        assert_eq!(f.render().px(1, 2), Some(0x1A), "0x201 -> 1, 0x202 -> 2");
+        // Raster (0x201, 0x202) wraps to raster (1, 2), which is inside the
+        // blanking region — so the wrap is visible only as far as the window
+        // reaches it. Place the wrapped sprite where the window can see it:
+        // raster 0x240 wraps to 0x40 = 64 = VISIBLE_X, i.e. visible column 0.
+        assert_eq!(0x240 & POS_MASK, VISIBLE_X);
+        assert_eq!(0x210 & POS_MASK, VISIBLE_Y);
+        f.put_raw(0, 0x240, 0x210, SOLID_CODE, 0x0001);
+        assert_eq!(
+            f.render().px(0, 0),
+            Some(0x1A),
+            "0x240 -> raster 64 -> visible 0; 0x210 -> raster 16 -> visible 0"
+        );
+    }
+
+    /// The visible window is the raster sub-rectangle at (64, 16).
+    ///
+    /// The assertion that fixes the sprite offset, written against literals rather
+    /// than against [`VISIBLE_X`]/[`VISIBLE_Y`] — so changing those constants fails
+    /// here rather than silently moving every sprite. A sprite whose register
+    /// position is (64, 16) lands at visible (0, 0); one at (0, 0) is entirely
+    /// inside blanking and invisible.
+    #[test]
+    fn the_visible_window_is_the_raster_subrectangle_at_sixty_four_sixteen() {
+        assert_eq!((VISIBLE_X, VISIBLE_Y), (64, 16), "cps1.h:42, :46");
+
+        let mut f = Fixture::new();
+        f.put_raw(0, 64, 16, SOLID_CODE, 0x0001);
+        let r = f.render();
+        assert_eq!(r.px(0, 0), Some(0x1A), "raster (64,16) is visible (0,0)");
+        assert_eq!(r.px(15, 15), Some(0x1A));
+        assert_eq!(r.opaque(), 16 * 16, "the whole tile, and nothing else");
+
+        // A sprite at raster (0, 0) sits in the blanking region: its rows are
+        // above the window and its columns left of it, so none of it is visible.
+        f.put_raw(0, 0, 0, SOLID_CODE, 0x0001);
+        assert!(
+            f.render().is_blank(),
+            "raster (0,0) is inside blanking, not the top-left pixel"
+        );
+
+        // One pixel short of the window in each axis still shows the overlap, so
+        // the boundary is exact rather than "far enough away".
+        f.put_raw(0, 64 - 1, 16 - 1, SOLID_CODE, 0x0001);
+        let r = f.render();
+        assert_eq!(r.px(0, 0), Some(0x1A), "the tile's last row and column");
+        assert_eq!(
+            r.opaque(),
+            15 * 15,
+            "exactly the 15x15 corner inside the window"
+        );
     }
 
     /// Pen 15 of a sprite is transparent.
@@ -654,15 +703,15 @@ mod tests {
 
     /// A sprite straddling the right or bottom edge is clipped, not wrapped.
     ///
-    /// The position lives in MAME's 512×256 drawing space, wider and taller than
-    /// the visible 384×224, so a sprite over the edge must lose the part that is
-    /// outside rather than reappear on the opposite side.
+    /// The position lives in the 512×262 raster, wider and taller than the visible
+    /// 384×224, so a sprite over the window's edge must lose the part outside it
+    /// rather than reappear on the opposite side.
     #[test]
     fn a_sprite_straddling_the_edge_is_clipped() {
         let mut f = Fixture::new();
 
         // Eight pixels past the right edge.
-        f.put(0, (WIDTH - 8) as u16, 0, SOLID_CODE, 0x0001);
+        f.put(0, WIDTH as i32 - 8, 0, SOLID_CODE, 0x0001);
         let r = f.render();
         assert_eq!(r.px(WIDTH - 1, 0), Some(0x1A), "the visible half drew");
         assert_eq!(r.px(0, 0), None, "and did not wrap to the left edge");
@@ -672,7 +721,7 @@ mod tests {
         assert_eq!(r.opaque(), 8 * 16, "only the eight visible columns");
 
         // And eight past the bottom.
-        f.put(0, 0, (HEIGHT - 8) as u16, SOLID_CODE, 0x0001);
+        f.put(0, 0, HEIGHT as i32 - 8, SOLID_CODE, 0x0001);
         let r = f.render();
         assert_eq!(r.px(0, HEIGHT - 1), Some(0x1A));
         assert_eq!(r.px(0, 0), None, "no wrap to the top");
@@ -912,13 +961,28 @@ mod tests {
             f
         }
 
-        /// Writes sprite record `rec`.
-        fn put(&mut self, rec: usize, x: u16, y: u16, code: u16, attr: u16) {
+        /// Writes sprite record `rec`, with the position as the hardware register
+        /// holds it — a **raster** coordinate.
+        fn put_raw(&mut self, rec: usize, x: u16, y: u16, code: u16, attr: u16) {
             let i = rec * RECORD_WORDS;
             self.latch.words[i] = x;
             self.latch.words[i + 1] = y;
             self.latch.words[i + 2] = code;
             self.latch.words[i + 3] = attr;
+        }
+
+        /// Writes sprite record `rec` with the position given in **visible-frame**
+        /// coordinates, converted to the raster value the register holds.
+        ///
+        /// Most tests here care about a sprite's pixels relative to the frame they
+        /// assert against, not about the blanking offset, so they place sprites
+        /// through this. The offset is not laundered by doing so: it is pinned
+        /// against literals by
+        /// [`the_visible_window_is_the_raster_subrectangle_at_sixty_four_sixteen`].
+        fn put(&mut self, rec: usize, x: i32, y: i32, code: u16, attr: u16) {
+            let rx = (x + VISIBLE_X) as u16;
+            let ry = (y + VISIBLE_Y) as u16;
+            self.put_raw(rec, rx, ry, code, attr);
         }
 
         /// Puts an end marker in record `rec`.
