@@ -200,9 +200,19 @@ Boundaries: scroll1/2/3 `0x4000`, obj `0x800`, other `0x800`, palette `0x400`
 ("minimum alignment is a single palette page (512 colors). Verified on pcb",
 `cps1_v.cpp:2541`).
 
-The `& 0x3FFFF` is what keeps a wild register value inside the 192 KB gfxram, and it
-is the reason this cannot panic. The `& !(boundary-1)` is not tidiness: MAME notes
-games that fail to align, naming Captain Commando's continue screen.
+The `& !(boundary-1)` is not tidiness: MAME notes games that fail to align, naming
+Captain Commando's continue screen.
+
+⚠️ **The `& 0x3FFFF` does not keep the index inside gfxram.** It bounds the result
+to a **256 KB** window, and gfxram is 192 KB — so a register above 0xDFFF resolves
+to a word index between 0x18000 and 0x1FE00, past the end of the array. MAME has the
+same gap: `cps1_base` returns a pointer into a `required_shared_ptr` with no bounds
+check. Every read through one of these bases therefore wraps with `% gfxram.len()`,
+and the alternative — clamping in `cps_a_base` — is rejected because it would
+silently relocate a table the guest asked for. The plan's
+`cps_a_base_can_point_past_gfxram_so_callers_must_wrap` sweeps all 65,536 register
+values against all three boundaries and pins 0x1FE00 as the worst index, so a later
+reader cannot delete a wrap believing it redundant.
 
 Power-on defaults (`cps1_v.cpp:2565-2569`): OBJ 0x9200, SCROLL1 0x9000,
 SCROLL2 0x9040, SCROLL3 0x9080, OTHER 0x9100.
@@ -321,10 +331,69 @@ Two facts a naive reimplementation misses:
   there, so later table entries draw first and earlier ones on top. With no marker
   found, the whole 0x800-byte table is used.
 
+  Two consequences of that `offset - 4` that are easy to get wrong. A marker in
+  record 2 leaves records **1 and 0** drawable, not records 0-1 plus the record
+  before the marker — the record immediately preceding the marker is skipped. And a
+  marker in record **0** gives −4, which MAME holds in a signed `int` so its
+  `i >= 0` loop draws nothing at all; the reimplementation returns
+  `Option<usize>` and `None` for that case, because a `saturating_sub` to 0 would
+  draw the very record the marker declares is not a sprite.
+
 Blocked sprites tile a `nx × ny` grid of 16×16 tiles from a base code, and the code
 arithmetic wraps within the low nibble: `(code & ~0xF) + ((code + nxs) & 0xF) +
-0x10 * nys`, with the x term counting down under X flip. That wrap is why a block
-crossing a 16-code boundary repeats rather than running on.
+0x10 * nys`, with the x term counting down as `(code + (nx - 1) - nxs)` under X flip
+and rows as `0x10 * (ny - 1 - nys)` under Y flip. That wrap is why a block crossing a
+16-code boundary repeats rather than running on.
+
+⚠️ **The bank mapper runs once on the base code, before the block arithmetic.**
+`cps1_v.cpp:2764` maps the code and `:2766` gates the whole record on
+`code != -1`; every tile of the block is then derived from the *mapped* value. A
+reimplementation that mapped each block tile separately would produce different
+codes wherever a range boundary falls inside a block, and would drop individual
+tiles rather than the whole sprite.
+
+### Row scroll, and screen flip (`cps1_v.cpp:3017-3033`, `:3005`)
+
+Two facts here had to be **derived** rather than transcribed, because MAME states
+both in coordinate systems this design does not use. Each is recorded with its
+derivation because in both cases the obvious reading of MAME's line is wrong.
+
+**Row scroll does not shift with the vertical scroll.** With `VIDEOCONTROL` bit 0
+set, MAME writes
+
+```c
+for (int i = 0; i < 256; i++)
+    tilemap[1]->set_scrollx((i - scrly) & 0x3ff,
+                            scrollx[1] + other[(i + otheroffs) & 0x3ff]);
+```
+
+where `scrly = -scrolly[1]`. That row index is a **tilemap** row. A tilemap
+scrolled by `scrolly` shows tilemap row `y + scrolly` at screen row `y`, so screen
+row `y` reads the entry the loop wrote at `t = y + scrolly = i - scrly = i + scrolly`
+— which gives `i = y`, and in screen coordinates
+
+```
+x[y] = scrollx[1] + other[(y + otheroffs) & 0x3FF]
+```
+
+with **no `scrolly` term**. The `- scrly` exists precisely to cancel the tilemap's
+own vertical scroll. Writing `(y + scrolly + otheroffs)` — the obvious translation —
+would shear every row-scrolled layer as it scrolled vertically. Row scroll applies to
+**scroll 2 only**: `tilemap[1]` is the 16×16 map (`cps1_v.cpp:2547`), and scrolls 1
+and 3 take a single `set_scrollx` at `:3015` and `:3035`.
+
+**One mirror of the finished frame is equivalent to MAME's per-primitive flip.**
+MAME sets a global flip flag (`cps1_v.cpp:3005`, `VIDEOCONTROL` bit 15) and each
+sprite blit then uses `512 - 16 - sx`, `256 - 16 - sy` with its own flip bits
+inverted. Those are the same transform: a 16-pixel sprite at `[sx, sx+15]` mirrored
+about `511 - p` spans `[496 - sx, 511 - sx]`, whose left edge is `512 - 16 - sx`, and
+vertically `[sy, sy+15]` about `255 - p` gives `256 - 16 - sy`. The 512 and 256 are
+mirror pivots plus one, not screen dimensions.
+
+The mirror commutes with the crop because the visible window is symmetric within
+those pivots: HBEND 64 and HBSTART−1 447 sum to 511, VBEND 16 and VBSTART−1 239 sum
+to 255 (`cps1.h:41-47`). So this design flips the finished 384×224 buffer in one pass
+rather than threading a flip flag through every blit.
 
 ### Layer order and priority (`cps1_v.cpp:2970-2999`, `:2515-2531`)
 
