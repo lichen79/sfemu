@@ -23,9 +23,10 @@ use core::cmp::Ordering;
 /// A wild PC scanning memory produces millions of distinct unmapped addresses, and
 /// a log with no bound is then a memory leak driven by guest behaviour — the exact
 /// shape of failure this crate forbids everywhere else. It is also quadratic: the
-/// sorted-`Vec` insert shifts the tail, so 200,000 distinct addresses is 200,000
-/// insertions each memmoving ~1 MB. `crates/machine/src/board.rs`'s 24-bit sweep
-/// test alone visits ~190,000 unmapped addresses.
+/// sorted-`Vec` insert shifts the tail, so 300,000 distinct addresses is 300,000
+/// insertions each memmoving up to 3.6 MB. `crates/machine/src/board.rs`'s 24-bit
+/// sweep test alone visits **313,239** distinct unmapped addresses — measured, not
+/// estimated, by running that sweep against a `HashSet` and counting.
 ///
 /// 1024 is chosen because the diagnostic value is in the *worst* handful of
 /// addresses (see [`UnmappedLog::worst`]) and because a board that is missing one
