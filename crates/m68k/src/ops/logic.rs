@@ -464,21 +464,77 @@ mod tests {
         assert!(cpu.ccr_z() && !cpu.ccr_n());
     }
 
-    /// `ORI to CCR` writes the low five bits and preserves everything above
-    /// them — including bits 5-7, which no documented register contains.
+    /// `to CCR` writes the low five bits and preserves everything above them —
+    /// including bits 5-7, which no documented register contains.
+    ///
+    /// ⚠️ **`ORI` cannot check this rule and this test used to consist of one
+    /// `ORI` row.** Mutating `(cpu.sr & 0xFFE0) | (r & 0x1F)` to the byte form
+    /// `(cpu.sr & 0xFF00) | (r & 0x00FF)` left every unit test green, this one
+    /// included, even though it does set bits 5-7 and does assert the full
+    /// 16-bit `cpu.sr`. The reason is arithmetic, not oversight: `ORI`'s result
+    /// `r` has bits 5-7 **set wherever `cpu.sr` had them set**, so the wider byte
+    /// mask copies them back out of `r` and lands on the same word. Every `ORI`
+    /// operand behaves that way. Only the suite caught it, in 2 groups.
+    ///
+    /// `ANDI` and `EORI` are the discriminating ops — both can *clear* a bit 5-7
+    /// in `r` that `cpu.sr` had set, which is precisely what the narrow mask must
+    /// preserve and the byte mask destroys. The `ORI` row is kept as the control
+    /// and labelled with the value both masks agree on.
+    ///
+    /// Every expected `sr` below is a **written-out literal**, not a value
+    /// recomputed from `0xFFE0`. Deriving it from the constant under test is what
+    /// would make this test unable to fail.
+    ///
+    /// The hand-written test is the only possible check for the preservation
+    /// half: **0 of 317,500** suite cases have any of SR bits 5-7 set on entry,
+    /// so the suite's kill comes from the operation's own result bits instead.
     #[test]
-    fn ori_to_ccr_touches_only_the_low_five_bits() {
-        let mut bus = FlatBus::new();
-        bus.load(0x1000, &[0x003C, 0x00FF, 0x4E71, 0x4E71]);
-        let mut cpu = at(&mut bus);
-        cpu.sr = SR_S | 0x0700 | 0x00E0; // bits 5-7 set
+    fn to_ccr_touches_only_the_low_five_bits() {
+        // Entry SR: supervisor, mask 7, bits 5-7 all set, and N+V set in the CCR.
+        const ENTRY: u16 = 0x27EA;
+        // (name, opcode, immediate, expected sr, sr under the 0xFF00/0x00FF form)
+        for (name, opcode, imm, want, byte_form) in [
+            // ANDI #$001A: r = 0x27EA & 0x001A = 0x000A. The narrow mask keeps
+            // bits 5-7 from the SR; the byte mask takes the whole low byte of a
+            // result whose bits 5-7 are clear, and loses them.
+            (
+                "ANDI #$001A,CCR",
+                0x023Cu16,
+                0x001Au16,
+                0x27EAu16,
+                0x270Au16,
+            ),
+            // EORI #$00FF: r = 0x27EA ^ 0x00FF = 0x2715.
+            ("EORI #$00FF,CCR", 0x0A3C, 0x00FF, 0x27F5, 0x2715),
+            // ORI #$001F: r = 0x27EA | 0x001F = 0x27FF. Both masks give 0x27FF —
+            // the control, and the reason an ORI-only test proves nothing here.
+            ("ORI #$001F,CCR", 0x003C, 0x001F, 0x27FF, 0x27FF),
+        ] {
+            let mut bus = FlatBus::new();
+            bus.load(0x1000, &[opcode, imm, 0x4E71, 0x4E71]);
+            let mut cpu = at(&mut bus);
+            cpu.sr = ENTRY;
 
-        let dec = Decoder::new();
-        let cycles = cpu.step_with(&dec, &mut bus);
+            let dec = Decoder::new();
+            let cycles = cpu.step_with(&dec, &mut bus);
 
-        assert_eq!(cpu.sr, SR_S | 0x0700 | 0x00E0 | 0x1F);
-        assert_eq!(cycles, 20);
-        assert_eq!(cpu.pc, 0x1008, "PC advances 4 from its primed value");
+            assert_eq!(cpu.sr, want, "{name}: full 16-bit SR");
+            assert_eq!(cycles, 20, "{name}: cycles");
+            assert_eq!(
+                cpu.pc, 0x1008,
+                "{name}: PC advances 4 from its primed value"
+            );
+            // Stated per row so that a row which cannot discriminate is visible
+            // as such in the source rather than looking like two more that can.
+            if name.starts_with("ORI") {
+                assert_eq!(want, byte_form, "{name} is the non-discriminating control");
+            } else {
+                assert_ne!(
+                    want, byte_form,
+                    "{name} must distinguish the narrow mask from the byte mask"
+                );
+            }
+        }
     }
 
     /// The queue refill re-reads the word after the opcode, so a two-word
