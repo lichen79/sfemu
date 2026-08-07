@@ -47,7 +47,7 @@
 //! either group's shape from the other, and never infer an access split from a
 //! cycle total: two different splits reach 34 here.
 
-use crate::cpu::{M68k, SR_MASK, SR_V};
+use crate::cpu::{M68k, SR_V};
 use crate::decode::Handler;
 use crate::exception::{
     self, FaultKind, Space, ADDRESS_ERROR_TAIL_CYCLES, SHORT_FRAME_ACCESSES, VEC_PRIVILEGE,
@@ -196,7 +196,7 @@ fn trapv(cpu: &mut M68k, bus: &mut dyn Bus, _opcode: u16) -> u32 {
 ///
 /// - **The pops ascend**, `{+0, +2, +4}` — the *opposite* of the frame write
 ///   order (`+4, +0, +2`). Reading and writing a frame are not mirror images.
-/// - **The SR goes through [`SR_MASK`]**, same as `STOP` and `MOVEtoSR`.
+/// - **The SR goes through [`SR_MASK`](crate::cpu::SR_MASK)**, same as `STOP` and `MOVEtoSR`.
 ///   Installing the raw word fails 594 of 600; the 6 that pass are the cases
 ///   where the popped word was already masked. RTE's address-error bucket
 ///   discriminates this harder — there the SR comes from unconstrained memory,
@@ -282,8 +282,23 @@ fn rte(cpu: &mut M68k, bus: &mut dyn Bus, _opcode: u16) -> u32 {
     // Commit the pops before installing the SR: `set_sr` may swap `a[7]` out to
     // the USP, and the `+6` belongs to the supervisor stack it was popped from.
     cpu.a[7] = sp.wrapping_add(6);
+    // The unconditional `ssp` write is correct *here* specifically because this
+    // point is only reachable in supervisor mode — the privilege check above
+    // returned otherwise — so `a[7]` is the SSP by definition and there is no
+    // branch to take. `ops::system`'s `sync_sp` is the conditional form for sites
+    // that can be in either mode, and it is private to that module; this is not a
+    // hand-rolled copy of it so much as the one case where the condition is
+    // statically known. Like `sync_sp`, it is belt-and-braces: `set_sr` on the
+    // next line saves the outgoing `a[7]` into the right slot itself, which is
+    // why deleting this line kills no test.
     cpu.ssp = cpu.a[7];
-    cpu.set_sr(new_sr & SR_MASK);
+    // `set_sr` masks with `SR_MASK` itself, so the `& SR_MASK` this line used to
+    // carry was unobservable and its removal mutant necessarily survived. Dropped
+    // rather than annotated, to match `stop`'s `cpu.set_sr(imm)` — one masking
+    // site, and reading it does not require checking whether two constants agree.
+    // ⚠️ Not the `MOVEtoCCR` hazard: both masks were `0xA71F`, so this was only
+    // the *reading* problem, not a wrong value hiding behind a normaliser.
+    cpu.set_sr(new_sr);
     cpu.pc = new_pc;
 
     // The refill faults on an odd PC. `Space::Program` unconditionally — RTE is

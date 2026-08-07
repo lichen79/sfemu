@@ -3,6 +3,21 @@
 use crate::cpu::{clamp_ipl, M68k, ADDR_MASK, SR_S, SR_T};
 use crate::Bus;
 
+/// Bus error — **the one vector this core never takes**, and deliberately so.
+///
+/// Nothing in the crate raises it, because nothing *can*: signalling a bus error
+/// requires the bus to be able to refuse an access, and [`crate::Bus`] has no
+/// failure channel and no function-code argument, so a device cannot tell the
+/// core that an address is unmapped. That is the same shape as `push16`'s
+/// documented absence: kept and explained rather than deleted, because the
+/// constant is part of the vector table's public description and its number
+/// (`2`, immediately below [`VEC_ADDRESS_ERROR`]) is what makes the table
+/// readable. Adding a bus error means changing `Bus`, not adding a caller here.
+///
+/// ⚠️ Being unused, it had **no test at all**: mutating it to `12` survived the
+/// entire workspace, while doc comments cited "bus-error (vector 2) fetches: 0"
+/// as a *measured control*. A `pub` constant nothing can be wrong about is not a
+/// control. It is now pinned by `the_bus_error_vector_is_two_and_is_never_taken`.
 pub const VEC_BUS_ERROR: u8 = 2;
 pub const VEC_ADDRESS_ERROR: u8 = 3;
 pub const VEC_ILLEGAL: u8 = 4;
@@ -1318,8 +1333,53 @@ mod tests {
         assert_eq!(cpu.pc, 0x1004, "the PC is untouched");
     }
 
-    /// The control for the test above: an **even** frame base at the same odd
-    /// fault address writes the ordinary seven-word frame.
+    /// [`VEC_BUS_ERROR`] is 2, and no path in the crate fetches it.
+    ///
+    /// ⚠️ Two claims, and the second is why this test exists. The number is
+    /// asserted as a **literal** because the constant was `pub` and unused, so
+    /// `2 → 12` survived the whole workspace — while `bus-error (vector 2)
+    /// fetches: 0` was being cited as a measured control in two doc comments. A
+    /// zero that no assertion could distinguish from a typo is not a control.
+    ///
+    /// The "never taken" half is checked here against the one path that could
+    /// plausibly reach it — a double bus fault, which on real hardware *is* a
+    /// bus-error condition — by asserting that its bus log is empty rather than
+    /// containing a fetch at `0x08`/`0x0A`. The crate-wide claim rests on there
+    /// being no caller at all, which is a property of the source: the only way to
+    /// take this vector is through [`take`], and nothing passes it this number.
+    #[test]
+    fn the_bus_error_vector_is_two_and_is_never_taken() {
+        assert_eq!(VEC_BUS_ERROR, 2, "the 68000's bus-error vector is 2");
+        // Adjacent literals, so a shifted table is visible as a shift.
+        assert_eq!(VEC_ADDRESS_ERROR, 3);
+        assert_eq!(VEC_ILLEGAL, 4);
+
+        // A double bus fault is the closest thing this core has to a bus error.
+        // It must halt, not fetch vector 2 at 0x08/0x0A.
+        let mut bus = RecordingBus::new();
+        bus.put16(0x0008, 0x0000); // vector 2, so a fetch would be visible
+        bus.put16(0x000A, 0x4000);
+        bus.load(0x4000, &[0x4E71, 0x4E71]);
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S;
+        cpu.a[7] = 0x2FFF; // odd frame base: double bus fault
+        cpu.pc = 0x1004;
+        bus.log.clear();
+
+        take(&mut cpu, &mut bus, VEC_ADDRESS_ERROR, 0x1000);
+
+        assert!(cpu.halted, "a double bus fault halts");
+        assert_eq!(
+            bus.log,
+            vec![],
+            "the bus-error vector is never fetched; got {:04X?}",
+            bus.log
+        );
+    }
+
+    /// The control for `an_odd_frame_base_halts_without_writing_a_frame`: an
+    /// **even** frame base at the same odd fault address writes the ordinary
+    /// seven-word frame.
     ///
     /// Without this, "no writes" would also hold for an `address_error` that was
     /// broken outright.
