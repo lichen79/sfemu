@@ -892,8 +892,32 @@ mod tests {
             bus.seen
         );
 
-        // MOVEM and MOVEP carry their own masking sites, away from `ea`.
-        // `MOVEM.w (A0),D0-D3` and `MOVEP.w D0,(d16,A0)`.
+        // The group-0 frame is written by `exception::address_error`, a second
+        // and completely separate set of masking sites from `take`'s. A high SSP
+        // plus an odd operand address reaches them: `MOVE.W D0,(A0)` with an odd
+        // `A0` faults, and the 7-word frame's lowest push is at SSP-14.
+        let mut bus = StrictBus::new();
+        bus.load(0x1000, &[0x3080]);
+        bus.load(0x000C, &[0x0000, 0x3000]); // vector 3
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S;
+        cpu.a[0] = 0x0000_2001; // odd
+        cpu.a[7] = 0xFF00_2000;
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+        cpu.step_with(&dec, &mut bus);
+        assert!(
+            bus.seen.contains(&0x0000_1FF2),
+            "the group-0 frame's lowest push must land at 0x00001FF2, saw {:#010X?}",
+            bus.seen
+        );
+
+        // MOVEM and MOVEP carry their own masking sites, away from `ea`, and
+        // MOVEP's read and write directions mask separately.
+        // ⚠️ `take`'s and `address_error`'s *vector fetch* masks are deliberately
+        // not asserted here: `(vector as u32) * 4` is at most 1020, so those two
+        // `& ADDR_MASK`es are no-ops by construction and no test can observe
+        // them. They are defensive, not load-bearing.
         for (name, prog, want) in [
             (
                 "MOVEM.w (A0),D0-D3",
@@ -901,6 +925,7 @@ mod tests {
                 0x0000_2000u32,
             ),
             ("MOVEP.w D0,(d16,A0)", &[0x0188, 0x0000][..], 0x0000_2000),
+            ("MOVEP.w (d16,A0),D0", &[0x0108, 0x0000][..], 0x0000_2000),
         ] {
             let mut bus = StrictBus::new();
             bus.load(0x1000, prog);
