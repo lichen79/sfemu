@@ -209,15 +209,6 @@ pub fn run_case(dec: &Decoder, case: &TestCase) -> Result<(), Failure> {
     if cycles != case.length {
         diffs.push(format!("cycles: got {cycles} want {}", case.length));
     }
-    for (addr, val) in &want.ram {
-        let got = bus.mem.get(addr).copied().unwrap_or(0);
-        if got != *val {
-            diffs.push(format!("ram[{addr:06X}]: got {got:02X} want {val:02X}"));
-        }
-    }
-
-    diffs.extend(compare_accesses(case, &bus.log));
-
     // `TestBus` records reads of addresses the case never seeded, and until now
     // nothing outside `testbus.rs`'s own unit tests looked at the field — a
     // detector whose rationale was written down and then never wired up.
@@ -229,6 +220,12 @@ pub fn run_case(dec: &Decoder, case: &TestCase) -> Result<(), Failure> {
     // never would — a class of bug the state and access comparisons can miss
     // entirely when the stray read happens to return the same 0 the real
     // sequence would have produced.
+    //
+    // ⚠️ Pushed **before** the ram and access comparisons, not after, because
+    // `diffs.truncate(12)` below would otherwise discard it: a stray read
+    // usually comes with a long tail of ram diffs, which is exactly the case
+    // where this line is the one worth reading. An assertion whose output the
+    // reporting path can drop is not an assertion.
     if !bus.unseeded_reads.is_empty() {
         let n = bus.unseeded_reads.len();
         let shown: Vec<String> = bus
@@ -240,9 +237,18 @@ pub fn run_case(dec: &Decoder, case: &TestCase) -> Result<(), Failure> {
         diffs.push(format!(
             "unseeded reads: {n} address(es) absent from initial.ram: {}{}",
             shown.join(" "),
-            if n > shown.len() { " …" } else { "" }
+            if n > shown.len() { " ..." } else { "" }
         ));
     }
+
+    for (addr, val) in &want.ram {
+        let got = bus.mem.get(addr).copied().unwrap_or(0);
+        if got != *val {
+            diffs.push(format!("ram[{addr:06X}]: got {got:02X} want {val:02X}"));
+        }
+    }
+
+    diffs.extend(compare_accesses(case, &bus.log));
 
     if diffs.is_empty() {
         Ok(())
@@ -505,6 +511,35 @@ mod tests {
         assert!(
             compare_accesses(&case, &log).is_empty(),
             "correct LDS byte must produce no diffs"
+        );
+    }
+
+    /// A read outside `initial.ram` must reach the diff list.
+    ///
+    /// ⚠️ The corpus measures 0 unseeded reads over 832,245 Read transactions,
+    /// so the suite passing green says **nothing** about whether the detector
+    /// works — the enforcing branch is never taken by any real case. That is the
+    /// whole reason this test exists: without it, the wiring added for F7 would
+    /// be a `if false { … }` that nothing could distinguish from a working one.
+    ///
+    /// The case is synthetic: an empty `initial.ram`, so the very first prefetch
+    /// reads unseeded memory.
+    #[test]
+    fn a_read_outside_the_seeded_ram_is_reported() {
+        let dec = Decoder::new();
+        // `initial.ram` empty and `pc` at 0, so every fetch is unseeded.
+        let case = TestCase {
+            name: "synthetic-unseeded".into(),
+            initial: State::default(),
+            final_: State::default(),
+            transactions: Vec::new(),
+            length: 4,
+        };
+        let err = run_case(&dec, &case).expect_err("an all-unseeded case must fail");
+        assert!(
+            err.diffs.iter().any(|d| d.starts_with("unseeded reads:")),
+            "the unseeded-read diff must survive to the report; got {:?}",
+            err.diffs
         );
     }
 }
