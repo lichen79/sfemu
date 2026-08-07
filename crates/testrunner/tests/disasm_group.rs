@@ -290,6 +290,7 @@ fn group_consistency() {
     let mut total_cases = 0u32;
     let mut total_passed = 0u32;
     let mut failures: Vec<String> = Vec::new();
+    let mut distinct_opcodes: std::collections::HashSet<u16> = std::collections::HashSet::new();
 
     for entry in &files {
         let path = entry.path();
@@ -311,6 +312,7 @@ fn group_consistency() {
         for case in &cases {
             let opcode = case.initial.prefetch[0];
             total_cases += 1;
+            distinct_opcodes.insert(opcode);
 
             let got_text = disassemble(
                 |a| {
@@ -370,13 +372,34 @@ fn group_consistency() {
         panic!("group consistency: {total_passed}/{total_cases} passed\n{msg}");
     }
 
-    // The exact count is asserted so a vacuous pass (e.g. empty testdata) is
-    // impossible. Per the dispatch notes: 41,766 distinct words, all covered.
-    // The suite may have duplicate opcode words across cases in the same group,
-    // so total_cases >= 41,766 (it equals the sum of cases, not distinct words).
-    assert!(
-        total_cases > 0,
-        "group_consistency ran zero cases — testdata/ may be empty"
+    // ⚠️ **The exact counts, because `total_cases > 0` is not the claim this test
+    // makes.** The comment here used to say "the exact count is asserted so a
+    // vacuous pass (e.g. empty testdata) is impossible … 41,766 distinct words,
+    // all covered", above an assertion that only checked for non-emptiness. With
+    // *one* of the 127 vector files present the test reported
+    // `2500/2500 cases passed … ok` — a green result over 2% of its stated
+    // coverage, while the module header above still claimed 41,766 words across
+    // 127 groups.
+    //
+    // So assert the coverage rather than describing it. Both figures are
+    // written-out literals, independently measured over `testdata/`, and neither
+    // is derived from anything this test computes for its own comparison.
+    assert_eq!(
+        files.len(),
+        127,
+        "expected all 127 vector files — run `cargo run -p testrunner --bin fetch`"
     );
-    println!("group_consistency: {total_passed}/{total_cases} cases passed");
+    assert_eq!(
+        distinct_opcodes.len(),
+        41_766,
+        "expected 41,766 distinct opcode words across the corpus, saw {} over \
+         {total_cases} cases",
+        distinct_opcodes.len()
+    );
+    println!(
+        "group_consistency: {total_passed}/{total_cases} cases passed, \
+         {} distinct opcode words across {} groups",
+        distinct_opcodes.len(),
+        files.len()
+    );
 }
