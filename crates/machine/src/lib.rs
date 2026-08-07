@@ -20,5 +20,9 @@
 #![deny(rustdoc::private_intra_doc_links)]
 
 pub mod board;
+pub mod config;
+pub mod inputs;
 
 pub use board::Board;
+pub use config::BoardConfig;
+pub use inputs::{Inputs, PlayerInput};

@@ -19,6 +19,8 @@
 //! Map cited to MAME `master`, `src/mame/capcom/cps1.cpp:577-594`
 //! (`cps_state::main_map`), read 2026-08-07.
 
+use crate::config::BoardConfig;
+use crate::inputs::Inputs;
 use m68k::Bus;
 
 /// Main RAM, 0xFF0000-0xFFFFFF: 64 KB = 32 K words (`cps1.cpp:593`).
@@ -31,6 +33,13 @@ const ROM_BYTES: usize = 0x40_0000;
 /// First byte of gfxram.
 const GFXRAM_BASE: u32 = 0x90_0000;
 
+/// CPS-A register file base, 0x800100-0x80013F (`cps1.cpp:586`).
+const CPS_A_BASE: u32 = 0x80_0100;
+/// CPS-B register file base, 0x800140-0x80017F (`cps1.cpp:589`).
+const CPS_B_BASE: u32 = 0x80_0140;
+/// Both custom register files are 0x40 bytes = 32 words.
+const CPS_REGS: usize = 0x20;
+
 /// What an unmapped read returns.
 ///
 /// The 68000's data bus floats high on an access no chip answers, and a board
@@ -40,10 +49,8 @@ const GFXRAM_BASE: u32 = 0x90_0000;
 /// taking an exception.
 const UNMAPPED: u16 = 0xFFFF;
 
-/// Everything on the 68000's bus: program ROM, main RAM, and gfxram.
-///
-/// The I/O block at 0x800000-0x80017F arrives in Task 6; until then those
-/// addresses are unmapped and read as 0xFFFF.
+/// Everything on the 68000's bus: program ROM, main RAM, gfxram, and the I/O
+/// block at 0x800000-0x80018F.
 pub struct Board {
     /// The assembled `maincpu` region, zero-padded to the full ROM space.
     pub rom: Vec<u8>,
@@ -55,6 +62,42 @@ pub struct Board {
     /// stores it. SF2CE executes code from here, so it is readable as well as
     /// writable (`cps1.cpp:592`).
     pub gfxram: Box<[u16; GFXRAM_WORDS]>,
+    /// CPS-A, 0x800100-0x80013F, indexed by **word**.
+    ///
+    /// Stored and not interpreted: sub-project C owns every meaning. `cps1.h:176-193`
+    /// gives the layout, and note that MAME's constants there are already divided
+    /// by two because its array is `uint16_t` — `CPS1_SCROLL1_SCROLLX = 0x0c / 2`.
+    pub cps_a: [u16; CPS_REGS],
+    /// CPS-B, 0x800140-0x80017F, indexed by word. Mostly RAM; see [`BoardConfig`]
+    /// for the reads the board answers itself.
+    pub cps_b: [u16; CPS_REGS],
+    /// Controls and DIP switches. The frontend writes this between frames.
+    pub inputs: Inputs,
+    /// Sound command and fade latches, 0x800180 and 0x800188. Sub-project D reads
+    /// them; here they only record what the 68000 wrote.
+    pub sound_latch: [u8; 2],
+    /// Coin counters and lockouts, 0x800030-0x800037. Recorded, not acted on.
+    pub coin_ctrl: u16,
+    /// Which CPS-B reads this board answers itself.
+    pub cfg: BoardConfig,
+}
+
+/// Which halves of a word a bus cycle asserts.
+///
+/// The 68000 has no byte-wide bus: it drives UDS and LDS to select halves of a
+/// 16-bit access. MAME passes the same information as `mem_mask`, and its I/O
+/// handlers branch on it (`ACCESSING_BITS_0_7` at `cps1.cpp:300-313`), so a board
+/// that models byte writes as read-modify-write gets write-only ports wrong — the
+/// read half returns 0xFFFF from a port that does not read, and the "preserved"
+/// neighbouring byte becomes 0xFF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lanes {
+    /// A full word: both UDS and LDS.
+    Word,
+    /// The high byte only, at an even address.
+    High,
+    /// The low byte only, at an odd address.
+    Low,
 }
 
 impl Board {
@@ -65,7 +108,7 @@ impl Board {
     /// Takes `&[u8]` and **not** a `romset::RomSet`: `machine` does not depend on
     /// `romset`, so this crate stays at one dependency and keeps working without
     /// `std`. Every test in this crate builds its program inline.
-    pub fn new(prog: &[u8]) -> Self {
+    pub fn new(prog: &[u8], cfg: BoardConfig) -> Self {
         let mut rom = vec![0u8; ROM_BYTES];
         let n = prog.len().min(ROM_BYTES);
         rom[..n].copy_from_slice(&prog[..n]);
@@ -73,6 +116,12 @@ impl Board {
             rom,
             ram: Box::new([0u16; RAM_WORDS]),
             gfxram: Box::new([0u16; GFXRAM_WORDS]),
+            cps_a: [0; CPS_REGS],
+            cps_b: [0; CPS_REGS],
+            inputs: Inputs::idle(),
+            sound_latch: [0; 2],
+            coin_ctrl: 0,
+            cfg,
         }
     }
 
@@ -101,14 +150,57 @@ impl Board {
 
     /// The word at `addr`, or `None` if `addr` is in no mapped range.
     ///
-    /// `&mut self` because Task 6's I/O arm mutates: reading a CPS-B register
-    /// clears a latch. Splitting mapped from unmapped here rather than in
-    /// [`Bus::read16`] is what lets Task 9's trace name the unmapped access.
+    /// `&mut self` because [`Bus::read16`] is, and because a later CPS-1 read
+    /// handler may mutate — MAME's own `cps1_cps_b_r` is non-const for the raster
+    /// counters. No arm here mutates today. Splitting mapped from unmapped in this
+    /// function rather than in [`Bus::read16`] is what lets Task 9's trace name the
+    /// unmapped access.
     pub(crate) fn read_word(&mut self, addr: u32) -> Option<u16> {
         match addr {
             0x00_0000..=0x3F_FFFF => {
                 let i = (addr & !1) as usize;
                 Some(u16::from_be_bytes([self.rom[i], self.rom[i + 1]]))
+            }
+            // ---- The I/O block. Ranges and handlers from `cps1.cpp:577-594`. ----
+            //
+            // Only the ranges MAME gives a *read* handler appear here. CPS-A, the
+            // coin control, and both sound latches are `.w(...)` — write-only — so
+            // a read of them decodes nothing and floats high, which is what
+            // returning `None` here produces one layer up.
+            0x80_0000..=0x80_0007 => Some(self.inputs.in1()),
+            0x80_0018..=0x80_001F => {
+                // `cps1_dsw_r`, `cps1.cpp:257-272`: four word offsets select IN0,
+                // DSWA, DSWB, DSWC, and the byte lands in the **high** half with
+                // 0xFF below it.
+                //
+                // Not `cps1_hack_dsw_r` (`cps1.cpp:274`), which is the same
+                // function with `| in` instead of `| 0xff`. The two are adjacent in
+                // the file and differ in one token; sf2 gets `main_map` from
+                // `cps1_10MHz` (`cps1.cpp:3909`, `GAME(1991, sf2, …)` at 15024),
+                // and `main_map` wires `cps1_dsw_r`.
+                let sel = ((addr - 0x80_0018) >> 1) & 3;
+                let byte = match sel {
+                    0 => self.inputs.in0(),
+                    n => self.inputs.dsw[(n - 1) as usize],
+                };
+                Some((u16::from(byte) << 8) | 0x00FF)
+            }
+            // `nopr()`, `cps1.cpp:583`: decoded as a read that returns nothing in
+            // particular. MAME's `nopr` yields the unmapped value; ours is 0xFFFF
+            // for the same reason the default is.
+            0x80_0020..=0x80_0021 => Some(UNMAPPED),
+            0x80_0140..=0x80_017F => {
+                let off = ((addr - CPS_B_BASE) as u8) & !1;
+                if self.cfg.cpsb_addr == Some(off) {
+                    // The boot self-test. `cps1_v.cpp:2139-2140`.
+                    Some(self.cfg.cpsb_value)
+                } else if self.cfg.in2_addr == Some(off) {
+                    // SF2's six kick buttons, on the C-board. `cps1_v.cpp:2155-2156`.
+                    // An 8-bit port read into a 16-bit space: 0x00 above the byte.
+                    Some(u16::from(self.inputs.in2()))
+                } else {
+                    Some(self.cps_b[(off >> 1) as usize])
+                }
             }
             0x90_0000..=0x92_FFFF => Some(self.gfxram[Self::gfx_index(addr)]),
             0xFF_0000..=0xFF_FFFF => Some(self.ram[Self::ram_index(addr)]),
@@ -118,20 +210,125 @@ impl Board {
 
     /// Writes the word at `addr`; false if `addr` is in no writable range.
     pub(crate) fn write_word(&mut self, addr: u32, val: u16) -> bool {
+        self.write_lanes(addr, val, Lanes::Word)
+    }
+
+    /// Writes `lanes` of the word at `addr`; false if `addr` is in no writable
+    /// range.
+    ///
+    /// `val` is positioned as the 68000 drives it: for [`Lanes::High`] the byte
+    /// sits in bits 15-8 and bits 7-0 are ignored, for [`Lanes::Low`] the reverse.
+    /// This is exactly MAME's `(data, mem_mask)` pair, and it is why this takes
+    /// lanes at all rather than doing a read-modify-write in [`Bus::write8`]: the
+    /// sound latch and the coin control do not read back, so there is no old word
+    /// to merge with, and `cps1_coinctrl_w` ignores a low-half access entirely.
+    pub(crate) fn write_lanes(&mut self, addr: u32, val: u16, lanes: Lanes) -> bool {
         match addr {
             // ROM: the write reaches no chip that latches it. Discarded and
             // reported as handled — guest behaviour, not our bug, and not an
             // unmapped access either. A real board decodes this range.
             0x00_0000..=0x3F_FFFF => true,
+            // `cps1_coinctrl_w`, `cps1.cpp:316-327`. Every bit it uses is in the
+            // high half and the handler is wrapped in `ACCESSING_BITS_8_15`, so a
+            // low-byte-only write is decoded and then does nothing.
+            0x80_0030..=0x80_0037 => {
+                if lanes != Lanes::Low {
+                    self.coin_ctrl = lanes.merge(self.coin_ctrl, val);
+                }
+                true
+            }
+            // `cps1_cps_a_w` / `cps1_cps_b_w` (`cps1_v.cpp:2115`, `:2183`) both
+            // begin with `COMBINE_DATA`, so a byte write merges into the register
+            // and leaves its other half alone.
+            0x80_0100..=0x80_013F => {
+                let i = (((addr - CPS_A_BASE) >> 1) as usize) & (CPS_REGS - 1);
+                self.cps_a[i] = lanes.merge(self.cps_a[i], val);
+                true
+            }
+            0x80_0140..=0x80_017F => {
+                // The write lands even at `cpsb_addr`: the ID register is
+                // readable-as-wired, not write-protected. MAME's `COMBINE_DATA`
+                // runs before `cps1_cps_b_r` ever intercepts the read.
+                let i = (((addr - CPS_B_BASE) >> 1) as usize) & (CPS_REGS - 1);
+                self.cps_b[i] = lanes.merge(self.cps_b[i], val);
+                true
+            }
+            // `cps1_soundlatch_w`, `cps1.cpp:300-306`: the low byte when the low
+            // lane is asserted, otherwise the high byte. A word write asserts both,
+            // so `ACCESSING_BITS_0_7` holds and the low byte wins.
+            0x80_0180..=0x80_0187 => {
+                self.sound_latch[0] = lanes.byte_written(val);
+                true
+            }
+            // `cps1_soundlatch2_w`, `cps1.cpp:308-312`: the low-lane branch only.
+            // A high-byte-only write is decoded and discarded.
+            0x80_0188..=0x80_018F => {
+                if lanes != Lanes::High {
+                    self.sound_latch[1] = val as u8;
+                }
+                true
+            }
             0x90_0000..=0x92_FFFF => {
-                self.gfxram[Self::gfx_index(addr)] = val;
+                let i = Self::gfx_index(addr);
+                self.gfxram[i] = lanes.merge(self.gfxram[i], val);
                 true
             }
             0xFF_0000..=0xFF_FFFF => {
-                self.ram[Self::ram_index(addr)] = val;
+                let i = Self::ram_index(addr);
+                self.ram[i] = lanes.merge(self.ram[i], val);
                 true
             }
             _ => false,
+        }
+    }
+}
+
+impl Lanes {
+    /// The lanes a byte access at `addr` asserts.
+    #[inline]
+    fn of_byte(addr: u32) -> Self {
+        if addr & 1 == 0 {
+            Self::High
+        } else {
+            Self::Low
+        }
+    }
+
+    /// `val` positioned on these lanes, as the 68000 drives it.
+    ///
+    /// The unasserted half is left zero. Nothing may read it — every consumer here
+    /// is gated on the lanes — and zero rather than a duplicate of the byte is what
+    /// makes a consumer that *isn't* gated fail a test instead of coincidentally
+    /// working.
+    #[inline]
+    fn place(self, val: u8) -> u16 {
+        match self {
+            Self::Word | Self::Low => u16::from(val),
+            Self::High => u16::from(val) << 8,
+        }
+    }
+
+    /// `old` with the asserted lanes of `new` written over it — MAME's
+    /// `COMBINE_DATA`.
+    #[inline]
+    fn merge(self, old: u16, new: u16) -> u16 {
+        match self {
+            Self::Word => new,
+            Self::High => (new & 0xFF00) | (old & 0x00FF),
+            Self::Low => (old & 0xFF00) | (new & 0x00FF),
+        }
+    }
+
+    /// The byte an 8-bit write-only port latches from a `val` on these lanes.
+    ///
+    /// MAME's idiom, verbatim: `if (ACCESSING_BITS_0_7) write(data & 0xff); else
+    /// write(data >> 8);`. A full word therefore latches the **low** byte —
+    /// counter-intuitive for a big-endian CPU, and what the hardware does.
+    #[inline]
+    fn byte_written(self, val: u16) -> u8 {
+        match self {
+            Self::Word | Self::Low => val as u8,
+            Self::High => (val >> 8) as u8,
         }
     }
 }
@@ -159,17 +356,15 @@ impl Bus for Board {
     }
 
     fn write8(&mut self, addr: u32, val: u8) {
-        // A byte write is a read-modify-write of the containing word because the
-        // storage is word-wide. On the real bus it is UDS or LDS alone; the
-        // observable result is the same, and the neighbouring byte must survive.
-        let base = addr & !1;
-        let old = self.read16(base);
-        let new = if addr & 1 == 0 {
-            (u16::from(val) << 8) | (old & 0x00FF)
-        } else {
-            (old & 0xFF00) | u16::from(val)
-        };
-        self.write16(base, new);
+        // A byte write asserts one strobe, and the board is told which. It is
+        // **not** a read-modify-write of the containing word: for a write-only
+        // port there is nothing to read back, so `read16` would return 0xFFFF and
+        // the "preserved" neighbouring byte would be latched as 0xFF. The RAM-like
+        // ranges get their read-modify-write from `Lanes::merge`, at the arm that
+        // owns the storage.
+        let addr = addr & 0x00FF_FFFF;
+        let lanes = Lanes::of_byte(addr);
+        let _ = self.write_lanes(addr & !1, lanes.place(val), lanes);
     }
 }
 
@@ -179,7 +374,7 @@ mod tests {
     use m68k::Bus;
 
     fn board() -> Board {
-        Board::new(&[])
+        Board::new(&[], BoardConfig::sf2())
     }
 
     #[test]
@@ -305,7 +500,7 @@ mod tests {
 
     #[test]
     fn rom_reads_the_program_and_ignores_writes() {
-        let mut b = Board::new(&[0x12, 0x34, 0x56, 0x78]);
+        let mut b = Board::new(&[0x12, 0x34, 0x56, 0x78], BoardConfig::sf2());
         assert_eq!(b.read16(0x00_0000), 0x1234);
         assert_eq!(b.read16(0x00_0002), 0x5678);
         b.write16(0x00_0000, 0xFFFF);
@@ -320,7 +515,7 @@ mod tests {
 
     #[test]
     fn rom_beyond_the_program_reads_zero_not_out_of_bounds() {
-        let mut b = Board::new(&[0x12, 0x34]);
+        let mut b = Board::new(&[0x12, 0x34], BoardConfig::sf2());
         assert_eq!(b.read16(0x3F_FFFE), 0x0000, "unpopulated ROM space");
         assert_eq!(b.read16(0x00_0002), 0x0000, "just past the program");
     }
@@ -333,7 +528,7 @@ mod tests {
     /// one past a 4 MB `Vec`, which is a host panic on a guest address.
     #[test]
     fn an_odd_rom_address_reads_the_containing_word_and_the_last_byte_does_not_panic() {
-        let mut b = Board::new(&[0x12, 0x34, 0x56, 0x78]);
+        let mut b = Board::new(&[0x12, 0x34, 0x56, 0x78], BoardConfig::sf2());
         assert_eq!(b.read16(0x00_0001), 0x1234, "not 0x3456");
         assert_eq!(b.read8(0x00_0003), 0x78);
         assert_eq!(
@@ -350,7 +545,7 @@ mod tests {
         let mut prog = vec![0u8; ROM_BYTES + 4];
         prog[ROM_BYTES - 2] = 0xC0;
         prog[ROM_BYTES - 1] = 0xDE;
-        let mut b = Board::new(&prog);
+        let mut b = Board::new(&prog, BoardConfig::sf2());
         assert_eq!(b.rom.len(), ROM_BYTES);
         assert_eq!(
             b.read16(0x3F_FFFE),
@@ -369,7 +564,7 @@ mod tests {
     fn unmapped_space_reads_all_ones() {
         let mut b = board();
         assert_eq!(b.read16(0x40_0000), 0xFFFF, "just above ROM");
-        assert_eq!(b.read16(0x80_0000), 0xFFFF, "the I/O block, until Task 6");
+        assert_eq!(b.read16(0x81_0000), 0xFFFF, "just above the I/O block");
         assert_eq!(b.read16(0x93_0000), 0xFFFF, "just above gfxram");
         assert_eq!(b.read16(0xFE_FFFE), 0xFFFF, "just below main RAM");
         assert_eq!(b.read8(0x40_0000), 0xFF, "and a byte read of the same");
@@ -399,8 +594,9 @@ mod tests {
         assert!(!b.write_word(0x40_0000, 0x1234), "just above ROM");
         assert!(
             !b.write_word(0x80_0000, 0x1234),
-            "the I/O block, until Task 6"
+            "IN1 is read-only: cps1.cpp:580 gives it no write handler"
         );
+        assert!(!b.write_word(0x81_0000, 0x1234), "just above the I/O block");
         assert!(!b.write_word(0x93_0000, 0x1234), "just above gfxram");
         assert!(!b.write_word(0xFE_FFFE, 0x1234), "just below main RAM");
     }
@@ -414,7 +610,12 @@ mod tests {
         assert!(b.read_word(0x90_0000).is_some());
         assert!(b.read_word(0x00_0000).is_some());
         assert!(b.read_word(0x40_0000).is_none());
-        assert!(b.read_word(0x80_0000).is_none());
+        assert!(b.read_word(0x80_0000).is_some(), "IN1");
+        assert!(
+            b.read_word(0x80_0100).is_none(),
+            "CPS-A is write-only: cps1.cpp:586 gives it no read handler"
+        );
+        assert!(b.read_word(0x81_0000).is_none());
         assert!(b.read_word(0x93_0000).is_none());
         assert!(b.read_word(0xFE_FFFE).is_none());
     }
@@ -511,7 +712,7 @@ mod tests {
     /// past a 4 MB `Vec`.
     #[test]
     fn an_address_above_24_bits_is_masked_not_indexed() {
-        let mut b = Board::new(&[0x12, 0x34]);
+        let mut b = Board::new(&[0x12, 0x34], BoardConfig::sf2());
         assert_eq!(b.read16(0xFF00_0000), 0x1234, "wraps to 0x000000");
         assert_eq!(b.read16(0xFFFF_FFFE), b.read16(0xFF_FFFE), "wraps into RAM");
         b.write16(0x01FF_0000, 0x9999);
@@ -520,5 +721,439 @@ mod tests {
             0x9999,
             "and a write wraps the same way"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // The I/O block, 0x800000-0x80018F.
+    // ---------------------------------------------------------------------------
+
+    /// Active low, everywhere, at boot.
+    ///
+    /// This is the assertion a model that returns 0 for "nothing pressed" fails,
+    /// and it is the difference between a game that boots and a game that thinks
+    /// every button is held from the first frame.
+    #[test]
+    fn an_idle_board_reads_all_ones_across_the_port_block() {
+        let mut b = board();
+        assert_eq!(b.read16(0x80_0000), 0xFFFF, "IN1");
+        assert_eq!(
+            b.read16(0x80_0018),
+            0xFFFF,
+            "IN0 in the high byte, 0xFF in the low"
+        );
+        assert_eq!(b.read16(0x80_001A), 0xFFFF, "DSWA");
+        assert_eq!(b.read16(0x80_001C), 0xFFFF, "DSWB");
+        assert_eq!(b.read16(0x80_001E), 0xFFFF, "DSWC");
+        assert_eq!(b.read16(0x80_0176), 0x00FF, "IN2 through CPS-B");
+    }
+
+    /// `cps1_dsw_r` puts the byte in the **high** half. `cps1.cpp:257-272`.
+    ///
+    /// A model that returns the byte in the low half passes every "is it 0xFF"
+    /// check above and then fails every actual DIP-switch read. The literals here
+    /// are asymmetric on purpose: 0x12FF and 0xFF12 are distinguishable, which
+    /// 0xFFFF and 0xFFFF are not.
+    #[test]
+    fn dsw_reads_put_the_selected_bank_in_the_high_byte() {
+        let mut b = board();
+        b.inputs.dsw = [0x12, 0x34, 0x56];
+        assert_eq!(b.read16(0x80_0018), 0xFFFF, "offset 0 is IN0, not DSWA");
+        assert_eq!(b.read16(0x80_001A), 0x12FF, "DSWA");
+        assert_eq!(b.read16(0x80_001C), 0x34FF, "DSWB");
+        assert_eq!(b.read16(0x80_001E), 0x56FF, "DSWC");
+    }
+
+    /// Offset 0 of the DSW window is IN0, and it is not one of the DIP banks.
+    ///
+    /// `cps1_dsw_r`'s switch has four cases and the first is a different port. A
+    /// model that computed `dsw[sel]` would shift all three banks down by one and
+    /// read DSWA where the game expects the coin inputs — and with the banks all
+    /// equal, as they are at boot, nothing would look wrong.
+    #[test]
+    fn the_dsw_window_selects_in0_then_the_three_dip_banks() {
+        let mut b = board();
+        b.inputs.dsw = [0x12, 0x34, 0x56];
+        b.inputs.coin1 = true;
+        assert_eq!(b.read16(0x80_0018), 0xFEFF, "IN0 with coin 1 in");
+        assert_eq!(b.read16(0x80_001A), 0x12FF, "and DSWA is still DSWA");
+    }
+
+    /// `IN1` carries P1 in the low byte and P2 in the high. `cps1.cpp:840-856`.
+    #[test]
+    fn in1_carries_p1_in_the_low_byte_and_p2_in_the_high() {
+        let mut b = board();
+        b.inputs.p1.punch[0] = true; // bit 4
+        b.inputs.p2.right = true; // bit 8
+        assert_eq!(b.read16(0x80_0000), 0xFEEF);
+    }
+
+    /// 0x800000-0x800007 is one 16-bit port (`cps1.cpp:580`), so all four word
+    /// addresses read the same value.
+    #[test]
+    fn in1_is_one_word_mirrored_across_its_eight_bytes() {
+        let mut b = board();
+        b.inputs.p1.up = true;
+        let v = b.read16(0x80_0000);
+        assert_eq!(v, 0xFFF7);
+        for a in [0x80_0002u32, 0x80_0004, 0x80_0006] {
+            assert_eq!(b.read16(a), v, "{a:#x} mirrors IN1");
+        }
+        assert_eq!(
+            b.read16(0x80_0008),
+            0xFFFF,
+            "0x800008 is past the port; unmapped, which also reads 0xFFFF"
+        );
+        assert!(
+            b.read_word(0x80_0008).is_none(),
+            "and that 0xFFFF is the floating bus, not the port"
+        );
+    }
+
+    /// The DSW window starts at 0x800018 and the gap below it is unmapped.
+    ///
+    /// `cps1.cpp:581` notes that a handful of games read 0x800010 as a
+    /// development leftover; sf2's map decodes nothing there.
+    #[test]
+    fn the_gap_between_in1_and_the_dsw_window_is_unmapped() {
+        let mut b = board();
+        b.inputs.dsw = [0x12, 0x34, 0x56];
+        assert!(b.read_word(0x80_0010).is_none());
+        assert!(b.read_word(0x80_0016).is_none());
+        assert!(b.read_word(0x80_0018).is_some(), "the window starts here");
+        assert!(b.read_word(0x80_001E).is_some(), "and ends here");
+        assert!(b.read_word(0x80_0022).is_none(), "past nopr()");
+    }
+
+    /// SF2's boot self-test: read 0x800140 + 0x32 and expect 0x0401.
+    ///
+    /// `cps1_v.cpp:491` (`CPS_B_11`) and `cps1_v.cpp:2139-2140`. The write must
+    /// still land in the register file — MAME's `COMBINE_DATA` runs before the read
+    /// interception — which is why this reads 0x0401 back *and*
+    /// `a_write_to_the_cpsb_id_register_still_lands_in_the_file` sees 0xDEAD.
+    #[test]
+    fn the_cpsb_id_register_reads_its_wired_value_not_what_was_written() {
+        let mut b = board();
+        assert_eq!(b.read16(0x80_0172), 0x0401);
+        b.write16(0x80_0172, 0xDEAD);
+        assert_eq!(
+            b.read16(0x80_0172),
+            0x0401,
+            "the ID register is wired, not RAM"
+        );
+    }
+
+    /// The write is not swallowed, only the read is intercepted.
+    ///
+    /// `cps1_cps_b_w` (`cps1_v.cpp:2183-2185`) starts with `COMBINE_DATA`
+    /// unconditionally. Sub-project C reads `cps_b` directly for the layer-enable
+    /// and priority registers, so an arm that skipped the store at `cpsb_addr`
+    /// would lose a write the video hardware needs — and no read through the bus
+    /// could ever show it, because that read returns the wired value.
+    #[test]
+    fn a_write_to_the_cpsb_id_register_still_lands_in_the_file() {
+        let mut b = board();
+        b.write16(0x80_0172, 0xDEAD);
+        assert_eq!(b.cps_b[0x32 / 2], 0xDEAD, "word index 0x19");
+        assert_eq!(b.read16(0x80_0172), 0x0401, "but the read is still wired");
+    }
+
+    #[test]
+    fn other_cps_b_registers_are_read_write() {
+        let mut b = board();
+        b.write16(0x80_0140, 0x1111);
+        b.write16(0x80_017E, 0x2222);
+        assert_eq!(b.read16(0x80_0140), 0x1111, "the first register");
+        assert_eq!(b.read16(0x80_017E), 0x2222, "and the last");
+        assert_eq!(
+            b.read16(0x80_0172),
+            0x0401,
+            "and the ID register still is not"
+        );
+    }
+
+    /// The kicks are read through CPS-B, not the 0x800000 block.
+    /// 0x800140 + 0x36 = 0x800176 (`cps1_v.cpp:1838`, `:2155-2156`).
+    #[test]
+    fn in2_is_read_through_cps_b_at_in2_addr() {
+        let mut b = board();
+        assert_eq!(b.read16(0x80_0176), 0x00FF, "idle: 0xFF in the low byte");
+        b.inputs.p1.kick[2] = true; // bit 2
+        assert_eq!(b.read16(0x80_0176), 0x00FB);
+        b.inputs.p2.kick[0] = true; // bit 4
+        assert_eq!(b.read16(0x80_0176), 0x00EB);
+    }
+
+    /// The wired reads come from the config, not from the address.
+    ///
+    /// With no `cpsb_addr` and no `in2_addr`, both of those addresses are plain
+    /// registers. Without this case a hardcoded `0x32` and `0x36` would pass every
+    /// `sf2()` test above — and sub-project F's SF1 board has a different CPS-B
+    /// row, so this is the test that will catch that.
+    #[test]
+    fn with_a_plain_config_the_wired_addresses_are_ordinary_registers() {
+        let mut b = Board::new(&[], BoardConfig::plain());
+        assert_eq!(b.read16(0x80_0172), 0x0000, "not 0x0401");
+        b.write16(0x80_0172, 0xDEAD);
+        assert_eq!(b.read16(0x80_0172), 0xDEAD, "plain RAM");
+        b.inputs.p1.kick = [true; 3];
+        assert_eq!(b.read16(0x80_0176), 0x0000, "and no IN2 here");
+    }
+
+    /// CPS-A is indexed by word, and this is the boundary the plan warns about.
+    ///
+    /// 0x800100 is word index 0; 0x80010C is `CPS1_SCROLL1_SCROLLX`, which
+    /// `cps1.h:182` writes as `0x0c / 2` = 6. An index of 0x0C here would put
+    /// scroll-1's X where scroll-2's Y belongs — one register off, and every value
+    /// in the file looks plausible in the wrong slot.
+    #[test]
+    fn cps_a_writes_land_in_the_register_file_by_word_index() {
+        let mut b = board();
+        b.write16(0x80_010C, 0x0040);
+        assert_eq!(b.cps_a[6], 0x0040, "CPS1_SCROLL1_SCROLLX, cps1.h:182");
+        assert_eq!(b.cps_a[0x0C], 0x0000, "not indexed by the byte offset");
+        b.write16(0x80_0100, 0x9000);
+        b.write16(0x80_013E, 0x0001);
+        assert_eq!(b.cps_a[0], 0x9000, "the first register");
+        assert_eq!(b.cps_a[0x1F], 0x0001, "and the last");
+    }
+
+    /// CPS-B is indexed by word too, and its file is separate from CPS-A's.
+    #[test]
+    fn cps_b_writes_land_in_their_own_file_by_word_index() {
+        let mut b = board();
+        b.write16(0x80_0146, 0x0055);
+        assert_eq!(b.cps_b[3], 0x0055);
+        assert_eq!(b.cps_a[3], 0x0000, "the two files are not the same array");
+        b.write16(0x80_0106, 0x00AA);
+        assert_eq!(b.cps_a[3], 0x00AA);
+        assert_eq!(b.cps_b[3], 0x0055, "and CPS-A's write did not reach CPS-B");
+    }
+
+    /// A word write to a sound latch latches the **low** byte.
+    ///
+    /// `cps1_soundlatch_w` (`cps1.cpp:300-306`) is
+    /// `if (ACCESSING_BITS_0_7) write(data & 0xff); else write(data >> 8);` — a
+    /// word write asserts both lanes, so the first branch holds. The literals are
+    /// asymmetric so a model that took `>> 8` fails.
+    #[test]
+    fn the_sound_latches_take_the_low_byte_of_a_word_write() {
+        let mut b = board();
+        b.write16(0x80_0180, 0x12AB);
+        assert_eq!(b.sound_latch[0], 0xAB, "not 0x12");
+        b.write16(0x80_0188, 0x34CD);
+        assert_eq!(b.sound_latch[1], 0xCD, "not 0x34");
+    }
+
+    /// Both latches are mirrored across their eight bytes, and they are distinct.
+    #[test]
+    fn the_two_sound_latches_are_separate_and_mirrored() {
+        let mut b = board();
+        for a in [0x80_0180u32, 0x80_0182, 0x80_0184, 0x80_0186] {
+            b.write16(a, 0x0011);
+            assert_eq!(b.sound_latch[0], 0x11, "{a:#x} mirrors the command latch");
+            assert_eq!(b.sound_latch[1], 0x00, "and does not touch the fade latch");
+        }
+        for a in [0x80_0188u32, 0x80_018A, 0x80_018C, 0x80_018E] {
+            b.write16(a, 0x0022);
+            assert_eq!(b.sound_latch[1], 0x22, "{a:#x} mirrors the fade latch");
+            assert_eq!(
+                b.sound_latch[0], 0x11,
+                "and does not touch the command latch"
+            );
+        }
+        assert!(
+            !b.write_word(0x80_0190, 0x0033),
+            "0x800190 is past the block"
+        );
+        assert!(b.read_word(0x80_0180).is_none(), "the latches do not read");
+    }
+
+    /// A byte write to a write-only port latches the byte on its own lane.
+    ///
+    /// This is what the read-modify-write `write8` of Task 5 got wrong. Reading
+    /// 0x800180 back returns 0xFFFF — nothing there reads — so merging a low byte
+    /// into it and writing the merged word would latch 0xFF for a high-byte write
+    /// and, worse, would have latched the *low* byte 0xFF even for a high write,
+    /// because a word write takes the low half.
+    #[test]
+    fn a_byte_write_to_a_sound_latch_uses_the_addressed_lane_not_a_merge() {
+        let mut b = board();
+        b.write8(0x80_0181, 0xAB);
+        assert_eq!(b.sound_latch[0], 0xAB, "the odd address is the low lane");
+        b.write8(0x80_0180, 0xCD);
+        assert_eq!(
+            b.sound_latch[0], 0xCD,
+            "the even address is the high lane, and cps1_soundlatch_w's else \
+             branch latches data >> 8 — which is this byte, not 0xFF"
+        );
+        // soundlatch2 has no high-lane branch at all (cps1.cpp:308-312).
+        b.write8(0x80_0189, 0x11);
+        assert_eq!(b.sound_latch[1], 0x11, "low lane writes");
+        b.write8(0x80_0188, 0x22);
+        assert_eq!(
+            b.sound_latch[1], 0x11,
+            "a high-lane write to soundlatch2 is decoded and discarded"
+        );
+    }
+
+    /// `cps1_coinctrl_w` uses only the high half. `cps1.cpp:316-327`.
+    #[test]
+    fn the_coin_control_records_high_half_writes_and_ignores_low_half_ones() {
+        let mut b = board();
+        b.write16(0x80_0030, 0x0100);
+        assert_eq!(b.coin_ctrl, 0x0100, "coin counter 1 is bit 8");
+        b.write8(0x80_0037, 0x03);
+        assert_eq!(
+            b.coin_ctrl, 0x0100,
+            "a low-lane write is inside ACCESSING_BITS_8_15's else, so nothing happens"
+        );
+        b.write8(0x80_0030, 0x02);
+        assert_eq!(b.coin_ctrl, 0x0200, "and a high-lane write merges");
+        assert!(
+            b.read_word(0x80_0030).is_none(),
+            "the coin control does not read"
+        );
+    }
+
+    /// A byte write to a register file merges rather than clobbering.
+    ///
+    /// `COMBINE_DATA` (`cps1_v.cpp:2117`, `:2185`). Distinguishing this from the
+    /// write-only ports above is the whole reason [`Lanes`] exists rather than a
+    /// bool.
+    #[test]
+    fn a_byte_write_to_a_register_file_merges_with_the_other_half() {
+        let mut b = board();
+        b.write16(0x80_0140, 0x1234);
+        b.write8(0x80_0140, 0xAB);
+        assert_eq!(b.cps_b[0], 0xAB34, "the high lane alone");
+        b.write8(0x80_0141, 0xCD);
+        assert_eq!(b.cps_b[0], 0xABCD, "and the low lane alone");
+        b.write16(0x80_0100, 0x1234);
+        b.write8(0x80_0101, 0x99);
+        assert_eq!(b.cps_a[0], 0x1299, "and the same for CPS-A");
+    }
+
+    /// The whole I/O block, one address at a time: which words decode a read and
+    /// which decode a write.
+    ///
+    /// The individual tests above each pin one port. This one pins the *map* — the
+    /// thing an off-by-one in any arm's bounds breaks, and the thing no
+    /// single-port test can see. Every range is a literal transcribed from
+    /// `cps1.cpp:579-591`, not derived from the constants the arms use.
+    #[test]
+    fn the_io_block_decodes_exactly_the_ranges_mame_maps() {
+        // (first, last, reads, writes) — inclusive byte bounds, word-aligned.
+        let ports: &[(u32, u32, bool, bool)] = &[
+            (0x80_0000, 0x80_0006, true, false),  // portr("IN1")
+            (0x80_0008, 0x80_0016, false, false), // the development-leftover gap
+            (0x80_0018, 0x80_001E, true, false),  // cps1_dsw_r
+            (0x80_0020, 0x80_0020, true, false),  // nopr()
+            (0x80_0022, 0x80_002E, false, false),
+            (0x80_0030, 0x80_0036, false, true), // cps1_coinctrl_w
+            (0x80_0038, 0x80_00FE, false, false),
+            (0x80_0100, 0x80_013E, false, true), // cps1_cps_a_w
+            (0x80_0140, 0x80_017E, true, true),  // cps1_cps_b_r / _w
+            (0x80_0180, 0x80_0186, false, true), // cps1_soundlatch_w
+            (0x80_0188, 0x80_018E, false, true), // cps1_soundlatch2_w
+            (0x80_0190, 0x80_01FE, false, false),
+        ];
+        let mut b = board();
+        for &(first, last, reads, writes) in ports {
+            let mut a = first;
+            while a <= last {
+                assert_eq!(
+                    b.read_word(a).is_some(),
+                    reads,
+                    "{a:#08x}: read decode should be {reads}"
+                );
+                assert_eq!(
+                    b.write_word(a, 0),
+                    writes,
+                    "{a:#08x}: write decode should be {writes}"
+                );
+                a += 2;
+            }
+        }
+        // The listed ranges must actually tile 0x800000-0x8001FF with no gap and
+        // no overlap — otherwise a hole in this table would look like coverage.
+        assert_eq!(ports[0].0, 0x80_0000);
+        assert_eq!(ports[ports.len() - 1].1, 0x80_01FE);
+        for w in ports.windows(2) {
+            assert_eq!(
+                w[1].0,
+                w[0].1 + 2,
+                "{:#08x}..{:#08x} does not abut the next range",
+                w[0].0,
+                w[0].1
+            );
+        }
+    }
+
+    /// Sanity: the I/O block never reaches RAM or ROM storage.
+    ///
+    /// A missing `0x80_...` arm would fall through to `_ => None`, which the
+    /// decode test catches. A *misplaced* arm — a range written 0x00_0140 instead
+    /// of 0x80_0140 — would instead corrupt ROM-space reads, which nothing above
+    /// would notice.
+    #[test]
+    fn io_writes_do_not_disturb_ram_gfxram_or_the_rom_image() {
+        let mut b = Board::new(&[0x12, 0x34], BoardConfig::sf2());
+        b.write16(0xFF_0000, 0x1111);
+        b.write16(0x90_0000, 0x2222);
+        let mut a = 0x80_0000u32;
+        while a < 0x80_0200 {
+            b.write16(a, 0xDEAD);
+            a += 2;
+        }
+        assert_eq!(b.read16(0x00_0000), 0x1234, "the ROM image is intact");
+        assert_eq!(b.read16(0xFF_0000), 0x1111, "main RAM is intact");
+        assert_eq!(b.read16(0x90_0000), 0x2222, "gfxram is intact");
+    }
+
+    /// An odd word address in the I/O block reads the word containing it.
+    ///
+    /// Found by mutation: dropping `& !1` from the CPS-B arm's offset survived
+    /// every test above, because none of them read an odd I/O address. The
+    /// consequence is a real behaviour change and not a cosmetic one — with an odd
+    /// offset, 0x800173 misses the `cpsb_addr` comparison and returns the register
+    /// file's contents instead of the wired 0x0401, contradicting
+    /// `an_odd_word_address_truncates_rather_than_panicking`, which is the
+    /// board-wide contract the debugger relies on.
+    #[test]
+    fn an_odd_address_in_the_io_block_reads_the_containing_word() {
+        let mut b = board();
+        b.inputs.dsw = [0x12, 0x34, 0x56];
+        b.inputs.p1.up = true;
+        b.write16(0x80_0172, 0xDEAD);
+        b.write16(0x80_0140, 0x1111);
+        assert_eq!(
+            b.read16(0x80_0173),
+            0x0401,
+            "the wired ID register, not 0xDEAD"
+        );
+        assert_eq!(b.read16(0x80_0177), 0x00FF, "IN2");
+        assert_eq!(b.read16(0x80_0141), 0x1111, "an ordinary CPS-B register");
+        assert_eq!(b.read16(0x80_0001), 0xFFF7, "IN1");
+        assert_eq!(b.read16(0x80_001B), 0x12FF, "DSWA, not DSWB");
+    }
+
+    /// `Lanes` is the file's one polarity-and-position decision, so it gets its
+    /// own literals.
+    #[test]
+    fn lanes_place_merge_and_select_the_documented_halves() {
+        assert_eq!(Lanes::of_byte(0x80_0180), Lanes::High, "even = UDS");
+        assert_eq!(Lanes::of_byte(0x80_0181), Lanes::Low, "odd = LDS");
+
+        assert_eq!(Lanes::Word.place(0xAB), 0x00AB);
+        assert_eq!(Lanes::High.place(0xAB), 0xAB00);
+        assert_eq!(Lanes::Low.place(0xAB), 0x00AB);
+
+        assert_eq!(Lanes::Word.merge(0x1234, 0xABCD), 0xABCD);
+        assert_eq!(Lanes::High.merge(0x1234, 0xABCD), 0xAB34);
+        assert_eq!(Lanes::Low.merge(0x1234, 0xABCD), 0x12CD);
+
+        assert_eq!(Lanes::Word.byte_written(0x12AB), 0xAB, "the low byte wins");
+        assert_eq!(Lanes::High.byte_written(0x12AB), 0x12);
+        assert_eq!(Lanes::Low.byte_written(0x12AB), 0xAB);
     }
 }
