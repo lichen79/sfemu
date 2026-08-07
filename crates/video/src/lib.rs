@@ -26,6 +26,7 @@
 #![deny(rustdoc::private_intra_doc_links)]
 
 pub mod regs;
+pub mod tiles;
 
 /// Visible pixels per line (`cps1.h:41-43`: HBSTART 448 − HBEND 64).
 pub const WIDTH: usize = 384;
