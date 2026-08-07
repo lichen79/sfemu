@@ -20,8 +20,33 @@ pub const ADDR_MASK: u32 = 0x00FF_FFFF;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct M68k {
     pub d: [u32; 8],
-    /// `a[7]` is the *active* stack pointer, mirroring `usp` or `ssp`
-    /// depending on the S bit.
+    /// `a[7]` is the *active* stack pointer. The inactive one lives in [`Self::usp`]
+    /// or [`Self::ssp`] depending on the S bit.
+    ///
+    /// ⚠️ **`a[7]` is the only authoritative copy, and the matching shadow slot goes
+    /// stale.** This doc used to say `a[7]` "mirrors" `usp`/`ssp`, which reads as an
+    /// invariant and is not one. Measured: after `BSR` in supervisor mode `a[7]` is
+    /// `0x2FFC` while `ssp` still reads `0x3000`, and after `BSR` in user mode `a[7]`
+    /// is `0x7FFC` while `usp` still reads `0x8000`. Most handlers that move the stack
+    /// do not write the shadow.
+    ///
+    /// That is sound because [`Self::set_sr`] saves the outgoing `a[7]` into the right
+    /// slot *before* loading the incoming one, so the stale value is always overwritten
+    /// before it can be read as the active pointer. The invariant is therefore the
+    /// weaker one:
+    ///
+    /// > The **inactive** pointer is valid in its slot; the **active** pointer is valid
+    /// > only in `a[7]`.
+    ///
+    /// So read the active SP from `a[7]` and never from `usp`/`ssp` — `exception.rs`'s
+    /// `frame_base` is the pattern to copy. `ops::system::sync_sp` writes the shadow
+    /// anyway for debugging and save-state legibility, and is pinned by exactly one
+    /// assertion: making it a no-op kills only
+    /// `ops::system::tests::link_a7_pushes_the_entry_stack_pointer` and no suite group
+    /// (measured, Task 14). One test is the right amount for a claim that is explicitly
+    /// not load-bearing — but it does mean the shadow's coherence rests on that single
+    /// assertion, not on the 317,500 cases, because the harness reads the active
+    /// pointer out of `a[7]` and so cannot see a stale shadow at all.
     pub a: [u32; 8],
     /// Always 4 bytes beyond the instruction word currently executing,
     /// because of the two-word prefetch queue.

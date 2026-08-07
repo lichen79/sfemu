@@ -234,6 +234,14 @@ fn jump_to(cpu: &mut M68k, bus: &mut dyn Bus, target: u32) {
 
 /// Pushes a 32-bit return address: SP down 4, then **high word first**, both
 /// writes ascending. See the module docs.
+///
+/// Writes `a[7]` and deliberately **not** the `usp`/`ssp` shadow, so after a `BSR` the
+/// shadow is stale — measured, in supervisor mode `a[7]` reads `0x2FFC` while `ssp`
+/// still reads `0x3000`. That is correct under the invariant `M68k::a` documents: the
+/// active pointer is authoritative only in `a[7]`, and `set_sr` saves it into the right
+/// slot before any S-bit change can expose the stale one. The harness agrees — it reads
+/// the active SP from `a[7]` — which is why 1,229/1,229 `BSR` cases pass without the
+/// sync.
 fn push_return(cpu: &mut M68k, bus: &mut dyn Bus, ret: u32) {
     let sp = cpu.a[7].wrapping_sub(4);
     cpu.a[7] = sp;

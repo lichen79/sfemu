@@ -18,12 +18,32 @@ pub const VEC_TRAP_BASE: u8 = 32;
 /// Autovectored interrupts use vectors 25-31 for levels 1-7.
 pub const VEC_AUTOVECTOR_BASE: u8 = 24;
 
-/// Pushes a word onto the active stack.
-// Used by future instruction handlers (TRAP, bus-error frame, etc.).
+/// Pushes a word onto the active stack: SP down 2, then write.
+///
+/// ⚠️ **Nothing calls this, and the reason is not "no handler needs it yet".** The
+/// comment here used to read "used by future instruction handlers (TRAP, bus-error
+/// frame, etc.)", which [`take`] fifty lines below directly contradicts: the 68000
+/// writes the short frame in a **non-sequential** bus order that three sequential
+/// `push16` calls cannot produce. `TRAP` was named as a future caller and is the
+/// clearest case that can never be one. The other pushers — `push_return` in
+/// `ops::branch`, `write_predec_long` in `ea` — likewise each have an order no shared
+/// helper expresses; the core has four distinct 32-bit stack write orders.
+///
+/// So this is kept as documentation of the *simple* order, for comparison against the
+/// three real ones, and not as a utility awaiting a caller. Removing its shadow-SP sync
+/// kills no test in the workspace (measured, Task 14) — which says nothing about the
+/// sync and everything about the function being unreachable. **A mutation score on dead
+/// code measures only its deadness**; do not read that zero as evidence about stack
+/// handling.
+///
+/// If you find yourself wanting this, check the required bus order first. If it is
+/// sequential you are probably not modelling a real 68000 stack write.
 #[allow(dead_code)]
 pub(crate) fn push16(cpu: &mut M68k, bus: &mut dyn Bus, val: u16) {
     cpu.a[7] = cpu.a[7].wrapping_sub(2);
     bus.write16(cpu.a[7] & ADDR_MASK, val);
+    // Kept coherent for the same debugging/save-state reason as `ops::system::sync_sp`;
+    // see `M68k::a`'s docs for why the shadow is not an invariant.
     if cpu.sr_s() {
         cpu.ssp = cpu.a[7];
     } else {
