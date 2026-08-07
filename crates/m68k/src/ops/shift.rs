@@ -357,7 +357,7 @@ mod tests {
     /// equivalence test cannot check it** — it is exactly the "restatement of
     /// themselves" this reference exists to avoid, for one branch. Measured
     /// (Task 14): change `c: kind == Kind::Rox && x0` to `c: false` in *both*
-    /// copies and `closed_forms_match_the_step_by_step_reference` still passes.
+    /// copies and `closed_forms_match_a_per_step_shift` still passes.
     /// Mutating one copy alone kills it, which is the trap — the test looks like it
     /// covers the zero-count rule and is only detecting disagreement between the
     /// two.

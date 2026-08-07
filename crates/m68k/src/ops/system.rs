@@ -1888,8 +1888,14 @@ mod tests {
     /// The operand write being absent is asserted by value, not by address: `A0`
     /// is loaded with `0xABCD_0000`, whose halves (`0xABCD`, `0x0000`) cannot
     /// appear in the exception frame, so the absence of `0xABCD` in all write
-    /// values confirms the push never happened — which is the contract at
-    /// `exception.rs:148-151`.
+    /// values confirms the push never happened — which is the contract of
+    /// [`exception::take`]'s early return, the one guarded by
+    /// `exception::double_bus_fault`: a halted entry writes no frame at all.
+    ///
+    /// ⚠️ That used to read "the contract at `exception.rs:148-151`". Those lines
+    /// are now the middle of `HALTED_IDLE_CYCLES`' doc — the citation decayed into
+    /// pointing at something unrelated, which is worse than not citing. Cite by
+    /// item plus a distinguishing phrase, never by line number.
     ///
     /// **The cycle count is asserted**, and its earlier absence is how this path
     /// kept returning `ADDRESS_ERROR_TAIL_CYCLES` — 58, `4 × 12 + 10` for an
