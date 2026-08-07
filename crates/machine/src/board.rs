@@ -21,6 +21,7 @@
 
 use crate::config::BoardConfig;
 use crate::inputs::Inputs;
+use crate::trace::Trace;
 use m68k::Bus;
 
 /// Main RAM, 0xFF0000-0xFFFFFF: 64 KB = 32 K words (`cps1.cpp:593`).
@@ -87,6 +88,12 @@ pub struct Board {
     pub coin_ctrl: u16,
     /// Which CPS-B reads this board answers itself.
     pub cfg: BoardConfig,
+    /// What the board saw. Sub-project B's whole observable surface.
+    ///
+    /// Counted here rather than in [`Cps1`](crate::Cps1) because the board is what
+    /// decodes: only this file knows whether 0x810000 is a chip or a hole. Not
+    /// cleared by [`Cps1::reset`](crate::Cps1::reset) — see [`Trace`].
+    pub trace: Trace,
     /// Set while IPL1 is asserted and the 68000 has not yet fetched its vector.
     ///
     /// # Why there is no public deassertion API
@@ -154,6 +161,7 @@ impl Board {
             sound_latch: [0; 2],
             coin_ctrl: 0,
             cfg,
+            trace: Trace::default(),
             vblank_pending: false,
         }
     }
@@ -161,6 +169,7 @@ impl Board {
     /// Asserts IPL1, as the beam reaching line 240 does (`cps1.cpp:394-396`).
     pub fn assert_vblank(&mut self) {
         self.vblank_pending = true;
+        self.trace.vblanks += 1;
     }
 
     /// Whether IPL1 is still asserted — i.e. the 68000 has not yet acknowledged.
@@ -193,6 +202,7 @@ impl Board {
         // load-bearing with no test signalling that it had become so.
         if self.vblank_pending && (addr & !3) == VEC_AUTOVECTOR_2 {
             self.vblank_pending = false;
+            self.trace.acks += 1;
         }
     }
 
@@ -276,7 +286,10 @@ impl Board {
             }
             0x90_0000..=0x92_FFFF => Some(self.gfxram[Self::gfx_index(addr)]),
             0xFF_0000..=0xFF_FFFF => Some(self.ram[Self::ram_index(addr)]),
-            _ => None,
+            _ => {
+                self.trace.unmapped_reads.record(addr);
+                None
+            }
         }
     }
 
@@ -299,7 +312,10 @@ impl Board {
             // ROM: the write reaches no chip that latches it. Discarded and
             // reported as handled — guest behaviour, not our bug, and not an
             // unmapped access either. A real board decodes this range.
-            0x00_0000..=0x3F_FFFF => true,
+            0x00_0000..=0x3F_FFFF => {
+                self.trace.rom_writes += 1;
+                true
+            }
             // `cps1_coinctrl_w`, `cps1.cpp:316-327`. Every bit it uses is in the
             // high half and the handler is wrapped in `ACCESSING_BITS_8_15`, so a
             // low-byte-only write is decoded and then does nothing.
@@ -315,6 +331,7 @@ impl Board {
             0x80_0100..=0x80_013F => {
                 let i = (((addr - CPS_A_BASE) >> 1) as usize) & (CPS_REGS - 1);
                 self.cps_a[i] = lanes.merge(self.cps_a[i], val);
+                self.trace.cps_a_writes += 1;
                 true
             }
             0x80_0140..=0x80_017F => {
@@ -323,6 +340,7 @@ impl Board {
                 // runs before `cps1_cps_b_r` ever intercepts the read.
                 let i = (((addr - CPS_B_BASE) >> 1) as usize) & (CPS_REGS - 1);
                 self.cps_b[i] = lanes.merge(self.cps_b[i], val);
+                self.trace.cps_b_writes += 1;
                 true
             }
             // `cps1_soundlatch_w`, `cps1.cpp:300-306`: the low byte when the low
@@ -330,6 +348,7 @@ impl Board {
             // so `ACCESSING_BITS_0_7` holds and the low byte wins.
             0x80_0180..=0x80_0187 => {
                 self.sound_latch[0] = lanes.byte_written(val);
+                self.trace.sound_latch_writes += 1;
                 true
             }
             // `cps1_soundlatch2_w`, `cps1.cpp:308-312`: the low-lane branch only.
@@ -338,11 +357,17 @@ impl Board {
                 if lanes != Lanes::High {
                     self.sound_latch[1] = val as u8;
                 }
+                // Counted even when the lane check discards the byte: the counter
+                // records that the 68000 *addressed* the sound block, which is the
+                // progress signal, and a write MAME decodes and drops is not an
+                // unmapped access.
+                self.trace.sound_latch_writes += 1;
                 true
             }
             0x90_0000..=0x92_FFFF => {
                 let i = Self::gfx_index(addr);
                 self.gfxram[i] = lanes.merge(self.gfxram[i], val);
+                self.trace.gfxram_writes += 1;
                 true
             }
             0xFF_0000..=0xFF_FFFF => {
@@ -350,7 +375,10 @@ impl Board {
                 self.ram[i] = lanes.merge(self.ram[i], val);
                 true
             }
-            _ => false,
+            _ => {
+                self.trace.unmapped_writes.record(addr);
+                false
+            }
         }
     }
 }
@@ -690,6 +718,59 @@ mod tests {
         assert!(b.read_word(0x81_0000).is_none());
         assert!(b.read_word(0x93_0000).is_none());
         assert!(b.read_word(0xFE_FFFE).is_none());
+    }
+
+    /// Each write counts against its own region's counter and no other's.
+    ///
+    /// The zeroes are the assertions that matter. A counter incremented in the
+    /// wrong arm still produces a plausible-looking report — a boot that touched
+    /// only main RAM would appear to have programmed the video hardware, which is
+    /// the one thing this trace exists to tell you it did *not* do. Found by
+    /// mutation: adding `gfxram_writes += 1` to the main-RAM arm survived every
+    /// other test in the crate, because they all check a counter's own region and
+    /// none checks that the neighbours stayed at zero.
+    #[test]
+    fn a_write_counts_against_its_own_region_and_no_other() {
+        let mut b = board();
+        b.write16(0xFF_0000, 0x1234);
+        b.write16(0xFF_0002, 0x5678);
+        assert_eq!(b.trace.gfxram_writes, 0, "main RAM is not gfxram");
+        assert_eq!(b.trace.cps_a_writes, 0);
+        assert_eq!(b.trace.cps_b_writes, 0);
+        assert_eq!(b.trace.sound_latch_writes, 0);
+        assert_eq!(b.trace.rom_writes, 0);
+        assert_eq!(b.trace.unmapped_writes.total(), 0, "main RAM is mapped");
+
+        b.write16(0x90_0000, 0x1234);
+        assert_eq!(b.trace.gfxram_writes, 1);
+        assert_eq!(b.trace.cps_a_writes, 0, "gfxram is not a CPS-A register");
+
+        b.write16(0x80_0100, 0x1234);
+        assert_eq!(b.trace.cps_a_writes, 1);
+        assert_eq!(b.trace.cps_b_writes, 0);
+        assert_eq!(b.trace.gfxram_writes, 1, "and gfxram did not move");
+    }
+
+    /// The unmapped log names the address it was given, not a rounded one.
+    ///
+    /// [`Board::read_word`] and [`Board::write_lanes`] are the crate's own entry
+    /// points and take the address verbatim: [`Bus::read8`]/[`Bus::write8`] align
+    /// before calling them, but the debugger's memory panes in sub-project E will
+    /// not, and a 68000 word access to an odd address is an address error the core
+    /// reports rather than something this board ever sees. Found by mutation:
+    /// masking the recorded address with `& !1` survived, and a report that folds
+    /// 0x810001 into 0x810000 sends the reader looking at the wrong register.
+    #[test]
+    fn the_unmapped_log_records_the_exact_address_including_odd_ones() {
+        let mut b = board();
+        assert!(!b.write_word(0x81_0001, 0x1234));
+        assert!(b.read_word(0x40_0003).is_none());
+        assert_eq!(
+            b.trace.unmapped_writes.entries(),
+            &[(0x81_0001, 1)],
+            "the odd address, not 0x810000"
+        );
+        assert_eq!(b.trace.unmapped_reads.entries(), &[(0x40_0003, 1)]);
     }
 
     #[test]

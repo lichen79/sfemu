@@ -1,0 +1,13 @@
+[package]
+name = "sfemu"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The one crate that joins the host-facing loader to the dependency-free
+# simulation. `machine` must never gain `romset` itself — that would drag
+# miniz_oxide and std into the WASM path — so the joining happens here.
+[dependencies]
+machine = { path = "../machine" }
+romset = { path = "../romset" }

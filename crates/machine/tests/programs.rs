@@ -382,6 +382,198 @@ fn a_masked_interrupt_stays_pending_across_scanlines_and_is_cleared_by_the_fetch
     assert_eq!(m.board.ram[0], 1, "one interrupt in the frame, not two");
 }
 
+/// The trace counts what the program actually did, and nothing it did not.
+///
+/// Every count is a literal derived from the program, one write per port. A
+/// counter placed on the wrong arm shows up as one of these being 0 and another
+/// being 2 — which is why they are asserted together rather than one per test.
+///
+/// ```text
+/// 1000  33FC 0040 0080 010C   move.w #$0040,$80010C   CPS-A
+/// 1008  33FC 1234 0090 0000   move.w #$1234,$900000   gfxram
+/// 1010  33FC 00AB 0080 0180   move.w #$00AB,$800180   sound latch
+/// 1018  33FC FFFF 0081 0000   move.w #$FFFF,$810000   unmapped
+/// 1020  33FC 5555 0080 0146   move.w #$5555,$800146   CPS-B
+/// 1028  4E72 2700             stop #$2700
+/// ```
+///
+/// `stop #$2700` and not the mask-0 form: with the mask down the vblank at line
+/// 240 vectors through an all-zero table and the resulting garbage adds writes of
+/// its own to every counter below.
+#[test]
+fn the_trace_counts_what_the_program_actually_did() {
+    let mut m = machine(&rom(
+        &[
+            0x33FC, 0x0040, 0x0080, 0x010C, //
+            0x33FC, 0x1234, 0x0090, 0x0000, //
+            0x33FC, 0x00AB, 0x0080, 0x0180, //
+            0x33FC, 0xFFFF, 0x0081, 0x0000, //
+            0x33FC, 0x5555, 0x0080, 0x0146, //
+            0x4E72, 0x2700,
+        ],
+        None,
+        &[],
+    ));
+    m.run_frame();
+    let t = &m.board.trace;
+    assert_eq!(t.cps_a_writes, 1, "0x80010C");
+    assert_eq!(t.cps_b_writes, 1, "0x800146");
+    assert_eq!(t.gfxram_writes, 1, "0x900000");
+    assert_eq!(t.sound_latch_writes, 1, "0x800180");
+    assert_eq!(t.rom_writes, 0, "this program writes no ROM");
+    assert_eq!(t.unmapped_writes.total(), 1);
+    assert_eq!(t.unmapped_writes.entries(), &[(0x81_0000, 1)]);
+    assert_eq!(t.unmapped_writes.dropped(), 0);
+    assert_eq!(
+        t.unmapped_reads.total(),
+        0,
+        "every read this program makes is a ROM fetch"
+    );
+    assert_eq!(t.frames, 1);
+    assert_eq!(t.vblanks, 1, "line 240 asserted once");
+    assert_eq!(t.acks, 0, "and the mask kept it from ever being taken");
+}
+
+/// A ROM write is counted apart from an unmapped one.
+///
+/// A real CPS-1 decodes 0x000000-0x3FFFFF, so a write there is a guest bug, not
+/// evidence our map is missing a chip. Folding the two together would put the
+/// program's own ROM address at the top of the "worst unmapped" report and send
+/// the reader looking for a chip that exists.
+///
+/// ```text
+/// 1000  33FC DEAD 0000 2000   move.w #$DEAD,$2000     ROM
+/// 1008  33FC BEEF 0040 0000   move.w #$BEEF,$400000   unmapped
+/// 1010  4E72 2700             stop #$2700
+/// ```
+#[test]
+fn a_rom_write_is_counted_separately_from_an_unmapped_one() {
+    let mut m = machine(&rom(
+        &[
+            0x33FC, 0xDEAD, 0x0000, 0x2000, //
+            0x33FC, 0xBEEF, 0x0040, 0x0000, //
+            0x4E72, 0x2700,
+        ],
+        None,
+        &[],
+    ));
+    m.run_frame();
+    let t = &m.board.trace;
+    assert_eq!(t.rom_writes, 1);
+    assert_eq!(t.unmapped_writes.total(), 1);
+    assert_eq!(t.unmapped_writes.entries(), &[(0x40_0000, 1)]);
+}
+
+/// An unmapped *read* is counted and named too.
+///
+/// ```text
+/// 1000  3039 0040 0000   move.w $400000,d0    unmapped read
+/// 1006  4E72 2700        stop #$2700
+/// ```
+///
+/// The value read is 0xFFFF (the floating bus), which the counter does not care
+/// about — what matters is that the address is on the report, because a boot that
+/// polls a chip we have not modelled shows up here and nowhere else.
+#[test]
+fn an_unmapped_read_is_counted_and_named() {
+    let mut m = machine(&rom(&[0x3039, 0x0040, 0x0000, 0x4E72, 0x2700], None, &[]));
+    m.run_frame();
+    let t = &m.board.trace;
+    assert_eq!(t.unmapped_reads.total(), 1);
+    assert_eq!(t.unmapped_reads.entries(), &[(0x40_0000, 1)]);
+    assert_eq!(t.unmapped_writes.total(), 0, "a read is not a write");
+    assert_eq!(m.cpu.d[0] & 0xFFFF, 0xFFFF, "and it read the floating bus");
+}
+
+/// Every vblank the guest services is counted as an acknowledge.
+///
+/// This is the trace's headline health check — `acks` short of `vblanks` means the
+/// game is not servicing the interrupt — so it gets its own test with a handler
+/// that returns, over ten frames.
+#[test]
+fn ten_serviced_frames_give_ten_vblanks_and_ten_acks() {
+    let mut m = machine(&rom(MAIN_LOOP, Some(0x2000), &[(0x2000, COUNTING_HANDLER)]));
+    for _ in 0..10 {
+        m.run_frame();
+    }
+    let t = &m.board.trace;
+    assert_eq!(t.frames, 10);
+    assert_eq!(t.vblanks, 10);
+    assert_eq!(t.acks, 10, "one acknowledge per vblank");
+    assert_eq!(m.board.ram[0], 10, "and the handler ran once per vblank");
+}
+
+/// `frames` counts wraps of the scanline counter, not calls to `run_frame`.
+///
+/// A counter incremented inside `run_frame` would report 0 for a debugger stepping
+/// scanline by scanline — the one caller most likely to be reading the trace.
+#[test]
+fn frames_are_counted_by_scanline_wraps_not_by_run_frame_calls() {
+    let mut m = machine(&rom(&[0x46FC, 0x2700, 0x60FE], None, &[]));
+    for _ in 0..261 {
+        m.run_scanline();
+    }
+    assert_eq!(m.board.trace.frames, 0, "line 261 has not wrapped yet");
+    m.run_scanline();
+    assert_eq!(m.board.trace.frames, 1, "the 262nd line wraps");
+    m.run_frame();
+    assert_eq!(m.board.trace.frames, 2, "and a whole frame adds one");
+}
+
+/// PC samples are capped rather than growing without bound.
+///
+/// Ten frames is 2,620 scanlines, so an uncapped sampler would hold 2,620 entries.
+/// The cap is 100 and the assertion is the literal 100.
+#[test]
+fn pc_samples_are_capped_rather_than_growing_without_bound() {
+    let mut m = machine(&rom(&[0x46FC, 0x2700, 0x60FE], None, &[]));
+    m.board.trace.pc_sample_cap = 100;
+    for _ in 0..10 {
+        m.run_frame();
+    }
+    assert_eq!(m.board.trace.pc_samples.len(), 100);
+    // The program is a two-instruction loop at 0x1004, so every sample is one of
+    // the two PCs inside it — evidence the samples are the guest's and not zeroes.
+    for &pc in &m.board.trace.pc_samples {
+        assert!(
+            (0x1004..=0x1008).contains(&pc),
+            "sampled PC {pc:#06x} is outside the loop"
+        );
+    }
+}
+
+/// Sampling is off unless the caller asks for it.
+///
+/// A frontend running for an hour is 56 million scanlines. A sampler on by default
+/// is a memory leak that only shows up in the one run nobody profiles.
+#[test]
+fn pc_sampling_is_off_by_default() {
+    let mut m = machine(&rom(&[0x46FC, 0x2700, 0x60FE], None, &[]));
+    m.run_frame();
+    assert!(m.board.trace.pc_samples.is_empty());
+}
+
+/// `reset` clears the machine's schedule and leaves the instrument alone.
+///
+/// The trace is attached to the machine, not part of it: a caller that raised
+/// `pc_sample_cap` and then reset would otherwise find sampling silently off, and
+/// a driver resetting mid-run would lose everything it had observed.
+#[test]
+fn a_reset_clears_the_schedule_but_not_the_trace() {
+    let mut m = machine(&rom(MAIN_LOOP, Some(0x2000), &[(0x2000, COUNTING_HANDLER)]));
+    m.board.trace.pc_sample_cap = 4;
+    m.run_frame();
+    assert_eq!(m.board.trace.frames, 1);
+    assert_eq!(m.board.trace.pc_samples.len(), 4);
+
+    m.reset();
+    assert_eq!(m.total_cycles, 0, "the schedule is cleared");
+    assert_eq!(m.line, 0);
+    assert_eq!(m.board.trace.frames, 1, "and the trace is not");
+    assert_eq!(m.board.trace.vblanks, 1);
+    assert_eq!(m.board.trace.pc_sample_cap, 4, "the cap the caller set");
+}
+
 /// An idle board reads all ones through the DIP-switch port.
 ///
 /// ```text

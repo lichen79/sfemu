@@ -103,7 +103,16 @@ impl Cps1 {
         }
         self.carry = budget; // <= 0
         self.total_cycles += u64::from(spent);
+        // One sample per scanline, taken after the line has run so the PC is where
+        // the program got to rather than where it started.
+        self.board.trace.sample_pc(self.cpu.pc);
         self.line = (self.line + 1) % self.timing.lines_per_frame;
+        // Counted on the wrap rather than in `run_frame`, so a caller driving
+        // scanlines by hand — the debugger, and every test in this crate — counts
+        // the same frames a `run_frame` caller does.
+        if self.line == 0 {
+            self.board.trace.frames += 1;
+        }
         spent
     }
 
