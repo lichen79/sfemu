@@ -466,6 +466,24 @@ mod tests {
 
     /// The high half of a register destination costs two extra cycles, and
     /// `BTST` is exempt because it does not write.
+    ///
+    /// ⚠️ **This test used to recompute the constant it was testing.** Its
+    /// expected value was `u32::from(op != 0x0100 && bit >= 16) * 2` — the cost
+    /// site's own expression, so it passed for *any* threshold. Four mutants
+    /// survived it with all unit tests green: `bit >= 15`, `>= 17`, `>= 8`, and
+    /// the cost site's `% 32` changed to `% 64`. Only the suite caught them, and
+    /// the compute site three lines below the cost site uses a *different*
+    /// modulus and is properly pinned, so the file demonstrated the right
+    /// standard one screen away from the defect.
+    ///
+    /// The rows below straddle every boundary instead:
+    ///
+    /// - **15 and 16** straddle the threshold, so `>= 15` and `>= 17` both fail.
+    /// - **8** would be the threshold under `>= 8`, so 15 failing at `extra = 0`
+    ///   catches it.
+    /// - **40** is `8 mod 32` and `40 mod 64`, so it costs 0 under the correct
+    ///   modulus and 2 under `% 64`. That is the only row that can see the
+    ///   modulus, and it is why 40 is in the list rather than another high bit.
     #[test]
     fn a_high_bit_number_costs_a_writing_op_two_more_cycles() {
         let dec = Decoder::new();
@@ -476,13 +494,16 @@ mod tests {
             (0x0180, 4, "BCLR"),
             (0x01C0, 2, "BSET"),
         ] {
-            for bit in [3u32, 20] {
+            // Expected values are written out, not re-derived from `bit >= 16`.
+            for (bit, extra) in [(3u32, 0u32), (15, 0), (16, 2), (31, 2), (40, 0)] {
                 let mut bus = FlatBus::new();
                 bus.load(0x1000, &[op, 0x4E71]);
                 let mut cpu = at(&mut bus);
                 cpu.d[0] = bit;
                 let cycles = cpu.step_with(&dec, &mut bus);
-                let hi = u32::from(op != 0x0100 && bit >= 16) * 2;
+                // `BTST` does not write, so it never pays the extra, whatever
+                // the bit number is.
+                let hi = if op == 0x0100 { 0 } else { extra };
                 assert_eq!(cycles, 4 + base + hi, "{name} #{bit},D0");
             }
         }
