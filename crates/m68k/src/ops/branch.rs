@@ -453,6 +453,19 @@ fn jump_idle(mode: u16, reg: u16) -> u32 {
 /// which it is in `prefetch[1]` in turn. PC-relative modes are relative to the
 /// extension word's own address, `opcode_addr + 2` — 46/46 and 44/44 for `JMP`
 /// and `JSR`'s two PC modes.
+///
+/// ⚠️ **The `Size::Long` passed below is not an operand size and pins nothing.** A
+/// jump has no operand: it computes an address and discards the size. Changing all
+/// three `Size::Long`s in this file to `Size::Word` leaves the entire workspace
+/// green (measured, Task 14 — 11 test binaries, 127/127 groups). That is not a gap
+/// in coverage but a fact about [`ea::ext_words`] and [`ea::resolve`]: size affects
+/// only `(An)+`, `-(An)` and `#imm`, and none of the three is a control mode, so
+/// `JMP`/`JSR` cannot reach a size-dependent path.
+///
+/// `Long` is nonetheless the right value to write, because it is what the address
+/// *is* — 32 bits wide — and a reader checking whether the argument matters should
+/// find this note rather than re-derive it. Do not "simplify" the parameter away
+/// from `ea::resolve`: other callers need it.
 fn jump_target(cpu: &mut M68k, bus: &mut dyn Bus, mode: u16, reg: u16) -> (u32, u32) {
     let opcode_addr = cpu.pc.wrapping_sub(exception::OPCODE_PC_OFFSET);
     let de = ea::ext_words(mode, reg, Size::Long);

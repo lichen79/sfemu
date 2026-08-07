@@ -199,6 +199,25 @@ fn nop(cpu: &mut M68k, bus: &mut dyn Bus, _opcode: u16) -> u32 {
 
 // --- Dispatch-table installation ------------------------------------------
 
+/// Generates the thin `Handler`-signature wrappers this module installs.
+///
+/// **Four modules define a macro with this name and none of them are the same
+/// macro** — `logic`, `bits`, `muldiv` and `arith` each have their own, matching the
+/// argument list their own helpers take. `muldiv`'s variadic form
+/// (`$name = $body $(, $arg)*;`) is general enough to subsume all four, so merging
+/// them into one crate-level macro is possible and is deliberately not done:
+///
+/// - the four call sites would then read `and_to_reg_b = to_reg, Op::And, Size::Byte`
+///   instead of `and_to_reg_b(Op::And, Size::Byte, to_reg)`, moving the argument
+///   order away from the helper signatures it mirrors in each module;
+/// - a shared macro is one more thing to find when reading a single module, and
+///   these bodies are three lines each.
+///
+/// The duplication is not hiding a bug: mutating this body to pass `Size::Byte`
+/// unconditionally fails **12** of the workspace's test binaries (measured, Task 14),
+/// so the expansion is pinned many times over. The name collision is the only real
+/// cost, and it is a cost paid when grepping — hence this note. If you do unify them,
+/// keep `muldiv`'s shape and expect four call-site rewrites, not one.
 macro_rules! handlers {
     ($($name:ident($op:expr, $size:expr, $body:path);)*) => {
         $(fn $name(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
