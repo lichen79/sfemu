@@ -575,14 +575,31 @@ mod tests {
     fn a_read_outside_the_seeded_ram_is_reported() {
         let dec = Decoder::new();
         // `initial.ram` empty and `pc` at 0, so every fetch is unseeded.
+        //
+        // `final_.ram` carries 20 bytes the run cannot produce, so the ram loop
+        // pushes a tail longer than `diffs.truncate(12)` keeps. That is what makes
+        // this test able to fail: with the unseeded block moved after the ram loop,
+        // the truncation drops it and the assertion below goes red. Seeding fewer
+        // than 12 mismatching bytes would leave the ordering claim untested — the
+        // diff would survive either placement.
+        let final_ = State {
+            ram: (0x100..0x114).map(|a| (a, 0xFF)).collect(),
+            ..Default::default()
+        };
         let case = TestCase {
             name: "synthetic-unseeded".into(),
             initial: State::default(),
-            final_: State::default(),
+            final_,
             transactions: Vec::new(),
             length: 4,
         };
         let err = run_case(&dec, &case).expect_err("an all-unseeded case must fail");
+        assert!(
+            err.diffs.len() == 12,
+            "the ram tail must overflow the truncation limit, or this test cannot \
+             see the ordering it exists to pin; got {} diffs",
+            err.diffs.len()
+        );
         assert!(
             err.diffs.iter().any(|d| d.starts_with("unseeded reads:")),
             "the unseeded-read diff must survive to the report; got {:?}",

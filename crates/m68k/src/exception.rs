@@ -287,12 +287,24 @@ pub fn entry_cycles(cpu: &M68k, accesses_made: u32, framed: u32) -> u32 {
 /// `MOVE.l` 471.
 ///
 /// - The denominator was **76,957**, one short. The off-by-one comes from
-///   scoring all 256 vectors, which reaches 76,965 with seven singleton false
-///   positives (vectors 22/70/119/120/149/213/237). Select by the legal set
-///   above, and require the vector fetch's **read pair** at `v*4` and `v*4+2` in
-///   supervisor-data space (`fc` 5, which is what the suite records for a vector
-///   fetch) — a single read in the range also catches instructions that merely
-///   touch low memory, which is worth 6 cases here.
+///   scoring all 256 vectors rather than the legal set: a permissive predicate
+///   admits instructions that merely read low memory without taking an
+///   exception. Select by the legal set above, and require the vector fetch's
+///   **read pair** at `v*4` and `v*4+2` in supervisor-data space (`fc` 5, which
+///   is what the suite records for a vector fetch) — a single read in the range
+///   also catches instructions that merely touch low memory.
+///
+///   ⚠️ This bullet used to name the over-count as "76,965 with seven singleton
+///   false positives (vectors 22/70/119/120/149/213/237)". Neither figure
+///   reproduces: a sweep of 32 predicate variants (`fc` filter × `is_word` ×
+///   read-pair vs single-read × masked vs raw address × including
+///   `ReadAddrErr`) produces no variant scoring 76,965 and none yielding that
+///   vector list. The nearest, `fc`-agnostic with the read pair, gives 76,966
+///   over `{22, 70, 98, 119, 149, 150, 151, 152, 153, 213, 237}`. The claim
+///   this bullet actually rests on — that the legal set gives **76,958** and
+///   that every permissive variant over-counts — holds under all 32. Do not
+///   restore a specific over-count without re-measuring it; the whole point of
+///   this ⚠️ block is that an unreproducible figure is worse than no figure.
 /// - **72,848 is a full-word figure that was sitting inside a low-5-bits
 ///   sentence.** Its low-5 counterpart is 72,865; the widths were crossed. Every
 ///   figure above therefore names its width.

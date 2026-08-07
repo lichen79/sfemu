@@ -75,7 +75,7 @@ cannot silently go unrun.
 
 ⚠️ **The debug run is not redundant, and leaving it out hid a live defect.**
 `[profile.release]` does not enable debug assertions, so under a release-only
-gate the core's 12 `debug_assert!`s were never evaluated — including the one in
+gate the core's 9 `debug_assert!`s were never evaluated — including the one in
 `ops::alu`'s `run_tail` that a whole task chose *over* deleting the field it
 checks. Measured: inverting that assertion to `debug_assert!(!plan.writes, …)`,
 which must fire on every write-back plan, leaves the release run entirely green
