@@ -153,11 +153,19 @@ fn bit_op(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16, op: Op, static_form: b
     if static_form {
         plan = plan.pre(1);
     }
-    // `Plan::writes` is dead state — it is assigned by every handler in the
-    // crate and read by none. What actually decides the write is whether the
-    // `compute` closure below returns `Some`, which for `BTST` it does not. Set
-    // here only for symmetry with the existing handlers; a fix that removes the
-    // field is queued separately.
+    // `Plan::writes` records this handler's *intent* that the result go back to
+    // the `<ea>`. What performs the write is `compute` returning `Some`, and
+    // `alu::run_tail` `debug_assert!`s the intent against it: `writes` set while
+    // nothing is written is 0 cases suite-wide and is the invariant. `BTST`
+    // deliberately leaves the flag clear, which is why this is conditional.
+    //
+    // ⚠️ This comment used to say the field was "dead state … read by none" with
+    // "a fix that removes the field queued separately". **Both halves are
+    // false.** `run_tail` reads it, and the fix that landed for the original
+    // 13-writes/0-reads finding was that assertion — chosen deliberately over
+    // deletion, because `Plan` carries live flags of identical shape that a
+    // reader cannot tell apart without grepping. Acting on the old comment would
+    // delete the field and silently revert a completed fix.
     if op.writes() {
         plan = plan.writes();
     }
