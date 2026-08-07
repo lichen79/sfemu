@@ -352,6 +352,28 @@ mod tests {
     /// One hardware step at a time: the definition the closed forms above are
     /// derived from, kept here so they can be checked against it rather than
     /// against a restatement of themselves.
+    ///
+    /// ⚠️ **The `count == 0` block below is copied from [`shift`], so the
+    /// equivalence test cannot check it** — it is exactly the "restatement of
+    /// themselves" this reference exists to avoid, for one branch. Measured
+    /// (Task 14): change `c: kind == Kind::Rox && x0` to `c: false` in *both*
+    /// copies and `closed_forms_match_the_step_by_step_reference` still passes.
+    /// Mutating one copy alone kills it, which is the trap — the test looks like it
+    /// covers the zero-count rule and is only detecting disagreement between the
+    /// two.
+    ///
+    /// What does catch the both-copies mutant is the suite: the **six `ROX` groups**
+    /// (`roxl_b/w/l`, `roxr_b/w/l`) and the unit test
+    /// `zero_count_preserves_the_operand_and_reports_x_only_for_rox`. Exactly the
+    /// six, which is the right shape — the rule is `ROX`-specific — so the rule is
+    /// well pinned; it is pinned *there*, not here. Do not read a green equivalence
+    /// test as covering zero-count flags.
+    ///
+    /// The duplication is kept rather than factored out, because a shared helper
+    /// would make the two agree by construction for *every* mutation and lose the
+    /// one-copy signal as well. The comment is the fix: the loop below cannot
+    /// express a zero-iteration case's flags, so some duplication is unavoidable
+    /// here.
     fn one_step_at_a_time(
         kind: Kind,
         left: bool,
