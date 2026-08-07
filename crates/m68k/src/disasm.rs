@@ -1179,16 +1179,28 @@ fn format_index_reg(ext: u16) -> String {
     format!("{bank}{ireg}{isz}")
 }
 
+/// The `(d16,An)` operand. A zero displacement prints as `($0,a0)`, **not** as
+/// `(a0)`.
+///
+/// ⚠️ **The eliding this replaces made two different instructions render
+/// identically.** `1028 0000` (4 bytes) printed `move.b (a0),d0`, character-for-
+/// character the same as `1010` (2 bytes). `len` was correct in both, so a
+/// debugger stepping by `len` stayed in sync and this was filed Minor — but a
+/// listing read by eye, or a round-trip through an assembler, lost the extension
+/// word with no indication.
+///
+/// MOVEP shares this helper and there it is not cosmetic: `0108 0000` printed
+/// `movep.w (a0),d0`, naming an addressing mode **MOVEP has no encoding for**.
+/// The only `<ea>` MOVEP accepts is `(d16,An)`, so the elided form was not a
+/// terser spelling of the truth, it was a spelling of something that cannot
+/// exist. That is why the fix is here rather than a special case in
+/// `decode_movep`: the general helper was the thing that was wrong.
+///
+/// Cost of the fix: every zero-displacement `(d16,An)` is now three characters
+/// wider. That is the intended trade — `($0,a0)` is unambiguous and `(a0)` was
+/// not.
 fn format_disp_an(disp: i16, an: u16) -> String {
-    if disp == 0 {
-        // ⚠️ Renders identically to `(a{an})`, which is the *correct* operand
-        // spelling but loses the distinction between a 4-byte `(d16,An)` with a
-        // zero displacement and a 2-byte `(An)`. `len` is right in both cases, so
-        // a debugger stepping by `len` stays in sync; only the text is ambiguous.
-        format!("(a{an})")
-    } else {
-        format!("({},a{an})", signed_hex(disp as i32))
-    }
+    format!("({},a{an})", signed_hex(disp as i32))
 }
 
 fn format_index_ea(ext: u16, an: usize) -> String {
@@ -1322,6 +1334,13 @@ mod tests {
         disassemble(|a| w.get((a / 2) as usize).copied().unwrap_or(0), 0).text
     }
 
+    /// The byte length only, for the cases where two encodings render as
+    /// different text and the length is the thing being distinguished.
+    fn dis_len(words: &[u16]) -> u32 {
+        let w = words.to_vec();
+        disassemble(|a| w.get((a / 2) as usize).copied().unwrap_or(0), 0).len
+    }
+
     /// Disassemble at a non-zero address. `words[0]` lives at `addr`; extension
     /// words follow at `addr+2`, etc. Used to verify branch-target arithmetic.
     fn dis_at(words: &[u16], addr: u32) -> (String, u32) {
@@ -1406,12 +1425,17 @@ mod tests {
     /// docstring saying so was never enumerated. Not covered here:
     /// `format_index_pc_ea` (the `(d8,PC,Xn)` mode), MOVEM's
     /// `(d16,An)` and absolute EAs, the `Scc`/`DBcc` condition names, the
-    /// `movem #0` empty-mask path, `movep`, `stop`, `move sr,`/`move ,ccr`/
+    /// `movem #0` empty-mask path, `stop`, `move sr,`/`move ,ccr`/
     /// `move ,sr`, `exg`, `abcd`/`sbcd`, `cmpm`, `chk`, and the shift/rotate
     /// memory forms. Every one of those was probed correct at the time of
     /// writing, so this is a gap in the *claim*, not a known defect — but a
     /// reader deciding whether a path needs a new assertion must not trust
     /// this test to have covered it.
+    ///
+    /// ⚠️ `movep` was on that list and is now asserted below, because being
+    /// "probed correct at the time of writing" turned out to be false for it: the
+    /// zero-displacement form named a mode MOVEP cannot encode. Treat the
+    /// remaining entries as unverified, not as verified-elsewhere.
     #[test]
     fn ea_and_operand_forms() {
         // Addressing modes.
@@ -1430,6 +1454,20 @@ mod tests {
         // -16 previously rendered as `$FFF0` and read as 65,520 forward.
         assert_eq!(dis(&[0x1028, 0xFFF0]), "move.b (-$10,a0),d0");
         assert_eq!(dis(&[0x1038, 0x1234]), "move.b $1234,d0");
+
+        // A zero (d16,An) displacement must NOT elide to `(a0)`. These two
+        // rendered identically before the fix while being 4 and 2 bytes; the
+        // pair, not either line alone, is the assertion.
+        let long_form = dis(&[0x1028, 0x0000]);
+        let short_form = dis(&[0x1010]);
+        assert_eq!(long_form, "move.b ($0,a0),d0");
+        assert_eq!(short_form, "move.b (a0),d0");
+        assert_ne!(
+            long_form, short_form,
+            "(d16,An) with disp 0 must be distinguishable from (An)"
+        );
+        assert_eq!(dis_len(&[0x1028, 0x0000]), 4);
+        assert_eq!(dis_len(&[0x1010]), 2);
         // Immediate EA: sized hex formatting.
         assert_eq!(dis(&[0x103C, 0x0042]), "move.b #$42,d0");
         // PC-relative.
@@ -1442,6 +1480,41 @@ mod tests {
         assert_eq!(dis(&[0x4E40]), "trap #0");
         // Sized immediate ops use hex.
         assert_eq!(dis(&[0x0C40, 0x1234]), "cmpi.w #$1234,d0");
+    }
+
+    /// MOVEP's only `<ea>` is `(d16,An)`, so its operand must always show a
+    /// displacement — including when the displacement is zero.
+    ///
+    /// ⚠️ `0108 0000` used to render `movep.w (a0),d0`. `(An)` is mode 2 and
+    /// MOVEP's encoding has no mode field at all: the operand named something
+    /// the instruction cannot express, so a reader who trusted the listing would
+    /// conclude the disassembler had mis-decoded the word. This is the case that
+    /// made the shared `format_disp_an` eliding a correctness bug rather than a
+    /// terseness preference.
+    ///
+    /// Zero displacement does not occur in the suite's 5,000 MOVEP cases
+    /// (measured, Task 14). The corpus-wide rate of a zero second prefetch word
+    /// is 5/317,500, so at that base rate 0/5,000 is what chance predicts and is
+    /// **not** evidence the generator excludes it — the encoding is legal and a
+    /// real program may use it. Hence a hand-written case rather than a suite
+    /// query.
+    #[test]
+    fn movep_always_shows_its_displacement() {
+        assert_eq!(dis(&[0x0108, 0x0000]), "movep.w ($0,a0),d0");
+        assert_eq!(dis(&[0x0108, 0x0004]), "movep.w ($4,a0),d0");
+        assert_eq!(dis(&[0x0108, 0xFFFC]), "movep.w (-$4,a0),d0");
+        // All four opmodes, since each builds the string separately.
+        assert_eq!(dis(&[0x0148, 0x0000]), "movep.l ($0,a0),d0");
+        assert_eq!(dis(&[0x0188, 0x0000]), "movep.w d0,($0,a0)");
+        assert_eq!(dis(&[0x01C8, 0x0000]), "movep.l d0,($0,a0)");
+        // The mode MOVEP cannot encode must not appear in any of them.
+        for w in [0x0108u16, 0x0148, 0x0188, 0x01C8] {
+            let text = dis(&[w, 0x0000]);
+            assert!(
+                !text.contains("(a0)"),
+                "movep rendered a bare (An), which it has no encoding for: {text}"
+            );
+        }
     }
 
     /// Branch targets use the `addr` argument of `disassemble`; asserting with
