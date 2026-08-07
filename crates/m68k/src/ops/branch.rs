@@ -286,7 +286,14 @@ fn bcc(cpu: &mut M68k, bus: &mut dyn Bus, op: u16) -> u32 {
         return 4 * 4 + TAKEN_IDLE;
     }
 
-    if cond == 0 || test_condition(cpu, cond) {
+    // `cond == 0` is BRA, and `test_condition` already returns `true` for it —
+    // condition 0 is T. The `cond == 0 ||` disjunct that used to sit here was
+    // redundant, and worse, it implied that condition 0 needed special handling in
+    // this line. It does not: the only encoding in line 0110 that `test_condition`
+    // cannot decide is `cond == 1`, which is BSR rather than F, and that is handled
+    // above. Removing the disjunct is what makes the remaining `cond == 1` check
+    // legible as *the* exception.
+    if test_condition(cpu, cond) {
         if target_faults(target) {
             return target_error(cpu, bus, target, op, base, 0, TAKEN_IDLE);
         }

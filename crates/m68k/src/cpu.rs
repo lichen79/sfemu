@@ -318,7 +318,24 @@ impl M68k {
     /// are written against, and edge sensitivity would silently change what
     /// "assert the line and step" means for every caller. The requirement is
     /// documented here instead. See [`crate::exception::check_interrupts`].
+    /// # Panics
+    ///
+    /// In debug builds, if `level > 7`. The three IPL pins encode 0..=7 and nothing
+    /// else, so a larger value is a caller bug rather than an input to clamp.
+    ///
+    /// ⚠️ **The `& 7` is a mask, not a clamp, and the difference is a silent wrong
+    /// answer.** `set_irq(8)` masks to **0** — a *deassertion* — so a caller that
+    /// computed a level off by one would silently disable interrupts rather than
+    /// request a high-priority one. `set_irq(9)` becomes level 1, the lowest priority.
+    /// Neither reports anything. The `debug_assert` turns both into a named failure in
+    /// tests while leaving release builds unchanged; the mask stays so release
+    /// behaviour is still defined.
     pub fn set_irq(&mut self, level: u8) {
+        debug_assert!(
+            level <= 7,
+            "IRQ level {level} is out of range: the IPL pins encode 0..=7, and masking \
+             would turn 8 into a deassertion rather than a high-priority request"
+        );
         self.pending_irq = level & 7;
     }
 
