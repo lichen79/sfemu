@@ -48,7 +48,7 @@
 //! constant per mode, and each was cross-checked against the measured
 //! per-`(mode, reg)` singleton buckets in the addendum. The two-cycle
 //! address-formation lead for `-(An)`, `(d8,An,Xn)` and `(d8,PC,Xn)` is the same
-//! `idle_lead` [`alu`](super::alu) charges, reproduced here as [`idle_lead`]
+//! `idle_lead` [`alu`](super::alu) charges, reproduced here as `idle_lead`
 //! because this module does not route through `alu::run`.
 
 use crate::cpu::{M68k, ADDR_MASK};
@@ -450,14 +450,24 @@ fn pea(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16) -> u32 {
             ir,
             opcode_addr.wrapping_add(4),
         );
-        // On the halt path (supervisor, odd `a[7]`) the only accesses that reached
-        // the bus are the ones `resolve_address` and the queue advance already
-        // made: `de` extension fetches, plus the advance for the non-absolute
-        // modes. Measured against the core's own log — `PEA (A0)` with an odd SP
-        // logs exactly 1. The 58 accounts for a frame and vector fetch that this
-        // path skips entirely.
+        // The lead goes in the caller's own term, per `entry_cycles`' convention:
+        // the accesses `resolve_address` and the queue advance already put on the
+        // bus (`de` extension fetches, plus the advance for the non-absolute
+        // modes), and the lead idle. Measured against the core's own log — `PEA
+        // (A0)` with an odd SP logs exactly 1 access and 0 idle.
+        //
+        // ⚠️ Folding the lead into `entry_cycles`' first argument instead — which
+        // is what this did — drops the idle on **both** arms, because
+        // `entry_cycles` has no idle term, and drops `4 * made` from the framed
+        // arm as well, because 58 is the tail alone. `(d8,An,Xn)` charges 4 of
+        // lead idle (`idle_lead` twice, see its docs), so the two spellings differ
+        // by 4 there and agree on `(An)` — which is why the mode-2 test could not
+        // see it. Under the timing law the total is
+        // `4 * (made + 12) + lead_idle + 10`, and the 58 is the `12`-and-`10` part.
         let made = de + u32::from(!absolute);
-        return exception::entry_cycles(cpu, made, ADDRESS_ERROR_TAIL_CYCLES);
+        return 4 * made
+            + 2 * idle_lead(mode, reg)
+            + exception::entry_cycles(cpu, 0, ADDRESS_ERROR_TAIL_CYCLES);
     }
     cpu.a[7] = sp;
     sync_sp(cpu);
@@ -1840,6 +1850,52 @@ mod tests {
             cycles,
             4 + exception::HALTED_IDLE_CYCLES,
             "4 × 1 access + the halt idle, not the framed 58"
+        );
+    }
+
+    /// The same halt, from an **indexed** mode, which is the only shape that can
+    /// see the lead idle.
+    ///
+    /// `pea_with_odd_sp_faults_without_writing` uses `PEA (A0)`, where
+    /// `idle_lead` is 0 — so it scores the same whether the halt arm charges the
+    /// lead idle or drops it, and it could not see that the arm *did* drop it.
+    /// `(d8,A0,D0)` is one of the three modes where `idle_lead` is nonzero, and
+    /// `pea` charges it twice (see `idle_lead`'s docs), so the two spellings
+    /// differ by 4 here.
+    ///
+    /// This is the control the mode-2 test needed: a case where the term under
+    /// test is guaranteed present by construction. Deleting `2 * idle_lead(..)`
+    /// from `pea`'s halt arm fails this and nothing else.
+    #[test]
+    fn pea_indexed_with_odd_sp_charges_its_lead_idle() {
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4870, 0x0000, 0x4E71]); // PEA (0,A0,D0.w)
+        bus.put16(0x000C, 0x0000); // vector 3 -> 0x5000
+        bus.put16(0x000E, 0x5000);
+        bus.load(0x5000, &[0x4E71, 0x4E71]);
+        let mut cpu = at(&mut bus);
+        cpu.a[0] = 0xABCD_0000;
+        cpu.d[0] = 0;
+        cpu.a[7] = 0x2FFF; // odd: SP - 4 = 0x2FFB, also odd
+        cpu.ssp = 0x2FFF;
+        bus.log.clear();
+
+        let dec = Decoder::new();
+        let cycles = cpu.step_with(&dec, &mut bus);
+
+        assert!(cpu.halted, "an odd frame base is a double bus fault");
+        assert_eq!(bus.writes(), vec![], "no frame and no operand push");
+        // The extension-word fetch and the queue advance, and nothing else: the
+        // aborted push must not reach the bus.
+        assert_eq!(
+            bus.log.len(),
+            2,
+            "the extension fetch and the queue advance"
+        );
+        assert_eq!(
+            cycles,
+            4 * 2 + 4 + exception::HALTED_IDLE_CYCLES,
+            "4 × 2 accesses + 4 of lead idle + the halt idle"
         );
     }
 

@@ -19,6 +19,13 @@
 
 #![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 #![forbid(unsafe_code)]
+// A public module's docs linking to a private item produces a *link that does
+// not resolve* in the rendered docs — and `clippy` cannot see it, which is why
+// four instances of this one class survived thirteen tasks and were each found
+// only by someone happening to run `cargo doc`. Denying it makes the next one
+// fail the build instead. Prefer plain code spans (`` `Plan::fetch_last` ``)
+// over `[`...`]` links when the target is not public.
+#![deny(rustdoc::private_intra_doc_links)]
 
 pub mod bus;
 pub mod cpu;

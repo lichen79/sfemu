@@ -160,10 +160,13 @@ fn immediate(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16, op: Op, size: Size)
 fn to_ccr_sr(cpu: &mut M68k, bus: &mut dyn Bus, op: Op, to_sr: bool) -> u32 {
     if to_sr && !cpu.sr_s() {
         // Privilege violation. The queue does not advance, so the stacked PC is
-        // the opcode's own address.
+        // the opcode's own address — and no access precedes the frame, so a
+        // double bus fault here leaves the bus log empty and owes 0 accesses.
+        // The framed 34 is `4 * SHORT_FRAME_ACCESSES + 6` for seven accesses
+        // this path would not have made. See `exception::entry_cycles`.
         let pc = cpu.pc.wrapping_sub(exception::OPCODE_PC_OFFSET);
         exception::take(cpu, bus, VEC_PRIVILEGE, pc);
-        return 34;
+        return exception::entry_cycles(cpu, 0, 4 * exception::SHORT_FRAME_ACCESSES + 6);
     }
 
     let imm = cpu.prefetch[1];
@@ -509,6 +512,45 @@ mod tests {
         // The stacked PC is the opcode's own address, not the next instruction.
         assert_eq!(bus.read16(0x3FFE), 0x1000);
         assert_eq!(cpu.sr & 0x2000, 0x2000, "supervisor on entry");
+    }
+
+    /// A privilege violation that double bus faults costs the halt idle, not 34.
+    ///
+    /// `to_ccr_sr` is the sixth site of this defect; the other five were fixed in
+    /// Task 11. The 34 is `4 * SHORT_FRAME_ACCESSES + 6` — it pays for seven frame
+    /// and vector accesses that a halted entry never performs, and this path
+    /// performs none of its own either, so its bus log is empty and it owes 0.
+    ///
+    /// Reaching it needs an odd **frame base**, which in user mode is the SSP, not
+    /// `a[7]` — an odd `a[7]` here would be an odd USP and the frame would still
+    /// go to an even SSP and be written normally. `to_ccr_is_legal_in_user_mode..`
+    /// above is the even-SSP control: same instruction, same mode, 34 cycles and a
+    /// real frame.
+    ///
+    /// Extrapolated, like every halt path: 0 of 317,500 cases halt.
+    #[test]
+    fn to_sr_privilege_violation_onto_an_odd_ssp_halts() {
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x007C, 0x0001, 0x4E71]); // ORI #1,SR
+        bus.put16(0x0022, 0x2000); // vector 8, so a frame would be visible
+        let mut cpu = at(&mut bus);
+        cpu.sr = 0; // user mode: the frame base is the SSP
+        cpu.a[7] = 0x3000;
+        cpu.usp = 0x3000;
+        cpu.ssp = 0x4001; // odd
+        bus.log.clear();
+
+        let cycles = cpu.step_with(&Decoder::new(), &mut bus);
+
+        assert!(cpu.halted, "an odd frame base is a double bus fault");
+        assert_eq!(bus.writes(), vec![], "no frame was written");
+        assert_eq!(bus.reads(), vec![], "not even the vector was fetched");
+        assert_eq!(
+            cycles,
+            exception::HALTED_IDLE_CYCLES,
+            "4 × 0 accesses + the halt idle; the framed 34 pays for seven \
+             accesses this step's bus log does not contain"
+        );
     }
 
     /// `ANDI to SR` can clear the S bit, which swaps the active stack pointer.

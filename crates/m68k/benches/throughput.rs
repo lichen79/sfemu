@@ -139,7 +139,7 @@ fn main() {
     // A single-instruction spin would make the total an exact multiple of the
     // instruction count. The real loop averages 9.33 cycles/instruction.
     assert!(
-        cycles % iters != 0,
+        !cycles.is_multiple_of(iters),
         "{cycles} cycles over {iters} instructions is an exact multiple — \
          the loop has collapsed to one instruction"
     );

@@ -77,7 +77,7 @@
 //! `Write`). The wrong inference was that this made them unmatchable. Their
 //! ordering is merely *unusual* — the queue advance follows the write instead of
 //! preceding it, alone among this core's memory-write forms — and it is
-//! unanimous. With [`alu::Plan::fetch_last`] the group is 2,500/2,500; before
+//! unanimous. With `alu::Plan::fetch_last` the group is 2,500/2,500; before
 //! it, the 392 that passed were exactly the register-destination cases, which
 //! have no write transaction to misplace.
 
