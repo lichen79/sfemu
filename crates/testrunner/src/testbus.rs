@@ -23,6 +23,11 @@ pub struct Access {
 /// Unseeded addresses read as 0 and are recorded: the suite seeds everything an
 /// instruction legitimately touches, so a read of unseeded memory is itself a
 /// signal that the core went somewhere it should not have.
+///
+/// [`crate::runner::run_case`] asserts on `unseeded_reads` — measured at 0 over
+/// the corpus's 832,245 Read transactions, so it is free to enforce. It was
+/// diagnostic-only for a while, read by nothing but this module's own unit tests;
+/// do not quietly demote it back.
 pub struct TestBus {
     pub mem: HashMap<u32, u8>,
     pub log: Vec<Access>,

@@ -218,6 +218,32 @@ pub fn run_case(dec: &Decoder, case: &TestCase) -> Result<(), Failure> {
 
     diffs.extend(compare_accesses(case, &bus.log));
 
+    // `TestBus` records reads of addresses the case never seeded, and until now
+    // nothing outside `testbus.rs`'s own unit tests looked at the field — a
+    // detector whose rationale was written down and then never wired up.
+    //
+    // It is free to assert: 0 of the corpus's 832,245 Read transactions have an
+    // address absent from `initial.ram`, so this fires on nothing that passes
+    // today. The suite seeds everything an instruction legitimately touches, so a
+    // read outside that set means the core computed an address the hardware
+    // never would — a class of bug the state and access comparisons can miss
+    // entirely when the stray read happens to return the same 0 the real
+    // sequence would have produced.
+    if !bus.unseeded_reads.is_empty() {
+        let n = bus.unseeded_reads.len();
+        let shown: Vec<String> = bus
+            .unseeded_reads
+            .iter()
+            .take(4)
+            .map(|a| format!("{a:06X}"))
+            .collect();
+        diffs.push(format!(
+            "unseeded reads: {n} address(es) absent from initial.ram: {}{}",
+            shown.join(" "),
+            if n > shown.len() { " …" } else { "" }
+        ));
+    }
+
     if diffs.is_empty() {
         Ok(())
     } else {
