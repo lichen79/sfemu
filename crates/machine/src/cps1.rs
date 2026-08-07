@@ -73,9 +73,28 @@ impl Cps1 {
     /// next line's carry, so the running total never drifts above
     /// `cycles_per_line × lines` by more than one instruction's cost.
     pub fn run_scanline(&mut self) -> u32 {
+        // Vblank: IPL1 on the line the beam leaves the visible area
+        // (`cps1.cpp:394-396`). CPS-1 wires the IPL pins individually —
+        // `set_interrupt_mixer(false)`, `cps1.cpp:3913` — so IPL1 is level 2, not an
+        // encoded priority.
+        if self.line == self.timing.vblank_line {
+            self.board.assert_vblank();
+        }
         let mut budget = i64::from(self.timing.cycles_per_line) + self.carry;
         let mut spent = 0u32;
         while budget > 0 {
+            // Re-drive the level from the board's own state before **every** step,
+            // not once per scanline.
+            //
+            // `M68k::pending_irq` is a level and nothing in the core clears it, while
+            // the acknowledge happens on the board — on the far side of the bus. Set
+            // once per line, the level would still read 2 after the handler's `rte`
+            // dropped the mask, so the handler would re-enter for the rest of the
+            // line: the 640-cycle budget fits about seven passes of a 90-cycle
+            // handler. Syncing per step is what makes "the board owns deassertion"
+            // actually true, and it costs one field write per instruction.
+            self.cpu
+                .set_irq(if self.board.vblank_pending() { 2 } else { 0 });
             // A halted CPU still burns time — the core returns 4 rather than 0 —
             // so `budget` always decreases and this cannot spin forever.
             let c = self.cpu.step_with(&self.dec, &mut self.board);
@@ -100,35 +119,51 @@ impl Cps1 {
 mod tests {
     use super::*;
 
-    /// The longest instruction in [`spin`]'s loop, in cycles.
+    /// The longest instruction in [`spin`], in cycles.
     ///
-    /// Verified against the core, not assumed: `nop` is 4 and `bra.s` is 10. Every
-    /// bound below is `640 × lines + SLOWEST` and this is the only place the 10
-    /// appears, so a wrong value here shows up as a test that no longer discriminates
-    /// rather than as a test that passes wrongly.
-    const SLOWEST: u64 = 10;
+    /// Measured on this core, not assumed: `move #imm,sr` is 16, `bra.s` is 10, `nop`
+    /// is 4. Every bound below is `640 × lines + SLOWEST` and this is the only place
+    /// the number appears, so a wrong value shows up as a test that no longer
+    /// discriminates rather than as a test that passes wrongly — and the mutation
+    /// pass is what confirms it still discriminates.
+    const SLOWEST: u64 = 16;
 
-    /// A two-instruction loop at 0x1000 that never terminates: `nop` then
-    /// `bra.s -4`.
+    /// A masking prologue and then a two-instruction loop that never terminates.
+    ///
+    /// ```text
+    /// 1000  46FC 2700   move #$2700,sr   supervisor, interrupt mask 7
+    /// 1004  4E71        nop
+    /// 1006  60FC        bra  $1004
+    /// ```
+    ///
+    /// # Why the mask
+    ///
+    /// `M68k::reset` leaves SR at 0x2000 — supervisor, mask **0** — so from Task 8 on
+    /// the scheduler asserts IPL1 at line 240 and this program would vector through
+    /// an all-zero vector table into ROM and stop being a loop. Masking to 7 keeps
+    /// these tests measuring the schedule and nothing else; the interrupt itself is
+    /// covered by `tests/programs.rs`.
     ///
     /// # Why not the obvious `bra.s -2`
     ///
     /// A lone `bra.s -2` costs 10 cycles and **640 / 10 = 64 exactly**, so every
-    /// scanline would end precisely on its budget and the carry would be zero for
-    /// the whole run. A test built on it cannot tell a working carry from
+    /// scanline would end precisely on its budget and the carry would be zero for the
+    /// whole run. A test built on it cannot tell a working carry from
     /// `self.carry = 0`: the mutant would survive with the suite green, which is the
     /// project's characteristic defect wearing a scheduler costume.
     ///
     /// `nop` + `bra.s` is 14 cycles, and 640 = 45 × 14 + 10, so the loop straddles
-    /// every scanline boundary and the carry is exercised on essentially every line.
+    /// nearly every scanline boundary and the carry is exercised on nearly every
+    /// line.
     ///
-    /// Encodings verified against `m68k::disasm` on 2026-08-07:
-    /// `0x4E71` renders `nop`, and `0x60FC` at 0x1002 renders `bra $1000`.
+    /// Encodings verified against `m68k::disasm` on 2026-08-07: `0x46FC 0x2700`
+    /// renders `move #$2700,sr`, `0x4E71` renders `nop`, and `0x60FC` at 0x1006
+    /// renders `bra $1004`.
     fn spin() -> Vec<u8> {
         let mut rom = vec![0u8; 0x2000];
         // Reset vector: SSP 0x00FF8000 (top of main RAM), PC 0x00001000.
         rom[0..8].copy_from_slice(&[0x00, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00]);
-        rom[0x1000..0x1004].copy_from_slice(&[0x4E, 0x71, 0x60, 0xFC]);
+        rom[0x1000..0x1008].copy_from_slice(&[0x46, 0xFC, 0x27, 0x00, 0x4E, 0x71, 0x60, 0xFC]);
         rom
     }
 
@@ -346,16 +381,20 @@ mod tests {
         let mut m = machine();
         let first: Vec<u32> = (0..8).map(|_| m.run_scanline()).collect();
 
-        // Hand-computed from the 14-cycle loop, not copied from a run. A 640-cycle
-        // budget takes 45 whole `nop`+`bra.s` pairs (630) and then two more
-        // instructions to cross it: `nop` to 634, `bra.s` to 644 — a 4-cycle debt.
-        // Line 2 has 636 to spend and lands on 644 the same way, debt 6. Line 3 has
-        // 634, which the 45th pair plus one `nop` meets exactly: 634, debt 0. Then
-        // it repeats.
+        // Hand-computed from the instruction costs, not copied from a run.
+        //
+        // Line 1 pays the 16-cycle `move #$2700,sr` prologue and then runs the
+        // 14-cycle `nop`+`bra.s` pair: 16 + 44 × 14 = 632, leaving 8 of the budget,
+        // so a `nop` takes it to 636 and the `bra.s` to **646** — a 6-cycle debt.
+        // Line 2 has 634 to spend and the next instruction is a `nop`: 45 × 14 = 630,
+        // then a `nop` lands on **634** exactly, debt 0.
+        // Line 3 has the full 640 and now begins mid-pair on a `bra.s`: 45 pairs is
+        // 630, then a `bra.s` lands on **640** exactly, debt 0 again.
         assert_eq!(
             &first[..3],
-            &[644, 644, 634],
-            "the first three lines of a 14-cycle loop against a 640-cycle budget"
+            &[646, 634, 640],
+            "the first three lines: a 16-cycle prologue then a 14-cycle loop against \
+             a 640-cycle budget"
         );
 
         assert!(m.total_cycles > 0);

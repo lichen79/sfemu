@@ -49,6 +49,13 @@ const CPS_REGS: usize = 0x20;
 /// taking an exception.
 const UNMAPPED: u16 = 0xFFFF;
 
+/// Where the 68000 fetches an autovectored level-2 handler address.
+///
+/// CPS-1 wires the IPL pins individually — `set_interrupt_mixer(false)`,
+/// `cps1.cpp:3913` — so IPL1 is interrupt **level 2**, whose autovector is
+/// 24 + 2 = 26, at 26 × 4 = 0x68.
+const VEC_AUTOVECTOR_2: u32 = 0x68;
+
 /// Everything on the 68000's bus: program ROM, main RAM, gfxram, and the I/O
 /// block at 0x800000-0x80018F.
 pub struct Board {
@@ -80,6 +87,31 @@ pub struct Board {
     pub coin_ctrl: u16,
     /// Which CPS-B reads this board answers itself.
     pub cfg: BoardConfig,
+    /// Set while IPL1 is asserted and the 68000 has not yet fetched its vector.
+    ///
+    /// # Why there is no public deassertion API
+    ///
+    /// On hardware the line is cleared by the CPU's own autovector fetch: the 68000
+    /// drives FC=7 with an address in 0xFFFFF2-0xFFFFFF and the board decodes that
+    /// to drop both IPL1 and IPL2 (`irqack_r`, `cps1.cpp:407-422`, wired through
+    /// `cpu_space_map` at `:419-422`). [`m68k::Bus`] carries no function code, so
+    /// that cycle is invisible here — an autovector fetch of vector 26 and a
+    /// `move.l $68,d0` are the same two `read16` calls.
+    ///
+    /// So the acknowledge is detected as a **read of the vector-26 longword** at
+    /// 0x68/0x6A while an assertion is outstanding. Autovector level 2 is vector
+    /// 24 + 2 = 26, at 26 × 4 = 0x68. On this board that inference is exact: the
+    /// vector table is in ROM and no game reads its own vector 26 as data. If one
+    /// did, the read would return the same value either way — only the deassertion
+    /// would be early.
+    ///
+    /// The alternative considered and rejected was deasserting a scanline later,
+    /// which is wrong in a way that hides: a handler slower than a line misses the
+    /// next assertion, a faster one takes the same interrupt twice. Widening `Bus`
+    /// with a function code is the correct fix and is deferred — it would break the
+    /// trait that 317,500 verified vector cases run through, for one bit that one
+    /// board needs.
+    vblank_pending: bool,
 }
 
 /// Which halves of a word a bus cycle asserts.
@@ -122,6 +154,45 @@ impl Board {
             sound_latch: [0; 2],
             coin_ctrl: 0,
             cfg,
+            vblank_pending: false,
+        }
+    }
+
+    /// Asserts IPL1, as the beam reaching line 240 does (`cps1.cpp:394-396`).
+    pub fn assert_vblank(&mut self) {
+        self.vblank_pending = true;
+    }
+
+    /// Whether IPL1 is still asserted — i.e. the 68000 has not yet acknowledged.
+    ///
+    /// See [`Board::assert_vblank`] and the `vblank_pending` field for how the
+    /// acknowledge is detected.
+    pub fn vblank_pending(&self) -> bool {
+        self.vblank_pending
+    }
+
+    /// The 68000's autovector-26 fetch, which on this board is the acknowledge
+    /// cycle.
+    ///
+    /// Split out of [`Board::read_word`]'s ROM arm so the reasoning lives next to
+    /// the address test rather than inside a hot path.
+    #[inline]
+    fn note_possible_ack(&mut self, addr: u32) {
+        // `& !3` because the vector is a longword: a 68000 with a 16-bit bus fetches
+        // it as two `read16` calls, 0x68 then 0x6A, and either half is the same
+        // acknowledge cycle.
+        //
+        // ⚠️ **Arithmetically dead today, and deliberately kept.** `m68k`'s
+        // `exception::take` reads the high half first (`exception.rs:371-372`), so
+        // 0x68 always arrives before 0x6A and `addr == VEC_AUTOVECTOR_2` would behave
+        // identically. Mutation confirmed: no test in this crate can kill dropping
+        // the mask, and none was contorted to try. It stays because it encodes "the
+        // acknowledge is the *longword* fetch", which is the hardware fact, and
+        // because the equivalence rests on one core's fetch order — a core that read
+        // the low half first, or a future `read32` fast path, would make it
+        // load-bearing with no test signalling that it had become so.
+        if self.vblank_pending && (addr & !3) == VEC_AUTOVECTOR_2 {
+            self.vblank_pending = false;
         }
     }
 
@@ -158,6 +229,7 @@ impl Board {
     pub(crate) fn read_word(&mut self, addr: u32) -> Option<u16> {
         match addr {
             0x00_0000..=0x3F_FFFF => {
+                self.note_possible_ack(addr);
                 let i = (addr & !1) as usize;
                 Some(u16::from_be_bytes([self.rom[i], self.rom[i + 1]]))
             }
