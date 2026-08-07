@@ -60,9 +60,18 @@ use crate::Bus;
 /// A singleton at 34 across the **twelve groups that enter at 7 accesses and 6
 /// idle** — `TRAP` 2500, LINE-A 2500, LINE-F 2500, and the nine groups whose
 /// privilege violations total 11,276 — which is 18,776 cases. `TRAPV`'s 1,250
-/// reach the same 34 at `4×8 + 2`; see the module docs. So 20,026 cases sit at
-/// 34, in **two** decompositions, and a doc comment citing 20,026 against
-/// `4×7 + 6` would be describing only 18,776 of them.
+/// reach the same 34 at `4×8 + 2`; see the module docs. So **20,026 group-2
+/// entries** sit at 34, in **two** decompositions, and a doc comment citing
+/// 20,026 against `4×7 + 6` would be describing only 18,776 of them.
+///
+/// ⚠️ **"20,026 cases sit at 34" — without "group-2 entries" — is false, and the
+/// missing scope is not a nicety.** All cases at 34 is **20,544**. The extra 518
+/// are 441 shift/rotate cases at `acc=1 idle=30` and 77 long-word ALU/`MOVEM`
+/// cases at `acc=8 idle=2`, and those 77 matter twice over: they share `TRAPV`'s
+/// decomposition exactly, so **the `(accesses, idle)` split does not identify a
+/// group-2 entry either**. Only the vector address does. The three shapes found
+/// at 34 suite-wide are `acc=7 idle=6` (18,776), `acc=8 idle=2` (1,327 — 1,250
+/// `TRAPV` plus those 77) and `acc=1 idle=30` (441).
 ///
 /// ⚠️ **Not every group-2 path costs 34.** `CHK` is group 2 and never is: its
 /// 1,326 trapping cases run 38/40/42/44/46/48/50/52 across ten `(accesses,

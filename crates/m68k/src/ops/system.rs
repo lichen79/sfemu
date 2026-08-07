@@ -125,9 +125,10 @@ fn misaligned(addr: u32) -> bool {
 /// The consequence is that **no test reading `cpu.sr` can tell the two apart**,
 /// no matter what operand it chooses: the difference is destroyed by the mask
 /// downstream of it. A test written that way looks discriminating and is not —
-/// verified by mutating this function back to the byte form, under which all 206
-/// unit tests and 127/127 suite groups still pass. The suite cannot help either:
-/// 0 of 317,500 initial SRs have bits 5-7 set.
+/// verified by mutating this function back to the byte form, under which the whole
+/// unit-test suite (206 tests, as of Task 10 — the count has grown since, and the
+/// figure is kept only to date the measurement) and 127/127 suite groups still
+/// pass. The suite cannot help either: 0 of 317,500 initial SRs have bits 5-7 set.
 ///
 /// Asserting the returned value is the only way the rule is checked at all. This
 /// is the same shape as `Plan::writes` in [`alu`](super::alu): an intent that

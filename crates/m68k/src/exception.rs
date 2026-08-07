@@ -56,8 +56,16 @@ pub(crate) fn push16(cpu: &mut M68k, bus: &mut dyn Bus, val: u16) {
 /// **Always the supervisor stack, even from user mode.** Entry sets S *before*
 /// pushing, so the frame lands on the SSP: measured **43,483/43,483** user-mode
 /// exception cases across all 127 groups, with the USP form as a control at
-/// 0/43,483 and the USP itself untouched. Reading the *active* SP instead scores
-/// ~50% — the coin-flip signature of a predicate that is itself half true.
+/// 0/43,483. Reading the *active* SP instead scores ~50% — the coin-flip
+/// signature of a predicate that is itself half true.
+///
+/// ⚠️ **"and the USP itself untouched" used to follow that control clause, and it
+/// is not universal: it holds in 41,475 of 43,483.** The 2,008 exceptions are
+/// correct behaviour, not a bug — in user mode `a[7]` *is* the USP, so any
+/// instruction that moves the stack before trapping moves it (`BSR` 618, `RTS`
+/// 598, `RTR` 578, `CHK` 40, and a tail). The clause is dropped rather than
+/// rescoped because the 0/43,483 control beside it is the real content and does
+/// not need it: what matters is that the frame goes to the SSP.
 ///
 /// The narrower 3,160/3,160 figure this doc used to quote is the same law measured
 /// over TRAP, TRAPV and RTE alone; it was written without its denominator, which
@@ -409,8 +417,25 @@ pub enum Space {
 /// writes, the 2 vector reads, the 2 prefetch refills, and 10 cycles of idle.
 ///
 /// Under the timing law (`cycles = 4 * non-idle accesses + idle`) that is
-/// `4 * 12 + 10`. Measured at 58 in 4,661 of 4,661 cases (addendum §9.6). The
-/// caller adds the cost of whatever schedule ran before the fault.
+/// `4 * 12 + 10`, and it is a **floor that every address error in the corpus
+/// satisfies**: over all **55,606** address-error cases suite-wide — selected by
+/// the presence of an aborted access, which is the only reliable predicate — the
+/// non-idle access count is ≥ 12 and the idle is ≥ 10, at 55,606/55,606 for each,
+/// with the timing law itself holding 55,606/55,606. The caller adds the cost of
+/// whatever schedule ran before the fault, which is why the total is a floor
+/// rather than a constant.
+///
+/// ⚠️ **This used to read "measured at 58 in 4,661 of 4,661 cases", and both the
+/// figure and the denominator were wrong for the claim.** 4,661 is the
+/// **MOVE/MOVEA-family** address-error population, stated without saying so, and
+/// only **1,355** of those 4,661 cost exactly 58 — the rest pay more, for the
+/// schedule that ran first. Suite-wide the population is 55,606. The floor above
+/// is the true statement and is stronger than the false constant it replaces.
+///
+/// ⚠️ Do not select address errors by a read of the vector-3 address. That
+/// predicate admits at least one false positive: an `ADD.l D6,(xxx).w` case that
+/// legitimately reads *and writes* `0x0C`/`0x0E` as ordinary data, with no
+/// aborted access anywhere in it. Select on `ReadAddrErr`/`WriteAddrErr`.
 pub const ADDRESS_ERROR_TAIL_CYCLES: u32 = 58;
 
 /// Takes an address error: vector 3 with a 7-word frame.
@@ -451,8 +476,14 @@ pub const ADDRESS_ERROR_TAIL_CYCLES: u32 = 58;
 /// | 7     | `base - 12` | `fault[31:16]`|
 ///
 /// `base` is `cpu.a[7]` **as it stands now** — not the instruction's entry SP.
-/// A faulting `-(A7)` or `(A7)+` has already moved it, and the frame lands
-/// below the moved value in 31 of 4,661 cases (addendum §9.5b).
+/// A faulting `-(A7)` or `(A7)+` has already moved it, and the frame lands below
+/// the moved value in **31 of the 2,351 supervisor-mode MOVE/MOVEA-family
+/// address errors** (addendum §9.5b). The restriction to supervisor mode is the
+/// point: in user mode the frame goes to the SSP while `-(A7)` moves the USP, so
+/// only a supervisor-mode case can show the interaction at all. This used to read
+/// "31 of 4,661", which is the whole MOVE/MOVEA address-error population across
+/// both modes — a denominator that silently included every case the effect
+/// cannot reach.
 pub fn address_error(
     cpu: &mut M68k,
     bus: &mut dyn Bus,
@@ -822,7 +853,9 @@ mod tests {
     /// address from the constant it was testing, which made the assertion
     /// self-consistent for every constant value: the handler moved with the
     /// mutation and the test still passed. Measured — `VEC_LINE_F = 12` survived
-    /// all 198 unit tests in that form and is killed here now, along with `= 10`
+    /// the whole unit-test suite in that form (198 tests, as of Task 10; the
+    /// count has grown since and the figure is kept only to date the
+    /// measurement) and is killed here now, along with `= 10`
     /// (which aliases Line-A) and `= 5`. `VEC_ILLEGAL` had independent coverage
     /// either way: its mutants fail two tests, not one.
     ///

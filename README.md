@@ -39,7 +39,7 @@ command that fetches it. It does not skip, warn, or silently pass.
 ## Getting started
 
 ```bash
-# Fetch the test vectors (132 MB over 127 files, into gitignored testdata/).
+# Fetch the test vectors (~138 MB (132 MiB) over 127 files, into gitignored testdata/).
 # Shells out to curl; no HTTP dependency is taken for a once-per-checkout job.
 cargo run -p testrunner --bin fetch --release
 
@@ -82,6 +82,11 @@ instruction). The spread is host load, and the low end is reproducibly the first
 run after a build — quote the range, not one sample. Of the three numbers the
 bench prints, only the 9.33 cycles/instruction is stable across runs, because it
 comes from the cycle model rather than the wall clock.
+
+Both the MHz **and the margin** are that machine's. A reviewer's host measured
+267.6 MHz, a 27x margin — outside the band by 3x — and the assertion passed,
+correctly, because it is `>= 10.0`. Read "72x-82x" as "a very large margin on one
+machine", not as a range this bench holds anywhere.
 
 A 72x margin will not catch a 5x regression, or a 20x one. What the assertion
 catches is "the core stopped executing", and — via a non-degeneracy census the

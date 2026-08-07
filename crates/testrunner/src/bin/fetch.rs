@@ -2,7 +2,10 @@
 //!
 //! Shells out to `curl` rather than taking an HTTP dependency: this runs once
 //! per checkout, and keeping the dependency tree empty is worth more than
-//! elegance here. ~138 MB over 127 files.
+//! elegance here. ~138 MB (132 MiB) over 127 files — 137,928,157 bytes, which is
+//! 137.9 MB decimal and 131.5 MiB. README.md gives the same figure the same way;
+//! it used to say "132 MB" here and "~138 MB" there, describing identical bytes
+//! in two units without naming either.
 
 use std::path::Path;
 use std::process::Command;

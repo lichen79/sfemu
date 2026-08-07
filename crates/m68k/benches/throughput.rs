@@ -4,12 +4,23 @@
 //!
 //! # The `assert!` below is a liveness smoke test, not a performance gate
 //!
-//! It passes at a 72x-82x margin (719-820 MHz over nine runs; the spread is host
-//! load and the low end is reproducibly the first run after a build), so it will
-//! not catch a 5x regression, or a 20x one. Quote the range rather than one
-//! sample — and note that of the three figures printed below, only
+//! It passes at a wide margin — **on the author's machine**, 719-820 MHz over
+//! nine runs, a 72x-82x margin, where the spread within that band is host load
+//! and the low end is reproducibly the first run after a build. So it will not
+//! catch a 5x regression, or a 20x one. Quote the range rather than one sample —
+//! and note that of the three figures printed below, only
 //! `cycles/instruction` is stable, since it comes from the cycle model and not
 //! from the wall clock.
+//!
+//! ⚠️ **719-820 MHz is a floor to read as "a large margin on one host", not a
+//! band this bench holds anywhere.** This paragraph used to give the range with
+//! no host caveat, while `README.md` correctly said "on the author's machine". A
+//! reviewer's host measured **267.6 MHz, a 27x margin** — outside the band by 3x
+//! — and the test **correctly still passed**, because the assertion is
+//! `>= 10.0`, three orders of magnitude below either figure. That is the design
+//! working: do not turn the assert into a margin threshold, because a threshold
+//! anywhere inside the band would fail on a slower but perfectly adequate host.
+//! The number to treat as durable is `cycles/instruction`.
 //!
 //! What it catches is "the core stopped executing" — and, with the
 //! non-degeneracy census in [`assert_workload_is_mixed`], "the core is still
