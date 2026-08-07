@@ -1,0 +1,11 @@
+[package]
+name = "video"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# No dependencies, ever. `machine` depends on this crate; the reverse would be a
+# cycle, and anything from crates.io would forfeit the WASM posture that
+# sub-projects A and B both paid for.
+[dependencies]
