@@ -213,6 +213,22 @@ fn read_transactions(c: &mut Cursor) -> Result<(Vec<Transaction>, u32), ParseErr
     Ok((out, num_cycles))
 }
 
+/// Reads a case name, substituting U+FFFD for any invalid UTF-8 rather than failing.
+///
+/// Lossy on purpose: the name is a diagnostic label, printed in failure messages and
+/// used by nothing that executes. A malformed name should not stop 2,500 cases of real
+/// timing data from being checked, which is what returning `Err` here would do.
+///
+/// Measured: **0 of 317,500** names contain a replacement character and 0 are even
+/// non-ASCII, so the lossy path is never taken on the current corpus. Control — the
+/// detector was confirmed against `from_utf8_lossy([41 FF 42])`, which does yield
+/// `"A\u{FFFD}B"`; without that check the zero would equally well have meant the query
+/// was broken.
+///
+/// So the choice is currently untested-by-corpus rather than load-bearing. It is kept
+/// because the alternative fails *more* on the same input, not because the input is
+/// expected: if a future suite version writes a name in some other encoding, this
+/// degrades one label and `from_utf8` would reject the whole file.
 fn read_name(c: &mut Cursor) -> Result<String, ParseError> {
     c.block_header(0x89AB_CDEF)?;
     let len = c.u32()? as usize;
@@ -330,23 +346,92 @@ mod tests {
     fn rejects_a_bad_magic() {
         let mut bad = synth();
         bad[0] ^= 0xFF;
-        assert!(parse_file(&bad).is_err());
+        // The variant, not just `is_err()`: a truncation reported as BadMagic (or the
+        // reverse) points a reader at the wrong half of the format.
+        assert!(
+            matches!(parse_file(&bad), Err(ParseError::BadMagic { .. })),
+            "a corrupted magic word must be reported as BadMagic"
+        );
     }
 
-    fn testdata(name: &str) -> Option<Vec<u8>> {
+    /// Every prefix of a valid file must be rejected as [`ParseError::Truncated`].
+    ///
+    /// `Truncated` is constructed at three sites in `Cursor` and had **no test**: the
+    /// only error-path test was `rejects_a_bad_magic`. A parser that read past the end
+    /// of a short buffer — or that returned `Ok` with a half-populated case — would have
+    /// been caught by nothing, and a truncated download is the most likely way a
+    /// real-world file goes wrong.
+    ///
+    /// Sweeping every prefix rather than one hand-picked length is what makes this
+    /// cover the three sites: `u8`, `u32`, and `take` each fail at different offsets,
+    /// and a single truncation point exercises whichever one happens to sit there.
+    #[test]
+    fn rejects_every_truncation() {
+        let full = synth();
+        // Control: the untruncated buffer must parse, otherwise "everything shorter
+        // fails" is trivially true and tests nothing.
+        assert!(
+            parse_file(&full).is_ok(),
+            "the full synthetic file must parse"
+        );
+
+        for len in 0..full.len() {
+            match parse_file(&full[..len]) {
+                Err(ParseError::Truncated { at, need }) => {
+                    // The offset must be inside the buffer we handed over, and the
+                    // need must be non-zero — an error reporting `need: 0` would be
+                    // describing a read that could not have failed.
+                    assert!(
+                        at <= len,
+                        "truncation at {len}: reported offset {at} is past the input"
+                    );
+                    assert!(need > 0, "truncation at {len}: reported need of 0 bytes");
+                }
+                Err(ParseError::BadMagic { .. }) => {
+                    // Legitimate: a prefix can cut a magic word in half so that the
+                    // bytes present compare unequal before the cursor runs out.
+                }
+                Err(e @ ParseError::BadKind { .. }) => panic!(
+                    "a {len}-byte prefix reported {e}: truncation cannot invent a \
+                     transaction-kind byte, so this means the cursor read past the end \
+                     of the input or resynchronised onto misaligned data"
+                ),
+                Ok(cases) => panic!(
+                    "a {len}-byte prefix of a {}-byte file parsed to {} case(s)",
+                    full.len(),
+                    cases.len()
+                ),
+            }
+        }
+    }
+
+    /// Reads a vector file, or fails naming the file and the fetch command.
+    ///
+    /// ⚠️ **This used to return `Option` and its two callers `eprintln!`ed and
+    /// returned**, so with an empty `testdata/` both tests passed while asserting
+    /// nothing — including `parses_every_suite_file`, whose entire content is a
+    /// comparison against 127. A green run meant either "the parser is correct" or "the
+    /// vectors are missing", and the two were indistinguishable in the output. Every
+    /// other testdata reader in the crate panics with the fetch command
+    /// (`runner::assert_group`, `tests/suite.rs`, `tests/disasm_group.rs`); these two
+    /// were the only holdouts, against the project's fail-loudly-and-name-the-file
+    /// rule.
+    fn testdata(name: &str) -> Vec<u8> {
         let p =
             std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata")).join(name);
-        std::fs::read(p).ok()
+        std::fs::read(&p).unwrap_or_else(|e| {
+            panic!(
+                "cannot read {}: {e} — run `cargo run -p testrunner --bin fetch`",
+                p.display()
+            )
+        })
     }
 
     /// Values here were confirmed by decoding `ADD.b` case 000 with the
     /// upstream `decode.py`, so this pins our parser to the real format.
     #[test]
     fn parses_real_add_b() {
-        let Some(bytes) = testdata("ADD.b.json.bin") else {
-            eprintln!("skipping: run `cargo run -p testrunner --bin fetch`");
-            return;
-        };
+        let bytes = testdata("ADD.b.json.bin");
         let cases = parse_file(&bytes).expect("parse ADD.b");
         assert_eq!(cases.len(), 2500);
 
@@ -373,17 +458,22 @@ mod tests {
     #[test]
     fn parses_every_suite_file() {
         let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata"));
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            eprintln!("skipping: no testdata/");
-            return;
-        };
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+            panic!(
+                "cannot read {}: {e} — run `cargo run -p testrunner --bin fetch`",
+                dir.display()
+            )
+        });
         let mut n = 0;
         for e in entries.flatten() {
             let p = e.path();
             if p.extension().and_then(|s| s.to_str()) != Some("bin") {
                 continue;
             }
-            let bytes = std::fs::read(&p).unwrap();
+            // Named, not `.unwrap()`: a bare unwrap here reports only "Os { code: 2 }"
+            // with no indication of which of the 127 files could not be read.
+            let bytes =
+                std::fs::read(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
             let cases = parse_file(&bytes).unwrap_or_else(|err| panic!("{}: {err}", p.display()));
             assert!(!cases.is_empty(), "{} is empty", p.display());
             n += 1;
