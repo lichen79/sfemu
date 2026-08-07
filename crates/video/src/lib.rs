@@ -64,6 +64,7 @@
 #![deny(rustdoc::private_intra_doc_links)]
 
 pub mod bank;
+pub mod compose;
 pub mod layers;
 pub mod palette;
 pub mod regs;
