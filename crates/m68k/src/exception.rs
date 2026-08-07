@@ -34,10 +34,15 @@ pub(crate) fn push16(cpu: &mut M68k, bus: &mut dyn Bus, val: u16) {
 /// Where the next exception frame will be written.
 ///
 /// **Always the supervisor stack, even from user mode.** Entry sets S *before*
-/// pushing, so the frame lands on the SSP: measured 3,160/3,160 user-mode cases
-/// across TRAP, TRAPV and RTE, with the USP form as a control at 0/3,160 and the
-/// USP itself untouched. Reading the *active* SP instead scores ~50% — the
-/// coin-flip signature of a predicate that is itself half true.
+/// pushing, so the frame lands on the SSP: measured **43,483/43,483** user-mode
+/// exception cases across all 127 groups, with the USP form as a control at
+/// 0/43,483 and the USP itself untouched. Reading the *active* SP instead scores
+/// ~50% — the coin-flip signature of a predicate that is itself half true.
+///
+/// The narrower 3,160/3,160 figure this doc used to quote is the same law measured
+/// over TRAP, TRAPV and RTE alone; it was written without its denominator, which
+/// made it read like a 14× disagreement with the census above rather than a subset
+/// of it. State the scope with the count.
 #[inline]
 fn frame_base(cpu: &M68k) -> u32 {
     if cpu.sr_s() {
@@ -49,9 +54,27 @@ fn frame_base(cpu: &M68k) -> u32 {
 
 /// The double bus fault: halts the CPU instead of entering an exception.
 ///
-/// Called first by both [`take`] and [`address_error`], **before either commits
-/// anything** — no SR change, no push, no vector fetch. Returns `true` if the
-/// CPU halted, in which case the caller must not proceed.
+/// Called first by both [`take`] and [`address_error`], before either of *those
+/// two functions* commits anything — no SR change, no push, no vector fetch.
+/// Returns `true` if the CPU halted, in which case the caller must not proceed.
+///
+/// ⚠️ **This is a guarantee about `take`/`address_error`, not about the whole
+/// boundary.** Two callers deliberately commit state before calling in, and both
+/// are correct: [`check_interrupts`] and [`take_trace`] clear `stopped` and
+/// refill the prefetch queue on the `STOP`-resume path, so a resumed entry that
+/// then halts has already advanced the PC by 4 and logged 2 bus accesses.
+/// Measured on this core: `halted=true acc=2 stopped true→false pc 0x1004→0x1008`
+/// at both sites. That refill is real hardware behaviour — the queue is reloaded
+/// when `STOP` is released, before the interrupt is acknowledged — and its 2
+/// accesses are charged through [`entry_cycles`]'s lead term and asserted by
+/// `a_halted_interrupt_entry_charges_its_refill_and_leaves_the_mask_alone` and
+/// `a_halted_trace_entry_is_charged_for_its_resume_refill_and_no_more`.
+///
+/// So do not "restore" the stricter reading by moving those refills after the
+/// halt check: it would contradict two passing tests and make the `resumed`
+/// term dead. The invariant that actually holds, and the one worth preserving,
+/// is that **no frame word is ever written and no vector ever fetched on a
+/// halting entry** — `acc=2` is the resume refill alone, never frame traffic.
 ///
 /// Two ways in, and the second is the one that matters in practice:
 ///
