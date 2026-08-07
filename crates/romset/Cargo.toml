@@ -1,0 +1,9 @@
+[package]
+name = "romset"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+miniz_oxide = "0.9"
