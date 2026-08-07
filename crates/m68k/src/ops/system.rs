@@ -112,6 +112,31 @@ fn misaligned(addr: u32) -> bool {
     addr & 1 != 0
 }
 
+/// The SR value `MOVE <ea>,CCR` installs: bits **4..0** from the operand, every
+/// bit above them kept.
+///
+/// ⚠️ **This exists as a named function so that the rule can be asserted
+/// directly, and that is the entire point of extracting it.** Written inline as
+/// `(sr & 0xFF00) | (val & 0x00FF)` — a *byte* mask, which is the weaker claim —
+/// it behaves identically, because [`M68k::set_sr`] masks with
+/// `SR_MASK = 0xA71F` and clears bits 7-5 a second time. So the weaker mask is
+/// *recovered*, not correct.
+///
+/// The consequence is that **no test reading `cpu.sr` can tell the two apart**,
+/// no matter what operand it chooses: the difference is destroyed by the mask
+/// downstream of it. A test written that way looks discriminating and is not —
+/// verified by mutating this function back to the byte form, under which all 206
+/// unit tests and 127/127 suite groups still pass. The suite cannot help either:
+/// 0 of 317,500 initial SRs have bits 5-7 set.
+///
+/// Asserting the returned value is the only way the rule is checked at all. This
+/// is the same shape as `Plan::writes` in [`alu`](super::alu): an intent that
+/// nothing read, made checkable by giving it a name.
+#[inline]
+fn move_to_ccr_value(sr: u16, val: u16) -> u16 {
+    (sr & 0xFFE0) | (val & 0x001F)
+}
+
 /// Program space iff the mode is PC-relative; data space otherwise.
 ///
 /// Confirmed from the address-error status word's function-code bits: MOVEM's
@@ -1046,7 +1071,7 @@ fn move_to_sr_ccr(cpu: &mut M68k, bus: &mut dyn Bus, opcode: u16, to_sr: bool) -
     if to_sr {
         cpu.set_sr(val);
     } else {
-        cpu.set_sr((cpu.sr & 0xFF00) | (val & 0x00FF));
+        cpu.set_sr(move_to_ccr_value(cpu.sr, val));
     }
 
     // Rewind and refill: the two trailing fetches replace the queue rather than
@@ -1628,6 +1653,41 @@ mod tests {
             "the full SR word, with Dn's upper half preserved"
         );
         assert_eq!(cycles, 6);
+    }
+
+    /// `MOVE <ea>,CCR` writes bits 4..0 and keeps every bit above them.
+    ///
+    /// Asserts [`move_to_ccr_value`]'s return rather than the resulting `cpu.sr`,
+    /// because `set_sr`'s `SR_MASK` clears bits 7-5 anyway and so hides the
+    /// difference between this rule and a byte mask. An earlier attempt at this
+    /// test drove a full `step_with` with bits 5-7 set in the source and asserted
+    /// `cpu.sr`; it passed under both masks, which is how the weaker spelling
+    /// survived in the first place.
+    #[test]
+    fn move_to_ccr_writes_only_the_low_five_bits() {
+        // Bits 7,6,5 set in the source alongside the five CCR bits.
+        assert_eq!(
+            move_to_ccr_value(0x0700, 0x00FF),
+            0x071F,
+            "bits 7-5 of the operand are not CCR bits and must not be taken"
+        );
+        // Every bit above 4 comes from the old SR, including ones SR_MASK would
+        // clear — so this also pins that the function itself does not mask.
+        assert_eq!(
+            move_to_ccr_value(0xFFE0, 0x0000),
+            0xFFE0,
+            "the whole system half is preserved, bit for bit"
+        );
+        assert_eq!(
+            move_to_ccr_value(0x0000, 0x001F),
+            0x001F,
+            "all five CCR bits are writable"
+        );
+        assert_eq!(
+            move_to_ccr_value(0xFFFF, 0x0000),
+            0xFFE0,
+            "and all five are clearable"
+        );
     }
 
     /// `MOVE <ea>,CCR` is unprivileged, writes only the low byte, and rewinds
