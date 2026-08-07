@@ -92,7 +92,7 @@ fn assert_workload_is_mixed(cpu: &mut M68k, dec: &Decoder, ram: &mut Ram) {
     }
     assert_eq!(
         pcs.len(),
-        PROG.len() - 2, // two of the eight words are extension words
+        PROG.len() - 2, // two of the nine words are extension words, so 7 instructions
         "expected every instruction in the loop to be reached, got {pcs:02X?}"
     );
     assert!(

@@ -513,19 +513,14 @@ pub(super) fn run_tail(
         Tail::Done => None,
     };
 
-    // `Plan::writes` records the handler's *intent* to write back; whether a write
-    // actually happens is decided by `compute` returning `Some`. Those must agree,
-    // and until this assertion existed nothing checked that they did — the field
-    // had 13 builder call sites and 0 reads, so it read as though it gated the
-    // write while being inert. Asserting is better than deleting: the intent is
-    // worth recording, and `Plan` demonstrably carries both live flags
-    // (`fetch_last`) and formerly-inert ones with identical shape, which a reader
+    // `Plan::writes` records the handler's *intent* that the result go back to the
+    // `<ea>`; whether a write actually happens is decided by `compute` returning
+    // `Some`. Until this assertion existed nothing checked that the two agreed —
+    // the field had 13 builder call sites and **0** reads, so it read as though it
+    // gated the write while being inert. Asserting is better than deleting: the
+    // intent is worth recording, and `Plan` demonstrably carries both live flags
+    // (`fetch_last`) and formerly-inert ones of identical shape, which a reader
     // cannot tell apart without grepping.
-    // `Plan::writes` records that the handler intends the result to go back to
-    // the `<ea>`, and until this assertion existed nothing checked it: the field
-    // had 13 builder call sites and **0** reads, so it read as though it gated
-    // the write while being inert. The write is actually decided by `compute`
-    // returning `Some`.
     //
     // ⚠️ The invariant is an **implication, not an equality**, and the difference
     // is measured. Over the full suite, `writes == result.is_some()` fails

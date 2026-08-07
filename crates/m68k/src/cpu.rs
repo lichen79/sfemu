@@ -318,6 +318,7 @@ impl M68k {
     /// are written against, and edge sensitivity would silently change what
     /// "assert the line and step" means for every caller. The requirement is
     /// documented here instead. See [`crate::exception::check_interrupts`].
+    ///
     /// # Panics
     ///
     /// In debug builds, if `level > 7`. The three IPL pins encode 0..=7 and nothing
