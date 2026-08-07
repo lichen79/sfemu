@@ -146,7 +146,8 @@ impl Video {
         let videocontrol = cps_a[VIDEOCONTROL];
         let hi_pens = self.hi_pens(cps_b);
 
-        for want in layer_order(layercontrol) {
+        let order = layer_order(layercontrol);
+        for (depth, want) in order.into_iter().enumerate() {
             match want {
                 0 => draw_sprites(
                     &mut self.fb.pens,
@@ -186,6 +187,15 @@ impl Video {
                         i32::from(cps_a[sy] as i16),
                         videocontrol,
                     );
+                    // A layer prepares the sprite mask only when the *next* depth
+                    // is the sprites: `render_layers` calls
+                    // `cps1_render_high_layer(..., l0)` only `if (l1 == 0)`, and so
+                    // on for each pair (`cps1_v.cpp:2985-2996`). A layer with no
+                    // sprite pass behind it — including the frontmost, which has no
+                    // next depth at all — occludes nothing, because there is
+                    // nothing there to occlude.
+                    let feeds_sprites = order.get(depth + 1) == Some(&0);
+                    let masks = if feeds_sprites { hi_pens } else { [0; DEPTHS] };
                     draw_tilemap(
                         &mut self.fb.pens,
                         &mut self.fb.prio,
@@ -195,7 +205,7 @@ impl Video {
                         cps_a_base(cps_a, base, SCROLL_BOUNDARY),
                         layer,
                         &rows,
-                        &hi_pens,
+                        &masks,
                     );
                 }
             }
@@ -207,12 +217,22 @@ impl Video {
         }
     }
 
-    /// The four priority masks, one per tile group.
+    /// The four priority masks, one per tile group: which pens occlude sprites.
     ///
-    /// A board without a register for a group occludes nothing there
-    /// (`cps1_v.cpp:2523-2527`, "completely transparent if priority masks not
-    /// defined"). Task 8 gives these their meaning; the inversion MAME applies is
-    /// its own, and is documented there.
+    /// A set bit means "this pen of this group hides a sprite behind it". MAME
+    /// says the same thing inverted twice: `cps1_update_transmasks`
+    /// (`cps1_v.cpp:2515-2531`) computes `mask = m_cps_b_regs[priority[i]/2] ^
+    /// 0xffff` and passes it to `set_transmask` as the pens that are *transparent*
+    /// in the high-priority pass — so a register bit that is **set** leaves that
+    /// pen opaque there, and an opaque high-priority pen is what marks the sprite
+    /// mask. Pen 15 corroborates the direction: it is the transparent pen
+    /// everywhere else, and `set_transmask`'s second argument keeps bit 15
+    /// transparent in the low pass regardless.
+    ///
+    /// A board with no register for a group occludes nothing there — `mask =
+    /// 0xffff`, every pen transparent in the high pass ("completely transparent if
+    /// priority masks not defined (qad)", `:2526`), which is a zero mask in this
+    /// crate's uninverted form.
     fn hi_pens(&self, cps_b: &[u16]) -> [u16; DEPTHS] {
         let mut out = [0u16; DEPTHS];
         for (slot, reg) in out.iter_mut().zip(self.cfg.priority) {
@@ -678,6 +698,185 @@ mod tests {
         assert_ne!(at(&r, 0, 0), want, "and off the origin");
     }
 
+    /// A set priority-register bit makes that pen occlude a sprite behind it.
+    ///
+    /// `cps1_v.cpp:2515-2531`. The register value here is a literal, so the double
+    /// inversion in [`Video::hi_pens`]'s documentation is checked rather than
+    /// transcribed: `1 << SOLID_PEN` set means the tile wins, and the same bit
+    /// clear means the sprite does.
+    #[test]
+    fn a_priority_register_bit_makes_that_pen_occlude_sprites() {
+        let cfg = VideoConfig::sf2();
+        let reg = cfg.priority[0].expect("group 0 has a register");
+        assert_eq!(reg, 0x28 / 2, "cps1_v.cpp:491");
+
+        // Scroll 2 at the back, the sprites in front of it — so without a priority
+        // bit the sprite covers the tile.
+        let mut f = Board::solid(Layer::Scroll2);
+        f.put_sprite(0, 0);
+        let tile = solid_pen(Layer::Scroll2);
+        let sprite = SPRITE_COLOUR * PEN_GRANULARITY + u16::from(SOLID_PEN);
+        assert_ne!(tile, sprite);
+        let lc = f.enable_mask() | depths([2, 0, 0, 0]);
+
+        // Bit clear: the sprite is in front, so it wins.
+        f.cps_b[reg] = 0;
+        assert_eq!(f.render(lc, 0x0004)[0], sprite, "no priority bit: sprite");
+
+        // The tile's own pen's bit set: the tile occludes the sprite that is
+        // nominally in front of it.
+        f.cps_b[reg] = 1u16 << SOLID_PEN;
+        assert_eq!(f.render(lc, 0x0004)[0], tile, "priority bit: the tile wins");
+
+        // A bit for some *other* pen does not protect this one — the mask is
+        // per-pen, not a per-group on switch.
+        f.cps_b[reg] = 1u16 << CORNER_PEN;
+        assert_ne!(SOLID_PEN, CORNER_PEN);
+        assert_eq!(f.render(lc, 0x0004)[0], sprite, "another pen's bit: sprite");
+    }
+
+    /// Each tile group reads its own priority register, not a fixed one.
+    #[test]
+    fn each_tile_group_reads_its_own_priority_register() {
+        let cfg = VideoConfig::sf2();
+        let regs = [0x28 / 2, 0x2A / 2, 0x2C / 2, 0x2E / 2];
+        assert_eq!(cfg.priority, regs.map(Some), "cps1_v.cpp:491");
+
+        let tile = solid_pen(Layer::Scroll2);
+        let sprite = SPRITE_COLOUR * PEN_GRANULARITY + u16::from(SOLID_PEN);
+
+        for (group, &own) in regs.iter().enumerate() {
+            let mut f = Board::solid(Layer::Scroll2);
+            f.set_group(group as u8);
+            f.put_sprite(0, 0);
+            let lc = f.enable_mask() | depths([2, 0, 0, 0]);
+
+            // Its own register set: the tile occludes.
+            f.cps_b = [0u16; 0x20];
+            f.cps_b[own] = 1u16 << SOLID_PEN;
+            assert_eq!(
+                f.render(lc, 0x0004)[0],
+                tile,
+                "group {group} reads {own:#x}"
+            );
+
+            // Every *other* register set and its own clear: the sprite wins, so
+            // the group is not reading a neighbour's.
+            f.cps_b = [0u16; 0x20];
+            for &r in regs.iter().filter(|&&r| r != own) {
+                f.cps_b[r] = 1u16 << SOLID_PEN;
+            }
+            assert_eq!(
+                f.render(lc, 0x0004)[0],
+                sprite,
+                "group {group} must not read another group's register"
+            );
+        }
+    }
+
+    /// A board with no priority register for a group occludes nothing there.
+    ///
+    /// `cps1_v.cpp:2526`: "completely transparent if priority masks not defined
+    /// (qad)". Distinct from a register that reads zero, which the next test
+    /// covers — a `None` board has no register to read at all.
+    #[test]
+    fn a_board_with_no_priority_register_occludes_nothing() {
+        let mut f = Board::solid(Layer::Scroll2);
+        f.put_sprite(0, 0);
+        let sprite = SPRITE_COLOUR * PEN_GRANULARITY + u16::from(SOLID_PEN);
+        let lc = f.enable_mask() | depths([2, 0, 0, 0]);
+
+        // Every CPS-B register set, so a board that read *any* register would
+        // occlude — but this configuration has none to read.
+        f.cps_b = [0xFFFFu16; 0x20];
+        f.cps_b[VideoConfig::sf2().palette_control] = 0x3F;
+
+        let cfg = VideoConfig {
+            priority: [None; 4],
+            ..VideoConfig::sf2()
+        };
+        let mut v = Video::new(cfg, fixture_mapper(), f.gfx.clone());
+        let mut cps_a = f.cps_a;
+        cps_a[VIDEOCONTROL] = 0x0004;
+        f.cps_b[cfg.layer_control] = lc;
+        v.latch_objects(&f.gfxram, &cps_a);
+        v.render(&f.gfxram, &cps_a, &f.cps_b);
+        assert_eq!(v.fb.pens[0], sprite, "no registers, so nothing occludes");
+        assert!(v.fb.prio.iter().all(|&p| p == 0), "and nothing is marked");
+    }
+
+    /// A priority register of zero occludes nothing — a freshly reset board.
+    #[test]
+    fn a_priority_register_of_zero_occludes_nothing() {
+        let mut f = Board::solid(Layer::Scroll2);
+        f.put_sprite(0, 0);
+        let sprite = SPRITE_COLOUR * PEN_GRANULARITY + u16::from(SOLID_PEN);
+        let lc = f.enable_mask() | depths([2, 0, 0, 0]);
+        for r in VideoConfig::sf2().priority.iter().flatten() {
+            f.cps_b[*r] = 0;
+        }
+        assert_eq!(f.render(lc, 0x0004)[0], sprite, "a zero mask hides nothing");
+    }
+
+    /// A layer only masks sprites when the very next depth is the sprites.
+    ///
+    /// `render_layers` calls `cps1_render_high_layer` on `l0` only `if (l1 == 0)`,
+    /// on `l1` only `if (l2 == 0)`, and on `l2` only `if (l3 == 0)`
+    /// (`cps1_v.cpp:2985-2996`) — and never on `l3`, which has no depth behind it.
+    /// The plan for this task did not state the adjacency; without it, a layer two
+    /// depths back would reach forward past an intervening layer and hide sprites
+    /// it never covers.
+    #[test]
+    fn a_layer_masks_sprites_only_when_the_next_depth_is_the_sprites() {
+        let cfg = VideoConfig::sf2();
+        let reg = cfg.priority[0].expect("group 0 has a register");
+        let tile = solid_pen(Layer::Scroll2);
+        let sprite = SPRITE_COLOUR * PEN_GRANULARITY + u16::from(SOLID_PEN);
+
+        // Scroll 2 at depth 0, sprites at depth 1: adjacent, so it masks.
+        let mut f = Board::solid(Layer::Scroll2);
+        f.put_sprite(0, 0);
+        f.cps_b[reg] = 1u16 << SOLID_PEN;
+        let lc = f.enable_mask() | depths([2, 0, 0, 0]);
+        assert_eq!(f.render(lc, 0x0004)[0], tile, "adjacent: it masks");
+
+        // Scroll 2 at depth 0, scroll 3 at depth 1, sprites at depth 2. Scroll 3
+        // is a transparent layer here, so scroll 2's pixel is still what shows
+        // under the sprite — but scroll 2 no longer feeds the mask, so the sprite
+        // draws over it.
+        let mut f = Board::solid(Layer::Scroll2);
+        f.gfx.resize(0x2000, 0); // no scroll-3 graphics, so scroll 3 draws nothing
+        f.put_sprite(0, 0);
+        f.cps_b[reg] = 1u16 << SOLID_PEN;
+        let lc = f.enable_mask() | cfg.layer_enable_mask[2] | depths([2, 3, 0, 0]);
+        assert_eq!(
+            f.render(lc, 0x000C)[0],
+            sprite,
+            "not adjacent: scroll 2 does not reach past scroll 3"
+        );
+
+        // Scroll 2 at the front, with no depth behind it at all: nothing to mask.
+        let mut f = Board::solid(Layer::Scroll2);
+        f.put_sprite(0, 0);
+        f.cps_b[reg] = 1u16 << SOLID_PEN;
+        let lc = f.enable_mask() | depths([0, 0, 0, 2]);
+        let r = f.render(lc, 0x0004);
+        assert_eq!(r[0], tile, "the frontmost layer covers the sprite anyway");
+        // The distinction the mask would make is invisible in the pens here, so
+        // this is asserted where it is visible: nothing was marked.
+        let mut v = f.video();
+        let mut cps_a = f.cps_a;
+        cps_a[VIDEOCONTROL] = 0x0004;
+        let mut cps_b = f.cps_b;
+        cps_b[cfg.layer_control] = lc;
+        v.latch_objects(&f.gfxram, &cps_a);
+        v.render(&f.gfxram, &cps_a, &cps_b);
+        assert!(
+            v.fb.prio.iter().all(|&p| p == 0),
+            "the frontmost layer marks nothing"
+        );
+    }
+
     /// The pens are cleared each frame, so last frame's picture does not persist.
     ///
     /// A fresh [`Framebuffer`] is already background-filled, so a first frame looks
@@ -1032,6 +1231,28 @@ mod tests {
                 Layer::Scroll3 => 3,
             };
             self.enable_mask() | (depth << 6)
+        }
+
+        /// Puts every tile of this board's map in priority `group` (0-3).
+        ///
+        /// The group is attribute bits 7-8 (`cps1_v.cpp:2505`), and the fixture's
+        /// zeroed map is group 0, so a per-group test must write this itself.
+        fn set_group(&mut self, group: u8) {
+            assert!(group < 4, "the group is two bits");
+            let attr = u16::from(group) << 7;
+            let table = cps_a_base(&self.cps_a, self.base_reg(), SCROLL_BOUNDARY);
+            for i in 0..0x1000 {
+                self.gfxram[table + 2 * i + 1] = attr;
+            }
+        }
+
+        /// This board's layer's tilemap base register.
+        fn base_reg(&self) -> usize {
+            match self.layer {
+                Layer::Scroll1 => SCROLL1_BASE,
+                Layer::Scroll2 => SCROLL2_BASE,
+                Layer::Scroll3 => SCROLL3_BASE,
+            }
         }
 
         /// Writes a sprite record into gfxram at the object base, in **visible**
