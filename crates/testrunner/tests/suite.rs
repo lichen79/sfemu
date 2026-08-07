@@ -3,7 +3,7 @@
 //! Groups are enabled as the core learns to execute them. Run with `--release`:
 //! 2500 cases per group is slow in a debug build.
 
-use testrunner::runner::assert_group;
+use testrunner::runner::{assert_group, group_name};
 
 /// Emits one `#[test]` per group plus `REGISTERED`, the list every group name is
 /// read back from.
@@ -277,11 +277,10 @@ fn every_vector_file_has_a_registered_group() {
     });
     let mut found: Vec<String> = entries
         .filter_map(Result::ok)
+        // `group_name` borrows from the path, so the path has to outlive the call.
         .filter_map(|e| {
-            e.file_name()
-                .to_str()
-                .and_then(|n| n.strip_suffix(".json.bin"))
-                .map(str::to_owned)
+            let path = e.path();
+            group_name(&path).map(str::to_owned)
         })
         .collect();
     found.sort();

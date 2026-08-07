@@ -275,14 +275,26 @@ impl GroupResult {
     }
 }
 
+/// The group name a vector file belongs to: its file stem with `.json.bin` off.
+///
+/// `None` for a path that is not a vector file at all — no file name, non-UTF-8,
+/// or a different extension — which lets a directory walk filter and name in one
+/// step rather than doing each separately.
+///
+/// ⚠️ `strip_suffix`, **not** `trim_end_matches`, which strips the suffix
+/// *repeatedly*: `trim_end_matches(".json.bin")` maps
+/// `"X.json.bin.json.bin"` to `"X"` and, worse, is a silent no-op distinction on
+/// every real file name, so the two spellings cannot be told apart by any suite
+/// run. Three copies of this had drifted into two spellings before this function
+/// existed; that no vector file happens to expose the difference is the reason to
+/// have one copy, not a reason it did not matter.
+pub fn group_name(path: &Path) -> Option<&str> {
+    path.file_name()?.to_str()?.strip_suffix(".json.bin")
+}
+
 /// Runs every case in one suite file.
 pub fn run_group(path: &Path) -> GroupResult {
-    let group = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("?")
-        .trim_end_matches(".json.bin")
-        .to_string();
+    let group = group_name(path).unwrap_or("?").to_string();
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let cases = parse_file(&bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 
@@ -388,6 +400,27 @@ mod tests {
             transactions,
             length: 4,
         }
+    }
+
+    /// `group_name` strips the suffix once, and rejects a non-vector path.
+    ///
+    /// ⚠️ The doubled-suffix row is the whole point: it is the **only** input on
+    /// which `strip_suffix` and the `trim_end_matches` this replaced disagree, so
+    /// without it the test passes identically against the spelling it exists to
+    /// rule out. Expected values are written as literals rather than built from
+    /// the same suffix string the function uses.
+    #[test]
+    fn group_name_strips_the_suffix_once_and_only_from_a_vector_file() {
+        assert_eq!(group_name(Path::new("/t/ADD.b.json.bin")), Some("ADD.b"));
+        assert_eq!(group_name(Path::new("MOVE.l.json.bin")), Some("MOVE.l"));
+        // trim_end_matches would give "X" here: it strips repeatedly.
+        assert_eq!(
+            group_name(Path::new("/t/X.json.bin.json.bin")),
+            Some("X.json.bin")
+        );
+        assert_eq!(group_name(Path::new("/t/notes.md")), None);
+        assert_eq!(group_name(Path::new("/t/ADD.b.json")), None);
+        assert_eq!(group_name(Path::new("/t/")), None);
     }
 
     #[test]

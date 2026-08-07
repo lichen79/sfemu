@@ -294,11 +294,8 @@ fn group_consistency() {
 
     for entry in &files {
         let path = entry.path();
-        let group = path
-            .file_name()
-            .and_then(|s| s.to_str())
+        let group = testrunner::runner::group_name(&path)
             .unwrap_or("?")
-            .trim_end_matches(".json.bin")
             .to_string();
 
         let bytes = std::fs::read(&path).unwrap_or_else(|e| {
