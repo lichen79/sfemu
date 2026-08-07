@@ -269,8 +269,26 @@ attr & 0x0180   priority group, >> 7
 | scroll2 | 16×16 | `+0x40` | — | `(row & 0x0F) + ((col & 0x3F) << 4) + ((row & 0x30) << 6)` |
 | scroll3 | 32×32 | `+0x60` | `& 0x3FFF` | `(row & 0x07) + ((col & 0x3F) << 3) + ((row & 0x38) << 6)` |
 
-A pen is `colour * 32 + pixel`, so the bases separate the layers: sprites take
+A pen is `colour * 16 + pixel`, so the bases separate the layers: sprites take
 schemes 0x00-0x1F, scroll1 0x20-0x3F, scroll2 0x40-0x5F, scroll3 0x60-0x7F.
+
+**Why 16 and not 32.** The multiplier is MAME's `gfx_element` granularity, which
+for a 4-bit-per-pixel layout is `1 << 4` = 16 — not the 32 that
+`m_palette_size = CPS1_PALETTE_ENTRIES * 32` (`cps1_v.cpp:2542`) invites, that
+32 being bytes per scheme in gfxram, two per entry. Four checks agree:
+
+- `GFXDECODE_ENTRY(..., 0, 0x80)` (`cps1.cpp:3882-3885`) gives 0x80 colour codes,
+  and 0x80 × 16 = 0x800 — exactly the four layers' 0x20 schemes each.
+- The star layers write pens `0x800 + col` and `0xa00 + col`
+  (`cps1_v.cpp:2900`, `:2926`), which sit immediately above that 0x800. At a
+  granularity of 32 the tile pens would run to 0x1000 and swallow them.
+- `set_entries(0xc00)` (`cps1.cpp:3932`) is the palette's real size, and
+  0x800 tile pens + 0x400 star pens = 0xC00.
+- [`BACKGROUND_PEN`] 0xBFF is the last of those 0xC00, in the star region rather
+  than the tile region — which is why nothing a tilemap draws can equal it, and
+  the "a solid layer hides the background" invariant is meaningful.
+
+So the highest pen any tilemap can produce is `(0x1F + 0x60) * 16 + 15` = 0x7FF.
 
 The mappers are column-major within a vertical strip, which is what makes them worth
 testing as bijections rather than transcribing and hoping: each is a permutation of
@@ -302,7 +320,7 @@ Integer division, truncating. `0x11` scales a nibble to 8 bits (0x0F → 0xFF) a
 MAME's comment reads "from my understanding of the schematics, when the 'brightness'
 component is set to 0 it should reduce brightness to 1/3".
 
-Total pens `32 * 6 * 32 = 0xC00`. The background fill is pen **0xBFF**, the last pen
+Total pens `6 * 0x200 = 0xC00`. The background fill is pen **0xBFF**, the last pen
 of the last page (`cps1_v.cpp:3041`): "Games use pen 0xbff as background color".
 
 ### Sprites (`cps1_v.cpp:2724-2861`, table format at `:2652-2680`)
