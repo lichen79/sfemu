@@ -88,6 +88,11 @@ fn compare_accesses(case: &TestCase, log: &[Access]) -> Vec<String> {
     let expected: Vec<_> = case
         .transactions
         .iter()
+        // The `Tas` disjunct is unexercised: 0 of 1,783,580 transactions in the
+        // current corpus carry that kind (measured, Task 14 — see `binfmt.rs`'s
+        // decode arm). It is kept so that a future suite version emitting the
+        // TAS read-modify-write signature is compared rather than silently
+        // dropped from `expected`, which would pass a case it should fail.
         .filter(|t| matches!(t.kind, TxKind::Read | TxKind::Write | TxKind::Tas))
         .collect();
 

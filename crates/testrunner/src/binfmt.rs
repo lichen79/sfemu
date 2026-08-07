@@ -176,6 +176,12 @@ fn read_transactions(c: &mut Cursor) -> Result<(Vec<Transaction>, u32), ParseErr
             0 => TxKind::Idle,
             1 => TxKind::Write,
             2 => TxKind::Read,
+            // Unexercised by the current corpus: `Tas` occurs 0 times in
+            // 1,783,580 transactions (measured, Task 14). The arm stays because
+            // `3` is part of the on-disk format — deleting it would turn a
+            // valid-per-format file into `BadKind`, which is a worse failure
+            // than a dead branch, and TAS's read-modify-write does have a
+            // distinct bus signature a future suite version could emit.
             3 => TxKind::Tas,
             4 => TxKind::ReadAddrErr,
             5 => TxKind::WriteAddrErr,

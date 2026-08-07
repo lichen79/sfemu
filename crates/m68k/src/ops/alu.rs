@@ -192,7 +192,14 @@ pub(super) struct Plan {
     /// stream, and it is also a term in the address-error stacked PC — adding it
     /// there took the `xxxI` fault cases from 0/746 to 746/746.
     pub pre: u32,
-    /// Does the result go back to the `<ea>`?
+    /// Does the result go back to a *memory* `<ea>`?
+    ///
+    /// Read only by [`run`]'s `debug_assert!`, which checks that a plan claiming
+    /// a write-back gets one. It does **not** gate the write — `compute`
+    /// returning `Some` decides that — and the assertion exists because for
+    /// thirteen builder call sites there was no read at all, so the field looked
+    /// causal while being inert. See the assertion for why the invariant is an
+    /// implication rather than an equality.
     pub writes: bool,
     /// Trailing idle cycles; see the module docs' table.
     pub idle: u32,
@@ -205,7 +212,23 @@ pub(super) struct Plan {
     /// The source resolves *first*, so its adjustment is committed before the
     /// destination address is formed. That is observable whenever both name the
     /// same register: `ADDX.w -(A3),-(A3)` reads its two operands from
-    /// *different* addresses, and 514 cases turn on it.
+    /// *different* addresses.
+    ///
+    /// **639 cases turn on it**, measured two independent ways that agree: a
+    /// census of the encodings (915 same-register memory-pair cases, of which
+    /// 276 fault before the second resolve, leaving 639), and a mutant that
+    /// rolls the source's predecrement back — which fails exactly 639 cases,
+    /// spread over all six groups (`ADDX.b` 158, `ADDX.w` 88, `ADDX.l` 82,
+    /// `SUBX.b` 161, `SUBX.w` 76, `SUBX.l` 74). That is the count over *all*
+    /// same-register non-faulting cases, `A7` included.
+    ///
+    /// ⚠️ Earlier revisions of this line said **514**, which reproduces under no
+    /// predicate tried. `arith.rs`'s test doc says **526** and is *correct* — it
+    /// states a narrower population, "non-faulting, excluding `A7`", and the 113
+    /// `A7` cases are exactly the difference. The ledger recorded 514-vs-526 as
+    /// one stale figure needing alignment; they are two scopes, and only the
+    /// first was wrong. **State the scope beside the count**, or the next reader
+    /// reconciles two right answers into one wrong one.
     pub pair: Option<(u16, u16)>,
     /// Read a long operand low word first. `ADDX`/`SUBX`'s memory form only.
     pub desc_reads: bool,
@@ -477,6 +500,34 @@ pub(super) fn run_tail(
         Tail::Write(v) => Some(v),
         Tail::Done => None,
     };
+
+    // `Plan::writes` records the handler's *intent* to write back; whether a write
+    // actually happens is decided by `compute` returning `Some`. Those must agree,
+    // and until this assertion existed nothing checked that they did — the field
+    // had 13 builder call sites and 0 reads, so it read as though it gated the
+    // write while being inert. Asserting is better than deleting: the intent is
+    // worth recording, and `Plan` demonstrably carries both live flags
+    // (`fetch_last`) and formerly-inert ones with identical shape, which a reader
+    // cannot tell apart without grepping.
+    // `Plan::writes` records that the handler intends the result to go back to
+    // the `<ea>`, and until this assertion existed nothing checked it: the field
+    // had 13 builder call sites and **0** reads, so it read as though it gated
+    // the write while being inert. The write is actually decided by `compute`
+    // returning `Some`.
+    //
+    // ⚠️ The invariant is an **implication, not an equality**, and the difference
+    // is measured. Over the full suite, `writes == result.is_some()` fails
+    // 82,380 times (`writes` false while a write happens — the register
+    // destinations), and `writes == (result.is_some() && dst is memory)` fails
+    // 7,918 times in the *opposite* direction (`BSET`/`BCLR`/`BCHG` on a
+    // register set `writes` legitimately). Neither equality is the rule. What
+    // never occurs is `writes` set while nothing is written — 0 cases — so that
+    // is what is asserted, and asserting either equality would be a false claim
+    // that happens to be shaped like a check.
+    debug_assert!(
+        !plan.writes || result.is_some(),
+        "Plan::writes was set but compute returned None: an intended write-back never happened"
+    );
 
     let mut nw = 0;
     match (result, dst_ea) {
