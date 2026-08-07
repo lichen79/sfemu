@@ -398,6 +398,18 @@ pub(super) fn run_tail(
     // read-modify-write reads its destination before writing it, so a misaligned
     // destination faults on the read and the write is never reached. The CCR is
     // untouched in all of them, so `compute` must not have run yet.
+    //
+    // The 29,896 denominator is the **32 sized data-alu groups**: the twelve
+    // binary forms, the ten unary (`CLR`/`NEG`/`NEGX`/`NOT`/`TST`), and the ten
+    // `ADDA`/`CMPA`/`SUBA`/`ADDX`/`SUBX`. Re-measured in Task 14 and it
+    // reproduces exactly. ⚠️ Naming the set matters more than it looks: an
+    // *approximation* of "Task 6's groups" scores 21,563 on the same query,
+    // which reads exactly like a stale figure and is a wrong denominator. Check
+    // the group list before concluding this number has drifted.
+    //
+    // The control for the zero is in `68000-notes.md`: write faults occur
+    // 2,446 times, in `MOVE.w/.l` and `MOVEM.w/.l` and no other group, so the
+    // query can see one. The zero is a property of the instruction class.
     macro_rules! fault {
         ($addr:expr, $mode:expr, $reg:expr, $faulted_src:expr) => {{
             adjust_on_fault(cpu, plan, size, $faulted_src);
