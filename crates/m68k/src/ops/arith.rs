@@ -676,6 +676,49 @@ mod tests {
         cpu
     }
 
+    /// A halted `alu` operand fault is charged for its lead and nothing else.
+    ///
+    /// `alu::run`'s fault arm returned `exception::ADDRESS_ERROR_TAIL_CYCLES`
+    /// unconditionally: 58 cycles for an aborted access, 7 frame writes, 2 vector
+    /// reads and 2 refills, none of which a double bus fault performs. This is the
+    /// arm every read-modify-write in the crate shares, so it is the widest of the
+    /// family.
+    ///
+    /// `-(A0)` is the form with a nonzero lead: it pays `idle_lead`'s 2 cycles of
+    /// address formation before the check, so it discriminates the idle term as
+    /// well as the tail. `(A0)` is included as the zero-lead case. The even-SSP
+    /// control is `an_odd_operand_address_faults_before_the_read`, which takes the
+    /// same fault to a real frame at the full 58.
+    ///
+    /// Extrapolated: 0 of 317,500 cases halt.
+    #[test]
+    fn a_halted_alu_operand_fault_costs_only_its_lead() {
+        for (label, opcode, lead_idle) in [("(A0)", 0xD150u16, 0), ("-(A0)", 0xD160, 2)] {
+            let mut bus = RecordingBus::new();
+            bus.load(0x1000, &[opcode, 0x4E71]); // ADD.w D0,<ea>
+            bus.put16(0x000C, 0x0000); // vector 3, so a frame would be visible
+            bus.put16(0x000E, 0x2000);
+            let mut cpu = M68k::new();
+            cpu.sr = SR_S;
+            cpu.a[0] = 0x4001; // odd either way: -(A0) decrements by 2
+            cpu.a[7] = 0x3001; // odd frame base
+            cpu.ssp = 0x3001;
+            cpu.pc = 0x1000;
+            cpu.prime_prefetch(&mut bus);
+            bus.log.clear();
+
+            let cycles = cpu.step_with(&Decoder::new(), &mut bus);
+
+            assert!(cpu.halted, "{label}: an odd frame base halts");
+            assert_eq!(bus.log.len(), 0, "{label}: nothing reached the bus");
+            assert_eq!(
+                cycles,
+                lead_idle + crate::exception::HALTED_IDLE_CYCLES,
+                "{label}: the lead idle + the halt idle, not the framed 58"
+            );
+        }
+    }
+
     /// `ADD.b D1,D0` — the simplest form, checking flags and the byte-width
     /// write into a register.
     #[test]

@@ -220,7 +220,9 @@ fn target_error(
         ir,
         pc_for_frame,
     );
-    4 * acc + idle + ADDRESS_ERROR_TAIL_CYCLES
+    // `acc` and `idle` happened; the tail has not, if the entry halted. Measured:
+    // `JMP (A0)` to an odd target with an odd SSP halts with an empty bus log.
+    4 * acc + idle + exception::entry_cycles(cpu, 0, ADDRESS_ERROR_TAIL_CYCLES)
 }
 
 /// Sets the PC and refills both queue slots. Two program reads.
@@ -603,6 +605,46 @@ mod tests {
         let mut cpu = M68k::new();
         cpu.set_ccr(false, n, z, v, c);
         cpu
+    }
+
+    /// A halted branch-target fault is charged for its lead and nothing else.
+    ///
+    /// `target_error`'s tail is [`ADDRESS_ERROR_TAIL_CYCLES`] — 58, `4 × 12 + 10`
+    /// for an aborted access, 7 frame writes, 2 vector reads and 2 refills. A
+    /// double bus fault performs none of the twelve, so returning it
+    /// unconditionally claimed 58 cycles for a step whose bus log is empty. `acc`
+    /// and `idle` stay outside the call because they really happened.
+    ///
+    /// `JMP (A0)` is the shape with no lead at all — 0 accesses, 0 idle — which
+    /// makes the whole return value the tail and the defect maximal. The even-SSP
+    /// control is `jmp_to_an_odd_address_faults` above: same instruction, 58
+    /// cycles, 11 accesses, a real frame.
+    ///
+    /// Extrapolated: 0 of 317,500 cases halt.
+    #[test]
+    fn a_halted_branch_target_fault_costs_only_its_lead() {
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4ED0, 0x4E71]); // JMP (A0)
+        bus.put16(0x000C, 0x0000); // vector 3, so a frame would be visible
+        bus.put16(0x000E, 0x2000);
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S;
+        cpu.a[0] = 0x4001; // odd target
+        cpu.a[7] = 0x3001; // odd frame base
+        cpu.ssp = 0x3001;
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+        bus.log.clear();
+
+        let cycles = cpu.step_with(&Decoder::new(), &mut bus);
+
+        assert!(cpu.halted, "an odd frame base is a double bus fault");
+        assert_eq!(bus.log.len(), 0, "nothing reached the bus");
+        assert_eq!(
+            cycles,
+            exception::HALTED_IDLE_CYCLES,
+            "JMP (A0) has no lead, so the halt idle is the whole cost"
+        );
     }
 
     #[test]

@@ -166,7 +166,7 @@ fn to_ccr_sr(cpu: &mut M68k, bus: &mut dyn Bus, op: Op, to_sr: bool) -> u32 {
         // this path would not have made. See `exception::entry_cycles`.
         let pc = cpu.pc.wrapping_sub(exception::OPCODE_PC_OFFSET);
         exception::take(cpu, bus, VEC_PRIVILEGE, pc);
-        return exception::entry_cycles(cpu, 0, 4 * exception::SHORT_FRAME_ACCESSES + 6);
+        return exception::entry_cycles(cpu, 0, exception::SHORT_FRAME_ENTRY_CYCLES);
     }
 
     let imm = cpu.prefetch[1];

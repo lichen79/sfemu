@@ -387,7 +387,14 @@ pub(super) fn run_tail(
                 ir,
                 stacked_pc(opcode_addr, plan, size),
             );
-            return 4 * acc + idle_lead + ADDRESS_ERROR_TAIL_CYCLES;
+            // The lead — `acc` accesses and `idle_lead` — is in this term
+            // because it really reached the bus; only the tail collapses on a
+            // halt. Measured on this core: `ADD.w D0,(A0)` with an odd A0 and an
+            // odd SSP halts with an **empty** bus log, where the bare 58 was a
+            // 58-cycle claim about 0 accesses. See `exception::entry_cycles`.
+            return 4 * acc
+                + idle_lead
+                + exception::entry_cycles(cpu, 0, ADDRESS_ERROR_TAIL_CYCLES);
         }};
     }
 
@@ -457,7 +464,15 @@ pub(super) fn run_tail(
     // accesses are counted, not re-emitted.
     let result = match result {
         Tail::Trapped => {
-            return 4 * (acc + exception::SHORT_FRAME_ACCESSES) + idle_lead + plan.idle;
+            // A halted entry writes no frame and fetches no vector, so
+            // `SHORT_FRAME_ACCESSES` is not owed; `acc` and the idle are, having
+            // already happened. Measured: `CHK D0,D1` trapping with an odd SSP
+            // halts with an empty bus log, where the unconditional form claimed
+            // 40 cycles for it.
+            return 4 * acc
+                + idle_lead
+                + plan.idle
+                + exception::entry_cycles(cpu, 0, 4 * exception::SHORT_FRAME_ACCESSES);
         }
         Tail::Write(v) => Some(v),
         Tail::Done => None,

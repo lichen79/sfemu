@@ -439,7 +439,12 @@ fn move_common(cpu: &mut M68k, bus: &mut dyn Bus, op: u16, size: Size, is_movea:
                 words[0],
                 stacked_pc(opcode_addr, &ops, size, FaultKind::Read, se),
             );
-            return 4 * fetches_done + src_idle + ADDRESS_ERROR_TAIL_CYCLES;
+            // Only the tail collapses on a halt; the fetches and the source idle
+            // already reached the bus. Measured: `MOVE.w (A0),D0` with an odd A0
+            // and an odd SSP halts with an empty bus log.
+            return 4 * fetches_done
+                + src_idle
+                + exception::entry_cycles(cpu, 0, ADDRESS_ERROR_TAIL_CYCLES);
         }
     }
     let src_val = ea::read(cpu, bus, src_ea, size);
@@ -494,7 +499,13 @@ fn move_common(cpu: &mut M68k, bus: &mut dyn Bus, op: u16, size: Size, is_movea:
                 write_fault_ir(&words, &ops, size, se),
                 stacked_pc(opcode_addr, &ops, size, FaultKind::Write, se),
             );
-            return 4 * (fetches_done + nr) + src_idle + dst_idle + ADDRESS_ERROR_TAIL_CYCLES;
+            // As the source-fault arm above: the lead is owed, the tail is not.
+            // Measured: `MOVE.w D0,(A0)` with an odd A0 and an odd SSP halts with
+            // an empty bus log.
+            return 4 * (fetches_done + nr)
+                + src_idle
+                + dst_idle
+                + exception::entry_cycles(cpu, 0, ADDRESS_ERROR_TAIL_CYCLES);
         }
         // `-(An)` is the one destination that writes a long descending
         // (§9.2, 147/147).
@@ -639,6 +650,61 @@ mod tests {
         cpu.pc = 0x1000;
         cpu.prime_prefetch(bus);
         cpu
+    }
+
+    /// A halted MOVE fault is charged for its fetches and nothing else.
+    ///
+    /// Both fault arms — source and destination — returned
+    /// [`ADDRESS_ERROR_TAIL_CYCLES`] unconditionally, so a double bus fault was
+    /// charged 58 cycles for twelve accesses it never made. The fetches stay
+    /// outside [`exception::entry_cycles`] because they did happen.
+    ///
+    /// Both arms are covered, because they are separate returns and fixing one
+    /// leaves the other wrong: `MOVE.w (A0),D0` faults on the source read,
+    /// `MOVE.w D0,(A0)` on the destination write. The `(A0)` forms have **no**
+    /// lead — the alignment check precedes every fetch, and the queue advance is
+    /// at the tail — so the `(d16,A0)` forms are included to give a nonzero one.
+    /// Without them the lead term is unobservable and dropping it into
+    /// `entry_cycles`' first argument would pass, which is exactly the mistake
+    /// `pea`'s halt arm made.
+    ///
+    /// Extrapolated: 0 of 317,500 cases halt.
+    #[test]
+    fn a_halted_move_fault_costs_only_its_fetches() {
+        for (label, prog, lead) in [
+            // No lead at all: the alignment check precedes every fetch.
+            ("source", &[0x3010u16, 0x4E71, 0x4E71][..], 0),
+            ("destination", &[0x3080, 0x4E71, 0x4E71][..], 0),
+            // `(d16,A0)` fetches its displacement first, so the lead is 1 and the
+            // two spellings differ by 4. Without this row the test pins only the
+            // tail collapse and a lead dropped into `entry_cycles` would pass.
+            ("source+ext", &[0x3028, 0x0000, 0x4E71][..], 1),
+            ("destination+ext", &[0x3140, 0x0000, 0x4E71][..], 1),
+        ] {
+            let mut bus = RecordingBus::new();
+            bus.load(0x1000, prog);
+            bus.put16(0x000C, 0x0000); // vector 3, so a frame would be visible
+            bus.put16(0x000E, 0x2000);
+            let mut cpu = M68k::new();
+            cpu.sr = crate::cpu::SR_S;
+            cpu.a[0] = 0x4001; // odd operand address
+            cpu.a[7] = 0x3001; // odd frame base
+            cpu.ssp = 0x3001;
+            cpu.pc = 0x1000;
+            cpu.prime_prefetch(&mut bus);
+            bus.log.clear();
+
+            let cycles = cpu.step_with(&Decoder::new(), &mut bus);
+
+            assert!(cpu.halted, "{label}: an odd frame base halts");
+            assert_eq!(bus.writes(), vec![], "{label}: no frame was written");
+            assert_eq!(bus.log.len(), lead as usize, "{label}: lead accesses only");
+            assert_eq!(
+                cycles,
+                4 * lead + exception::HALTED_IDLE_CYCLES,
+                "{label}: 4 × lead + the halt idle, not the framed 58"
+            );
+        }
     }
 
     #[test]

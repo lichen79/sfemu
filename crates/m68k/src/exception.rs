@@ -140,7 +140,7 @@ pub const HALTED_IDLE_CYCLES: u32 = 4;
 /// faulted.
 ///
 /// Every constant in this crate that pays for an exception entry —
-/// [`crate::ops::trap`]'s group-2 `34`, [`ADDRESS_ERROR_TAIL_CYCLES`],
+/// [`SHORT_FRAME_ENTRY_CYCLES`], [`ADDRESS_ERROR_TAIL_CYCLES`],
 /// [`INTERRUPT_CYCLES`] — is `4 × accesses + idle` for accesses that
 /// `double_bus_fault` never performs: no frame, no vector fetch, no refill.
 /// Returning one of them after a halt contradicts the core's own bus log, and the
@@ -167,10 +167,34 @@ pub const HALTED_IDLE_CYCLES: u32 = 4;
 /// cycle count precisely because its absence is how a stale constant survived
 /// here once already.
 ///
-/// ⚠️ **Not yet a single chokepoint.** `ops::{alu, branch, move_, muldiv, logic}`
-/// have fault sites of the same shape that still return their framed constant
-/// unconditionally; they are reachable only with an odd A7, and routing them
-/// through here is a follow-up (their files are owned elsewhere this round).
+/// # This is now the single chokepoint, and that is a checked claim
+///
+/// Task 11 left this doc saying "not yet a single chokepoint", naming
+/// `ops::{alu, branch, move_, muldiv, logic}` as having fault sites that still
+/// returned their framed constant unconditionally. All of them do route through
+/// here now. The six that were fixed in Task 14 were each *measured* first, by
+/// stepping the core into the halt and reading its own bus log — not argued from
+/// the shape of the code:
+///
+/// ```text
+///   alu::run fault arm     ADD.w D0,(A0)   odd A0, odd SSP   58 claimed, 0 acc
+///   alu::run_tail Trapped  CHK.w D1,D0     trapping, odd SSP 40 claimed, 0 acc
+///   branch::target_error   JMP (A0)        odd target/SSP    58 claimed, 0 acc
+///   move_ source fault     MOVE.w (A0),D0  odd A0, odd SSP   58 claimed, 0 acc
+///   move_ dest fault       MOVE.w D0,(A0)  odd A0, odd SSP   58 claimed, 0 acc
+///   logic::to_ccr_sr       ORI #1,SR       user, odd SSP     34 claimed, 0 acc
+/// ```
+///
+/// Each is pinned by a test named `a_halted_*`, and each of those tests was
+/// confirmed to fail — alone — with its fix reverted. Two of them needed a second
+/// case with a **nonzero lead** to be meaningful at all: the zero-lead form scores
+/// the same whether the lead is charged or dropped into `accesses_made`, which is
+/// how `pea`'s missing lead idle survived a test that looked like it covered it.
+///
+/// ⚠️ So do not add a fault site that returns a framed constant directly. There is
+/// no longer a precedent for it in this crate, and the class is invisible to both
+/// `clippy` and the vector suite: 0 of 317,500 cases halt, so **every one of these
+/// six was wrong through thirteen tasks of a fully green suite.**
 #[inline]
 pub fn entry_cycles(cpu: &M68k, accesses_made: u32, framed: u32) -> u32 {
     if cpu.halted {
@@ -265,6 +289,37 @@ pub fn take(cpu: &mut M68k, bus: &mut dyn Bus, vector: u8, pc_for_frame: u32) {
 /// idle and the aborted access, whereas a group-2 trap's idle is data-dependent
 /// (`CHK`'s is 6, 10 or 12) and belongs to the instruction, not the frame.
 pub const SHORT_FRAME_ACCESSES: u32 = 7;
+
+/// Cycles an exception entry costs when the frame is the *first* thing it does:
+/// `4 * SHORT_FRAME_ACCESSES + 6`, which is **34**.
+///
+/// Measured 18,776/18,776 at this decomposition — `TRAP` 2,500, LINE-A 2,500,
+/// LINE-F 2,500, and 11,276 privilege violations across nine groups. Those are
+/// the four code sites that shared the arithmetic and now share this name.
+///
+/// # Three things at 34 that are not this
+///
+/// The total 34 is *not* the claim; the split is. A handler that reaches 34 by a
+/// different route must keep its own spelling, because consolidating on the
+/// total would assert a bus shape the vectors contradict:
+///
+/// - **`TRAPV`'s 1,250 trapping cases are `4×8 + 2`.** One more access — the
+///   queue advance it performs before checking V — and 4 fewer idle. Same total,
+///   different shape; see `ops::trap::trapv`.
+/// - **The trace exception is extrapolated.** Vector 9 is fetched 0 times in
+///   317,500 cases, so its 34 rests on the frame shape alone, and its resume
+///   path has a lead of 2. See [`take_trace`].
+/// - **`CHK` is group 2 and never costs 34.** Its 1,326 trapping cases run
+///   38/40/42/44/46/48/50/52 across ten `(accesses, idle)` shapes, because it
+///   pays for an operand comparison first. No statement of the form "group 2
+///   costs 34" is true — the true scope is "entries whose frame is their first
+///   access", which is what this constant's name says.
+///
+/// So this replaces four identical expressions, not seven occurrences of the
+/// number 34. Two of the remaining three are deliberate; the third does not
+/// exist, and asserting 20,026 cases against `4×7 + 6` would be describing only
+/// 18,776 of them.
+pub const SHORT_FRAME_ENTRY_CYCLES: u32 = 4 * SHORT_FRAME_ACCESSES + 6;
 
 /// Whether a faulting access was a read or a write. Selects bit 4 of the
 /// address-error status word.
@@ -578,8 +633,12 @@ pub fn check_interrupts(cpu: &mut M68k, bus: &mut dyn Bus) -> Option<u32> {
 /// Both the cost and the **sampling point** are extrapolated, for the same reason:
 /// no case takes a trace exception, so no measurement here can be a count.
 ///
-/// - *Cost:* the group-2 short frame, the same `34` five other group-2 paths
-///   measure. Nothing verifies it for vector 9 specifically.
+/// - *Cost:* [`SHORT_FRAME_ENTRY_CYCLES`], the 34 measured at `4×7 + 6` over
+///   18,776 cases in twelve groups. ⚠️ It is **not** "the same 34 five other
+///   group-2 paths measure", as this line used to say: the number 34 is reached by
+///   two different splits, `TRAPV` uses the other one, and `CHK` is group 2 and
+///   never reaches 34 at all. Borrowing the 7-access arm is a choice between two
+///   shapes, and nothing verifies either for vector 9 specifically.
 /// - *Sampling point:* start-of-instruction, from the 68000 User's Manual's
 ///   definition of T. ⚠️ The suite's census of which instructions can *clear* T
 ///   (`ANDItoSR`, `EORItoSR`, `STOP`, `MOVEtoSR`, `RTE` — 1,277 clean cases, with
@@ -597,11 +656,11 @@ pub fn take_trace(cpu: &mut M68k, bus: &mut dyn Bus) -> u32 {
     take(cpu, bus, VEC_TRACE, pc);
     // Only the resume refill can precede the frame; without it a halt here logged
     // nothing at all.
-    entry_cycles(
-        cpu,
-        if resumed { 2 } else { 0 },
-        4 * SHORT_FRAME_ACCESSES + 6,
-    )
+    // ⚠️ Extrapolated: vector 9 is fetched 0 times in 317,500 cases, so this
+    // shares `SHORT_FRAME_ENTRY_CYCLES`' arithmetic without sharing its evidence.
+    // The name is the shape claim — frame first, 7 accesses, 6 idle — and that
+    // much is structural; the number is unmeasured for *this* vector.
+    entry_cycles(cpu, if resumed { 2 } else { 0 }, SHORT_FRAME_ENTRY_CYCLES)
 }
 
 /// Byte distance from `cpu.pc` at handler entry back to the opcode word.
@@ -632,7 +691,7 @@ pub fn illegal_instruction(cpu: &mut M68k, bus: &mut dyn Bus, op: u16) -> u32 {
     let pc = cpu.pc.wrapping_sub(OPCODE_PC_OFFSET);
     take(cpu, bus, vector, pc);
     // No access precedes the frame — the queue is never advanced on this path.
-    entry_cycles(cpu, 0, 34)
+    entry_cycles(cpu, 0, SHORT_FRAME_ENTRY_CYCLES)
 }
 
 #[cfg(test)]

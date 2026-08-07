@@ -459,7 +459,7 @@ pub(super) fn register(table: &mut [Handler; 65536]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cpu::tests_support::FlatBus;
+    use crate::cpu::tests_support::{FlatBus, RecordingBus};
     use crate::cpu::{SR_C, SR_N, SR_S, SR_V, SR_X, SR_Z};
     use crate::decode::Decoder;
 
@@ -470,6 +470,52 @@ mod tests {
         cpu.prime_prefetch(bus);
         let dec = Decoder::new();
         cpu.step_with(&dec, bus)
+    }
+
+    /// A halted `CHK` trap is charged for its lead and nothing else.
+    ///
+    /// This is `alu::run_tail`'s [`Tail::Trapped`] arm, and the one site in the
+    /// family whose framed constant is a *frame* rather than a fault tail: it
+    /// added `4 * SHORT_FRAME_ACCESSES` unconditionally, so a double bus fault was
+    /// charged 28 cycles for a frame and vector fetch it never performed. `acc`
+    /// and the idle stay outside [`exception::entry_cycles`] because they did
+    /// happen; `SHORT_FRAME_ACCESSES` does not.
+    ///
+    /// The register form is the zero-access case, and its `chk_idle` is 12 here —
+    /// value negative, not greater than the bound, and the difference fits a word
+    /// — so the expected cost is `12 + 4`. Taking `chk_idle`'s value from the
+    /// condition rather than assuming its most common 10 matters: the framed cost
+    /// would be 40, and 40 − 28 is 12, so a wrong idle would have looked like a
+    /// correct fix.
+    ///
+    /// Extrapolated: 0 of 317,500 cases halt. Note this arm is reachable *only*
+    /// through a trap, so it is the one halt path in the crate that is not an
+    /// address error.
+    #[test]
+    fn a_halted_chk_trap_costs_only_its_lead() {
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4181, 0x4E71]); // CHK.w D1,D0 — bound D1, value D0
+        bus.put16(0x0018, 0x0000); // vector 6, so a frame would be visible
+        bus.put16(0x001A, 0x2000);
+        let mut cpu = M68k::new();
+        cpu.sr = SR_S;
+        cpu.d[0] = 0xFFFF_FFFF; // value: negative, so it traps
+        cpu.d[1] = 1; // bound
+        cpu.a[7] = 0x3001; // odd frame base
+        cpu.ssp = 0x3001;
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+        bus.log.clear();
+
+        let cycles = cpu.step_with(&Decoder::new(), &mut bus);
+
+        assert!(cpu.halted, "an odd frame base is a double bus fault");
+        assert_eq!(bus.log.len(), 0, "no frame and no vector fetch");
+        assert_eq!(
+            cycles,
+            12 + crate::exception::HALTED_IDLE_CYCLES,
+            "chk_idle's 12 + the halt idle. The 28 for the frame is not owed"
+        );
     }
 
     fn cpu_at(sr: u16) -> M68k {

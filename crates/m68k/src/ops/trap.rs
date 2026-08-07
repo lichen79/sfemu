@@ -82,7 +82,7 @@ use crate::Bus;
 /// arithmetic just does not show it. Every other group is unaffected because
 /// none of the 34-cycle paths has an `<ea>` at all. Prefer the vector fetch:
 /// it survives an operand that touches the stack pointer.
-const GROUP2_CYCLES: u32 = 4 * SHORT_FRAME_ACCESSES + 6;
+const GROUP2_CYCLES: u32 = exception::SHORT_FRAME_ENTRY_CYCLES;
 
 /// `TRAP #n` — an unconditional trap through vectors 32-47.
 ///
@@ -298,10 +298,24 @@ fn rte(cpu: &mut M68k, bus: &mut dyn Bus, _opcode: u16) -> u32 {
         // the 2 vector reads, the 2 refills, and 10 idle. The aborted access
         // counts — 614/614 under the timing law.
         //
-        // A halt here needs an odd frame base, which is the post-pop SSP: reachable
-        // only from user mode with an odd SSP, since supervisor entry with an odd
-        // SSP was already caught above. The 3 pops did reach the bus, so they are
-        // still owed.
+        // ⚠️ **The halt arm here is UNREACHABLE, and the `3` is therefore
+        // unverifiable — not merely unverified.** The comment this replaces said
+        // "reachable only from user mode with an odd SSP"; that is wrong. The
+        // frame base is the post-pop SSP, and `sp` was checked even above, so
+        // `sp + 6` is even; `set_sr` then either leaves `a[7]` at that even value
+        // (staying supervisor) or swaps it out to `ssp`, which the line above set
+        // to that same even value. Both branches of `frame_base` are even, whatever
+        // SR the frame carried. Probed over all four combinations of {popped SR
+        // clears S, keeps S} × {odd USP, even USP}: `halted=false`, 70 cycles, 14
+        // accesses, every time. The only other halt trigger, `in_exception`, is
+        // false on any path that reached an instruction handler.
+        //
+        // So the `3` cannot be pinned by a test, and mutating it to `0` changes no
+        // observable behaviour. It is kept because it is what the law says the 3
+        // pops cost if the arm ever does become reachable — `frame_base` gaining a
+        // third case would do it — and because a `0` here would be a false claim
+        // sitting next to a bus log holding three reads. Do not read its survival
+        // of mutation as a missing test.
         return exception::entry_cycles(cpu, 3, 4 * 3 + ADDRESS_ERROR_TAIL_CYCLES);
     }
 
@@ -331,6 +345,51 @@ mod tests {
     use crate::cpu::tests_support::RecordingBus;
     use crate::cpu::SR_S;
     use crate::decode::Decoder;
+
+    /// `TRAPV`'s halted entry is charged for its leading read and nothing else.
+    ///
+    /// `TRAPV` is the one group-2 path with an access *before* the frame, so its
+    /// [`exception::entry_cycles`] lead is 1, not 0. That `1` was unpinned:
+    /// mutating it to `0` passed every test. It is the difference between a
+    /// 4-cycle claim and a 0-cycle claim about a step whose bus log holds exactly
+    /// one access, so the law decides it and this test records the decision.
+    ///
+    /// User mode with an odd SSP is the reachable way in — the frame base is the
+    /// SSP there (see `exception::frame_base`), and an odd `a[7]` in user mode is
+    /// an odd *USP*, which frames normally. Both are probed: `a7=0x3001,
+    /// ssp=0x4000` does not halt and costs the ordinary 34 with 3 frame writes.
+    ///
+    /// Extrapolated in its idle term only: 0 of 317,500 cases halt, so
+    /// [`exception::HALTED_IDLE_CYCLES`] is a choice. The `4 * 1` beside it is
+    /// derived from the bus log asserted below.
+    #[test]
+    fn a_halted_trapv_is_charged_for_its_leading_read() {
+        let mut bus = RecordingBus::new();
+        bus.load(0x1000, &[0x4E76, 0x4E71]); // TRAPV
+        bus.put16(0x001E, 0x2000); // vector 7, so a frame would be visible
+        let mut cpu = M68k::new();
+        cpu.sr = SR_V; // user mode, V set: the trapping path
+        cpu.a[7] = 0x3000; // even USP — the frame does not go here
+        cpu.usp = 0x3000;
+        cpu.ssp = 0x4001; // odd frame base
+        cpu.pc = 0x1000;
+        cpu.prime_prefetch(&mut bus);
+        bus.log.clear();
+
+        let cycles = cpu.step_with(&Decoder::new(), &mut bus);
+
+        assert!(cpu.halted, "an odd frame base is a double bus fault");
+        assert_eq!(bus.writes(), vec![], "no frame was written");
+        // The unconditional queue advance, which happens before the V check and so
+        // before any chance of halting. It really reached the bus, so it is owed.
+        assert_eq!(bus.log.len(), 1, "just the leading queue advance");
+        assert_eq!(
+            cycles,
+            4 + exception::HALTED_IDLE_CYCLES,
+            "4 × 1 access + the halt idle. A lead of 0 would claim this step \
+             touched the bus for free"
+        );
+    }
 
     /// `RTE` returning to user mode must install the popped SR through
     /// `set_sr`, so `a[7]` becomes the USP.

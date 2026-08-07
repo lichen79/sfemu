@@ -16,8 +16,11 @@
 //!
 //! # Privilege
 //!
-//! Privileged instructions cost **34 cycles** to trap, `4 * SHORT_FRAME_ACCESSES
-//! + 6` idle. The stacked PC is the **opcode address** with no bump, and the
+//! Privileged instructions cost **34 cycles** to trap —
+//! [`exception::SHORT_FRAME_ENTRY_CYCLES`], `4 × 7 accesses + 6` idle, whose docs
+//! name the two other things that reach 34 by a different split and the one
+//! group-2 instruction that never reaches it at all. The stacked PC is the
+//! **opcode address** with no bump, and the
 //! queue is not advanced: a privilege violation aborts the instruction before
 //! its own fetch. Measured 6,260/6,260 over the **five groups this module owns**
 //! — `MOVEtoSR` 1290, `MOVEtoUSP` 1226, `MOVEfromUSP` 1207, `STOP` 1270,
@@ -53,9 +56,7 @@
 
 use crate::cpu::{M68k, ADDR_MASK};
 use crate::ea::{self, mode_is_mem, Ea, Size};
-use crate::exception::{
-    self, FaultKind, Space, ADDRESS_ERROR_TAIL_CYCLES, SHORT_FRAME_ACCESSES, VEC_PRIVILEGE,
-};
+use crate::exception::{self, FaultKind, Space, ADDRESS_ERROR_TAIL_CYCLES, VEC_PRIVILEGE};
 use crate::flags::logic_flags;
 use crate::Bus;
 
@@ -63,7 +64,7 @@ use crate::Bus;
 ///
 /// Singleton at 34 across all **nine** suite groups that fetch vector 8,
 /// 11,276 cases; 6,260 of those are this module's five. See the module docs.
-const PRIVILEGE_CYCLES: u32 = 4 * SHORT_FRAME_ACCESSES + 6;
+const PRIVILEGE_CYCLES: u32 = exception::SHORT_FRAME_ENTRY_CYCLES;
 
 /// Traps to vector 8 if the CPU is in user mode, returning the cycle cost.
 ///
