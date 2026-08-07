@@ -43,8 +43,11 @@ command that fetches it. It does not skip, warn, or silently pass.
 # Shells out to curl; no HTTP dependency is taken for a once-per-checkout job.
 cargo run -p testrunner --bin fetch --release
 
-# Unit tests, plus one test per suite group.
+# Unit tests, plus one test per suite group. Both profiles: `--release` is
+# where the timing law is measured, and debug is where `debug_assert!` is
+# evaluated. Neither run subsumes the other.
 cargo test --workspace --release
+cargo test --workspace
 
 # The full-suite report: a per-group table, then the headline figures.
 # Exits nonzero if any group is red.
@@ -54,10 +57,20 @@ cargo run -p testrunner --bin report --release
 cargo bench -p m68k
 ```
 
-`cargo test --workspace --release` is the real gate. It runs 209 `m68k` unit
-tests and 128 harness tests — one per suite group, plus one that fails if a file
-appears in `testdata/` without a corresponding registered group, so adding a
-vector file cannot silently go unrun.
+The gate is **both** profiles. `--release` runs 210 `m68k` unit tests and 128
+harness tests — one per suite group, plus one that fails if a file appears in
+`testdata/` without a corresponding registered group, so adding a vector file
+cannot silently go unrun.
+
+⚠️ **The debug run is not redundant, and leaving it out hid a live defect.**
+`[profile.release]` does not enable debug assertions, so under a release-only
+gate the core's 12 `debug_assert!`s were never evaluated — including the one in
+`ops::alu`'s `run_tail` that a whole task chose *over* deleting the field it
+checks. Measured: inverting that assertion to `debug_assert!(!plan.writes, …)`,
+which must fire on every write-back plan, leaves the release run entirely green
+across all 11 binaries and all 128 groups, while failing 21 of 210 in debug. The
+debug run costs 6 s, because `[profile.test] opt-level = 2` compiles the
+dependencies optimised anyway; the suite itself takes 0.08 s of it.
 
 ### The benchmark is a liveness check, not a performance gate
 
