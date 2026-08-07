@@ -125,6 +125,16 @@ the `Bus` trait. There is no wall-clock access, no randomness, and no interior
 mutability — the properties that make save states, WASM, and rollback netplay
 cheap later rather than a rewrite.
 
+"WASM-safe by construction" is about the *interfaces* — no threads, no clock, no
+host I/O — and it does not extend to one resource requirement worth knowing
+before you spawn anything. **The dispatch table is 512 KB and `Decoder::new()`
+builds it on the stack, so it needs at least 1 MB;** measured, 640 KB aborts and
+1024 KB succeeds, `Box` does not avoid it, and a Rust stack overflow is a process
+abort rather than a catchable panic. `wasm32`'s default 1 MB stack clears that bar
+but spends most of its margin on it, and the 8 MB main thread is why this never
+shows up in testing. Build the decoder once on the main thread and pass
+`&Decoder` to `step_with`. `decode.rs` has the full note.
+
 ## What the vectors actually establish
 
 `docs/hardware/68000-notes.md` is the durable output of this sub-project, and it
