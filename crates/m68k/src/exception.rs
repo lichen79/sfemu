@@ -246,11 +246,42 @@ pub fn entry_cycles(cpu: &M68k, accesses_made: u32, framed: u32) -> u32 {
 ///
 /// `old_sr` below is read when the exception is taken, so an instruction that
 /// updates flags and *then* traps stacks the **updated** flags. This is not
-/// incidental — measured suite-wide over all 76,957 vector-taking cases, the
-/// frame's low 5 bits match the post-instruction CCR in 76,369, against 72,848
-/// for an instruction-entry snapshot. The 3,521-case gap is exactly the
-/// flags-then-trap instructions: `CHK` 1,240, `RTR` 1,180, `MOVE.w` 604,
+/// incidental. Measured suite-wide over all **76,958** vector-taking cases —
+/// legal vectors {3..=11} ∪ {32..=47}, selected by the vector address the case
+/// reads — the frame's **low 5 bits** match the post-instruction CCR in
+/// **76,958 of 76,958**: universally. The same low-5 comparison against an
+/// *instruction-entry* snapshot scores 72,865. At **full word width** the
+/// entry-snapshot figure is 72,848.
+///
+/// The 4,093-case low-5 gap against the entry snapshot is exactly the
+/// flags-then-trap instructions, and these rows sum to it: `CHK` 1,241,
+/// `RTR` 1,180, `MOVE.w` 604, `RTE` 597, `MOVE.l` 471.
+///
+/// ⚠️ **Three things this paragraph used to get wrong, all of the same kind — a
+/// figure printed without the width, denominator or scope that makes it
+/// checkable.** It read "over all 76,957 vector-taking cases … match in 76,369,
+/// against 72,848", itemised as `CHK` 1,240 / `RTR` 1,180 / `MOVE.w` 604 /
 /// `MOVE.l` 471.
+///
+/// - The denominator was **76,957**, one short. The off-by-one comes from
+///   scoring all 256 vectors, which reaches 76,965 with seven singleton false
+///   positives (vectors 22/70/119/120/149/213/237). Select by the legal set
+///   above, and require the vector fetch's **read pair** at `v*4` and `v*4+2` in
+///   supervisor-data space (`fc` 5, which is what the suite records for a vector
+///   fetch) — a single read in the range also catches instructions that merely
+///   touch low memory, which is worth 6 cases here.
+/// - **72,848 is a full-word figure that was sitting inside a low-5-bits
+///   sentence.** Its low-5 counterpart is 72,865; the widths were crossed. Every
+///   figure above therefore names its width.
+/// - The itemisation did not close: 1,240 + 1,180 + 604 + 471 = 3,495, against a
+///   stated gap of 3,521. The `RTE` row was missing and `CHK` was one low.
+///
+/// `76,369` is not reproducible and is not any of the four predicates above; a
+/// suggested replacement of "full-word 76,370" is likewise unverified, so neither
+/// is printed here. Do not relabel one as the other — measure it. Note also that
+/// the stacked SR reaches `final_.sr` only through entry's S-set/T-clear
+/// normalisation, so **no comparison against `final_.sr` recovers the pre-entry
+/// word**: a "full == final SR" reading is 16,556 and means nothing.
 ///
 /// So a caller that traps must set the CCR **before** calling this, which is what
 /// [`crate::ops::muldiv`]'s `chk` does. Do not add an entry-time SR parameter to
@@ -258,9 +289,23 @@ pub fn entry_cycles(cpu: &M68k, accesses_made: u32, framed: u32) -> u32 {
 /// one stacked word, which reads as a flag bug in the compare rather than a frame
 /// bug.
 ///
-/// Entry sets S and clears T, and leaves the interrupt mask **unchanged** —
-/// `SR_MASK` keeps bits 10-8, so do not raise the IPL here (38,542/38,542 on each
-/// of the three).
+/// # What entry does to the SR, in three separately-measured legs
+///
+/// Over the 38,542 vector-taking cases that enter with `T` set, entry **sets S**
+/// (38,542/38,542) and **clears T** (38,542/38,542), and leaves the **interrupt
+/// mask** unchanged in **38,267 of 38,542**. `SR_MASK` keeps bits 10-8, so do not
+/// raise the IPL here.
+///
+/// The 275 mask changers are all `RTE`, which replaces the whole SR from the
+/// frame and so alters the mask by definition. Scoped to non-`RTE` entries the
+/// mask leg is universal too: **37,569/37,569**.
+///
+/// ⚠️ This used to read "sets S, clears T, and leaves the interrupt mask
+/// **unchanged** … (38,542/38,542 on each of the three)" — three legs collapsed
+/// onto one denominator, asserting as universal a quantity this project had
+/// already measured at 38,267 elsewhere in its own ledger. Two of the three legs
+/// really are 38,542/38,542; printing the third as though it were is what made
+/// the claim unfalsifiable. Keep them separate.
 pub fn take(cpu: &mut M68k, bus: &mut dyn Bus, vector: u8, pc_for_frame: u32) {
     if double_bus_fault(cpu) {
         return;
@@ -541,8 +586,10 @@ pub const IACK_AS_IDLE_CYCLES: u32 = 4;
 ///
 /// Entry raises the mask to the interrupt's own level, which is the one place a
 /// vector-taking path *does* touch bits 10-8 — [`take`] deliberately leaves them
-/// alone (38,542/38,542), so the raise happens here, after the frame is stacked
-/// with the old mask.
+/// alone (38,267 of 38,542; the 275 exceptions are all `RTE`, and 37,569/37,569
+/// once `RTE` is excluded — see [`take`]'s three legs, and do not cite this as
+/// 38,542/38,542), so the raise happens here, after the frame is stacked with the
+/// old mask.
 ///
 /// # The caller owns deassertion — and level 7 has no substitute for it
 ///
