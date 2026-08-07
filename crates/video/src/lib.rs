@@ -29,6 +29,7 @@ pub mod bank;
 pub mod layers;
 pub mod palette;
 pub mod regs;
+pub mod sprites;
 pub mod tiles;
 
 /// Visible pixels per line (`cps1.h:41-43`: HBSTART 448 − HBEND 64).
