@@ -661,12 +661,24 @@ mod tests {
     }
 
     /// A Line-F opcode uses vector 11, and a plain illegal opcode uses 4.
+    ///
+    /// ⚠️ The vector number below is an **independent literal**, not
+    /// [`VEC_LINE_F`] / [`VEC_ILLEGAL`]. This test used to derive the handler
+    /// address from the constant it was testing, which made the assertion
+    /// self-consistent for every constant value: the handler moved with the
+    /// mutation and the test still passed. Measured — `VEC_LINE_F = 12` survived
+    /// all 198 unit tests in that form and is killed here now, along with `= 10`
+    /// (which aliases Line-A) and `= 5`. `VEC_ILLEGAL` had independent coverage
+    /// either way: its mutants fail two tests, not one.
+    ///
+    /// Keep the literals. A test that installs the handler wherever the constant
+    /// points is checking self-consistency, never the vector number.
     #[test]
     fn line_f_and_plain_illegal_use_their_own_vectors() {
-        for (opcode, vector) in [(0xF000u16, VEC_LINE_F), (0x4AFC, VEC_ILLEGAL)] {
+        for (opcode, vector) in [(0xF000u16, 11u32), (0x4AFC, 4u32)] {
             let mut bus = FlatBus::new();
             bus.load(0x1000, &[opcode, 0x4E71]);
-            let vaddr = (vector as u32) * 4;
+            let vaddr = vector * 4;
             bus.put16(vaddr, 0x0000);
             bus.put16(vaddr + 2, 0x2000);
             bus.load(0x2000, &[0x4E71, 0x4E71]);

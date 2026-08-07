@@ -469,12 +469,24 @@ mod tests {
 
     /// `TRAP #n` uses vector `32 + n` and stacks `opcode + 2`, with no leading
     /// read.
+    ///
+    /// ⚠️ The base `32` below is an **independent literal**, not [`VEC_TRAP_BASE`].
+    /// Deriving the handler address from the constant under test makes the
+    /// assertion self-consistent for any constant value — the handler moves with
+    /// the mutation and the test still passes — which is how a wrong
+    /// `VEC_TRAP_BASE` stayed invisible to the test named for it. Measured:
+    /// `VEC_TRAP_BASE = 33` is killed here now; in the derived form it was killed
+    /// only incidentally, by an `exception.rs` trace test that happens to hard-code
+    /// `0x4004` for an unrelated reason.
+    ///
+    /// Keep the literal. See `exception::tests::line_f_and_plain_illegal_use_their_own_vectors`,
+    /// which had the same defect for `VEC_LINE_F`.
     #[test]
     fn trap_uses_vector_32_plus_n_and_stacks_opcode_plus_2() {
         for n in [0u16, 7, 15] {
             let mut bus = RecordingBus::new();
             bus.load(0x1000, &[0x4E40 + n, 0x4E71]);
-            let vaddr = (VEC_TRAP_BASE as u32 + n as u32) * 4;
+            let vaddr = (32 + n as u32) * 4;
             bus.put16(vaddr, 0x0000);
             bus.put16(vaddr + 2, 0x2000);
             bus.load(0x2000, &[0x4E71, 0x4E71]);
