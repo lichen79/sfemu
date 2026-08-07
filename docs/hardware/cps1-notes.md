@@ -21,7 +21,7 @@ Collection, or a board you own and dumped.
 
 Two crystals, and every other number on this page is derived from them by exact
 integer division. The primitives are MAME's `cps1.h:39-47`, which credits Charles
-MacDonald's measurements of a real board (`cps1.h:30-38`).
+MacDonald's measurements of a real board (`cps1.h:31-38`).
 
 ```
 CPS_PIXEL_CLOCK = XTAL(16'000'000) / 2 = 8,000,000 Hz     cps1.h:39
@@ -31,7 +31,7 @@ CPS_HBSTART     = 448   one past the last visible column  cps1.h:43
 CPS_VTOTAL      = 262   scanlines per frame               cps1.h:45
 CPS_VBEND       = 16    first visible scanline            cps1.h:46
 CPS_VBSTART     = 240   one past the last visible line    cps1.h:47
-68000 clock     = XTAL(10'000'000), "verified on pcb"     cps1.cpp:3911
+68000 clock     = XTAL(10'000'000), "verified on pcb"     cps1.cpp:3912
 ```
 
 Derived, each with its arithmetic:
@@ -118,23 +118,24 @@ renderer consumes `Board` state per scanline. Anything finer is work C cannot us
 `cps_state::main_map`, `cps1.cpp:577-594`. Ranges MAME gives no handler are
 genuinely undecoded and float high.
 
-The "MAME line" column cites the individual `map(...)` line where one was read
-directly, and the handler function's line range in every case. Where a map line is
-not cited individually, the range `577-594` is the citation and only the handler
-line is exact — the map lines were not each read, and interpolating them from their
-neighbours would be a guess dressed as a reference.
+Every line number below was read from the file, not inferred. That distinction has
+already cost this document once: an earlier draft cited four map lines it had
+interpolated from their neighbours, and although the guesses turned out to be
+right when the reference was finally read, a citation whose accuracy is luck is
+not a citation. The MAME tree read here is `master` as of 2026-08-07; the "handler"
+citations give the function's first line.
 
 | Range | Direction | MAME line | What it is |
 |---|---|---|---|
 | `000000-3FFFFF` | R, W discarded | `cps1.cpp:4063` (`CODE_SIZE`) | Program ROM space. SF2's files populate only `000000-0FFFFF`; the rest reads as zero. |
 | `800000-800007` | R | `:579-580` | IN1 — player controls. One 16-bit port across 8 bytes: all four word offsets read the same value. `:580` gives it no write handler, so it is read-only. |
-| `800018-80001F` | R | handler `:257-272` | `cps1_dsw_r`: four word offsets select IN0, DSWA, DSWB, DSWC in that order, and there is no fifth. |
+| `800018-80001F` | R | `:582`, handler `:257` | `cps1_dsw_r`: four word offsets select IN0, DSWA, DSWB, DSWC in that order, and there is no fifth. |
 | `800020-800021` | R | `:583` | `nopr()` — decoded, returns nothing in particular. |
-| `800030-800037` | W | handler `:316-327` | `cps1_coinctrl_w` — coin counters and lockouts. |
+| `800030-800037` | W | `:584`, handler `:316` | `cps1_coinctrl_w` — coin counters and lockouts. |
 | `800100-80013F` | W | `:586`, handler `cps1_v.cpp:2115` | CPS-A register file, 32 words. **Write-only** — `:586` gives it no read handler. |
-| `800140-80017F` | R/W | `:589`, handlers `cps1_v.cpp:2139`, `:2183` | CPS-B register file, 32 words. |
-| `800180-800187` | W | handler `:300-306` | `cps1_soundlatch_w` — the sound command. |
-| `800188-80018F` | W | handler `:308-312` | `cps1_soundlatch2_w` — the fade latch. |
+| `800140-80017F` | R/W | `:589`, handlers `cps1_v.cpp:2136`, `:2183` | CPS-B register file, 32 words. |
+| `800180-800187` | W | `:590`, handler `:302` | `cps1_soundlatch_w` — the sound command. |
+| `800188-80018F` | W | `:591`, handler `:310` | `cps1_soundlatch2_w` — the fade latch. |
 | `900000-92FFFF` | R/W | `:592` | gfxram, 192 KB. Readable as well as writable: SF2CE executes code from it. |
 | `FF0000-FFFFFF` | R/W | `:593` | Main RAM, 64 KB. |
 
