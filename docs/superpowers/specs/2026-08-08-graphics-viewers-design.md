@@ -191,9 +191,9 @@ Two consequences that must be written down rather than discovered:
   session, not the machine. `Cps1::restore` touches `Video` only through
   `set_obj_latch`, so this holds as the tree stands and gets a test to pin it.
 
-## The two API changes in `video`
+## The API changes in `video`
 
-Both are gaps found by survey rather than designed, and both are the minimum:
+Every one is a gap found by survey rather than designed, and each is the minimum:
 
 ```rust
 // crates/video/src/compose.rs
@@ -216,6 +216,10 @@ impl Video {
 /// Whether the *guest* has this layer enabled. Was private.
 pub fn layer_enabled(cfg: &VideoConfig, layer: Layer,
                      layercontrol: u16, videocontrol: u16) -> bool;
+
+/// Whether the layer at `depth` prepares the sprite mask: the next depth is
+/// the sprites. Extracted from `render`, which now calls it.
+pub fn feeds_sprites(order: &[u8; DEPTHS], depth: usize) -> bool;
 ```
 
 `enable` is a public field on `Video` rather than a parameter to `render`, and the
@@ -224,9 +228,19 @@ choice is between one default-valued field and threading an argument through
 for a value that is `all()` at every one of those call sites. The field is honest
 about what it is: a persistent view setting, like `Debugger::panels`.
 
-`render` combines the two with `&&`, in that order: the hardware's answer first,
-then the mask. Sprites gain their first enable check, which the mask is the only
-thing that can fail.
+**The viewer never writes it.** `gfx.rs` computes a `LayerMask` and the loop
+assigns it, exactly as `Debugger` returns decisions and the loop performs them.
+This keeps every `frontend` entry point on `&Cps1` and leaves one place where a
+view setting reaches the machine.
+
+`render` combines the hardware's answer with the mask using `&&`, in that order.
+Sprites gain their first enable check, which the mask is the only thing that can
+fail.
+
+`feeds_sprites` is one line, and extracting it is the same argument as
+`layer_enabled`'s at smaller scale: the layers view's "feeds sprites" column must
+be the renderer's answer, and a second `order.get(depth + 1) == Some(&0)` written
+in `frontend` is a second answer.
 
 **E3 adds no dependency and no manifest change**, and reaches `video` the way
 `frontend` already does — `machine::video`, never past `machine`. Verified against
@@ -279,7 +293,8 @@ total match that will not compile until each is mapped. All five exist in
 
 ```
 crates/video/src/compose.rs        LayerMask, Video::enable, Video::gfx,
-                                   layer_enabled published (modified)
+                                   layer_enabled and feeds_sprites
+                                   published (modified)
 crates/frontend/src/gfx.rs         the viewer's state: which view, the cursors
 crates/frontend/src/gfxpanels.rs   the pixels: four view drawers
 crates/frontend/src/keys.rs        five keys, and KeySet becomes u64 (modified)
