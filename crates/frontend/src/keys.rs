@@ -96,6 +96,16 @@ pub enum Key {
     PageDown,
     /// Return the focused panel to following the machine.
     Home,
+    /// Show or hide the graphics viewer.
+    GfxToggled,
+    /// Cycle which graphics view is shown.
+    GfxView,
+    /// Page or move back within the graphics view.
+    BracketLeft,
+    /// Page or move forward within the graphics view.
+    BracketRight,
+    /// Act on the current graphics view.
+    Enter,
 }
 
 impl Key {
@@ -104,7 +114,7 @@ impl Key {
     /// `tests::all_lists_every_key_exactly_once` fails if a variant is added and
     /// not listed here, which is what stops the tests that iterate this from
     /// quietly narrowing.
-    pub const ALL: [Key; 29] = [
+    pub const ALL: [Key; 34] = [
         Key::Up,
         Key::Down,
         Key::Left,
@@ -134,6 +144,11 @@ impl Key {
         Key::PageUp,
         Key::PageDown,
         Key::Home,
+        Key::GfxToggled,
+        Key::GfxView,
+        Key::BracketLeft,
+        Key::BracketRight,
+        Key::Enter,
     ];
 
     /// This key's bit in a [`KeySet`].
@@ -141,7 +156,7 @@ impl Key {
     /// A `match` and not `self as u32`: a cast makes the bit a function of
     /// declaration order, so reordering the enum for readability would silently
     /// remap every key. Written out, a reorder changes nothing.
-    const fn bit(self) -> u32 {
+    pub(crate) const fn bit(self) -> u32 {
         match self {
             Key::Up => 0,
             Key::Down => 1,
@@ -172,6 +187,11 @@ impl Key {
             Key::PageUp => 26,
             Key::PageDown => 27,
             Key::Home => 28,
+            Key::GfxToggled => 29,
+            Key::GfxView => 30,
+            Key::BracketLeft => 31,
+            Key::BracketRight => 32,
+            Key::Enter => 33,
         }
     }
 }
@@ -179,11 +199,16 @@ impl Key {
 /// Which keys are held.
 ///
 /// A bitmask rather than a `Vec`, so [`Controls`] can keep last frame's set by
-/// copy and the edge detection is one `&`. Twenty-nine keys fit a `u32` with room
-/// to spare.
+/// copy and the edge detection is one `&`.
+///
+/// `u64` and not `u32`: 34 keys hold bits 0-33. It was a `u32` through E2's 29 keys,
+/// and the alternative to widening was overloading `PageUp`/`PageDown`/`Home` to
+/// mean something else while the graphics viewer is up — which would have reached 31
+/// keys, leaving exactly one free bit, and `scripts/mutate.py`'s control mutant needs
+/// a free bit to move `Escape` to. A `u64` is one field type and 30 bits to spare.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KeySet {
-    bits: u32,
+    bits: u64,
 }
 
 impl KeySet {
@@ -194,12 +219,12 @@ impl KeySet {
 
     /// Marks `k` held.
     pub fn press(&mut self, k: Key) {
-        self.bits |= 1 << k.bit();
+        self.bits |= 1u64 << k.bit();
     }
 
     /// Whether `k` is held.
     pub fn contains(&self, k: Key) -> bool {
-        self.bits & (1 << k.bit()) != 0
+        self.bits & (1u64 << k.bit()) != 0
     }
 
     /// A set of exactly these keys.
@@ -253,6 +278,16 @@ pub struct Actions {
     pub scroll_down: bool,
     /// Return the focused panel to following the machine.
     pub follow_reset: bool,
+    /// Show or hide the graphics viewer.
+    pub gfx_toggled: bool,
+    /// Cycle to the next graphics view.
+    pub gfx_view_cycled: bool,
+    /// Move back within the graphics view.
+    pub gfx_back: bool,
+    /// Move forward within the graphics view.
+    pub gfx_forward: bool,
+    /// Act on the current graphics view — cycle its tile kind or layer, or toggle.
+    pub gfx_act: bool,
 }
 
 /// The keyboard, frame to frame.
@@ -319,6 +354,13 @@ impl Controls {
             scroll_up: edge(Key::PageUp),
             scroll_down: edge(Key::PageDown),
             follow_reset: edge(Key::Home),
+            // Edge-triggered, every one, for the reason written just above: a held
+            // `]` walking sixty pages a second is not a way to find a tile.
+            gfx_toggled: edge(Key::GfxToggled),
+            gfx_view_cycled: edge(Key::GfxView),
+            gfx_back: edge(Key::BracketLeft),
+            gfx_forward: edge(Key::BracketRight),
+            gfx_act: edge(Key::Enter),
         };
         self.was = now;
         actions
@@ -342,6 +384,8 @@ mod tests {
         assert!(!a.overlay_toggled && !a.step_instruction && !a.focus_cycled);
         assert!(!a.breakpoint_toggled && !a.scroll_up && !a.scroll_down);
         assert!(!a.follow_reset);
+        assert!(!a.gfx_toggled && !a.gfx_view_cycled && !a.gfx_act);
+        assert!(!a.gfx_back && !a.gfx_forward);
     }
 
     /// Each game key clears exactly its own port bit, with the expected values as
@@ -467,20 +511,20 @@ mod tests {
 
     /// Every control key is edge-triggered, not just the one above.
     ///
-    /// Checked as a table over all fourteen, because the natural implementation is one
+    /// Checked as a table over all nineteen, because the natural implementation is one
     /// `edge` helper per action and the natural mistake is to forget it on one of
-    /// them — which then works exactly once out of fourteen, in whichever action the
+    /// them — which then works exactly once out of nineteen, in whichever action the
     /// author tested by hand.
     ///
-    /// The debugger's seven are in the same table as the original seven rather than a
-    /// table of their own: they are the same kind of thing, and a separate table is a
-    /// second place to forget to add a row.
+    /// The debugger's seven and the graphics viewer's five are in the same table as
+    /// the original seven rather than tables of their own: they are the same kind of
+    /// thing, and a separate table is a second place to forget to add a row.
     #[test]
     fn every_control_action_is_edge_triggered() {
         /// Reads one action's flag. Named because clippy calls the inline array
         /// type too complex, and it is: a table of key-and-accessor pairs.
         type Reader = fn(&Actions) -> bool;
-        let cases: [(Key, Reader); 14] = [
+        let cases: [(Key, Reader); 19] = [
             (Key::P, |a| a.pause_toggled),
             (Key::Period, |a| a.step),
             (Key::F3, |a| a.reset),
@@ -495,6 +539,11 @@ mod tests {
             (Key::PageUp, |a| a.scroll_up),
             (Key::PageDown, |a| a.scroll_down),
             (Key::Home, |a| a.follow_reset),
+            (Key::GfxToggled, |a| a.gfx_toggled),
+            (Key::GfxView, |a| a.gfx_view_cycled),
+            (Key::BracketLeft, |a| a.gfx_back),
+            (Key::BracketRight, |a| a.gfx_forward),
+            (Key::Enter, |a| a.gfx_act),
         ];
         // Every key that is not a game input and not the test switch must be in the
         // table. Without this, adding a key and forgetting the row leaves the new
@@ -609,6 +658,37 @@ mod tests {
         }
     }
 
+    /// Every key's bit fits the set, and the set is wide enough for the next one.
+    ///
+    /// `every_key_has_its_own_slot` proves the bits are distinct; it does not prove
+    /// they are *reachable*. `1u32 << 33` is a shift overflow — a debug-build panic
+    /// and a release-build wrap to bit 1, which would silently alias `GfxView` to
+    /// `Down`. So the width is asserted against the highest bit any key uses.
+    #[test]
+    fn every_key_fits_the_set_with_room_left() {
+        let highest = Key::ALL.iter().map(|k| k.bit()).max().expect("29+ keys");
+        assert!(
+            highest < u64::BITS,
+            "key bit {highest} does not fit a u64 KeySet"
+        );
+        // Not merely "fits": every key must round-trip through a set, which a
+        // wrapped shift would break by aliasing two keys onto one bit.
+        for k in Key::ALL {
+            let s = KeySet::from_keys(&[k]);
+            assert!(
+                s.contains(k),
+                "{k:?} on bit {} does not round-trip",
+                k.bit()
+            );
+            let others = Key::ALL.iter().filter(|&&o| o != k).count();
+            assert_eq!(
+                Key::ALL.iter().filter(|&&o| s.contains(o)).count(),
+                1,
+                "{k:?} aliases one of the other {others} keys"
+            );
+        }
+    }
+
     /// `Key::ALL` lists every variant.
     ///
     /// Four tests above iterate `ALL` and would silently stop covering a key that
@@ -619,7 +699,7 @@ mod tests {
     fn all_lists_every_key_exactly_once() {
         assert_eq!(
             Key::ALL.len(),
-            29,
+            34,
             "add new keys to ALL, and to this literal"
         );
         for (i, a) in Key::ALL.iter().enumerate() {

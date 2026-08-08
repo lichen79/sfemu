@@ -151,6 +151,11 @@ fn translate(k: minifb::Key) -> Option<Key> {
         M::PageUp => Key::PageUp,
         M::PageDown => Key::PageDown,
         M::Home => Key::Home,
+        M::F9 => Key::GfxToggled,
+        M::F10 => Key::GfxView,
+        M::LeftBracket => Key::BracketLeft,
+        M::RightBracket => Key::BracketRight,
+        M::Enter => Key::Enter,
         _ => return None,
     })
 }
@@ -297,6 +302,11 @@ mod tests {
             M::PageUp,
             M::PageDown,
             M::Home,
+            M::F9,
+            M::F10,
+            M::LeftBracket,
+            M::RightBracket,
+            M::Enter,
         ];
         for want in Key::ALL {
             let n = candidates
@@ -312,7 +322,7 @@ mod tests {
         // panic, because `minifb` reports keys this program has no opinion about.
         assert_eq!(translate(M::Q), None, "an unmapped key is None");
         assert_eq!(
-            translate(M::F9),
+            translate(M::F11),
             None,
             "including a neighbouring function key"
         );
