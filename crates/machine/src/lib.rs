@@ -36,6 +36,15 @@ pub mod trace;
 /// crate — the same reasoning that keeps `m68k` out of `sfemu`'s manifest.
 pub use video;
 
+/// The CPU crate, re-exported, for the same reason [`video`] is.
+///
+/// A save-state codec has to name [`m68k::M68k`] — [`MachineState::cpu`] is one —
+/// and it has to construct one to fill from a file. Re-exporting is how `frontend`
+/// does that while keeping its manifest one dependency wide: a second edge on
+/// `m68k` would let `frontend` reach past `machine` into the core, which is the
+/// coupling the boundary exists to prevent.
+pub use m68k;
+
 pub use board::Board;
 pub use config::BoardConfig;
 pub use cps1::Cps1;

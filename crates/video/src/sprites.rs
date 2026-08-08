@@ -81,6 +81,17 @@ impl ObjLatch {
         &self.words
     }
 
+    /// The latched words, for a save-state decoder to fill.
+    ///
+    /// ⚠️ **Not for the renderer or the beam.** [`ObjLatch::latch`] is what a vblank
+    /// calls, and it reads the table the guest wrote. This exists because a decoder
+    /// has bytes from a file and no gfxram to latch from — and because a decoder
+    /// that had to build a `Box<[u16; OBJ_WORDS]>` to hand over would allocate a
+    /// second one for no reason.
+    pub fn words_mut(&mut self) -> &mut [u16; OBJ_WORDS] {
+        &mut self.words
+    }
+
     /// Word offset of the last drawable sprite record, or [`None`] for none.
     ///
     /// `find_last_sprite` (`cps1_v.cpp:2684`) walks forward in steps of four for
