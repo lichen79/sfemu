@@ -1,0 +1,15 @@
+[package]
+name = "frontend"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Frame pacing, controls, and save states — everything a frontend decides, with no window"
+
+# One dependency, and it must stay one. A windowing crate belongs to `sfemu`:
+# naming one here would put the key map and the pacer behind a boundary no test
+# can reach, which is the whole reason this crate is separate from `sfemu`.
+# `romset` would drag in miniz_oxide. `video` arrives through `machine`'s
+# `pub use video`.
+[dependencies]
+machine = { path = "../machine" }
