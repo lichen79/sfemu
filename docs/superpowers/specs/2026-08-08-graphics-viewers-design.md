@@ -220,6 +220,16 @@ pub fn layer_enabled(cfg: &VideoConfig, layer: Layer,
 /// Whether the layer at `depth` prepares the sprite mask: the next depth is
 /// the sprites. Extracted from `render`, which now calls it.
 pub fn feeds_sprites(order: &[u8; DEPTHS], depth: usize) -> bool;
+
+/// Depths the compositor draws. Was private, and is in two public signatures.
+pub const DEPTHS: usize = 4;
+
+// crates/video/src/layers.rs
+
+/// One axis of a layer's map coordinate: the tile index modulo the map's 64,
+/// and the offset within that tile, from a raster position. Extracted from
+/// `draw_tilemap`, which now calls it for both axes.
+pub fn map_axis(edge: u32, raster: i32) -> (u32, u32);
 ```
 
 `enable` is a public field on `Video` rather than a parameter to `render`, and the
@@ -241,6 +251,25 @@ fail.
 `layer_enabled`'s at smaller scale: the layers view's "feeds sprites" column must
 be the renderer's answer, and a second `order.get(depth + 1) == Some(&0)` written
 in `frontend` is a second answer.
+
+`map_axis` is the same argument again, and it is the one with teeth. The tilemap
+view's cursor default — the tile at the top-left of the visible screen — is
+`draw_tilemap`'s own opening arithmetic:
+
+```rust
+let map_y = y as i32 + VISIBLE_Y + rows.scroll_y;
+let row = map_y.div_euclid(step).rem_euclid(tiles) as u32;
+let ty  = map_y.rem_euclid(step) as u32;
+```
+
+Four things a viewer must get right to agree with the picture — the `VISIBLE_X`/
+`VISIBLE_Y` bias, `div_euclid` rather than `/`, `rem_euclid` rather than `%`, and
+the wrap at 64 tiles — and `video`'s own history says how that goes: the crate had
+to fix the raster-coordinate bias three times, from three independent readings of
+MAME. A viewer that got it wrong would report a tile the renderer never fetched,
+which is worse than no viewer: it is a diagnostic that lies at exactly the moment
+you are trusting it. Extracted, `draw_tilemap` calls it for both axes and the
+viewer calls it for its cursor, so the four decisions exist once.
 
 **E3 adds no dependency and no manifest change**, and reaches `video` the way
 `frontend` already does — `machine::video`, never past `machine`. Verified against
@@ -293,8 +322,9 @@ total match that will not compile until each is mapped. All five exist in
 
 ```
 crates/video/src/compose.rs        LayerMask, Video::enable, Video::gfx,
-                                   layer_enabled and feeds_sprites
+                                   layer_enabled, feeds_sprites, and DEPTHS
                                    published (modified)
+crates/video/src/layers.rs         map_axis extracted and published (modified)
 crates/frontend/src/gfx.rs         the viewer's state: which view, the cursors
 crates/frontend/src/gfxpanels.rs   the pixels: four view drawers
 crates/frontend/src/keys.rs        five keys, and KeySet becomes u64 (modified)
@@ -328,6 +358,12 @@ and is asserted against a buffer. What is testable, and how:
 - **The tilemap view's codes are `tile_info`'s**, over a gfxram written with known
   codes — so a wrong scan mapper or a wrong table base shows up as the wrong code
   in the wrong cell.
+- **The cursor's default is the tile the renderer drew at the top-left pixel.**
+  Not by calling `map_axis` twice — that would assert it equals itself — but by
+  rendering a frame with a distinctive tile at one map position and a negative
+  scroll, and requiring the cursor to name *that* position. This is what makes the
+  `map_axis` extraction load-bearing rather than tidy, and the negative scroll is
+  the case that separates `div_euclid` from `/`.
 - **An unmapped code renders as `----`, not as tile 0.** The one case the picture
   cannot show.
 - **The mask can only subtract.** Over every one of the sixteen masks, a layer the
