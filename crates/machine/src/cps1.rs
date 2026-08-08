@@ -30,8 +30,8 @@ pub struct Cps1 {
     pub total_cycles: u64,
     /// The current scanline, `0..lines_per_frame`.
     pub line: u32,
-    /// How far the last instruction overran its scanline budget, as a value `<= 0`
-    /// carried into the next line.
+    /// The current scanline's remaining cycle budget, counting down; `<= 0` between
+    /// lines, where it is how far the last instruction overran.
     ///
     /// The 68000 cannot be stopped mid-instruction — a `divs` costs 158 cycles and
     /// does not divide at a scanline boundary — so overshoot is inherent. Carrying
@@ -40,6 +40,15 @@ pub struct Cps1 {
     /// slightly long and the frame rate slightly slow: music drifting against
     /// animation over a match, with nothing ever looking broken enough to
     /// investigate.
+    ///
+    /// It holds the *live* budget rather than only the overshoot because that is
+    /// what makes [`Cps1::step_instruction`] possible: a budget living in
+    /// `run_scanline`'s stack frame cannot survive a return to the caller, and a
+    /// debugger stepping one instruction is exactly such a caller. The two readings
+    /// coincide wherever anything observes this field — [`Cps1::run_scanline`] and
+    /// [`Cps1::run_frame`] both return with a line finished — so a
+    /// [`MachineState`] saved at a frame boundary carries the same value and means
+    /// the same thing as before.
     carry: i64,
     /// The video subsystem: the graphics ROM, the object latch, and the frame.
     pub video: Video,
@@ -93,61 +102,95 @@ impl Cps1 {
         self.carry = 0;
     }
 
+    /// Runs exactly one 68000 instruction, returning the cycles it consumed.
+    ///
+    /// The debugger's stepping primitive, and [`Cps1::run_scanline`] is a loop over
+    /// it — **one code path deliberately.** A separate stepping path is a debugger
+    /// that single-steps a machine subtly unlike the one that runs, and the IRQ sync
+    /// below is the specific thing that would be left out of it: the symptom would be
+    /// a machine that takes no interrupts under the debugger, which is the thing a
+    /// debugger is most often opened to investigate.
+    ///
+    /// One instruction can overrun the scanline budget — a `divs` costs 158 cycles
+    /// and does not divide at a line boundary — so this may end a line, in which case
+    /// it does everything the end of a line does: sample the PC, advance the beam, and
+    /// count a frame on the wrap. Arriving at [`Timing::vblank_line`] asserts vblank
+    /// and latches the object table, once for the line however many instructions it
+    /// takes.
+    pub fn step_instruction(&mut self) -> u32 {
+        // The start-of-line work. It lives here rather than in `run_scanline` so that
+        // a caller which only ever steps still gets it, and it is guarded on the
+        // budget being spent so it happens once per line rather than once per
+        // instruction.
+        if self.carry <= 0 {
+            self.carry += i64::from(self.timing.cycles_per_line);
+            // Vblank: IPL1 on the line the beam leaves the visible area
+            // (`cps1.cpp:394-396`). CPS-1 wires the IPL pins individually —
+            // `set_interrupt_mixer(false)`, `cps1.cpp:3913` — so IPL1 is level 2, not
+            // an encoded priority.
+            if self.line == self.timing.vblank_line {
+                self.board.assert_vblank();
+                // The object table is latched here, once per frame, at the same
+                // instant vblank is asserted — `cps1_v.cpp:3060-3068`, where the
+                // memcpy sits in `screen_vblank_cps1` under "CPS1 sprites have to be
+                // delayed one frame". Taking it from the frame schedule rather than
+                // simulating a delay is what makes the delay exactly one frame for a
+                // caller driving scanlines — or instructions — by hand as much as for
+                // a `run_frame` caller.
+                self.video
+                    .latch_objects(&self.board.gfxram[..], &self.board.cps_a);
+            }
+        }
+        // Re-drive the level from the board's own state before **every** step, not
+        // once per scanline.
+        //
+        // `M68k::pending_irq` is a level and nothing in the core clears it, while the
+        // acknowledge happens on the board — on the far side of the bus. Set once per
+        // line, the level would still read 2 after the handler's `rte` dropped the
+        // mask, so the handler would re-enter for the rest of the line: the 640-cycle
+        // budget fits about seven passes of a 90-cycle handler. Syncing per step is
+        // what makes "the board owns deassertion" actually true, and it costs one
+        // field write per instruction.
+        self.cpu
+            .set_irq(if self.board.vblank_pending() { 2 } else { 0 });
+        // A halted CPU still burns time — the core returns 4 rather than 0 — so the
+        // budget always decreases and a line can always end.
+        let c = self.cpu.step_with(&self.dec, &mut self.board);
+        self.carry -= i64::from(c);
+        self.total_cycles += u64::from(c);
+        if self.carry <= 0 {
+            // One sample per scanline, taken after the line has run so the PC is where
+            // the program got to rather than where it started.
+            self.board.trace.sample_pc(self.cpu.pc);
+            self.line = (self.line + 1) % self.timing.lines_per_frame;
+            // Counted on the wrap rather than in `run_frame`, so a caller driving
+            // scanlines by hand — the debugger, and every test in this crate — counts
+            // the same frames a `run_frame` caller does.
+            if self.line == 0 {
+                self.board.trace.frames += 1;
+            }
+        }
+        c
+    }
+
     /// Runs one scanline's worth of CPU, returning the cycles actually consumed.
     ///
     /// Consumes at least `cycles_per_line + carry` cycles; the excess becomes the
     /// next line's carry, so the running total never drifts above
     /// `cycles_per_line × lines` by more than one instruction's cost.
     pub fn run_scanline(&mut self) -> u32 {
-        // Vblank: IPL1 on the line the beam leaves the visible area
-        // (`cps1.cpp:394-396`). CPS-1 wires the IPL pins individually —
-        // `set_interrupt_mixer(false)`, `cps1.cpp:3913` — so IPL1 is level 2, not an
-        // encoded priority.
-        if self.line == self.timing.vblank_line {
-            self.board.assert_vblank();
-            // The object table is latched here, once per frame, at the same instant
-            // vblank is asserted — `cps1_v.cpp:3060-3068`, where the memcpy sits in
-            // `screen_vblank_cps1` under "CPS1 sprites have to be delayed one
-            // frame". Taking it from the frame schedule rather than simulating a
-            // delay is what makes the delay exactly one frame for a caller driving
-            // scanlines by hand as much as for a `run_frame` caller.
-            self.video
-                .latch_objects(&self.board.gfxram[..], &self.board.cps_a);
+        let start = self.total_cycles;
+        let line = self.line;
+        // `step_instruction` advances `line` when the budget runs out, so this ends
+        // when — and only when — the line it was called on has finished. It cannot
+        // spin: every step spends at least four cycles against a finite budget.
+        while self.line == line {
+            self.step_instruction();
         }
-        let mut budget = i64::from(self.timing.cycles_per_line) + self.carry;
-        let mut spent = 0u32;
-        while budget > 0 {
-            // Re-drive the level from the board's own state before **every** step,
-            // not once per scanline.
-            //
-            // `M68k::pending_irq` is a level and nothing in the core clears it, while
-            // the acknowledge happens on the board — on the far side of the bus. Set
-            // once per line, the level would still read 2 after the handler's `rte`
-            // dropped the mask, so the handler would re-enter for the rest of the
-            // line: the 640-cycle budget fits about seven passes of a 90-cycle
-            // handler. Syncing per step is what makes "the board owns deassertion"
-            // actually true, and it costs one field write per instruction.
-            self.cpu
-                .set_irq(if self.board.vblank_pending() { 2 } else { 0 });
-            // A halted CPU still burns time — the core returns 4 rather than 0 —
-            // so `budget` always decreases and this cannot spin forever.
-            let c = self.cpu.step_with(&self.dec, &mut self.board);
-            budget -= i64::from(c);
-            spent += c;
-        }
-        self.carry = budget; // <= 0
-        self.total_cycles += u64::from(spent);
-        // One sample per scanline, taken after the line has run so the PC is where
-        // the program got to rather than where it started.
-        self.board.trace.sample_pc(self.cpu.pc);
-        self.line = (self.line + 1) % self.timing.lines_per_frame;
-        // Counted on the wrap rather than in `run_frame`, so a caller driving
-        // scanlines by hand — the debugger, and every test in this crate — counts
-        // the same frames a `run_frame` caller does.
-        if self.line == 0 {
-            self.board.trace.frames += 1;
-        }
-        spent
+        // A line is hundreds of cycles, so this cannot truncate; `try_from` rather
+        // than `as` so that if it somehow could, it saturates visibly instead of
+        // wrapping to a small number that looks like a fast line.
+        u32::try_from(self.total_cycles - start).unwrap_or(u32::MAX)
     }
 
     /// Runs `lines_per_frame` scanlines.
@@ -262,6 +305,222 @@ mod tests {
         let mut m = Cps1::new(&spin(), BoardConfig::sf2(), Timing::cps1_10mhz());
         m.reset();
         m
+    }
+
+    /// [`spin`], but with the mask down and a level-2 handler that counts itself.
+    ///
+    /// ```text
+    /// 0068  0000 2000        the level-2 autovector -> 0x2000
+    /// 1000  46FC 2000   move  #$2000,sr        supervisor, interrupt mask 0
+    /// 1004  4E71        nop
+    /// 1006  60FC        bra   $1004
+    /// 2000  5279 00FF 0000   addq.w #1,$FF0000
+    /// 2006  4E73        rte
+    /// ```
+    ///
+    /// The fixture for everything about [`Cps1::step_instruction`], and it is this
+    /// program rather than [`spin`] for three reasons, each of which a weaker fixture
+    /// would silently drop from the claim:
+    ///
+    /// - **The interrupt is taken and acknowledged.** `spin` masks to 7, so
+    ///   `trace.acks` stays 0 and a stepping path that forgot to re-drive the IRQ
+    ///   level would compare equal to a running one. Here the handler's own
+    ///   increment in `ram[0]` is the artifact.
+    /// - **The loop straddles scanline boundaries.** `nop` + `bra.s` is 14 cycles
+    ///   against a 640-cycle budget, so the carry is non-zero on nearly every line
+    ///   — see [`spin`]'s own note on why a bare `bra.s -2` cannot show that.
+    /// - **It contains multi-word instructions.** `move #imm,sr` is two words and
+    ///   `addq.w #1,$FF0000` is three, so a claim about an instruction's address is
+    ///   not satisfiable by a fixture where every instruction is one word.
+    ///
+    /// Encodings are [`spin`]'s and `tests/programs.rs`'s, both verified against
+    /// `m68k::disasm` and quoted there.
+    fn a_running_machine() -> Cps1 {
+        let mut rom = vec![0u8; 0x4000];
+        rom[0..8].copy_from_slice(&[0x00, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00]);
+        // Autovector level 2 = vector 24 + 2 = 26, at 26 * 4 = 0x68.
+        rom[0x68..0x6C].copy_from_slice(&[0x00, 0x00, 0x20, 0x00]);
+        rom[0x1000..0x1008].copy_from_slice(&[0x46, 0xFC, 0x20, 0x00, 0x4E, 0x71, 0x60, 0xFC]);
+        rom[0x2000..0x2008].copy_from_slice(&[0x52, 0x79, 0x00, 0xFF, 0x00, 0x00, 0x4E, 0x73]);
+        let mut m = Cps1::new(&rom, BoardConfig::sf2(), Timing::cps1_10mhz());
+        m.reset();
+        m
+    }
+
+    /// Runs `f` on a thread with an 8 MB stack.
+    ///
+    /// A `Cps1` is 525 KB, almost all of it [`Decoder`]'s 512 KB dispatch table, and
+    /// `Decoder::new` builds that table *on the stack* before it lands in the struct
+    /// — `m68k::decode`'s own note measures the floor at 1 MB and records that
+    /// `Box::new` does not avoid it. So two live machines do not fit a test thread's
+    /// 2 MB, and elsewhere in this crate the answer is "one machine, not two".
+    ///
+    /// A divergence test cannot take that answer: comparing two ways of running the
+    /// *same* program is the entire claim, and it needs both machines alive at once.
+    /// Hence an explicit stack rather than a contorted single-machine version. The
+    /// overflow it avoids is a process abort rather than a test failure, so getting
+    /// this wrong does not look like a bug in the thing under test.
+    fn on_a_big_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(f)
+            .expect("spawn")
+            .join()
+            .expect("the divergence test panicked; its own message is above");
+    }
+
+    /// One frame by scanlines and one frame by `run_frame` reach the same machine.
+    ///
+    /// A baseline, not a tautology: it passes trivially as written, because
+    /// `run_frame` *is* a loop over `run_scanline`. It exists to pin current
+    /// behaviour before [`Cps1::step_instruction`] is extracted out from under both,
+    /// so that a refactor which changes what a frame does fails here — and can only
+    /// fail here for that reason.
+    #[test]
+    fn a_frame_of_scanlines_equals_a_frame() {
+        on_a_big_stack(|| {
+            let mut a = a_running_machine();
+            let mut b = a_running_machine();
+            for _ in 0..a.timing.lines_per_frame {
+                a.run_scanline();
+            }
+            b.run_frame();
+            assert_eq!(a.total_cycles, b.total_cycles, "cycles");
+            assert_eq!(a.line, b.line, "beam");
+            assert_eq!(a.carry, b.carry, "and the schedule's debt");
+            assert_eq!(a.cpu, b.cpu, "the whole CPU, every field");
+            assert_eq!(&a.board.ram[..], &b.board.ram[..], "RAM");
+            assert_eq!(a.board.trace.frames, b.board.trace.frames, "frames");
+            assert_eq!(a.board.trace.vblanks, b.board.trace.vblanks, "vblanks");
+            assert_eq!(a.board.trace.acks, b.board.trace.acks, "acks");
+
+            // The premises. Without these the test passes for two machines that both did
+            // nothing, and every claim above is vacuous.
+            assert_ne!(a.total_cycles, 0, "the machines ran");
+            assert_eq!(a.board.trace.vblanks, 1, "a frame contains one vblank");
+            assert_eq!(a.board.trace.acks, 1, "which was acknowledged");
+            assert_eq!(a.board.ram[0], 1, "and the handler ran, once");
+        });
+    }
+
+    /// N instructions equal one frame, for an N the machine reports itself.
+    ///
+    /// **The test the refactor exists to satisfy**, and a divergence rather than a
+    /// comparison: the count comes from stepping until the frame wraps, then running
+    /// the same program on a fresh machine with `run_frame`. A literal N would be a
+    /// number to re-derive every time the fixture changed, and would be wrong in a
+    /// way that looked like a refactor bug.
+    #[test]
+    fn instructions_add_up_to_a_frame() {
+        on_a_big_stack(|| {
+            let mut a = a_running_machine();
+            // Sampling is off by default (cap 0), so the `pc_samples` comparison below
+            // would otherwise be `[] == []` — a claim about where each line ended that
+            // holds for a stepping path which ended lines anywhere at all.
+            a.board.trace.pc_sample_cap = 512;
+            let mut n = 0u64;
+            // Step until the machine says a frame has passed. `line == 0` would be the
+            // obvious condition and is wrong: the machine *starts* on line 0, so it
+            // holds after the first step and the test would compare one instruction
+            // against a frame. `trace.frames` is incremented on the wrap, by the same
+            // code `run_frame` reaches, and is 0 until then.
+            while a.board.trace.frames == 0 {
+                a.step_instruction();
+                n += 1;
+                assert!(n < 1_000_000, "a frame cannot be a million instructions");
+            }
+
+            let mut b = a_running_machine();
+            b.board.trace.pc_sample_cap = 512;
+            b.run_frame();
+            assert_eq!(a.total_cycles, b.total_cycles, "cycles");
+            assert_eq!(a.line, b.line, "beam");
+            assert_eq!(a.carry, b.carry, "the schedule's debt");
+            assert_eq!(a.cpu, b.cpu, "the whole CPU, every field");
+            assert_eq!(&a.board.ram[..], &b.board.ram[..], "RAM");
+            assert_eq!(a.board.trace.frames, b.board.trace.frames, "frames");
+            assert_eq!(a.board.trace.vblanks, b.board.trace.vblanks, "vblanks");
+            assert_eq!(a.board.trace.acks, b.board.trace.acks, "acks");
+            assert_eq!(
+                a.board.trace.pc_samples, b.board.trace.pc_samples,
+                "and the same per-scanline PC samples, which is where a stepping path \
+                 that ended lines at the wrong instruction would show up"
+            );
+
+            // The premises.
+            assert!(n > 100, "a frame is many instructions, got {n}");
+            assert_eq!(
+                a.board.trace.pc_samples.len(),
+                262,
+                "one sample per line of the frame, so the comparison above is not \
+                 two empty vectors"
+            );
+            assert_eq!(a.board.trace.vblanks, 1, "a frame contains one vblank");
+            assert_eq!(a.board.trace.acks, 1, "which was acknowledged");
+            assert_eq!(a.board.ram[0], 1, "and the handler ran, once");
+        });
+    }
+
+    /// A single step advances the machine by exactly one instruction's cycles.
+    #[test]
+    fn one_step_is_one_instruction() {
+        let mut m = a_running_machine();
+        let pc0 = m.cpu.pc;
+        let c = m.step_instruction();
+        assert!(c >= 4, "every 68000 instruction costs at least four cycles");
+        assert_eq!(m.total_cycles, u64::from(c), "cycles are accrued, once");
+        assert_ne!(m.cpu.pc, pc0, "and the PC moved");
+        // 16 rather than any four-cycle instruction: the fixture's first instruction
+        // is `move #$2000,sr`, which this crate's `SLOWEST` also pins at 16. A step
+        // that ran two instructions would report 20 or more.
+        assert_eq!(c, 16, "`move #imm,sr` is 16 cycles, and only one ran");
+    }
+
+    /// Stepping advances the beam, which is what makes a debugger's video update.
+    ///
+    /// A `step_instruction` that left the budget alone would single-step forever on
+    /// scanline 0: the game would never draw, and the bug would present as a video
+    /// bug rather than a scheduling one.
+    #[test]
+    fn stepping_advances_the_beam() {
+        let mut m = a_running_machine();
+        let mut steps = 0;
+        while m.line == 0 {
+            m.step_instruction();
+            steps += 1;
+            assert!(
+                steps < 10_000,
+                "the beam must move; the budget is not being charged"
+            );
+        }
+        assert_eq!(m.line, 1, "one line at a time, not a jump");
+        assert!(
+            m.total_cycles >= 640,
+            "and a line's worth of cycles was spent: {}",
+            m.total_cycles
+        );
+    }
+
+    /// Stepping across the vblank line asserts vblank exactly once.
+    ///
+    /// The per-line work is not per-instruction work. A `step_instruction` that ran
+    /// the start-of-line block on every call would assert vblank tens of times on
+    /// line 240 — and `assert_vblank` counts, so the trace would show it while the
+    /// game merely took one interrupt and looked fine.
+    #[test]
+    fn stepping_asserts_vblank_once_per_frame_not_once_per_instruction() {
+        let mut m = a_running_machine();
+        while m.line != m.timing.vblank_line {
+            m.step_instruction();
+        }
+        assert_eq!(m.board.trace.vblanks, 0, "the premise: not yet asserted");
+        while m.line == m.timing.vblank_line {
+            m.step_instruction();
+        }
+        assert_eq!(
+            m.board.trace.vblanks, 1,
+            "one vblank for the line, however many instructions it took"
+        );
     }
 
     /// Reset takes SSP and PC from the vectors, as the hardware does.

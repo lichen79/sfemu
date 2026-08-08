@@ -25,6 +25,11 @@ import sys
 # SURVIVE for every mutant, since those tests never load the mutated code.
 CRATES: dict[str, str] = {"snapshot": "machine", "loop": "sfemu", "wiring": "sfemu"}
 
+# How long one mutant's test run may take before it is declared killed. The whole
+# workspace suite is under 3 s in this tree, so 120 is two orders of magnitude of
+# headroom -- generous enough that a slow cold build is never mistaken for a hang.
+MUTANT_TIMEOUT_S = 120
+
 # name -> (file, [(mutant-name, old, new, expectation), ...])
 SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
     "pace": (
@@ -507,12 +512,30 @@ def run_rows(name: str) -> list[tuple[str, str, str]]:
                 rows.append((mname, expect, f"NO-OP ({n} matches)"))
                 continue
             open(src, "w").write(text.replace(old, new, 1))
-            r = subprocess.run(
-                ["cargo", "test", "-p", crate, "--quiet"],
-                capture_output=True,
-                text=True,
-            )
-            rows.append((mname, expect, "SURVIVE" if r.returncode == 0 else "KILL"))
+            # A timeout, because a mutant can hang rather than fail. Measured, not
+            # hypothetical: dropping the cycle charge in `Cps1::step_instruction`
+            # leaves `run_scanline`'s `while self.line == line` spinning forever, so
+            # the suite never returns a verdict at all. Without this the harness
+            # itself hangs -- and a harness that hangs on a mutant it should kill
+            # reads, from the outside, exactly like a slow build.
+            #
+            # A timeout counts as KILL. That is the right reading: the mutant made the
+            # suite stop passing. It is recorded distinctly in the result string so a
+            # *control* that times out cannot masquerade as a clean SURVIVE->KILL
+            # discrepancy -- a control is meant to run to completion, and one that
+            # hangs means the timeout is too short rather than the mutant fatal.
+            try:
+                r = subprocess.run(
+                    ["cargo", "test", "-p", crate, "--quiet"],
+                    capture_output=True,
+                    text=True,
+                    timeout=MUTANT_TIMEOUT_S,
+                )
+                got = "SURVIVE" if r.returncode == 0 else "KILL"
+            except subprocess.TimeoutExpired:
+                got = "KILL"
+                mname = f"{mname} (hung)"
+            rows.append((mname, expect, got))
     finally:
         shutil.copy(backup, src)
     return rows
