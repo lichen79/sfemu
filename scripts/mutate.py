@@ -104,6 +104,15 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
                 '    g!(".##.", "#..#", ".###", "..##", ".##.", "...."), // \'9\'',
                 "KILL",
             ),
+            # A whole row gone rather than a pixel. Coarser than the mutant above and
+            # a different failure: `5` missing its waist is still a distinct glyph, so
+            # `every_glyph_is_distinct` cannot see it and only the literals can.
+            (
+                "a-row-dropped-from-a-hex-digit",
+                '    g!("####", "#...", "###.", "...#", "###.", "...."), // \'5\'',
+                '    g!("####", "#...", "....", "...#", "###.", "...."), // \'5\'',
+                "KILL",
+            ),
             # The art parser, from both ends: a mirrored row, and every row blank.
             (
                 "art-parsed-right-to-left",
@@ -140,6 +149,26 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
                 "cursor-does-not-advance-past-the-edge",
                 "        cx += ADVANCE;",
                 "        if cx < WIDTH {\n            cx += ADVANCE;\n        }",
+                "KILL",
+            ),
+            # The cursor not advancing at all: every character of a string drawn over
+            # the first, which is one illegible blob rather than a register dump.
+            (
+                "the-cursor-never-advances",
+                "        cx += ADVANCE;",
+                "        cx += 0;",
+                "KILL",
+            ),
+            # `fill_rect` one column too wide. Not caught by this module's own clipping
+            # test -- that one fills at the right edge, where the extra column is
+            # clipped away anyway. It is `overlay`'s
+            # `a_panel_leaves_the_rest_of_the_frame_alone` that sees it, which is the
+            # point: a panel background one pixel wider than its box eats into its
+            # neighbour.
+            (
+                "fill-rect-one-column-too-wide",
+                "        for px in x..(x + w).min(WIDTH) {",
+                "        for px in x..(x + w + 1).min(WIDTH) {",
                 "KILL",
             ),
             # Text painting its own background, which would leave a rectangle of it
@@ -203,6 +232,16 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
                 "a7-read-from-the-shadow",
                 'let line = format!("D{i} {:08X} A{i} {:08X}", m.cpu.d[i], m.cpu.a[i]);',
                 'let line = format!("D{i} {:08X} A{i} {:08X}", m.cpu.d[i], if i == 7 { m.cpu.ssp } else { m.cpu.a[i] });',
+                "KILL",
+            ),
+            # The two register labels swapped, values left where they were: the panel
+            # shows every data register under an address register's name. Invisible to
+            # any test that read the numbers without reading the label beside them,
+            # which is why `read_text` reads the whole row.
+            (
+                "the-register-labels-are-swapped",
+                'let line = format!("D{i} {:08X} A{i} {:08X}", m.cpu.d[i], m.cpu.a[i]);',
+                'let line = format!("A{i} {:08X} D{i} {:08X}", m.cpu.d[i], m.cpu.a[i]);',
                 "KILL",
             ),
             # The listing advancing by a constant rather than by the instruction's
@@ -322,6 +361,148 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
             ),
         ],
     ),
+    # E2 Task 5: the debugger's state. Every mutant here is a debugger that still
+    # works -- it draws, it scrolls, it stops -- and lies about one thing. The two
+    # worst are in the set: a breakpoint compared against `cpu.pc`, which fires at an
+    # address that is not an instruction boundary, and a suppression that never
+    # expires, which is a breakpoint you can reach and never pass.
+    "debug": (
+        "crates/frontend/src/debug.rs",
+        [
+            # The prefetch, in the one place it decides whether the machine stops.
+            # `cpu.pc` is four bytes past the executing instruction, so this fires late
+            # -- and for the fixture's three-word instruction, at 0x1004, which is the
+            # middle of it.
+            (
+                "a-breakpoint-is-compared-against-the-pc",
+                "self.stopped_at != Some(m.total_cycles) && self.breakpoints.contains(&executing_pc(m))",
+                "self.stopped_at != Some(m.total_cycles) && self.breakpoints.contains(&m.cpu.pc)",
+                "KILL",
+            ),
+            # The same error one step earlier: `F7` marking the PC rather than the
+            # instruction. Distinct from the mutant above, because a debugger that set
+            # and compared *both* at the PC would be self-consistent and still stop two
+            # instructions from where you asked.
+            (
+                "f7-marks-the-pc-not-the-instruction",
+                "            let at = executing_pc(m);",
+                "            let at = m.cpu.pc;",
+                "KILL",
+            ),
+            # The suppression that never expires: once a breakpoint has fired, it never
+            # fires again for the rest of the session. Which is worse than it sounds --
+            # you get exactly one stop and then the debugger silently does nothing.
+            (
+                "the-suppression-never-expires",
+                "self.stopped_at != Some(m.total_cycles) && self.breakpoints.contains(&executing_pc(m))",
+                "self.stopped_at.is_none() && self.breakpoints.contains(&executing_pc(m))",
+                "KILL",
+            ),
+            # The suppression recorded as an address rather than as this stop's cycle
+            # count. `should_break` still compares against `total_cycles`, so the two
+            # never agree and the breakpoint re-fires on the instruction it stopped at,
+            # forever: set it and you can never get past it.
+            (
+                "note-stopped-records-the-address",
+                "        self.stopped_at = Some(m.total_cycles);",
+                "        self.stopped_at = Some(u64::from(executing_pc(m)));",
+                "KILL",
+            ),
+            # The focus not reaching the scroll. Both panels move together, which reads
+            # as `F6` being broken rather than as the scroll being wrong.
+            (
+                "the-focus-does-not-affect-which-panel-scrolls",
+                "    fn scroll(&mut self, m: &Cps1, forward: bool) {\n        match self.focus {",
+                "    fn scroll(&mut self, m: &Cps1, forward: bool) {\n        match Focus::Disasm {",
+                "KILL",
+            ),
+            (
+                "the-scroll-directions-are-swapped",
+                "                self.disasm_at = Some(if forward {\n                    from.wrapping_add(DIS_PAGE)\n                } else {\n                    from.wrapping_sub(DIS_PAGE)",
+                "                self.disasm_at = Some(if forward {\n                    from.wrapping_sub(DIS_PAGE)\n                } else {\n                    from.wrapping_add(DIS_PAGE)",
+                "KILL",
+            ),
+            # The first scroll of a following listing has to materialise an address, and
+            # the address is the one on screen. Starting from zero sends the listing to
+            # the reset vector, nowhere near what you were reading.
+            (
+                "the-first-scroll-starts-from-zero",
+                "                let from = self.disasm_at.unwrap_or_else(|| executing_pc(m));",
+                "                let from = self.disasm_at.unwrap_or(0);",
+                "KILL",
+            ),
+            # `Home` as `Some(pc)` rather than `None`. Identical on the frame it is
+            # pressed and wrong on the very next step: the listing stops following.
+            (
+                "home-sets-the-current-pc-rather-than-following",
+                "                Focus::Disasm => self.disasm_at = None,",
+                "                Focus::Disasm => self.disasm_at = Some(executing_pc(m)),",
+                "KILL",
+            ),
+            # `Home` on the dump reading the shadow stack pointer: a plausible address,
+            # wrong exactly inside an exception handler, which is where you press it.
+            (
+                "home-sends-the-dump-to-the-shadow-pointer",
+                "                Focus::Mem => self.mem_at = m.cpu.a[7],",
+                "                Focus::Mem => self.mem_at = m.cpu.ssp,",
+                "KILL",
+            ),
+            # A toggle that clears the list instead of removing one entry: every other
+            # breakpoint lost on the press that was meant to clear one.
+            (
+                "clearing-one-breakpoint-clears-them-all",
+                "                self.breakpoints.remove(i);",
+                "                self.breakpoints.clear();",
+                "KILL",
+            ),
+            (
+                "f1-only-ever-turns-the-overlay-on",
+                "            self.panels = if self.panels.any() {\n                Panels::none()\n            } else {\n                Panels::on()\n            };",
+                "            self.panels = Panels::on();",
+                "KILL",
+            ),
+            # `F6` focusing the dump without showing it. The default panel set does not
+            # include the dump, so the key that moves the focus to memory appears to do
+            # nothing at all -- and it is the key you press to look at memory.
+            (
+                "focusing-the-dump-does-not-show-it",
+                "            if self.focus == Focus::Mem {\n                self.panels.mem = true;\n            }",
+                "",
+                "KILL",
+            ),
+            # The focus stuck: `F6` moves it to memory and never back.
+            (
+                "the-focus-does-not-cycle-back",
+                "            Focus::Mem => Focus::Disasm,",
+                "            Focus::Mem => Focus::Mem,",
+                "KILL",
+            ),
+            # EQUIVALENT, and documented rather than dressed up as a control: the guard
+            # in `draw` really is redundant, because `overlay::draw` with `Panels::none()`
+            # draws nothing (`nothing_enabled_draws_nothing` proves it). What the guard
+            # buys is the `buf.len()` assert not firing on a frame-sized buffer the
+            # caller has yet to fill -- which no test reaches, and which the loop's own
+            # ordering makes unreachable. Kept in the set so that the day the guard
+            # becomes load-bearing, this line stops surviving and says so.
+            (
+                "EQUIVALENT-the-drawing-guard-is-redundant",
+                "        if !self.panels.any() {\n            return;\n        }\n",
+                "",
+                "SURVIVE",
+            ),
+            # CONTROL: how far a page of disassembly moves. What is pinned is that a
+            # page forward and a page back cancel, which any constant satisfies; the
+            # distance itself is taste, and the docs say two bytes per row is a
+            # compromise rather than a fact. The tests spell it `DIS_PAGE` for exactly
+            # this reason.
+            (
+                "CONTROL-disassembly-page-size",
+                "const DIS_PAGE: u32 = (DIS_ROWS * 2) as u32;",
+                "const DIS_PAGE: u32 = (DIS_ROWS * 3) as u32;",
+                "SURVIVE",
+            ),
+        ],
+    ),
     "keys": (
         "crates/frontend/src/keys.rs",
         [
@@ -354,6 +535,24 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
                 "save-is-level-triggered",
                 "save: edge(Key::F5),",
                 "save: now.contains(Key::F5),",
+                "KILL",
+            ),
+            # A debugger key made level-triggered. It lives in this set rather than in
+            # `debug`, because this is the file where a key becomes an edge -- `debug.rs`
+            # is handed an `Actions` and never sees a keyboard. It is killed from both
+            # ends: `keys`'s own `a_held_key_acts_once` and `debug`'s
+            # `a_held_debugger_key_acts_once`, which is what proves the debugger is
+            # driven by the edge rather than by the level.
+            (
+                "breakpoint-is-level-triggered",
+                "breakpoint_toggled: edge(Key::F7),",
+                "breakpoint_toggled: now.contains(Key::F7),",
+                "KILL",
+            ),
+            (
+                "instruction-step-is-level-triggered",
+                "step_instruction: edge(Key::F4),",
+                "step_instruction: now.contains(Key::F4),",
                 "KILL",
             ),
             (
@@ -796,6 +995,23 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
                 "states-tagged-for-another-board",
                 "const BOARD: u32 = frontend::BOARD_SF2;",
                 "const BOARD: u32 = 0x5346_3100;",
+                "KILL",
+            ),
+            # The overlay drawn before the pen conversion rather than after. Written
+            # out at length because the naive form of this mutant is not a mutant: the
+            # honest version has to `resize` first, or `overlay::draw`'s "not a frame"
+            # assert fires on the empty `Vec` and the run panics for a reason that has
+            # nothing to do with the ordering. And the draw-after call has to *move*,
+            # not be duplicated -- with both present the later one masks the earlier
+            # and the mutant survives as a no-op.
+            #
+            # What it then does is worth naming: `pens_to_argb` clears the buffer and
+            # refills it, so an overlay drawn first is not merely miscoloured, it is
+            # gone. Killed by `the_overlay_reaches_the_presented_buffer`.
+            (
+                "overlay-drawn-before-the-pen-conversion",
+                "        pens_to_argb(&m.video, &mut buf);\n        // After the conversion, never before: the overlay's pixels are already\n        // `0x00RRGGBB`, while `m.video`'s are CPS-1 pens. Drawn into the pen buffer\n        // they would be run through the palette and come out as whatever colours\n        // those indices happen to name.\n        dbg.draw(&mut buf, m);",
+                "        buf.resize(machine::video::WIDTH * machine::video::HEIGHT, 0);\n        dbg.draw(&mut buf, m);\n        pens_to_argb(&m.video, &mut buf);",
                 "KILL",
             ),
             # CONTROL: the title's exact wording. Nothing pins the phrasing, and
