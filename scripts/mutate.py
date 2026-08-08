@@ -23,7 +23,13 @@ import sys
 # against `frontend`, which is where this harness started. Naming the crate
 # matters: scoring a mutation of `machine` against `frontend`'s tests would report
 # SURVIVE for every mutant, since those tests never load the mutated code.
-CRATES: dict[str, str] = {"snapshot": "machine", "loop": "sfemu", "wiring": "sfemu"}
+CRATES: dict[str, str] = {
+    "snapshot": "machine",
+    "peek": "machine",
+    "peekcps1": "machine",
+    "loop": "sfemu",
+    "wiring": "sfemu",
+}
 
 # How long one mutant's test run may take before it is declared killed. The whole
 # workspace suite is under 3 s in this tree, so 120 is two orders of magnitude of
@@ -274,6 +280,102 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
                 "CONTROL-restore-cps-b-twice",
                 "        self.board.cps_b = s.cps_b;\n",
                 "        self.board.cps_b = s.cps_b;\n        self.board.cps_b = s.cps_b;\n",
+                "SURVIVE",
+            ),
+        ],
+    ),
+    # E2 Task 2: the debugger's read path. Every mutant here is a way for a read that
+    # is supposed to observe the machine to *change* it instead, or to observe a
+    # different machine than the one running. Both are silent: a debugger that
+    # acknowledges the interrupt it is watching still displays plausible numbers.
+    "peek": (
+        "crates/machine/src/board.rs",
+        [
+            # The CPU's own bookkeeping, removed. Note what is *absent* from this set:
+            # a mutant that gives `peek_word` a side effect. There is no way to write
+            # one -- `&self` refuses it at compile time, so the failure mode is
+            # unrepresentable rather than merely untested.
+            (
+                "read-no-longer-acknowledges",
+                "        self.note_possible_ack(addr);\n        let v = self.peek_word(addr);",
+                "        let v = self.peek_word(addr);",
+                "KILL",
+            ),
+            (
+                "read-no-longer-records-the-unmapped-access",
+                "            self.trace.unmapped_reads.record(addr);\n",
+                "",
+                "KILL",
+            ),
+            # The two answers a debugger must be able to tell apart. Returning a value
+            # for an undecoded address makes a memory panel show 0xFFFF where the
+            # honest answer is "nothing lives here" -- and the CPU's own trace of
+            # unmapped reads goes empty at the same time, since `read_word` reads
+            # `is_none()`.
+            (
+                "undecoded-reads-as-all-ones",
+                "            _ => None,\n        }\n    }",
+                "            _ => Some(UNMAPPED),\n        }\n    }",
+                "KILL",
+            ),
+            # One arm of the map wrong: RAM read from the ROM image. Peek and read
+            # agree with each other perfectly here -- they share the map -- so only a
+            # test that knows what RAM should contain catches it.
+            (
+                "ram-peeks-into-the-rom",
+                "            0xFF_0000..=0xFF_FFFF => Some(self.ram[Self::ram_index(addr)]),",
+                "            0xFF_0000..=0xFF_FFFF => Some(u16::from(self.rom[Self::ram_index(addr)])),",
+                "KILL",
+            ),
+            # A computed I/O range answered from the wrong side of the word. The
+            # interesting case, because it is the one the design worried could not be
+            # `&self` at all.
+            (
+                "dip-byte-in-the-low-half",
+                "                Some((u16::from(byte) << 8) | 0x00FF)",
+                "                Some(u16::from(byte) | 0xFF00)",
+                "KILL",
+            ),
+            # CONTROL: `note_possible_ack` hoisted back inside a ROM-range guard. The
+            # address it tests for is 0x68, which is in ROM space, so the guard is
+            # redundant and this is observably identical. It is the right control for
+            # this set because it looks exactly like the shape the refactor removed.
+            (
+                "CONTROL-ack-back-inside-a-rom-guard",
+                "        self.note_possible_ack(addr);\n",
+                "        if addr <= 0x3F_FFFF {\n            self.note_possible_ack(addr);\n        }\n",
+                "SURVIVE",
+            ),
+        ],
+    ),
+    # The delegate on `Cps1`, which is what the debugger actually calls. A separate
+    # set because it is a different file: `peek` proves the board's map and side
+    # effects, this proves the one line between them is not a stub.
+    "peekcps1": (
+        "crates/machine/src/cps1.rs",
+        [
+            (
+                "the-delegate-answers-nothing",
+                "    pub fn peek_word(&self, addr: u32) -> Option<u16> {\n        self.board.peek_word(addr)",
+                "    pub fn peek_word(&self, addr: u32) -> Option<u16> {\n        let _ = addr;\n        None",
+                "KILL",
+            ),
+            (
+                "the-delegate-drops-the-address",
+                "        self.board.peek_word(addr)\n    }",
+                "        self.board.peek_word(0)\n    }",
+                "KILL",
+            ),
+            # CONTROL: the address rounded down to a word boundary on the way through.
+            # Observably identical, and not obviously so -- which is what earns it a
+            # place here. Every range in the map starts even and ends odd, and every
+            # arm already discards bit 0 (`addr & !1` in the ROM arm, `>> 1` in the RAM,
+            # gfx, and DIP index arithmetic), so clearing it can neither leave a range
+            # nor select a different word.
+            (
+                "CONTROL-address-rounded-to-a-word",
+                "        self.board.peek_word(addr)\n    }",
+                "        self.board.peek_word(addr & !1)\n    }",
                 "SURVIVE",
             ),
         ],

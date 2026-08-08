@@ -102,6 +102,14 @@ impl Cps1 {
         self.carry = 0;
     }
 
+    /// The word at `addr` as a debugger sees it, or `None` if nothing decodes it.
+    ///
+    /// See [`Board::peek_word`]: no side effects, which is why a debugger does not
+    /// read through the CPU's own path. `&self` is what enforces it.
+    pub fn peek_word(&self, addr: u32) -> Option<u16> {
+        self.board.peek_word(addr)
+    }
+
     /// Runs exactly one 68000 instruction, returning the cycles it consumed.
     ///
     /// The debugger's stepping primitive, and [`Cps1::run_scanline`] is a loop over
@@ -521,6 +529,63 @@ mod tests {
             m.board.trace.vblanks, 1,
             "one vblank for the line, however many instructions it took"
         );
+    }
+
+    /// The machine can be read without being disturbed, mid-run.
+    ///
+    /// `Board`'s own tests cover the address map and the side effects. This is the
+    /// claim the debugger actually rests on: peeking a *running* machine, over the
+    /// vector table with an interrupt outstanding, changes nothing about what it
+    /// does next. Asserted by continuing the run afterwards and comparing against a
+    /// machine that was never peeked.
+    #[test]
+    fn peeking_a_running_machine_does_not_change_where_it_goes() {
+        on_a_big_stack(|| {
+            let mut a = a_running_machine();
+            let mut b = a_running_machine();
+            // Stop mid-frame, on the vblank line, so the interrupt is outstanding and
+            // `note_possible_ack`'s address is live.
+            while a.line != a.timing.vblank_line {
+                a.run_scanline();
+                b.run_scanline();
+            }
+            a.run_scanline();
+            b.run_scanline();
+            assert!(
+                a.board.trace.vblanks > 0,
+                "the premise: a vblank has been asserted"
+            );
+
+            // Everything a memory panel would read on arriving here: the vector table,
+            // the stack, the code, and a gap.
+            for addr in (0..0x400).step_by(2) {
+                a.peek_word(addr);
+            }
+            for addr in (0x00FF_7F00..0x00FF_8000).step_by(2) {
+                a.peek_word(addr);
+            }
+            for addr in (0x40_0000..0x40_0080).step_by(2) {
+                a.peek_word(addr);
+            }
+            assert_eq!(a.peek_word(0xFF_0000), Some(a.board.ram[0]), "and it read");
+
+            // Then run both on, a whole frame, and require identical machines.
+            for _ in 0..a.timing.lines_per_frame {
+                a.run_scanline();
+                b.run_scanline();
+            }
+            assert_eq!(a.total_cycles, b.total_cycles, "cycles");
+            assert_eq!(a.carry, b.carry, "the schedule's debt");
+            assert_eq!(a.cpu, b.cpu, "the whole CPU");
+            assert_eq!(&a.board.ram[..], &b.board.ram[..], "RAM");
+            assert_eq!(a.board.trace.acks, b.board.trace.acks, "acks");
+            assert_eq!(
+                a.board.trace.unmapped_reads.total(),
+                b.board.trace.unmapped_reads.total(),
+                "and the debugger's reads are not in the trace"
+            );
+            assert!(a.board.ram[0] >= 1, "the premise: the handler ran");
+        });
     }
 
     /// Reset takes SSP and PC from the vectors, as the hardware does.

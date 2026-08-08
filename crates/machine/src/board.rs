@@ -244,13 +244,51 @@ impl Board {
     ///
     /// `&mut self` because [`Bus::read16`] is, and because a later CPS-1 read
     /// handler may mutate — MAME's own `cps1_cps_b_r` is non-const for the raster
-    /// counters. No arm here mutates today. Splitting mapped from unmapped in this
-    /// function rather than in [`Bus::read16`] is what lets Task 9's trace name the
-    /// unmapped access.
+    /// counters. Splitting mapped from unmapped in this function rather than in
+    /// [`Bus::read16`] is what lets Task 9's trace name the unmapped access.
+    ///
+    /// The address map itself lives in [`Board::peek_word`]. This is the map **plus
+    /// the CPU's own bookkeeping**: the acknowledge cycle, and the trace's record of
+    /// a read no chip answered. Both are why a debugger must not read through here.
     pub(crate) fn read_word(&mut self, addr: u32) -> Option<u16> {
+        // Unconditional rather than inside a ROM-range arm, as it was when this was
+        // one function: the address it tests for is 0x68, which is in ROM space, so
+        // the range guard could only ever be redundant with the test inside.
+        self.note_possible_ack(addr);
+        let v = self.peek_word(addr);
+        if v.is_none() {
+            self.trace.unmapped_reads.record(addr);
+        }
+        v
+    }
+
+    /// The word at `addr`, or `None` if `addr` is in no mapped range — **with no
+    /// side effects.**
+    ///
+    /// For a debugger, a memory viewer, or anything else that reads the machine
+    /// without being part of it. `read_word` is what the CPU uses and it is
+    /// not side-effect-free: it acknowledges a pending interrupt on a read of the
+    /// vector-26 longword, and records unmapped addresses in the trace. A memory
+    /// panel built on it would clear the interrupt it was opened to investigate, and
+    /// one parked on unmapped space would fill the counter it displays with its own
+    /// reads.
+    ///
+    /// `&self` is the enforcement, not a preference: a `&mut self` version could
+    /// acknowledge the interrupt and the compiler would not object.
+    ///
+    /// (`read_word` and `note_possible_ack` are named in plain code spans rather than
+    /// rustdoc links: both are private, and rustdoc rejects a public item linking to
+    /// a private one.)
+    ///
+    /// This holds the whole address map and `read_word` delegates to it, so the two
+    /// **cannot** disagree. That was not a given — the design for this expected to
+    /// duplicate the map and hold the copies together with an agreement test, on the
+    /// grounds that the I/O ranges compute rather than store. They do compute, but
+    /// every one of those computations reads only [`Board::inputs`] and
+    /// [`Board::cfg`], so all of it is `&self`-safe and there is one map after all.
+    pub fn peek_word(&self, addr: u32) -> Option<u16> {
         match addr {
             0x00_0000..=0x3F_FFFF => {
-                self.note_possible_ack(addr);
                 let i = (addr & !1) as usize;
                 Some(u16::from_be_bytes([self.rom[i], self.rom[i + 1]]))
             }
@@ -297,10 +335,7 @@ impl Board {
             }
             0x90_0000..=0x92_FFFF => Some(self.gfxram[Self::gfx_index(addr)]),
             0xFF_0000..=0xFF_FFFF => Some(self.ram[Self::ram_index(addr)]),
-            _ => {
-                self.trace.unmapped_reads.record(addr);
-                None
-            }
+            _ => None,
         }
     }
 
@@ -729,6 +764,137 @@ mod tests {
         assert!(b.read_word(0x81_0000).is_none());
         assert!(b.read_word(0x93_0000).is_none());
         assert!(b.read_word(0xFE_FFFE).is_none());
+    }
+
+    /// Peeking never disturbs the machine.
+    ///
+    /// [`Board::read_word`] acknowledges a pending interrupt on a read of the
+    /// vector-26 longword and records unmapped reads in the trace. A debugger's
+    /// memory panel scrolled over 0x68 must not acknowledge the interrupt it was
+    /// opened to investigate, and one parked on unmapped space must not fill the
+    /// counter it displays with its own reads.
+    ///
+    /// Swept over the whole vector table *and* unmapped space, with an interrupt
+    /// outstanding — the state in which every one of those side effects is live.
+    #[test]
+    fn peeking_does_not_disturb_the_machine() {
+        let mut b = board();
+        b.assert_vblank();
+        assert!(
+            b.vblank_pending(),
+            "the premise: an interrupt is outstanding"
+        );
+        let acks = b.trace.acks;
+        let unmapped = b.trace.unmapped_reads.total();
+
+        for addr in (0..0x400).step_by(2) {
+            b.peek_word(addr);
+        }
+        for addr in (0x40_0000..0x40_0100).step_by(2) {
+            b.peek_word(addr);
+        }
+
+        assert!(
+            b.vblank_pending(),
+            "the interrupt must still be outstanding"
+        );
+        assert_eq!(b.trace.acks, acks, "no acknowledge was invented");
+        assert_eq!(
+            b.trace.unmapped_reads.total(),
+            unmapped,
+            "and the debugger's own reads are not in the counter"
+        );
+
+        // The control: the same reads through `read_word` *do* disturb it. Without
+        // this the test passes for a machine that was never disturbable in the first
+        // place — which is exactly what a future refactor moving the acknowledge
+        // elsewhere would produce, silently.
+        assert!(b.read_word(0x68).is_some());
+        assert_eq!(
+            b.trace.acks,
+            acks + 1,
+            "read_word acknowledges, which is why peek exists"
+        );
+        assert!(!b.vblank_pending(), "and drops the line");
+        b.read_word(0x40_0000);
+        assert!(
+            b.trace.unmapped_reads.total() > unmapped,
+            "and records an unmapped read"
+        );
+    }
+
+    /// Peek and read agree everywhere.
+    ///
+    /// Otherwise the debugger shows a different machine than the one running.
+    /// `read_word` delegates to `peek_word` today, so this is a *pin* rather than a
+    /// discovery: it fails if the two are ever split into separate maps that drift.
+    /// Walked over both sides of every boundary in the map, in a state where
+    /// `read_word`'s side effects are inert — no interrupt pending — so the
+    /// comparison is legal.
+    #[test]
+    fn peek_and_read_agree_across_the_address_map() {
+        let mut b = board();
+        assert!(!b.vblank_pending(), "the premise: no side effect is live");
+        let edges = [
+            0x00_0000u32,
+            0x3F_FFFE,
+            0x40_0000,
+            0x7F_FFFE,
+            0x80_0000,
+            0x80_0006,
+            0x80_0008,
+            0x80_0016,
+            0x80_0018,
+            0x80_001E,
+            0x80_0020,
+            0x80_0022,
+            0x80_0100,
+            0x80_013E,
+            0x80_0140,
+            0x80_017E,
+            0x80_0180,
+            0x8F_FFFE,
+            0x90_0000,
+            0x92_FFFE,
+            0x93_0000,
+            0xFE_FFFE,
+            0xFF_0000,
+            0xFF_FFFE,
+        ];
+        for addr in edges {
+            let peeked = b.peek_word(addr);
+            assert_eq!(
+                peeked,
+                b.read_word(addr),
+                "peek and read disagree at {addr:#08X}"
+            );
+        }
+        // The premise: that loop compared something. Without these it passes for a
+        // `peek_word` that returns `None` everywhere and a `read_word` that agrees.
+        assert_eq!(b.peek_word(0xFF_0000), Some(0), "RAM decodes");
+        assert_eq!(b.peek_word(0x40_0000), None, "and a gap does not");
+        assert!(
+            b.peek_word(0x80_0018).is_some(),
+            "and so does a computed I/O range, which is the interesting case"
+        );
+    }
+
+    /// Undecoded is `None`, not `0xFFFF`.
+    ///
+    /// "Nothing decodes here" and "this decodes and reads as all ones" are different
+    /// facts, and a debugger that renders both as `FFFF` sends you looking in the
+    /// wrong place. `0x800020` is the one address that genuinely reads all ones while
+    /// being decoded — MAME's `nopr` — which is what makes the distinction testable
+    /// rather than theoretical.
+    #[test]
+    fn undecoded_and_all_ones_are_different_answers() {
+        let b = board();
+        assert_eq!(b.peek_word(0x40_0000), None, "a gap decodes nothing");
+        assert_eq!(
+            b.peek_word(0x80_0020),
+            Some(0xFFFF),
+            "nopr decodes, to all ones"
+        );
     }
 
     /// Each write counts against its own region's counter and no other's.
