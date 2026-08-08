@@ -16,12 +16,16 @@
 
 use std::path::PathBuf;
 
-/// The base-page opcodes the core implements so far, as of Task 8 — all 252 of
-/// them, which is the whole page bar the four prefixes (`CB`, `DD`, `ED`, `FD`).
+/// The opcodes the core implements so far: as of Task 9, the 252 non-prefix
+/// base-page opcodes and all 256 of the `CB` page.
 ///
 /// Kept as a literal list rather than derived from the decoder: a default that
 /// asked the decoder what it handled would report "all green" on exactly the
 /// opcodes the decoder had wrongly claimed.
+///
+/// The `CB` stems are generated rather than listed, because that page is complete
+/// and uniform — `cb_00` through `cb_ff` with no gaps, which the base page cannot
+/// say. See [`cb_stems`].
 const DEFAULT: &[&str] = &[
     "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "0a", "0b", "0c", "0d", "0e", "0f",
     "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "1a", "1b", "1c", "1d", "1e", "1f",
@@ -41,13 +45,27 @@ const DEFAULT: &[&str] = &[
     "f3", "f4", "f5", "f6", "f7", "f8", "f9", "fa", "fb", "fc", "fe", "ff",
 ];
 
+/// `cb_00` through `cb_ff`.
+///
+/// Generated because the `CB` page is complete: all 256 opcodes exist and all 256
+/// files do. The base page cannot be generated the same way — four of its 256 are
+/// prefixes with no file of their own — which is why only this half is.
+fn cb_stems() -> Vec<String> {
+    (0..=255u8).map(|op| format!("cb_{op:02x}")).collect()
+}
+
 fn main() {
     // Anchored to the manifest so the tool works from any directory, matching
     // `fetchz80`. A relative path would silently look in the wrong place.
     let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/z80"));
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let generated = cb_stems();
     let stems: Vec<&str> = if args.is_empty() {
-        DEFAULT.to_vec()
+        DEFAULT
+            .iter()
+            .copied()
+            .chain(generated.iter().map(String::as_str))
+            .collect()
     } else {
         args.iter().map(String::as_str).collect()
     };

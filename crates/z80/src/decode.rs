@@ -416,13 +416,74 @@ pub fn execute<B: Bus>(cpu: &mut Z80, bus: &mut B, op: u8) -> u32 {
             cpu.q = 0;
             11
         }
-        // Only the five prefixes are left: CB, ED, DD, FD, and the double-prefix
-        // forms, which Tasks 9 through 12 fill in. Until then an unimplemented
+        0xCB => cb_page(cpu, bus),
+        // Only the four prefixes are left: ED, DD, FD, and the double-prefix
+        // forms, which Tasks 10 through 12 fill in. Until then an unimplemented
         // opcode is a panic *in development only*: it is unreachable once the suite
         // is green, and a silent 4-T-state NOP here would make a missing instruction
         // look like a flag bug across a hundred vector files. Task 12 deletes this
         // arm and lets the compiler prove the match exhaustive.
         other => unimplemented!("base opcode {other:#04X}"),
+    }
+}
+
+/// The `CB` page: rotates and shifts, then `BIT`, `RES` and `SET`.
+///
+/// Four uniform quarters of 64, with one asymmetry: `BIT b,(HL)` is 12 T-states
+/// rather than 15, because it writes nothing back.
+///
+/// No opcode on this page touches [`Z80::wz`] — confirmed over all 256 files. That
+/// matters for `BIT b,(HL)`, whose F3 and F5 come from the *incoming* latch's high
+/// byte: they are the residue of whatever earlier instruction last wrote it, which
+/// is why a core must carry `wz` between instructions rather than recompute it.
+pub fn cb_page<B: Bus>(cpu: &mut Z80, bus: &mut B) -> u32 {
+    let op = cpu.fetch(bus);
+    let (slot, bit) = (op & 7, (op >> 3) & 7);
+    let mem = slot == 6;
+    match op {
+        0x00..=0x3F => {
+            let v = reg(cpu, bus, slot);
+            let r = bits::rot(cpu, bits::RotOp::from_index(bit), v);
+            set_reg(cpu, bus, slot, r);
+            if mem {
+                15
+            } else {
+                8
+            }
+        }
+        0x40..=0x7F => {
+            let v = reg(cpu, bus, slot);
+            // The register forms take F3/F5 from the operand; `(HL)` takes them from
+            // the latch's high byte. Measured: for `cb_46` the latch is right on all
+            // 1,000 cases and `H` -- which the plan named -- is wrong on 760.
+            let f35 = if mem { (cpu.wz >> 8) as u8 } else { v };
+            bits::bit_test(cpu, bit, v, f35);
+            if mem {
+                12
+            } else {
+                8
+            }
+        }
+        0x80..=0xBF => {
+            let v = reg(cpu, bus, slot);
+            set_reg(cpu, bus, slot, v & !(1 << bit));
+            cpu.q = 0;
+            if mem {
+                15
+            } else {
+                8
+            }
+        }
+        0xC0..=0xFF => {
+            let v = reg(cpu, bus, slot);
+            set_reg(cpu, bus, slot, v | (1 << bit));
+            cpu.q = 0;
+            if mem {
+                15
+            } else {
+                8
+            }
+        }
     }
 }
 
@@ -1001,6 +1062,108 @@ mod tests {
         c.a = 0x12;
         assert_eq!(run(&mut c, &[0xD3, 0xFF]), 11, "OUT (n),A");
         assert_eq!(c.wz, 0x1200, "a write does not, and A is the high half");
+    }
+
+    /// `SET` and `RES` touch no flags whatsoever, and clear `Q`.
+    #[test]
+    fn set_and_res_write_no_flags() {
+        let mut c = Z80::new();
+        c.b = 0x00;
+        c.f = 0x5A;
+        c.q = 0x5A;
+        assert_eq!(run(&mut c, &[0xCB, 0xC0]), 8, "SET 0,B");
+        assert_eq!(c.b, 0x01);
+        assert_eq!(c.f, 0x5A, "no flags");
+        assert_eq!(c.q, 0, "and Q clears, because none were written");
+
+        assert_eq!(run(&mut c, &[0xCB, 0x80]), 8, "RES 0,B");
+        assert_eq!(c.b, 0x00);
+        assert_eq!(c.f, 0x5A);
+    }
+
+    /// The bit field is bits 5–3, and it selects a bit rather than an operation.
+    ///
+    /// `SET 5,B` and `SET 3,B` differ only in that field. A decoder that read the
+    /// register field for the bit number would set bit 0 of every register here and
+    /// pass any test whose bit number happened to be zero.
+    #[test]
+    fn the_bit_field_is_bits_five_to_three() {
+        for (op, want) in [(0xC0u8, 0x01u8), (0xC8, 0x02), (0xE8, 0x20), (0xFF, 0x80)] {
+            let mut c = Z80::new();
+            c.b = 0;
+            c.a = 0;
+            run(&mut c, &[0xCB, op]);
+            // 0xFF is SET 7,A; the rest are SET n,B.
+            let got = if op == 0xFF { c.a } else { c.b };
+            assert_eq!(got, want, "CB {op:#04X}");
+        }
+    }
+
+    /// The page's T-state costs: 8 for a register, 15 for `(HL)`, and **12 for
+    /// `BIT b,(HL)`** — which writes nothing back and so is three cheaper.
+    #[test]
+    fn the_cb_page_costs_eight_fifteen_or_twelve() {
+        let mut c = Z80::new();
+        c.set_hl(0x2000);
+        assert_eq!(run(&mut c, &[0xCB, 0x00]), 8, "RLC B: a register form");
+        assert_eq!(
+            run(&mut c, &[0xCB, 0x06]),
+            15,
+            "RLC (HL): read, modify, write"
+        );
+        assert_eq!(
+            run(&mut c, &[0xCB, 0x46]),
+            12,
+            "BIT 0,(HL) writes nothing back"
+        );
+        assert_eq!(run(&mut c, &[0xCB, 0x86]), 15, "RES 0,(HL) does");
+    }
+
+    /// `BIT b,(HL)` reads the byte but writes nothing back.
+    ///
+    /// The T-state count above is the cheap half of this; the expensive half is that
+    /// a `cb_page` reusing the rotate quarter's `set_reg` call would write the
+    /// operand back unchanged. RAM would be identical, so only the write log shows
+    /// it — and the vectors compare the bus.
+    #[test]
+    fn bit_through_memory_writes_nothing() {
+        let mut c = Z80::new();
+        c.pc = 0x100;
+        c.set_hl(0x2000);
+        let mut m = Mem::at(0x100, &[0xCB, 0x46]);
+        m.ram[0x2000] = 0x5A;
+        c.step(&mut m);
+        assert!(m.writes.is_empty(), "BIT (HL) is read-only");
+    }
+
+    /// `BIT b,(HL)` takes F3 and F5 from the latch; the register forms do not.
+    ///
+    /// Two runs of the same bit number on the same value, differing only in the
+    /// addressing mode, with the latch's high byte set to the complement of the
+    /// operand's F3/F5 — so a decoder that passed the operand for both forms, or
+    /// the latch for both, fails one of the two assertions.
+    #[test]
+    fn bit_through_memory_takes_the_undocumented_flags_from_the_latch() {
+        let mut c = Z80::new();
+        c.pc = 0x100;
+        c.set_hl(0x2000);
+        c.wz = u16::from(F5 | F3) << 8; // both set in the latch
+        let mut m = Mem::at(0x100, &[0xCB, 0x46]);
+        m.ram[0x2000] = 0x01; // bit 0 set, and neither F3 nor F5
+        c.step(&mut m);
+        assert_eq!(c.f & (F5 | F3), F5 | F3, "from the latch, not the operand");
+        assert_eq!(
+            c.wz,
+            u16::from(F5 | F3) << 8,
+            "and the page leaves wz alone"
+        );
+
+        // The register form, same bit and same operand, takes them from the operand.
+        let mut c = Z80::new();
+        c.b = 0x01;
+        c.wz = u16::from(F5 | F3) << 8;
+        run(&mut c, &[0xCB, 0x40]); // BIT 0,B
+        assert_eq!(c.f & (F5 | F3), 0, "the operand has neither");
     }
 
     /// `EX (SP),HL` latches the **new** `HL` — the word it took off the stack.
