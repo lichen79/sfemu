@@ -143,6 +143,51 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
             ("CONTROL-escape-moves-to-another-free-bit", "Key::Escape => 21,", "Key::Escape => 25,", "SURVIVE"),
         ],
     ),
+    "pixels": (
+        "crates/frontend/src/pixels.rs",
+        [
+            (
+                "red-and-blue-swapped",
+                "    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)\n}",
+                "    (u32::from(b) << 16) | (u32::from(g) << 8) | u32::from(r)\n}",
+                "KILL",
+            ),
+            (
+                "red-in-the-alpha-byte",
+                "    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)\n}",
+                "    (u32::from(r) << 24) | (u32::from(g) << 8) | u32::from(b)\n}",
+                "KILL",
+            ),
+            (
+                "green-not-shifted",
+                "    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)\n}",
+                "    (u32::from(r) << 16) | u32::from(g) | u32::from(b)\n}",
+                "KILL",
+            ),
+            ("buffer-never-cleared", "    out.clear();\n", "", "KILL"),
+            (
+                "only-part-of-the-frame-converted",
+                "out.extend(v.fb.pens.iter().map",
+                "out.extend(v.fb.pens.iter().take(1000).map",
+                "KILL",
+            ),
+            (
+                "every-pixel-takes-pen-zero",
+                "out.extend(v.fb.pens.iter().map(|&pen| argb(pal[usize::from(pen)])));",
+                "out.extend(v.fb.pens.iter().map(|&_pen| argb(pal[0])));",
+                "KILL",
+            ),
+            # Control: the palette is read once into a local either way. Reading it
+            # per pixel is slower and observably identical -- nothing here can tell
+            # the two apart, which is the point of a control.
+            (
+                "CONTROL-palette-read-per-pixel",
+                "    let pal = v.palette();\n    out.clear();\n    out.extend(v.fb.pens.iter().map(|&pen| argb(pal[usize::from(pen)])));",
+                "    out.clear();\n    let pens = v.fb.pens.clone();\n    out.extend(pens.iter().map(|&pen| argb(v.palette()[usize::from(pen)])));",
+                "SURVIVE",
+            ),
+        ],
+    ),
 }
 
 

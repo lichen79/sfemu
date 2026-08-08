@@ -31,6 +31,8 @@
 
 pub mod keys;
 pub mod pace;
+pub mod pixels;
 
 pub use keys::{Actions, Controls, Key, KeySet};
 pub use pace::{FramePacer, FRAME_NS, MAX_CATCH_UP};
+pub use pixels::pens_to_argb;
