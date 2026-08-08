@@ -23,7 +23,7 @@ import sys
 # against `frontend`, which is where this harness started. Naming the crate
 # matters: scoring a mutation of `machine` against `frontend`'s tests would report
 # SURVIVE for every mutant, since those tests never load the mutated code.
-CRATES: dict[str, str] = {"snapshot": "machine"}
+CRATES: dict[str, str] = {"snapshot": "machine", "loop": "sfemu"}
 
 # name -> (file, [(mutant-name, old, new, expectation), ...])
 SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
@@ -369,6 +369,84 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
                 "CONTROL-display-text-reworded",
                 'write!(f, "not a save state (wrong magic)")',
                 'write!(f, "this file is not a save state")',
+                "SURVIVE",
+            ),
+        ],
+    ),
+    "loop": (
+        "crates/sfemu/src/loop_.rs",
+        [
+            ("step-runs-two-frames", "        let frames = if a.step {\n            1", "        let frames = if a.step {\n            2", "KILL"),
+            (
+                "paused-still-runs-frames",
+                "        } else if paused {\n            0\n        } else {",
+                "        } else if paused {\n            pacer.tick(elapsed)\n        } else {",
+                "KILL",
+            ),
+            (
+                "pause-only-ever-pauses",
+                "            paused = !paused;",
+                "            paused = true;",
+                "KILL",
+            ),
+            # The reset genuinely removed. Anchored on the trailing comment line so
+            # the pattern is unique -- `pacer.reset();` alone also matches the F3
+            # branch, and a two-match pattern is a NO-OP rather than a result.
+            (
+                "no-pacer-reset-on-pause",
+                "            // this line and it is not the real one.\n            pacer.reset();",
+                "            // this line and it is not the real one.",
+                "KILL",
+            ),
+            # The `render` *moved* inside the frame loop -- not duplicated. A copy
+            # leaves the unconditional call in place and changes nothing, which is a
+            # mutant that reports SURVIVE for being a no-op.
+            (
+                "render-only-when-frames-ran",
+                "        m.render();\n        pens_to_argb(&m.video, &mut buf);",
+                "        pens_to_argb(&m.video, &mut buf);",
+                "KILL",
+            ),
+            (
+                "inputs-never-reach-the-board",
+                "        m.board.inputs = a.inputs;",
+                "        let _ = a.inputs;",
+                "KILL",
+            ),
+            (
+                "a-failed-save-panics",
+                'Err(e) => note(s, format!("cannot write `{}`: {e}", o.state_path.display())),',
+                'Err(e) => panic!("cannot write `{}`: {e}", o.state_path.display()),',
+                "KILL",
+            ),
+            # A notice per press rather than one per distinct problem.
+            (
+                "notices-are-not-deduplicated",
+                "    if !s.notices.contains(&msg) {\n        s.notices.push(msg);\n    }",
+                "    s.notices.push(msg);",
+                "KILL",
+            ),
+            # A load applied despite a refusal: the machine ends up neither the saved
+            # one nor the running one.
+            (
+                "a-refused-load-is-still-applied",
+                "        Err(e) => note(s, format!(\"cannot load `{}`: {e}\", o.state_path.display())),",
+                "        Err(_) => m.reset(),",
+                "KILL",
+            ),
+            (
+                "quit-is-ignored",
+                "        if a.quit {\n            break;\n        }",
+                "        if a.quit && false {\n            break;\n        }",
+                "KILL",
+            ),
+            # CONTROL: the title's exact wording. Nothing pins the phrasing, and
+            # nothing should -- the tests look for "paused", "halted", and the drop
+            # count, not for a sentence.
+            (
+                "CONTROL-title-wording",
+                'let mut t = String::from("sfemu");',
+                'let mut t = String::from("sfemu -- CPS-1");',
                 "SURVIVE",
             ),
         ],

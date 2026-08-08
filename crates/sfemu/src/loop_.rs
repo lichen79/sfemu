@@ -123,10 +123,14 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, o: &LoopOpts) -> Summary {
         }
         if a.pause_toggled {
             paused = !paused;
-            // Whichever way it went. Pausing discards the debt accrued before the
-            // pause; unpausing discards the pause itself, which is the one that
-            // matters — without it, a minute paused is a minute owed, and the
-            // machine sprints through four frames and drops 3,575.
+            // Whichever way it went, so a resume starts from a clean slate.
+            //
+            // What this discards is the sub-frame *remainder* held from before the
+            // pause — at most one frame's worth. The time spent paused is not owed
+            // and never was: `tick` is not called on a paused iteration, so the
+            // debt cannot accrue in the first place. Worth stating, because "a
+            // minute paused would be a minute owed" is the plausible reason for
+            // this line and it is not the real one.
             pacer.reset();
         }
 
@@ -261,6 +265,9 @@ mod tests {
         tick: usize,
         /// Every buffer length handed to `present`.
         presented: Vec<usize>,
+        /// The first buffer, in full. Only the first: 86,016 pixels a tick is a lot
+        /// to keep, and one is enough to ask whether it was rendered.
+        first: Option<Vec<u32>>,
         titles: Vec<String>,
     }
 
@@ -271,6 +278,7 @@ mod tests {
                 script,
                 tick: 0,
                 presented: Vec::new(),
+                first: None,
                 titles: Vec::new(),
             }
         }
@@ -289,6 +297,9 @@ mod tests {
     impl Display for Fake {
         fn present(&mut self, buf: &[u32]) -> Result<(), String> {
             self.presented.push(buf.len());
+            if self.first.is_none() {
+                self.first = Some(buf.to_vec());
+            }
             Ok(())
         }
         fn held_keys(&self) -> KeySet {
@@ -333,6 +344,53 @@ mod tests {
         rom[0x1100..0x1104].copy_from_slice(&[0x52, 0x41, 0x4E, 0x73]);
         let mut m = Cps1::new(&rom, BoardConfig::sf2(), Timing::cps1_10mhz());
         m.reset();
+        m
+    }
+
+    /// A machine whose rendered frame is not one flat colour.
+    ///
+    /// The plain fixture draws nothing, so its frame is uniform and a presented
+    /// buffer cannot say whether it was rendered or is the framebuffer's power-on
+    /// fill. This one has a sprite and a palette entry, so a rendered frame and an
+    /// unrendered one are distinguishable — which is what
+    /// `a_paused_tick_presents_a_rendered_frame` needs.
+    ///
+    /// The program is the plain fixture's, unchanged: what is under test is the
+    /// loop's ordering, not the guest.
+    fn machine_that_draws() -> Cps1 {
+        let mut rom = vec![0u8; 0x2000];
+        rom[0..8].copy_from_slice(&[0x00, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00]);
+        rom[0x68..0x6C].copy_from_slice(&[0x00, 0x00, 0x11, 0x00]);
+        rom[0x1000..0x100E].copy_from_slice(&[
+            0x46, 0xFC, 0x20, 0x00, 0x52, 0x40, 0x33, 0xC0, 0x00, 0xFF, 0x00, 0x00, 0x60, 0xF6,
+        ]);
+        rom[0x1100..0x1104].copy_from_slice(&[0x52, 0x41, 0x4E, 0x73]);
+
+        // A 16x16 tile solid in pen 0x0A.
+        let mut gfx = vec![0u8; 128];
+        for row in 0..16 {
+            for half in [0usize, 4] {
+                gfx[row * 8 + half + 1] = 0xFF;
+                gfx[row * 8 + half + 3] = 0xFF;
+            }
+        }
+
+        let cfg = BoardConfig::sf2();
+        let mut m = Cps1::with_gfx(&rom, gfx, cfg, Timing::cps1_10mhz());
+        m.reset();
+        m.board.cps_a[machine::video::regs::OBJ_BASE] = 0x40;
+        m.board.cps_a[machine::video::regs::PALETTE_BASE] = 0;
+        m.board.gfxram[0x2000] = WIDTH as u16 / 2;
+        m.board.gfxram[0x2001] = HEIGHT as u16 / 2;
+        m.board.gfxram[0x2002] = 0;
+        m.board.gfxram[0x2003] = 3;
+        m.board.gfxram[0x2007] = 0xFF00;
+        m.board.cps_b[cfg.video.palette_control] = 0x0001;
+        m.board.gfxram[0x3A] = 0x0F0F;
+        // The sprite table is latched at vblank, so one frame must pass before the
+        // renderer has anything to draw. Run it here rather than in the loop: the
+        // test's point is a *paused* tick, which runs no frames at all.
+        m.run_frame();
         m
     }
 
@@ -517,6 +575,66 @@ mod tests {
             d.presented
         );
         assert_eq!(WIDTH * HEIGHT, 86_016, "384 x 224");
+    }
+
+    /// A paused tick presents a *rendered* frame, not a blank one.
+    ///
+    /// `presented.len()` cannot see this: a loop that rendered only when frames ran
+    /// still presents a buffer every tick — it just presents the same stale one. The
+    /// pixels are the artifact, and this fixture's frame is not uniform, so a
+    /// rendered frame and an unrendered one differ.
+    #[test]
+    fn a_paused_tick_presents_a_rendered_frame() {
+        let (o, _s, _p) = opts("paused-render");
+        let mut m = machine_that_draws();
+        // The very first tick pauses, so no frame runs inside the loop at all.
+        let mut d = Fake::new(vec![Fake::held(&[Key::P])]);
+        let s = run(&mut m, &mut d, &o);
+        assert_eq!(s.frames, 0, "the premise: the loop ran no frames");
+        let first = d.first.expect("a paused tick still presents");
+        assert!(
+            first.iter().any(|&px| px != first[0]),
+            "a rendered frame is not one flat colour"
+        );
+    }
+
+    /// Unpausing discards the frame debt held from before the pause.
+    ///
+    /// A sub-frame remainder is the observable. Before pausing, a tick of
+    /// `FRAME_NS - 1` runs no frame and leaves that much owed; after resuming, a tick
+    /// of 1 ns completes it. With the pacer reset, the remainder is gone and no frame
+    /// runs; without it, the two add to exactly one frame's worth and one does.
+    ///
+    /// One frame, not a burst, because `tick` keeps only the remainder — which is
+    /// also why this is the *only* way to see the reset. A long pause is already
+    /// discarded by never calling `tick` while paused.
+    #[test]
+    fn unpausing_discards_the_debt_from_before_the_pause() {
+        let (o, _s, _p) = opts("pause-debt");
+        let mut d = Fake::new(vec![
+            (KeySet::new(), FRAME_NS - 1),
+            Fake::held(&[Key::P]),
+            Fake::held(&[]),
+            (KeySet::from_keys(&[Key::P]), 1),
+        ]);
+        let s = run(&mut machine(), &mut d, &o);
+        assert_eq!(
+            s.frames, 0,
+            "the pre-pause remainder must not complete a frame after the resume"
+        );
+    }
+
+    /// And that remainder really would complete a frame without the pause.
+    ///
+    /// The premise for the test above: if `FRAME_NS - 1` then `1` did not add to a
+    /// frame in the first place, that test would pass for a loop that never resets
+    /// the pacer at all.
+    #[test]
+    fn the_remainder_completes_a_frame_when_nothing_is_paused() {
+        let (o, _s, _p) = opts("pace-remainder");
+        let mut d = Fake::new(vec![(KeySet::new(), FRAME_NS - 1), (KeySet::new(), 1)]);
+        let s = run(&mut machine(), &mut d, &o);
+        assert_eq!(s.frames, 1, "the two ticks are one frame between them");
     }
 
     /// The title reports dropped frames — and only when there are some.
