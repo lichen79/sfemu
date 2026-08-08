@@ -722,6 +722,30 @@ mod tests {
         }
     }
 
+    /// `[` and `]` move the palette cursor by exactly one row of swatches.
+    ///
+    /// Read off `gfxpanels::pal_cell` — the layout the view actually draws — and not
+    /// against `PAL_PAGE`, which is the number under test. `assert_eq!(pal_at,
+    /// PAL_PAGE)` above cannot fail for any value of `PAL_PAGE`, so a half-row step
+    /// would pass it while landing the cursor in the middle of a row of colours: the
+    /// swatch under the highlight would not be the entry the title line names.
+    #[test]
+    fn the_palette_cursor_moves_by_one_row_of_swatches() {
+        let m = a_machine();
+        let mut g = looking_at(&m, View::Palette);
+        let (x0, y0) = gfxpanels::pal_cell(g.state().pal_at);
+        g.update(&act(|a| a.gfx_forward = true), &m);
+        let (x1, y1) = gfxpanels::pal_cell(g.state().pal_at);
+        assert_eq!(x1, x0, "the cursor stays in its column");
+        assert!(y1 > y0, "and moves down a row");
+        // And the next press is the same distance again, so the step is *a row*
+        // rather than something that merely happens to change the row.
+        g.update(&act(|a| a.gfx_forward = true), &m);
+        let (x2, y2) = gfxpanels::pal_cell(g.state().pal_at);
+        assert_eq!(x2, x0, "still the same column");
+        assert_eq!(y2 - y1, y1 - y0, "and the same one row each time");
+    }
+
     /// A hidden viewer ignores its own keys but keeps its mask.
     ///
     /// Two separate claims and both are deliberate. The keys are ignored so `]` does

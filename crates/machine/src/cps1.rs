@@ -1026,4 +1026,32 @@ mod tests {
              carry shows up as a different first line"
         );
     }
+
+    /// The layer mask is not machine state.
+    ///
+    /// It records how you are *looking* at the machine, the way the [`Trace`] records
+    /// the session — so a snapshot must not carry it and a restore must not clear it.
+    /// A mask that round-tripped through a save state would come back with someone
+    /// else's layers subtracted, and one that a load reset would silently undo the
+    /// thing you were in the middle of looking at.
+    ///
+    /// Asserted through `restore` rather than by comparing two snapshots:
+    /// `MachineState` has no `PartialEq`, and the field's absence *is* `restore` not
+    /// touching it.
+    ///
+    /// [`Trace`]: crate::board::Trace
+    #[test]
+    fn the_layer_mask_is_not_machine_state() {
+        let mut m = machine();
+        let s = m.snapshot();
+        m.video.enable = video::compose::LayerMask {
+            sprites: false,
+            ..video::compose::LayerMask::all()
+        };
+        m.restore(&s);
+        assert!(
+            !m.video.enable.sprites,
+            "a restore must not reset the view's mask"
+        );
+    }
 }

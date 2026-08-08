@@ -1419,6 +1419,94 @@ mod tests {
         assert_ne!(masked, full, "subtracting a layer changed the picture");
     }
 
+    /// **The criterion that matters most:** looking at the video does not change the
+    /// machine.
+    ///
+    /// `watching_the_machine_does_not_change_it` proves the debugger is inert. This
+    /// changes the *picture* on purpose, which makes the same claim harder and more
+    /// important: the mask must reach `Video` and nothing else. Nothing the 68000 or
+    /// the board reads depends on the framebuffer, so this is provable rather than
+    /// merely intended.
+    ///
+    /// The `machine()` fixture and not `machine_that_draws()`: what is compared is CPU
+    /// and RAM state, and `machine()`'s program moves `d0` and a word of RAM every
+    /// frame — so two runs that differed at all would differ visibly.
+    ///
+    /// Compared field by field rather than through `snapshot()`, because a snapshot
+    /// leaves out the trace and the trace is where a stray acknowledge would show.
+    #[test]
+    fn looking_at_the_video_does_not_change_the_machine() {
+        let (o, _s, _p) = opts("looking");
+        let mut m = machine();
+        // One machine, restored between the two runs — 525 KB on the stack means two
+        // do not fit in a test thread.
+        let start = m.snapshot();
+
+        // Every view, and a subtracted layer. Ten ticks, so the comparison run's ten
+        // idle ticks ask for the same frames — the fake advances one frame per tick
+        // whether keys are held or not.
+        //
+        // A released tick after each press: these keys are all edge-triggered, so
+        // consecutive held ticks are one press and the script would stop short of the
+        // layers view.
+        let base = (m.board.trace.acks, m.board.trace.vblanks);
+        let mut d = Fake::new(vec![
+            Fake::held(&[Key::GfxToggled]),
+            Fake::held(&[]),
+            Fake::held(&[Key::GfxView]),
+            Fake::held(&[]),
+            Fake::held(&[Key::GfxView]),
+            Fake::held(&[]),
+            Fake::held(&[Key::GfxView]),
+            Fake::held(&[]),
+            Fake::held(&[Key::Enter]),
+            Fake::held(&[]),
+        ]);
+        let s_on = run(&mut m, &mut d, &o);
+        let on = (
+            m.total_cycles,
+            m.cpu.d,
+            m.cpu.a,
+            m.cpu.pc,
+            m.line,
+            m.board.trace.acks - base.0,
+            m.board.trace.vblanks - base.1,
+        );
+        let ram_on = m.board.ram.clone();
+        assert_ne!(on.0, 0, "the premise: the machine ran");
+        assert_ne!(
+            m.video.enable,
+            machine::video::compose::LayerMask::all(),
+            "the premise: a layer really was subtracted"
+        );
+
+        m.restore(&start);
+        // `restore` leaves `enable` alone — it is not machine state — so the
+        // comparison run must clear it by hand. That this is necessary is itself the
+        // point of `machine`'s own `the_layer_mask_is_not_machine_state`.
+        m.video.enable = machine::video::compose::LayerMask::all();
+        let base = (m.board.trace.acks, m.board.trace.vblanks);
+        let mut d = Fake::new(Fake::idle(10));
+        let s_off = run(&mut m, &mut d, &o);
+
+        assert_eq!(s_on.frames, s_off.frames, "the same frames were asked for");
+        assert_eq!(s_on.frames, 10, "and there were some");
+        assert_eq!(
+            on,
+            (
+                m.total_cycles,
+                m.cpu.d,
+                m.cpu.a,
+                m.cpu.pc,
+                m.line,
+                m.board.trace.acks - base.0,
+                m.board.trace.vblanks - base.1,
+            ),
+            "the viewer must not move the machine"
+        );
+        assert_eq!(ram_on, m.board.ram, "nor write a word of its memory");
+    }
+
     /// **The criterion that matters most:** watching the machine does not change it.
     ///
     /// A tool that observes the bug must not be part of it. `peek_word` taking `&self`

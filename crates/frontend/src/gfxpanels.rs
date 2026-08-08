@@ -1108,6 +1108,29 @@ mod tests {
             },
         );
         assert!(panel_contains(&buf, "S1 OFF", OFF), "and now disabled");
+
+        // And scroll 2's *second* gate: videocontrol bit 2, which the layer control
+        // knows nothing about. Both halves above move the one bit a re-derived
+        // "layercontrol & 0x08" would get right, so neither can tell the two apart —
+        // a viewer that read only the layer control would report this layer as on
+        // while the renderer draws nothing of it, which is the exact case
+        // `layer_enabled` is public to prevent.
+        m.board.cps_b[VideoConfig::sf2().layer_control] |= 0x08;
+        m.board.cps_a[VIDEOCONTROL] &= !0x0004;
+        let mut buf = frame();
+        draw(
+            &mut buf,
+            &m,
+            &ViewState {
+                view: View::Layers,
+                ..base_state()
+            },
+        );
+        assert!(panel_contains(&buf, "S1 ON", FG), "scroll 1 is on again");
+        assert!(
+            panel_contains(&buf, "S2 OFF", OFF),
+            "and scroll 2 is off through videocontrol, not the layer control"
+        );
     }
 
     /// Sprites read `ALWAYS`, because CPS-1 has no sprite enable bit.
@@ -1157,6 +1180,13 @@ mod tests {
     /// The same claim `overlay`'s `a_panel_leaves_the_rest_of_the_frame_alone`
     /// makes, and for the same reason: a view that ran one pixel past its box would
     /// look like a rendering bug in the game.
+    ///
+    /// **The border is checked against literal twos, not against [`VX`] and [`VW`].**
+    /// The loop below asks whether a view stayed inside whatever the box currently is,
+    /// which is a claim that cannot fail when the box itself is what moved: widen `VW`
+    /// to `WIDTH` and the loop's own `inside` widens with it. The two-pixel border is
+    /// the visible promise — it is what keeps the viewer from looking like the game
+    /// broke — so it is pinned as a number here and derived nowhere.
     #[test]
     fn every_view_stays_inside_its_box() {
         let m = a_machine(gfx_rom(TileKind::Tile16x16, 64));
@@ -1178,6 +1208,14 @@ mod tests {
                             buf[y * WIDTH + x],
                             0x00FF_00FF,
                             "{view:?} touched ({x}, {y}), outside its box"
+                        );
+                    }
+                    // And the border, in numbers of its own.
+                    if !(2..WIDTH - 2).contains(&x) || !(2..HEIGHT - 2).contains(&y) {
+                        assert_eq!(
+                            buf[y * WIDTH + x],
+                            0x00FF_00FF,
+                            "{view:?} touched ({x}, {y}), inside the two-pixel border"
                         );
                     }
                 }

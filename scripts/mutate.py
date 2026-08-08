@@ -597,14 +597,19 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
             # Escape to another free bit changes nothing observable. Worth having
             # precisely because it looks like it should fail.
             #
-            # ⚠️ 30, and not 25, which is what this said until Task 5 gave bit 25 to
-            # `F7`. The control then *died*, correctly: it had quietly become a
-            # two-keys-share-a-bit mutant, which the suite is supposed to kill. This is
+            # ⚠️ It has moved twice, both times because a later task took the bit it
+            # was parked on: E2 took 25 for `F7`, and E3 took 30 for `GfxView`. Each
+            # time the control *died*, correctly -- it had quietly become a
+            # two-keys-share-a-bit mutant, which the suite is supposed to kill. That is
             # the failure mode a control exists to expose in the harness itself, and it
-            # is why `--all` is run rather than one set at a time. 29 keys hold bits
-            # 0-28, so 30 is free and stays free unless a key is added -- at which
-            # point this control dies again and says so.
-            ("CONTROL-escape-moves-to-another-free-bit", "Key::Escape => 21,", "Key::Escape => 30,", "SURVIVE"),
+            # is why `--all` is run rather than one set at a time.
+            #
+            # The denominator, written down this time: 34 keys hold bits 0-33, and
+            # `KeySet` is a `u64`, so everything from 34 up is free. 62 leaves room
+            # above and below. This control will die again if a key is ever given bit
+            # 62, and that death is the signal it exists for, not a mutant to
+            # re-expect.
+            ("CONTROL-escape-moves-to-another-free-bit", "Key::Escape => 21,", "Key::Escape => 62,", "SURVIVE"),
         ],
     ),
     "pixels": (
@@ -1056,6 +1061,234 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
                 "CONTROL-initializer-field-order",
                 "        state_path: args.state.clone(),\n        shot_path: default_shot_path(&args.path),",
                 "        shot_path: default_shot_path(&args.path),\n        state_path: args.state.clone(),",
+                "SURVIVE",
+            ),
+        ],
+    ),
+    # E3 Task 6: the graphics viewer's state machine. Its characteristic bug is not a
+    # wrong pixel, it is a key that acts on the wrong view -- five keys with four
+    # meanings each is twenty behaviours, and nineteen of them right reads on screen as
+    # a key that does nothing.
+    "gfx": (
+        "crates/frontend/src/gfx.rs",
+        [
+            # `Enter`'s dispatch pinned to one view. Anchored on the `fn act` line
+            # because `match self.state.view {` opens `step` as well, and a two-match
+            # pattern is a NO-OP rather than a result.
+            (
+                "enter-always-acts-on-the-tile-view",
+                "    fn act(&mut self) {\n        match self.state.view {",
+                "    fn act(&mut self) {\n        match View::Tiles {",
+                "KILL",
+            ),
+            # The guard genuinely removed, not disabled: a hidden viewer that cycles
+            # its view is the bug where `]` pages something you cannot see, and the
+            # game's own bracket keys stop being free.
+            (
+                "a-hidden-viewer-still-takes-keys",
+                "        if !self.on {\n            return false;\n        }\n",
+                "",
+                "KILL",
+            ),
+            # The mask reset by `F9`. The single most tempting wrong decision in this
+            # module -- it reads as tidy -- and it makes "show me the game with scroll
+            # 1 off" unreachable, which is the whole point of a layer mask.
+            (
+                "toggling-the-viewer-clears-the-mask",
+                "        if a.gfx_toggled {\n            self.on = !self.on;\n        }",
+                "        if a.gfx_toggled {\n            self.on = !self.on;\n            self.state.mask = LayerMask::all();\n        }",
+                "KILL",
+            ),
+            (
+                "the-cursor-keeps-following-after-a-move",
+                "                self.state.map_at = Some((c, r));",
+                "                self.state.map_at = None;",
+                "KILL",
+            ),
+            # The reset dropped from the layer arm, anchored on its comment so the
+            # pattern does not also match the assignment in `step`.
+            (
+                "a-new-layer-keeps-the-old-cursor",
+                "                // old one means nothing. Back to following the beam.\n                self.state.map_at = None;",
+                "                // old one means nothing. Back to following the beam.",
+                "KILL",
+            ),
+            ("the-viewer-starts-shown", "            on: false,", "            on: true,", "KILL"),
+            # Wrapping instead of saturating at the end of the ROM: reads as the view
+            # resetting itself, and in release it lands on a real tile.
+            (
+                "paging-wraps-at-the-bottom",
+                "        at.saturating_sub(page)",
+                "        at.wrapping_sub(page)",
+                "KILL",
+            ),
+            # A half-row palette step. This one is here for a specific reason: it
+            # SURVIVES `the_palette_cursor_wraps_within_the_palette`, whose
+            # `assert_eq!(pal_at, PAL_PAGE)` and `PENS - PAL_PAGE` hold for *any* value
+            # of `PAL_PAGE` -- a claim that cannot fail. Only
+            # `the_palette_cursor_moves_by_one_row_of_swatches`, which reads the step
+            # off `pal_cell`, can tell.
+            (
+                "the-palette-steps-by-one-entry",
+                "const PAL_PAGE: usize = 64;",
+                "const PAL_PAGE: usize = 1;",
+                "KILL",
+            ),
+            (
+                "the-row-selection-sticks-at-the-top",
+                "                    (self.state.row + ROWS - 1) % ROWS",
+                "                    self.state.row.saturating_sub(1)",
+                "KILL",
+            ),
+            # Two rows sharing a layer: the table that is right in three places and
+            # wrong in the fourth, which subtracts a layer you can still see.
+            (
+                "row-one-toggles-the-sprites",
+                "            1 => m.scroll1 = !m.scroll1,",
+                "            1 => m.sprites = !m.sprites,",
+                "KILL",
+            ),
+            # The layout SF2's scroll 1 actually uses, skipped. A browser that cannot
+            # reach it shows scroll 1 at the wrong x bias and looks like a decoder bug.
+            (
+                "enter-skips-the-odd-tile-layout",
+                "        TileKind::Tile8x8 => TileKind::Tile8x8Odd,",
+                "        TileKind::Tile8x8 => TileKind::Tile16x16,",
+                "KILL",
+            ),
+            # CONTROL: two fields of the initial `ViewState`, written in the other
+            # order. A struct initializer's field order is not its layout, so this is
+            # observably identical.
+            #
+            # Not the plan's proposed control -- `tile_at: 0` -> `0x40` -- which was
+            # tried and dies honestly: `the_tile_view_pages_by_a_screenful_and_stops_at_zero`
+            # reads `tile_at` after one page and expects exactly one page. Every other
+            # field of `new()` is pinned by a test for the same reason, which is the
+            # answer to "why is this set's control so unambitious": in a constructor
+            # whose every value is asserted, the only safe edit is one that changes no
+            # value at all.
+            (
+                "CONTROL-initial-state-field-order",
+                "                map_at: None,\n                row: 0,",
+                "                row: 0,\n                map_at: None,",
+                "SURVIVE",
+            ),
+        ],
+    ),
+    # E3 Task 6: the four views. What this set is really testing is the module's one
+    # rule -- that nothing here re-derives what the renderer knows. Three of the
+    # mutants below are re-derivations that look right and are wrong in exactly the
+    # case the renderer already handles.
+    "gfxpanels": (
+        "crates/frontend/src/gfxpanels.rs",
+        [
+            # `View::cycled` lives here, not in `gfx.rs` -- the plan tabled this mutant
+            # under the `gfx` set, which is a plan/implementation mismatch, not a
+            # second copy of the function.
+            (
+                "the-view-does-not-cycle-back",
+                "            Self::Layers => Self::Tiles,",
+                "            Self::Layers => Self::Layers,",
+                "KILL",
+            ),
+            (
+                "the-tile-pens-are-not-the-roms",
+                "                    let pen = tile_pen(rom, s.kind, code, x, y);",
+                "                    let pen = 0;",
+                "KILL",
+            ),
+            (
+                "the-greys-are-inverted",
+                "    GREYS[(pen & 0x0F) as usize]",
+                "    GREYS[15 - (pen & 0x0F) as usize]",
+                "KILL",
+            ),
+            # The mapper's `None` printed as a tile number. The one failure the picture
+            # cannot show, turned into a diagnostic that sends you to tile 0.
+            (
+                "an-unmapped-code-shows-as-tile-zero",
+                '        None => text(buf, tx, ty + 2 * LINE, "ROM ----", OFF),',
+                '        None => text(buf, tx, ty + 2 * LINE, "ROM 0000", OFF),',
+                "KILL",
+            ),
+            # Three re-derivations of `map_origin`'s one line, which is four decisions
+            # long. Each is a viewer that names a tile the renderer never fetched.
+            (
+                "the-cursor-ignores-the-scroll",
+                "    let x = VISIBLE_X + i32::from(m.board.cps_a[sx] as i16);",
+                "    let x = VISIBLE_X;",
+                "KILL",
+            ),
+            (
+                "the-cursor-reads-the-scroll-unsigned",
+                "    let x = VISIBLE_X + i32::from(m.board.cps_a[sx] as i16);",
+                "    let x = VISIBLE_X + i32::from(m.board.cps_a[sx] as i32);",
+                "KILL",
+            ),
+            (
+                "the-cursor-forgets-the-visible-origin",
+                "    let x = VISIBLE_X + i32::from(m.board.cps_a[sx] as i16);",
+                "    let x = i32::from(m.board.cps_a[sx] as i16);",
+                "KILL",
+            ),
+            # The layers view answering "is this layer enabled" itself. The re-derived
+            # form is not sloppy -- it is the layer-control bit, correctly -- and it is
+            # wrong only for scrolls 2 and 3, which have a second gate in videocontrol.
+            # That is precisely the case `the_layers_view_agrees_with_the_renderer`'s
+            # third stanza was added for; the first two stanzas move the one bit both
+            # versions agree about, so this mutant survives them.
+            (
+                "the-layers-view-derives-its-own-enable",
+                "                    Some(layer_enabled(cfg, layer, layercontrol, videocontrol)),",
+                "                    Some(layercontrol & cfg.layer_enable_mask[n - 1] != 0),",
+                "KILL",
+            ),
+            # The box two pixels wider than its border. `WIDTH - 2` and not `WIDTH`: at
+            # `WIDTH` the `put` guard's range runs past the row and the run panics on an
+            # index, which is a kill for the wrong reason. This one draws, and draws
+            # into the border -- killed only by the literal-`2` half of
+            # `every_view_stays_inside_its_box`, since the derived half widens with it.
+            (
+                "a-view-runs-into-its-border",
+                "const VW: usize = WIDTH - 4;",
+                "const VW: usize = WIDTH - 2;",
+                "KILL",
+            ),
+            (
+                "a-swatch-is-not-the-windows-own-colour",
+                "        let fill = crate::pixels::argb(entry);",
+                "        let fill = EDGE;",
+                "KILL",
+            ),
+            # "Past the end of the ROM" drawn as a tile as well as a dot: `tile_pen`
+            # returns the transparent pen out there, which is a solid white square.
+            (
+                "an-off-rom-tile-is-drawn-anyway",
+                "                put(buf, cx, cy, OFF);\n                continue;",
+                "                put(buf, cx, cy, OFF);",
+                "KILL",
+            ),
+            (
+                "the-sprites-are-given-a-hardware-enable",
+                '            0 => ("OB", 0u8, None, s.mask.permits(None)),',
+                '            0 => ("OB", 0u8, Some(true), s.mask.permits(None)),',
+                "KILL",
+            ),
+            # The two columns collapsed into one: the mask column showing the
+            # hardware's answer means the view can no longer tell you what *you* did.
+            (
+                "the-mask-column-is-the-hardwares",
+                "                    s.mask.permits(Some(layer)),",
+                "                    layer_enabled(cfg, layer, layercontrol, videocontrol),",
+                "KILL",
+            ),
+            # CONTROL: a swatch's border shade. Nothing pins it and nothing should --
+            # the tests read a swatch's *fill*, one pixel in, and the border exists to
+            # separate neighbouring swatches rather than to be a particular grey.
+            (
+                "CONTROL-the-swatch-border-shade",
+                "const EDGE: u32 = 0x0080_8080;",
+                "const EDGE: u32 = 0x0070_7070;",
                 "SURVIVE",
             ),
         ],
