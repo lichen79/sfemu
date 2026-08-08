@@ -197,6 +197,36 @@ impl ScrollRows {
     }
 }
 
+/// One axis of a layer's map coordinate: `(tile, offset within the tile)`.
+///
+/// `edge` is the layer's tile edge in pixels and `raster` a **raster** position — the
+/// caller has already added [`crate::VISIBLE_X`] or [`crate::VISIBLE_Y`] and the
+/// scroll. Signed throughout, with Euclidean division, so a negative scroll is the
+/// same arithmetic as a positive one rather than a branch: 0xFFC0 is −64, and `-1 / 16`
+/// truncating to 0 would put the wrong tile at the left edge of the screen. The tile
+/// wraps at [`MAP_TILES`], because a layer's map is 64×64 and a scroll past its span
+/// shows the map again.
+///
+/// The `rem_euclid(MAP_TILES)` cannot be killed by a test, and that is provable rather
+/// than a gap: the returned tile reaches nothing but [`Layer::scan`], whose masks
+/// already cover exactly six bits (0x3F for the column; 0x1F|0x20, 0x0F|0x30,
+/// 0x07|0x38 for the row), and for a power-of-two modulus the low bits of a
+/// two's-complement `as u32` are the mathematical remainder — negatives included. It
+/// stays because it makes the returned tile the in-range value its name claims, rather
+/// than leaving that to a mask two functions away.
+///
+/// Published because a graphics viewer must name the tile the renderer fetched, and
+/// four decisions live in these two lines: the raster bias's absence, `div_euclid`,
+/// `rem_euclid`, and the wrap. This crate had to correct its raster-coordinate
+/// doctrine three times; a viewer with a fourth reading of it would report a tile that
+/// was never drawn, which is a diagnostic that lies exactly when it is being trusted.
+pub fn map_axis(edge: u32, raster: i32) -> (u32, u32) {
+    let step = edge as i32;
+    let tile = raster.div_euclid(step).rem_euclid(MAP_TILES as i32) as u32;
+    let offset = raster.rem_euclid(step) as u32;
+    (tile, offset)
+}
+
 /// Draws one scroll layer into `pens`, skipping transparent pixels.
 ///
 /// `pens` and `prio` are `WIDTH * HEIGHT`, row-major. A pixel is written only
@@ -234,37 +264,21 @@ pub fn draw_tilemap(
 
     let edge = layer.tile_edge();
     let step = edge as i32;
-    let tiles = MAP_TILES as i32;
     let gfx_type = layer.gfx_type();
     let screen_w = WIDTH as i32;
 
     for y in 0..HEIGHT {
-        // Signed throughout, with `rem_euclid` for the wrap, so a negative
-        // scroll is the same arithmetic as a positive one rather than a branch.
-        //
-        // The two `rem_euclid(tiles)` here and below cannot be killed by a test,
-        // and that is provable rather than a gap: `col` and `row` reach nothing
-        // but `Layer::scan`, whose masks already cover exactly six bits
-        // (0x3F for the column; 0x1F|0x20, 0x0F|0x30, 0x07|0x38 for the row), and
-        // for a power-of-two modulus the low bits of a two's-complement `as u32`
-        // are the mathematical remainder — negatives included. They stay because
-        // they make `col` and `row` the in-range values their names claim, rather
-        // than leaving that to a mask two functions away.
-        // Visible row `y` is raster row `y + VISIBLE_Y`, and the scroll
-        // registers are raster-space — see the crate documentation.
-        let map_y = y as i32 + VISIBLE_Y + rows.scroll_y;
-        let row = map_y.div_euclid(step).rem_euclid(tiles) as u32;
-        let ty = map_y.rem_euclid(step) as u32;
+        // Visible row `y` is raster row `y + VISIBLE_Y`, and the scroll registers
+        // are raster-space — see the crate documentation.
+        let (row, ty) = map_axis(edge, y as i32 + VISIBLE_Y + rows.scroll_y);
         let scroll_x = rows.x[y];
 
         let mut x = 0i32;
         while x < screen_w {
-            let map_x = x + VISIBLE_X + scroll_x;
-            let col = map_x.div_euclid(step).rem_euclid(tiles) as u32;
-            let tx0 = map_x.rem_euclid(step);
+            let (col, tx0) = map_axis(edge, x + VISIBLE_X + scroll_x);
             // The pixels of this tile still on screen: the rest of the tile, or
             // the rest of the line, whichever ends first.
-            let run = (step - tx0).min(screen_w - x);
+            let run = (step - tx0 as i32).min(screen_w - x);
 
             let info = tile_info(gfxram, table, layer, col, row);
             let Some(code) = mapper.map(gfx_type, info.code) else {
@@ -289,7 +303,7 @@ pub fn draw_tilemap(
             let base = y * WIDTH + x as usize;
 
             for k in 0..run {
-                let tx = (tx0 + k) as u32;
+                let tx = tx0 + k as u32;
                 let tx_eff = if info.flip_x { edge - 1 - tx } else { tx };
                 let pen = tile_pen(gfx, kind, code, tx_eff, ty_eff);
                 if pen == TRANSPARENT_PEN {
@@ -613,6 +627,52 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// `map_axis` is Euclidean, unbiased, and wraps at the map's edge.
+    ///
+    /// Four decisions live here and a viewer that re-derived them would get one wrong:
+    /// the wrap at [`MAP_TILES`], `div_euclid` rather than `/`, `rem_euclid` rather
+    /// than `%`, and no bias of its own — the caller adds `VISIBLE_X` or `VISIBLE_Y`.
+    /// Every expectation below is computed by hand.
+    #[test]
+    fn map_axis_is_euclidean_and_wraps_at_the_map_edge() {
+        // 16-pixel tiles. Raster 0 is tile 0, pixel 0, so this function adds no
+        // bias of its own.
+        assert_eq!(map_axis(16, 0), (0, 0));
+        assert_eq!(map_axis(16, 15), (0, 15), "the last pixel of tile 0");
+        assert_eq!(map_axis(16, 16), (1, 0), "the first pixel of tile 1");
+        assert_eq!(map_axis(16, 40), (2, 8));
+
+        // Negative: `/` truncates toward zero and would give tile 0 for −1, with `%`
+        // giving pixel −1 — which as a `u32` is 4294967295. Euclidean gives the last
+        // pixel of the tile *before* tile 0, which after the wrap is tile 63.
+        assert_eq!(map_axis(16, -1), (63, 15));
+        assert_eq!(map_axis(16, -16), (63, 0));
+        assert_eq!(map_axis(16, -64), (60, 0), "SF2's bootleg scroll1xoff");
+
+        // The wrap: 64 tiles of 16 pixels is 1024, and 1024 is tile 0 again.
+        assert_eq!(map_axis(16, 1024), (0, 0));
+        assert_eq!(map_axis(16, 1024 + 40), (2, 8), "the same as raster 40");
+        assert_eq!(map_axis(16, -1024), (0, 0), "and a whole map back");
+
+        // The other two edges, whose spans differ.
+        assert_eq!(map_axis(8, -1), (63, 7), "8-pixel tiles: 64 * 8 = 512");
+        assert_eq!(map_axis(8, 512), (0, 0));
+        assert_eq!(map_axis(32, -1), (63, 31), "32-pixel: 64 * 32 = 2048");
+        assert_eq!(map_axis(32, 2048), (0, 0));
+
+        // And every layer's own edge, so the three the renderer uses are covered by
+        // name rather than by their numbers happening to appear above.
+        for layer in [Layer::Scroll1, Layer::Scroll2, Layer::Scroll3] {
+            let e = layer.tile_edge();
+            assert_eq!(map_axis(e, -1), (63, e - 1), "{layer:?} at raster −1");
+            assert_eq!(
+                map_axis(e, (MAP_TILES * e) as i32),
+                (0, 0),
+                "{layer:?} wraps after a whole map"
+            );
         }
     }
 

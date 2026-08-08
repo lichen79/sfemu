@@ -31,7 +31,70 @@ use crate::sprites::{draw_sprites, ObjLatch};
 use crate::{HEIGHT, WIDTH};
 
 /// The four depths `layercontrol` selects a layer for.
-const DEPTHS: usize = 4;
+///
+/// Public because it is in [`layer_order`]'s and [`feeds_sprites`]' signatures, and a
+/// caller that must build an order array cannot spell its length otherwise.
+pub const DEPTHS: usize = 4;
+
+/// Which layers the caller permits to draw.
+///
+/// **Subtractive only.** A `false` hides a layer the hardware has enabled; a `true`
+/// cannot show one the hardware has disabled. [`Video::render`] combines this with
+/// [`layer_enabled`] using `&&`, hardware first, and the direction is not a stylistic
+/// choice: forcing a layer on would draw a tilemap from a base register the guest
+/// never set up, producing garbage indistinguishable from the tile-decode bug a
+/// graphics viewer exists to rule out. "Show me only scroll 2" is reached by clearing
+/// the other three.
+///
+/// This is a *view* setting and not machine state. Nothing the 68000 or the board
+/// reads depends on the framebuffer, so a mask changes the picture and not the
+/// machine — `sfemu`'s `looking_at_the_video_does_not_change_the_machine` is what
+/// holds that line, and `Cps1::snapshot` deliberately does not carry this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerMask {
+    /// Draw the sprites.
+    pub sprites: bool,
+    /// Draw scroll 1, the 8×8 layer.
+    pub scroll1: bool,
+    /// Draw scroll 2, the 16×16 layer.
+    pub scroll2: bool,
+    /// Draw scroll 3, the 32×32 layer.
+    pub scroll3: bool,
+}
+
+impl LayerMask {
+    /// Everything drawn: the default, and the identity.
+    pub const fn all() -> Self {
+        Self {
+            sprites: true,
+            scroll1: true,
+            scroll2: true,
+            scroll3: true,
+        }
+    }
+
+    /// Whether this mask permits a layer — or the sprites, for `None`.
+    ///
+    /// `Option<Layer>` rather than a fifth enum variant: [`layer_order`]'s vocabulary
+    /// is already "the sprites or one of three layers", and a new enum would need
+    /// converting at both call sites.
+    pub const fn permits(&self, layer: Option<Layer>) -> bool {
+        match layer {
+            None => self.sprites,
+            Some(Layer::Scroll1) => self.scroll1,
+            Some(Layer::Scroll2) => self.scroll2,
+            Some(Layer::Scroll3) => self.scroll3,
+        }
+    }
+}
+
+impl Default for LayerMask {
+    /// [`LayerMask::all`] — **not** the derived all-`false`, which would render a
+    /// blank screen for every caller that never heard of a mask.
+    fn default() -> Self {
+        Self::all()
+    }
+}
 
 /// A finished frame: one palette pen per pixel, and the sprite priority mask.
 #[derive(Debug, Clone)]
@@ -98,6 +161,12 @@ pub struct Video {
     pub mapper: BankMapper,
     /// The most recently rendered frame.
     pub fb: Framebuffer,
+    /// A debugger's subtraction. [`LayerMask::all`] by default, so nothing changes.
+    ///
+    /// A field rather than a [`Video::render`] parameter: threading it would touch
+    /// `Cps1::render`, every test that renders, the screenshot path, and the test
+    /// runner, for a value that is `all()` in all of them.
+    pub enable: LayerMask,
     /// The graphics ROM. Supplied by the caller; this crate holds no ROM.
     gfx: Vec<u8>,
     /// The previous frame's object table.
@@ -113,6 +182,9 @@ impl Video {
             cfg,
             mapper,
             fb: Framebuffer::new(),
+            // Spelled out rather than `Default::default()`, so the value is visible
+            // at the one place it is set.
+            enable: LayerMask::all(),
             gfx,
             obj: ObjLatch::new(),
             pal: Box::new([0u16; palette::PENS]),
@@ -149,13 +221,18 @@ impl Video {
         let order = layer_order(layercontrol);
         for (depth, want) in order.into_iter().enumerate() {
             match want {
-                0 => draw_sprites(
-                    &mut self.fb.pens,
-                    &self.fb.prio,
-                    &self.obj,
-                    &self.gfx,
-                    &self.mapper,
-                ),
+                0 => {
+                    if !self.enable.permits(None) {
+                        continue;
+                    }
+                    draw_sprites(
+                        &mut self.fb.pens,
+                        &self.fb.prio,
+                        &self.obj,
+                        &self.gfx,
+                        &self.mapper,
+                    )
+                }
                 n => {
                     let layer = match n {
                         1 => Layer::Scroll1,
@@ -163,7 +240,12 @@ impl Video {
                         // `layer_order` masks to two bits, so this is 3.
                         _ => Layer::Scroll3,
                     };
-                    if !layer_enabled(&self.cfg, layer, layercontrol, videocontrol) {
+                    // Hardware first, then the view's subtraction — `&&`, never
+                    // `||`: see [`LayerMask`]. A mask can hide what the hardware
+                    // shows and can never show what the hardware hides.
+                    if !layer_enabled(&self.cfg, layer, layercontrol, videocontrol)
+                        || !self.enable.permits(Some(layer))
+                    {
                         continue;
                     }
                     let (base, sx, sy) = match layer {
@@ -187,15 +269,11 @@ impl Video {
                         i32::from(cps_a[sy] as i16),
                         videocontrol,
                     );
-                    // A layer prepares the sprite mask only when the *next* depth
-                    // is the sprites: `render_layers` calls
-                    // `cps1_render_high_layer(..., l0)` only `if (l1 == 0)`, and so
-                    // on for each pair (`cps1_v.cpp:2985-2996`). A layer with no
-                    // sprite pass behind it — including the frontmost, which has no
-                    // next depth at all — occludes nothing, because there is
-                    // nothing there to occlude.
-                    let feeds_sprites = order.get(depth + 1) == Some(&0);
-                    let masks = if feeds_sprites { hi_pens } else { [0; DEPTHS] };
+                    let masks = if feeds_sprites(&order, depth) {
+                        hi_pens
+                    } else {
+                        [0; DEPTHS]
+                    };
                     draw_tilemap(
                         &mut self.fb.pens,
                         &mut self.fb.prio,
@@ -246,6 +324,15 @@ impl Video {
         &self.pal
     }
 
+    /// The graphics ROM, for a viewer that decodes tiles straight out of it.
+    ///
+    /// `&[u8]` rather than `&Vec<u8>`: every consumer wants a slice, and
+    /// [`crate::tiles::tile_pen`] takes one. Exposed so a tile browser reads the same
+    /// bytes the renderer draws from rather than holding a second copy.
+    pub fn gfx(&self) -> &[u8] {
+        &self.gfx
+    }
+
     /// The previous frame's object table, for a save state.
     pub fn obj_latch(&self) -> &ObjLatch {
         &self.obj
@@ -271,13 +358,24 @@ impl Video {
     }
 }
 
-/// Whether a scroll layer draws this frame.
+/// Whether the *guest* has this scroll layer enabled.
 ///
 /// Two conditions, both from `cps1_v.cpp:2331-2333`: the layer's bit in the
 /// layer-control register, and — for scrolls 2 and 3 only — a bit of
 /// `videocontrol`, bit 2 for scroll 2 and bit 3 for scroll 3. Scroll 1 has no
 /// second condition.
-fn layer_enabled(cfg: &VideoConfig, layer: Layer, layercontrol: u16, videocontrol: u16) -> bool {
+///
+/// Distinct from [`LayerMask`], which is a debugger's subtraction on top of this.
+/// Published so a layers view can *display* the hardware's answer: a two-condition
+/// rule written a second time somewhere else is a second answer, and a viewer that
+/// disagreed with the renderer about which layers are on would be a diagnostic that
+/// lies at exactly the moment it is being trusted.
+pub fn layer_enabled(
+    cfg: &VideoConfig,
+    layer: Layer,
+    layercontrol: u16,
+    videocontrol: u16,
+) -> bool {
     let (mask_index, extra) = match layer {
         Layer::Scroll1 => (0, None),
         Layer::Scroll2 => (1, Some(2)),
@@ -287,6 +385,22 @@ fn layer_enabled(cfg: &VideoConfig, layer: Layer, layercontrol: u16, videocontro
         return false;
     }
     extra.is_none_or(|bit| videocontrol & (1 << bit) != 0)
+}
+
+/// Whether the layer at `depth` prepares the sprite occlusion mask.
+///
+/// True when the *next* depth is the sprites. `render_layers` calls
+/// `cps1_render_high_layer(..., l0)` only `if (l1 == 0)`, and so on for each pair
+/// (`cps1_v.cpp:2985-2996`), so a layer with no sprite pass behind it — including the
+/// frontmost, which has no next depth at all — occludes nothing, because there is
+/// nothing there to occlude.
+///
+/// One line, and published anyway: a layers view must show this column, and a second
+/// `order.get(depth + 1) == Some(&0)` written elsewhere is a second answer. `depth`
+/// past the end is false rather than a panic, which is what the frontmost depth
+/// relies on.
+pub fn feeds_sprites(order: &[u8; DEPTHS], depth: usize) -> bool {
+    order.get(depth + 1) == Some(&0)
 }
 
 /// A layer's scroll, row scroll included where the board asks for it.
@@ -980,6 +1094,203 @@ mod tests {
         assert_eq!(v.fb.pens[i], want, "the same pixel the pens call a corner");
     }
 
+    /// The default mask changes not one pixel.
+    ///
+    /// The whole risk of publishing a layer mask, in one assertion: `render` gains a
+    /// condition, and a condition that was wrong in the default case would change
+    /// every rendered frame in the workspace — the composition tests here, the board
+    /// tests in `machine`, and the 127/127 vector suite, all at once and all in ways
+    /// that look like a video bug rather than like this change.
+    ///
+    /// Both frames come from the *same* code, so this cannot prove the default equals
+    /// the tree before the mask existed; what proves that is every other test in this
+    /// file and in `machine` passing **unmodified**. This pins the property going
+    /// forward: [`LayerMask::all`] is the identity, and so is leaving `enable` alone.
+    #[test]
+    fn the_default_mask_is_the_identity() {
+        for layer in [Layer::Scroll1, Layer::Scroll2, Layer::Scroll3] {
+            let f = Board::solid(layer);
+            let lc = f.enable_only();
+
+            let want = f.render(lc, 0x000C);
+            // The premise: the frame has something in it, or this compares two
+            // background fills and would pass whatever the mask did.
+            assert!(
+                want.iter().any(|&p| p != BACKGROUND_PEN),
+                "{layer:?}: the premise, the fixture draws something"
+            );
+
+            assert_eq!(
+                f.render_masked(lc, 0x000C, LayerMask::all()),
+                want,
+                "{layer:?}: an explicit all() draws the default frame"
+            );
+            assert_eq!(
+                LayerMask::default(),
+                LayerMask::all(),
+                "and the derived all-false Default is not what a caller gets"
+            );
+        }
+    }
+
+    /// The mask subtracts and never adds.
+    ///
+    /// Over all sixteen masks and each of the three layers: a layer the hardware has
+    /// disabled stays disabled whatever the mask says. A mask combined with `||`
+    /// rather than `&&` would pass every other test in this file — it differs only
+    /// where the hardware says no, and every other fixture here enables what it
+    /// draws.
+    #[test]
+    fn the_mask_can_only_subtract() {
+        for layer in [Layer::Scroll1, Layer::Scroll2, Layer::Scroll3] {
+            let f = Board::solid(layer);
+            // The premise: enabled, this layer covers the screen.
+            assert!(
+                f.drew(f.enable_only(), 0x000C),
+                "{layer:?}: the premise, it draws when enabled"
+            );
+
+            // Its own enable bit cleared, its depth field still in place.
+            let lc = f.enable_only() & !f.enable_mask();
+            for bits in 0u8..16 {
+                let mask = LayerMask {
+                    sprites: bits & 1 != 0,
+                    scroll1: bits & 2 != 0,
+                    scroll2: bits & 4 != 0,
+                    scroll3: bits & 8 != 0,
+                };
+                let r = f.render_masked(lc, 0x000C, mask);
+                assert!(
+                    r.iter().all(|&p| p == BACKGROUND_PEN),
+                    "{layer:?} mask {bits:04b} drew a layer the hardware disabled"
+                );
+            }
+        }
+    }
+
+    /// Each layer's mask bit subtracts its own layer and no other.
+    ///
+    /// Sixteen masks is a lot of coverage for "nothing appeared"; this is the other
+    /// direction, and it is what a mask wired to the wrong field would fail. Every
+    /// layer is enabled in hardware and all three draw; clearing one bit must remove
+    /// exactly that layer's pens.
+    #[test]
+    fn a_mask_bit_subtracts_its_own_layer() {
+        // All three layers enabled, one per depth, each solid in its own colour
+        // base — so `solid_pen` tells them apart in the finished frame.
+        let mut f = Board::solid(Layer::Scroll1);
+        let cfg = VideoConfig::sf2();
+        let lc = cfg.layer_enable_mask.iter().fold(0, |a, m| a | m) | depths([1, 2, 3, 0]);
+
+        // Scroll 1 is 8x8 and scroll 2 and 3 are 16x16 and 32x32, so one graphics
+        // slice cannot be solid for all three at once. Only scroll 1's pens are
+        // asserted present here; the other two are asserted absent, which is what
+        // the subtraction claim needs.
+        f.gfx = frame_bytes(Layer::Scroll1, SOLID_PEN);
+        let s1 = solid_pen(Layer::Scroll1);
+
+        let full = f.render_masked(lc, 0x000C, LayerMask::all());
+        assert!(full.contains(&s1), "the premise: scroll 1 draws its pen");
+
+        let without = f.render_masked(
+            lc,
+            0x000C,
+            LayerMask {
+                scroll1: false,
+                ..LayerMask::all()
+            },
+        );
+        assert!(
+            !without.contains(&s1),
+            "clearing scroll 1's bit removed scroll 1"
+        );
+
+        // And clearing a *different* layer's bit leaves scroll 1 alone.
+        for other in [
+            LayerMask {
+                scroll2: false,
+                ..LayerMask::all()
+            },
+            LayerMask {
+                scroll3: false,
+                ..LayerMask::all()
+            },
+            LayerMask {
+                sprites: false,
+                ..LayerMask::all()
+            },
+        ] {
+            assert_eq!(
+                f.render_masked(lc, 0x000C, other),
+                full,
+                "another layer's bit must not touch scroll 1: {other:?}"
+            );
+        }
+    }
+
+    /// The sprite bit subtracts the sprites.
+    ///
+    /// The one mask bit no tilemap test reaches, and the only one whose `render` arm
+    /// is the sprite path rather than the tilemap path.
+    #[test]
+    fn the_sprite_bit_subtracts_the_sprites() {
+        let mut f = Board::solid(Layer::Scroll2);
+        f.put_sprite(0, 0);
+        // Scroll 2 at the back, the sprites in front of it.
+        let lc = f.enable_mask() | depths([2, 0, 0, 0]);
+        let tile = solid_pen(Layer::Scroll2);
+        let sprite = SPRITE_COLOUR * PEN_GRANULARITY + u16::from(SOLID_PEN);
+        assert_ne!(tile, sprite, "the two are distinguishable");
+
+        assert_eq!(
+            f.render_masked(lc, 0x0004, LayerMask::all())[0],
+            sprite,
+            "the premise: the sprite is in front"
+        );
+        assert_eq!(
+            f.render_masked(
+                lc,
+                0x0004,
+                LayerMask {
+                    sprites: false,
+                    ..LayerMask::all()
+                }
+            )[0],
+            tile,
+            "subtracted, the tile behind it shows"
+        );
+    }
+
+    /// `feeds_sprites` is true exactly where the next depth is the sprites.
+    ///
+    /// Including the frontmost depth, which has no next depth at all: `order.get(4)`
+    /// is `None`, not `Some(&0)`, and a `depth + 1` written as an index would panic
+    /// there rather than answering false. The behavioural claim is
+    /// [`a_layer_masks_sprites_only_when_the_next_depth_is_the_sprites`]; this pins
+    /// the extracted function a viewer reads.
+    #[test]
+    fn only_the_layer_below_the_sprites_feeds_them() {
+        // Sprites at depth 2: scroll1, scroll3, sprites, scroll2.
+        let order = [1u8, 3, 0, 2];
+        assert!(!feeds_sprites(&order, 0), "two depths above the sprites");
+        assert!(feeds_sprites(&order, 1), "immediately below them");
+        assert!(!feeds_sprites(&order, 2), "the sprites themselves");
+        assert!(
+            !feeds_sprites(&order, 3),
+            "the frontmost, with no next depth"
+        );
+
+        // Sprites frontmost: depth 2 feeds them, and depth 3 is the sprites.
+        assert!(feeds_sprites(&[1, 2, 3, 0], 2));
+        assert!(!feeds_sprites(&[1, 2, 3, 0], 3));
+
+        // Sprites at the back feed nothing, because nothing is behind them.
+        assert!(!feeds_sprites(&[0, 1, 2, 3], 0));
+
+        // And a depth past the end is false rather than a panic.
+        assert!(!feeds_sprites(&[1, 2, 3, 0], DEPTHS));
+    }
+
     /// Reading a scroll register unsigned is an equivalent mutant, and here is why.
     ///
     /// The two readings differ by exactly 65536. Each layer's map is 64 tiles of
@@ -1311,7 +1622,17 @@ mod tests {
         /// pens. The object table is latched first, so a board with a sprite
         /// record draws it.
         fn render(&self, layercontrol: u16, videocontrol: u16) -> Vec<u16> {
+            self.render_masked(layercontrol, videocontrol, LayerMask::all())
+        }
+
+        /// As [`Board::render`], with a debugger's layer mask applied.
+        ///
+        /// The default path goes through `render` with no mask mentioned at all,
+        /// which is what makes "the default is the identity" a claim about the code
+        /// every other test in this file runs rather than about a second path.
+        fn render_masked(&self, layercontrol: u16, videocontrol: u16, m: LayerMask) -> Vec<u16> {
             let mut v = self.video();
+            v.enable = m;
             let mut cps_a = self.cps_a;
             let mut cps_b = self.cps_b;
             cps_a[VIDEOCONTROL] = videocontrol;
