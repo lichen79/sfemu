@@ -37,10 +37,20 @@ pub struct Z80 {
     ///
     /// | instruction | latch |
     /// |---|---|
-    /// | `LD A,(rr)`, `LD A,(nn)` | `addr + 1` |
-    /// | `LD (rr),A`, `LD (nn),A` | low byte of `addr + 1`, high byte **the byte written** |
+    /// | `LD A,(rr)`, `LD A,(nn)`, `IN A,(n)` | `addr + 1`, all sixteen bits |
+    /// | `LD (rr),A`, `LD (nn),A`, `OUT (n),A` | low byte of `addr + 1`, high byte **the byte written** |
     /// | `LD (nn),HL`, `LD HL,(nn)` | `nn + 1` — one increment, whichever direction |
     /// | `ADD HL,rr` | the **old** `HL` plus one, not the sum |
+    /// | `JP nn`, `JP cc,nn`, `CALL nn`, `CALL cc,nn` | `nn`, taken or not |
+    /// | `RET`, `RET cc` taken | the popped address |
+    /// | `JR`, `JR cc`, `DJNZ` taken | the jump target |
+    /// | `RST n` | `n * 8` |
+    /// | `EX (SP),HL` | the **new** `HL` |
+    ///
+    /// A conditional *relative* jump not taken leaves the latch alone, and so does
+    /// `RET cc` not taken — but a conditional *absolute* jump latches `nn` either
+    /// way, because the operand reaches the latch before the condition is consulted.
+    /// `JP (HL)` fetches no operand and so writes nothing.
     ///
     /// Every other base-page instruction leaves it alone. Each row was wrong in
     /// its own way before being fixed, and each cost 1,000 of 1,000 cases on its

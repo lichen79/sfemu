@@ -116,6 +116,8 @@ mod tests {
         assert_eq!(c.sp, 0x7FFE);
         assert_eq!(m.ram[0x7FFF], 0x12, "the high byte went to SP-1");
         assert_eq!(m.ram[0x7FFE], 0x34, "the low byte to SP-2");
+        // In that order, which the final RAM contents cannot show.
+        assert_eq!(m.writes, vec![(0x7FFF, 0x12), (0x7FFE, 0x34)]);
     }
 
     /// `POP` reads low then high and post-increments.

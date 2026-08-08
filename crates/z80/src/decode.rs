@@ -12,7 +12,7 @@
 //! dispatch, so an arm only ever sets those.
 
 use crate::flags::{self, C, F3, F5, H, N, PV, S, Z};
-use crate::ops::{alu, load};
+use crate::ops::{alu, bits, flow, load};
 use crate::{Bus, Z80};
 
 /// Executes a base-page opcode. Returns T-states.
@@ -256,9 +256,170 @@ pub fn execute<B: Bus>(cpu: &mut Z80, bus: &mut B, op: u8) -> u32 {
             cpu.q = 0;
             6
         }
-        // Tasks 8 and 9 fill the rest. Until then an unimplemented opcode is
-        // a panic *in development only*: it is unreachable once the suite is
-        // green, and a silent 4-T-state NOP here would make a missing instruction
+        // The four accumulator rotates.
+        0x07 => {
+            bits::rlca(cpu);
+            4
+        }
+        0x0F => {
+            bits::rrca(cpu);
+            4
+        }
+        0x17 => {
+            bits::rla(cpu);
+            4
+        }
+        0x1F => {
+            bits::rra(cpu);
+            4
+        }
+        // JR d, and the four conditional forms. The condition index for
+        // 0x20/0x28/0x30/0x38 is bits 4-3 of the opcode, which encode NZ Z NC C.
+        0x18 => {
+            let d = cpu.imm(bus);
+            flow::jr(cpu, d);
+            // Every jump that is *taken* latches its target; one that is not taken
+            // leaves the latch alone. See [`Z80::wz`].
+            cpu.wz = cpu.pc;
+            cpu.q = 0;
+            12
+        }
+        0x20 | 0x28 | 0x30 | 0x38 => {
+            let d = cpu.imm(bus);
+            cpu.q = 0;
+            if flow::cond(cpu, (op >> 3) & 3) {
+                flow::jr(cpu, d);
+                cpu.wz = cpu.pc;
+                12
+            } else {
+                7
+            }
+        }
+        0x10 => {
+            // DJNZ. B is decremented without flags -- this is not `dec8`, and
+            // using it here would clobber a comparison the loop body depends on.
+            let d = cpu.imm(bus);
+            cpu.b = cpu.b.wrapping_sub(1);
+            cpu.q = 0;
+            if cpu.b != 0 {
+                flow::jr(cpu, d);
+                cpu.wz = cpu.pc;
+                13
+            } else {
+                8
+            }
+        }
+        0xC3 => {
+            let nn = cpu.imm16(bus);
+            cpu.pc = nn;
+            cpu.wz = nn;
+            cpu.q = 0;
+            10
+        }
+        // JP cc,nn: 10 T-states either way -- the operand is read regardless, and
+        // there is nothing else to charge for.
+        0xC2 | 0xCA | 0xD2 | 0xDA | 0xE2 | 0xEA | 0xF2 | 0xFA => {
+            let nn = cpu.imm16(bus);
+            if flow::cond(cpu, (op >> 3) & 7) {
+                cpu.pc = nn;
+            }
+            // The latch takes `nn` either way: unlike a relative jump, the absolute
+            // forms compute their target in the latch before the condition is
+            // consulted, so it is written even when the jump is not taken.
+            cpu.wz = nn;
+            cpu.q = 0;
+            10
+        }
+        0xE9 => {
+            // JP (HL): the target is HL itself. The parentheses are Zilog's, and
+            // they are wrong. No operand is fetched, so nothing reaches the latch.
+            cpu.pc = cpu.hl();
+            cpu.q = 0;
+            4
+        }
+        0xCD => {
+            let nn = cpu.imm16(bus);
+            flow::call(cpu, bus, nn);
+            cpu.wz = nn;
+            cpu.q = 0;
+            17
+        }
+        0xC4 | 0xCC | 0xD4 | 0xDC | 0xE4 | 0xEC | 0xF4 | 0xFC => {
+            let nn = cpu.imm16(bus);
+            cpu.q = 0;
+            let taken = flow::cond(cpu, (op >> 3) & 7);
+            if taken {
+                flow::call(cpu, bus, nn);
+            }
+            cpu.wz = nn;
+            if taken {
+                17
+            } else {
+                10
+            }
+        }
+        0xC9 => {
+            flow::ret(cpu, bus);
+            cpu.wz = cpu.pc;
+            cpu.q = 0;
+            10
+        }
+        0xC0 | 0xC8 | 0xD0 | 0xD8 | 0xE0 | 0xE8 | 0xF0 | 0xF8 => {
+            cpu.q = 0;
+            if flow::cond(cpu, (op >> 3) & 7) {
+                flow::ret(cpu, bus);
+                cpu.wz = cpu.pc;
+                11
+            } else {
+                5
+            }
+        }
+        0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF => {
+            flow::rst(cpu, bus, (op >> 3) & 7);
+            cpu.wz = cpu.pc;
+            cpu.q = 0;
+            11
+        }
+        // EX (SP),HL: the word at the top of the stack, swapped with HL.
+        0xE3 => {
+            let lo = bus.read(cpu.sp);
+            let hi = bus.read(cpu.sp.wrapping_add(1));
+            // `H` goes back first, at `SP + 1`, before `L` at `SP` -- the reverse
+            // of the read order, and what the per-T-state trace records.
+            bus.write(cpu.sp.wrapping_add(1), cpu.h);
+            bus.write(cpu.sp, cpu.l);
+            cpu.h = hi;
+            cpu.l = lo;
+            cpu.wz = cpu.hl();
+            cpu.q = 0;
+            19
+        }
+        // IN A,(n) and OUT (n),A. The port's high byte is A, not zero -- the
+        // reason `Bus::port_in` takes 16 bits.
+        0xDB => {
+            let n = cpu.imm(bus);
+            let port = u16::from(cpu.a) << 8 | u16::from(n);
+            cpu.a = bus.port_in(port);
+            cpu.wz = port.wrapping_add(1);
+            cpu.q = 0;
+            11
+        }
+        0xD3 => {
+            let n = cpu.imm(bus);
+            let port = u16::from(cpu.a) << 8 | u16::from(n);
+            bus.port_out(port, cpu.a);
+            // A port write follows the same rule as a memory write: the byte on the
+            // data bus lands in the latch's high half. Here that byte is `A`, which
+            // is also the port's high half, so the two are indistinguishable --
+            // hence [`wz_after_write`] rather than a hand-written expression.
+            cpu.wz = wz_after_write(port, cpu.a);
+            cpu.q = 0;
+            11
+        }
+        // Only the five prefixes are left: CB, ED, DD, FD, and the double-prefix
+        // forms, which Tasks 9 through 12 fill in. Until then an unimplemented
+        // opcode is a panic *in development only*: it is unreachable once the suite
+        // is green, and a silent 4-T-state NOP here would make a missing instruction
         // look like a flag bug across a hundred vector files. Task 12 deletes this
         // arm and lets the compiler prove the match exhaustive.
         other => unimplemented!("base opcode {other:#04X}"),
@@ -701,5 +862,159 @@ mod tests {
         assert_eq!(run(&mut c, &[0xF9]), 6);
         assert_eq!(c.sp, 0x1234);
         assert_eq!(c.hl(), 0x1234, "HL is unchanged");
+    }
+
+    /// A value no instruction here could produce, so "the latch was left alone" and
+    /// "the latch was written with the right answer" cannot be confused.
+    const SENTINEL: u16 = 0x5EED;
+
+    /// A **taken** relative jump latches its target; one not taken leaves the latch.
+    ///
+    /// Three rules are distinguishable here and two of them are wrong: `pc + 2`
+    /// (the instruction after) and `pc + 2 + d` computed unconditionally. Both were
+    /// measured at 100% wrong on every not-taken case of `20.z80bin` through
+    /// `38.z80bin`, which is what established that the latch is untouched.
+    #[test]
+    fn a_relative_jump_latches_its_target_only_when_taken() {
+        // JR NZ,+4 with Z clear: taken.
+        let mut c = Z80::new();
+        c.wz = SENTINEL;
+        c.f = 0;
+        assert_eq!(run(&mut c, &[0x20, 0x04]), 12);
+        assert_eq!(c.pc, 0x106, "0x102 + 4");
+        assert_eq!(c.wz, 0x106, "the latch holds the target");
+
+        // The same instruction with Z set: not taken, and the latch is untouched --
+        // not 0x102, which is where PC ends up.
+        let mut c = Z80::new();
+        c.wz = SENTINEL;
+        c.f = Z;
+        assert_eq!(run(&mut c, &[0x20, 0x04]), 7);
+        assert_eq!(c.pc, 0x102);
+        assert_eq!(c.wz, SENTINEL, "a jump not taken writes no latch");
+
+        // DJNZ follows the same rule, on B rather than a flag.
+        let mut c = Z80::new();
+        c.wz = SENTINEL;
+        c.b = 1; // decrements to zero: not taken
+        assert_eq!(run(&mut c, &[0x10, 0x04]), 8);
+        assert_eq!(c.wz, SENTINEL);
+        let mut c = Z80::new();
+        c.wz = SENTINEL;
+        c.b = 2;
+        assert_eq!(run(&mut c, &[0x10, 0x04]), 13);
+        assert_eq!(c.wz, 0x106);
+    }
+
+    /// An **absolute** jump or call latches `nn` whether or not it is taken.
+    ///
+    /// This is the rule that makes the relative and absolute forms different, and
+    /// carrying the relative rule over to `JP cc` would fail every not-taken case
+    /// of eight vector files. The target is chosen to differ from both `PC` values.
+    #[test]
+    fn an_absolute_jump_latches_its_operand_even_when_not_taken() {
+        for (op, name) in [(0xC2u8, "JP NZ,nn"), (0xC4, "CALL NZ,nn")] {
+            let mut c = Z80::new();
+            c.wz = SENTINEL;
+            c.sp = 0x8000;
+            c.f = Z; // Z set: NZ is false, so not taken
+            run(&mut c, &[op, 0x78, 0x56]);
+            assert_eq!(c.pc, 0x103, "{name} was not taken");
+            assert_eq!(c.wz, 0x5678, "{name} latches nn regardless");
+        }
+
+        // And the unconditional forms, which have nothing to be regardless of.
+        let mut c = Z80::new();
+        c.wz = SENTINEL;
+        run(&mut c, &[0xC3, 0x78, 0x56]);
+        assert_eq!(c.wz, 0x5678, "JP nn");
+
+        // JP (HL) fetches no operand, so nothing reaches the latch. A core that
+        // wrote HL here would look right in a debugger and fail `e9.z80bin`.
+        let mut c = Z80::new();
+        c.wz = SENTINEL;
+        c.set_hl(0x4000);
+        assert_eq!(run(&mut c, &[0xE9]), 4);
+        assert_eq!(c.pc, 0x4000);
+        assert_eq!(
+            c.wz, SENTINEL,
+            "JP (HL) reads no operand and latches nothing"
+        );
+    }
+
+    /// `RET` latches the address it popped; `RET cc` not taken latches nothing.
+    #[test]
+    fn a_return_latches_the_popped_address_only_when_taken() {
+        let mut c = Z80::new();
+        c.pc = 0x100;
+        c.wz = SENTINEL;
+        c.sp = 0x8000;
+        let mut m = Mem::at(0x100, &[0xC9]);
+        m.ram[0x8000] = 0x78;
+        m.ram[0x8001] = 0x56;
+        assert_eq!(c.step(&mut m), 10);
+        assert_eq!(c.pc, 0x5678);
+        assert_eq!(c.wz, 0x5678);
+
+        // RET NZ with Z set: nothing is popped, and nothing is latched.
+        let mut c = Z80::new();
+        c.wz = SENTINEL;
+        c.sp = 0x8000;
+        c.f = Z;
+        assert_eq!(run(&mut c, &[0xC0]), 5);
+        assert_eq!(c.sp, 0x8000, "the stack was not touched");
+        assert_eq!(c.wz, SENTINEL);
+    }
+
+    /// `RST n` latches its fixed target, and pushes the address after itself.
+    #[test]
+    fn rst_latches_its_fixed_target() {
+        let mut c = Z80::new();
+        c.pc = 0x100;
+        c.wz = SENTINEL;
+        c.sp = 0x8000;
+        let mut m = Mem::at(0x100, &[0xEF]); // RST 28h
+        assert_eq!(c.step(&mut m), 11);
+        assert_eq!(c.pc, 0x28);
+        assert_eq!(c.wz, 0x28);
+        assert_eq!(m.ram[0x7FFF], 0x01, "0x101 was pushed, high byte first");
+        assert_eq!(m.ram[0x7FFE], 0x01);
+    }
+
+    /// `IN A,(n)` latches `port + 1` across all 16 bits; `OUT (n),A` truncates.
+    ///
+    /// `n = 0xFF` is the one operand that separates them. Reading, the increment
+    /// carries into the high half: `0x12FF + 1` is `0x1300`. Writing, only the low
+    /// half increments and the high half takes the byte on the data bus — which for
+    /// `OUT (n),A` is `A` — so the answer is `0x1200`, not `0x1300`. Any other `n`
+    /// makes the two rules agree.
+    #[test]
+    fn the_port_instructions_differ_in_the_latch_on_a_carry() {
+        let mut c = Z80::new();
+        c.wz = SENTINEL;
+        c.a = 0x12;
+        assert_eq!(run(&mut c, &[0xDB, 0xFF]), 11, "IN A,(n)");
+        assert_eq!(c.wz, 0x1300, "a read carries into the high half");
+
+        let mut c = Z80::new();
+        c.wz = SENTINEL;
+        c.a = 0x12;
+        assert_eq!(run(&mut c, &[0xD3, 0xFF]), 11, "OUT (n),A");
+        assert_eq!(c.wz, 0x1200, "a write does not, and A is the high half");
+    }
+
+    /// `EX (SP),HL` latches the **new** `HL` — the word it took off the stack.
+    #[test]
+    fn ex_sp_hl_latches_the_word_it_loaded() {
+        let mut c = Z80::new();
+        c.pc = 0x100;
+        c.wz = SENTINEL;
+        c.sp = 0x8000;
+        c.set_hl(0x1234);
+        let mut m = Mem::at(0x100, &[0xE3]);
+        m.ram[0x8000] = 0x78;
+        m.ram[0x8001] = 0x56;
+        assert_eq!(c.step(&mut m), 19);
+        assert_eq!(c.wz, 0x5678, "the new HL, not the old one");
     }
 }

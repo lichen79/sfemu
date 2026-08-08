@@ -10,10 +10,23 @@
 
 use crate::Bus;
 
-/// 64 KiB of RAM, a log of port writes, and one canned port-read value.
+/// 64 KiB of RAM, logs of every write and of both port directions, and one canned
+/// port-read value.
 pub struct Mem {
     pub ram: [u8; 0x1_0000],
+    /// Every `write`, in the order it happened.
+    ///
+    /// The final contents of `ram` cannot distinguish the order of two writes to
+    /// two addresses, and the order is exactly what `EX (SP),HL` and `PUSH` get
+    /// wrong: both write the high byte first, and both leave identical RAM either
+    /// way. The per-T-state vector trace compares this, so the unit tests must be
+    /// able to as well.
+    pub writes: Vec<(u16, u8)>,
     pub ports_out: Vec<(u16, u8)>,
+    /// The port addresses `port_in` was asked for. Logged as well as `ports_out`
+    /// because the address is half of what an `IN` can get wrong, and a bus that
+    /// only returned a value would make that half untestable.
+    pub ports_in: Vec<u16>,
     pub port_in_value: u8,
 }
 
@@ -23,7 +36,9 @@ impl Mem {
     pub fn new() -> Self {
         Mem {
             ram: [0; 0x1_0000],
+            writes: Vec::new(),
             ports_out: Vec::new(),
+            ports_in: Vec::new(),
             port_in_value: 0xFF,
         }
     }
@@ -51,8 +66,10 @@ impl Bus for Mem {
     }
     fn write(&mut self, addr: u16, val: u8) {
         self.ram[usize::from(addr)] = val;
+        self.writes.push((addr, val));
     }
-    fn port_in(&mut self, _port: u16) -> u8 {
+    fn port_in(&mut self, port: u16) -> u8 {
+        self.ports_in.push(port);
         self.port_in_value
     }
     fn port_out(&mut self, port: u16, val: u8) {
