@@ -210,26 +210,35 @@ mod tests {
         acks: u64,
         gfxram_writes: u64,
         total_cycles: u64,
+        line: u32,
         d0: u32,
         d1: u32,
+        ram_word: u16,
+        gfx_word: u16,
     }
 
-    /// Runs `frames` frames and describes *what those frames did*.
+    /// Runs `lines` **scanlines** and describes what they did.
+    ///
+    /// Scanlines and not frames, and a count that is deliberately not a multiple of
+    /// 262. A whole number of frames contains exactly one vblank per frame wherever
+    /// it starts, so it cannot see a restored `line` being wrong — the mutant
+    /// dropping `self.line = s.line` from `restore` survived a 30-frame version of
+    /// this. A partial frame at each end makes the starting line observable.
     ///
     /// The trace counters are **deltas**, not absolutes. The trace is deliberately
     /// not restored — it records the session — so its absolute values necessarily
     /// differ between a first run and a replay, and comparing them would fail for
     /// the one reason that is correct behaviour. The delta is the interesting
-    /// number: it says the replayed frames took and acknowledged the same
-    /// interrupts and wrote gfxram the same number of times.
-    fn advance_and_fingerprint(m: &mut Cps1, frames: u32) -> Fingerprint {
+    /// number: it says the replayed lines took and acknowledged the same interrupts
+    /// and wrote gfxram the same number of times.
+    fn advance_and_fingerprint(m: &mut Cps1, lines: u32) -> Fingerprint {
         let (v0, a0, w0) = (
             m.board.trace.vblanks,
             m.board.trace.acks,
             m.board.trace.gfxram_writes,
         );
-        for _ in 0..frames {
-            m.run_frame();
+        for _ in 0..lines {
+            m.run_scanline();
         }
         m.render();
         Fingerprint {
@@ -238,8 +247,15 @@ mod tests {
             acks: m.board.trace.acks - a0,
             gfxram_writes: m.board.trace.gfxram_writes - w0,
             total_cycles: m.total_cycles,
+            line: m.line,
             d0: m.cpu.d[0],
             d1: m.cpu.d[1],
+            // A word of each memory the program writes. The loop rewrites every word
+            // it touches from `d0`, so identical memory follows from an identical
+            // `d0` — which is why the single-field tests below, not this one, are
+            // what pin RAM and gfxram being restored at all.
+            ram_word: m.board.ram[0],
+            gfx_word: m.board.gfxram[0],
         }
     }
 
@@ -251,20 +267,31 @@ mod tests {
     /// fields that must be in a state are private, so that is exactly the mistake
     /// available here.
     ///
-    /// So: run 20 frames, snapshot, run 30 more and record what happened, restore,
-    /// run the same 30, and require the framebuffer and the counters to match. A
-    /// dropped `carry` shifts every later scanline boundary; a dropped
-    /// `vblank_pending` doubles or misses an interrupt at the seam; a dropped object
-    /// latch draws one frame of wrong sprites.
+    /// So: run to a point **mid-frame**, snapshot, run 7,777 scanlines and record
+    /// what happened, restore, run the same 7,777, and require the framebuffer and
+    /// the counters to match. A dropped `carry` shifts every later scanline
+    /// boundary; a dropped `vblank_pending` doubles or misses an interrupt at the
+    /// seam; a dropped object latch draws one frame of wrong sprites.
+    ///
+    /// # Why the two odd numbers
+    ///
+    /// 5,241 lines is 20 frames and 1 line — so the snapshot is taken with a
+    /// non-zero `line` and a non-zero `carry`, which a frame boundary would hide.
+    /// 7,777 lines is 29 frames and 179 — a partial frame at each end, so the
+    /// vblank count depends on where the run started. A whole number of frames sees
+    /// exactly one vblank per frame from any starting line, and a 30-frame version
+    /// of this test let the mutant dropping `self.line = s.line` survive.
     #[test]
-    fn a_restored_machine_runs_the_same_thirty_frames() {
+    fn a_restored_machine_runs_the_same_seven_thousand_lines() {
         let mut m = machine();
-        for _ in 0..20 {
-            m.run_frame();
+        for _ in 0..5_241 {
+            m.run_scanline();
         }
         let s = m.snapshot();
+        assert_ne!(s.line, 0, "the premise: the snapshot is taken mid-frame");
+        assert_ne!(s.carry, 0, "and mid-scanline, with debt carried");
 
-        let first = advance_and_fingerprint(&mut m, 30);
+        let first = advance_and_fingerprint(&mut m, 7_777);
         // The premise for comparing framebuffers at all: this one has more than one
         // pen in it. A uniform frame would make the `pens` half of the fingerprint
         // agree no matter what the sprite path did.
@@ -274,31 +301,32 @@ mod tests {
         );
 
         m.restore(&s);
-        let second = advance_and_fingerprint(&mut m, 30);
+        let second = advance_and_fingerprint(&mut m, 7_777);
 
         assert_eq!(
             first, second,
-            "a restored machine must run the same thirty frames"
+            "a restored machine must run the same 7,777 scanlines"
         );
     }
 
     /// And the fingerprint can tell two runs apart.
     ///
-    /// The test above is only meaningful if its comparison can fail. This runs a
-    /// *different* number of frames and requires a different fingerprint — the
-    /// control every "they matched" claim needs.
+    /// The test above is only meaningful if its comparison can fail. This runs one
+    /// scanline fewer and requires a different fingerprint — the control every
+    /// "they matched" claim needs. One line and not one frame, because one line is
+    /// the smallest difference the test above could fail to notice.
     #[test]
-    fn the_fingerprint_distinguishes_different_runs() {
+    fn the_fingerprint_distinguishes_runs_one_scanline_apart() {
         let mut m = machine();
-        for _ in 0..20 {
-            m.run_frame();
+        for _ in 0..5_241 {
+            m.run_scanline();
         }
         let s = m.snapshot();
-        let thirty = advance_and_fingerprint(&mut m, 30);
+        let long = advance_and_fingerprint(&mut m, 7_777);
         m.restore(&s);
-        let twenty_nine = advance_and_fingerprint(&mut m, 29);
+        let short = advance_and_fingerprint(&mut m, 7_776);
         assert_ne!(
-            thirty, twenty_nine,
+            long, short,
             "if these matched, the divergence test above would prove nothing"
         );
     }
@@ -319,7 +347,59 @@ mod tests {
         assert!(m.board.trace.gfxram_writes > 0, "and the loop wrote gfxram");
     }
 
-    /// The scheduler's carry is part of the state.
+    /// RAM and gfxram are part of the state.
+    ///
+    /// The divergence test cannot see this, and finding out why was worth the
+    /// mutation pass: the test program rewrites every word it touches from `d0`, so
+    /// restoring `d0` alone makes the memory converge within one loop iteration.
+    /// Both mutants dropping a `copy_from_slice` survived it.
+    ///
+    /// So this writes a word each memory's *guest* never touches — the program
+    /// writes RAM word 0 and gfxram word 0 — and requires it to come back. A word
+    /// far from anything the fixture uses, so nothing else can be what restores it.
+    #[test]
+    fn ram_and_gfxram_are_part_of_the_state() {
+        let mut m = machine();
+        m.board.ram[0x1234] = 0xBEEF;
+        m.board.gfxram[0x1_0000] = 0xCAFE;
+        let s = m.snapshot();
+
+        m.board.ram[0x1234] = 0x0000;
+        m.board.gfxram[0x1_0000] = 0x0000;
+        m.restore(&s);
+
+        assert_eq!(m.board.ram[0x1234], 0xBEEF, "main RAM is restored");
+        assert_eq!(m.board.gfxram[0x1_0000], 0xCAFE, "and so is gfxram");
+    }
+
+    /// The scanline counter is part of the state.
+    ///
+    /// The divergence test's earlier 30-*frame* form could not see this: a whole
+    /// number of frames contains one vblank per frame from any starting line. It now
+    /// runs 7,777 lines, which does see it — and this says which field, directly.
+    #[test]
+    fn the_scanline_counter_is_part_of_the_state() {
+        let mut m = machine();
+        for _ in 0..100 {
+            m.run_scanline();
+        }
+        let s = m.snapshot();
+        assert_eq!(s.line, 100, "100 lines run, 100 lines counted");
+
+        for _ in 0..50 {
+            m.run_scanline();
+        }
+        assert_eq!(m.line, 150, "the premise: the machine has moved on");
+
+        m.restore(&s);
+        assert_eq!(
+            m.line, 100,
+            "the beam goes back where the state left it, or the next vblank lands \
+             in the wrong place"
+        );
+    }
+
+    /// The scheduler's carry reaches the scheduler.
     ///
     /// The divergence test catches all three private fields together, which means it
     /// says "something is missing" rather than which. This says which: it restores
@@ -346,12 +426,63 @@ mod tests {
         );
     }
 
+    /// And the carry is *captured*, not just restorable.
+    ///
+    /// A `snapshot` hard-coding `carry: 0` passes the test above — that one supplies
+    /// its own carry values — and it also survives the divergence test, which was
+    /// the surprise the mutation pass turned up. The reason is arithmetic: a
+    /// scanline spends `640 + carry_in - carry_out` cycles, so over a run the carried
+    /// terms cancel at both ends and a wrong starting carry changes no cycle total
+    /// by more than one instruction's worth. The observable is the carry itself.
+    ///
+    /// So: reach a non-zero carry, snapshot, run on, restore, and require the same
+    /// carry — read back through a second snapshot, which is the only way out.
+    #[test]
+    fn the_carry_is_captured_and_not_just_restorable() {
+        let mut m = machine();
+        m.run_scanline();
+        let s = m.snapshot();
+        let carry = s.carry;
+        assert_ne!(
+            carry, 0,
+            "the premise: this fixture straddles line boundaries"
+        );
+
+        for _ in 0..7 {
+            m.run_scanline();
+        }
+        assert_ne!(
+            m.snapshot().carry,
+            carry,
+            "the premise: seven more lines moved the carry"
+        );
+
+        m.restore(&s);
+        assert_eq!(
+            m.snapshot().carry,
+            carry,
+            "a state that did not capture the carry restores the machine \
+             mid-instruction out of step, every line, forever"
+        );
+    }
+
     /// The pending vblank is part of the state.
     #[test]
     fn the_pending_vblank_is_part_of_the_state() {
         let mut m = machine();
         let mut s = m.snapshot();
         assert!(!s.vblank_pending, "a fresh machine has none");
+
+        // Captured, and not just restored. Asserted through the beam's own path
+        // rather than the restore setter, so this cannot pass by the setter agreeing
+        // with itself. A snapshot hard-coding `false` survives every restore
+        // assertion below and fails here.
+        m.board.assert_vblank();
+        assert!(
+            m.snapshot().vblank_pending,
+            "a state taken with the line asserted must say so"
+        );
+        m.board.set_vblank_pending(false);
 
         s.vblank_pending = true;
         m.restore(&s);
