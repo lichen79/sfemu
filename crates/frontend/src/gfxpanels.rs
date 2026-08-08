@@ -187,6 +187,16 @@ pub fn map_origin(m: &Cps1, layer: Layer) -> (u32, u32) {
     // `as i16` before widening: 0xFFC0 is −64, not 65472. The registers are
     // unsigned words holding signed scrolls, which is the trap `compose.rs`
     // documents at length.
+    //
+    // **No test can tell this from `as i32`**, and that is provable rather than a
+    // gap: the two readings differ by exactly 65536, and 65536 is a whole number of
+    // map spans for every layer — 64×8, 64×16 and 64×32 all divide it — so
+    // `map_axis`'s `div_euclid`/`rem_euclid` land on the same tile *and* the same
+    // offset for either. `a_map_span_divides_the_register_range` pins that
+    // precondition, since it is a fact about the hardware's numbers rather than
+    // about this line. The `as i16` stays because the intermediate value is a
+    // scroll, and a scroll of −64 is not 65472 whatever the wrap does with it
+    // afterwards.
     let x = VISIBLE_X + i32::from(m.board.cps_a[sx] as i16);
     let y = VISIBLE_Y + i32::from(m.board.cps_a[sy] as i16);
     let edge = layer.tile_edge();
@@ -1074,6 +1084,45 @@ mod tests {
             },
         );
         assert!(panel_contains(&buf, "MAP 63,63", HI), "and it is on screen");
+    }
+
+    /// A whole number of map spans fits in the scroll registers' range.
+    ///
+    /// The precondition behind [`map_origin`]'s "no test can tell `as i16` from
+    /// `as i32`": the two readings differ by 65536, so they agree exactly when 65536
+    /// is a multiple of every layer's map span. Asserted here rather than left as a
+    /// remark, because it is the claim the remark rests on — if a later board gave a
+    /// layer a map that did not divide it, the sign of the scroll would start
+    /// mattering to the cursor and the comment would be quietly wrong.
+    ///
+    /// The offsets are checked too, not just the tiles: `map_axis` returns both, and
+    /// a span dividing the range settles the tile without saying anything about the
+    /// pixel within it.
+    #[test]
+    fn a_map_span_divides_the_register_range() {
+        for layer in [Layer::Scroll1, Layer::Scroll2, Layer::Scroll3] {
+            let span = MAP_TILES * layer.tile_edge();
+            assert_eq!(
+                65536 % span,
+                0,
+                "{layer:?}: {span} pixels of map must divide the 16-bit range"
+            );
+        }
+        // And the consequence, at the register values where the two readings are
+        // furthest apart: the largest negative scroll, and the value either side of
+        // the sign boundary.
+        for layer in [Layer::Scroll1, Layer::Scroll2, Layer::Scroll3] {
+            let edge = layer.tile_edge();
+            for reg in [0x8000u16, 0x8001, 0xFFC0, 0xFFFF, 0x7FFF, 0xC000] {
+                let signed = VISIBLE_X + i32::from(reg as i16);
+                let unsigned = VISIBLE_X + i32::from(reg);
+                assert_eq!(
+                    map_axis(edge, signed),
+                    map_axis(edge, unsigned),
+                    "{layer:?} at scroll {reg:#06X}: the wrap hides the sign"
+                );
+            }
+        }
     }
 
     /// The layers view's enable column is the renderer's answer, not its own.

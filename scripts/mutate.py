@@ -1219,11 +1219,20 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
                 "    let x = VISIBLE_X;",
                 "KILL",
             ),
+            # Expected KILL when it was written, and it survived. Diagnosed rather
+            # than re-expected: the two readings differ by exactly 65536, and 64*8,
+            # 64*16 and 64*32 all divide 65536, so `map_axis`'s Euclidean wrap gives
+            # the same tile and the same offset for either -- no register value on any
+            # layer can separate them. Proven for all 65536 values of all three
+            # layers, and the precondition is now pinned by
+            # `a_map_span_divides_the_register_range`. The line keeps `as i16`
+            # because the intermediate value is a scroll and -64 is not 65472; the
+            # mutant is an equivalent, not a gap.
             (
-                "the-cursor-reads-the-scroll-unsigned",
+                "EQUIVALENT-the-cursor-reads-the-scroll-unsigned",
                 "    let x = VISIBLE_X + i32::from(m.board.cps_a[sx] as i16);",
                 "    let x = VISIBLE_X + i32::from(m.board.cps_a[sx] as i32);",
-                "KILL",
+                "SURVIVE",
             ),
             (
                 "the-cursor-forgets-the-visible-origin",
