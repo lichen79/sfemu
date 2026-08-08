@@ -12,8 +12,9 @@ framework with a MAME ROM-set loader** (B), the **CPS-1 scanline renderer** (C),
 the **frontend** — window, frame clock, keyboard, and save states (E1) — the
 **debugger** (E2): `F1` for an in-window overlay, `F4` to step one instruction,
 `F7` for a breakpoint — and the **graphics viewers** (E3): `F9` for a tile,
-tilemap, palette and layer browser, `F10` to cycle it. The Z80 and audio (D) and
-the Street Fighter 1 driver (F) are not built yet: **there is no sound.**
+tilemap, palette and layer browser, `F10` to cycle it. The audio sub-projects
+(D1 the Z80, D2 the YM2151, D3 the samples and the speaker) and the Street
+Fighter 1 driver (F) are not built yet: **there is no sound.**
 
 ## The 68000 core
 
@@ -416,7 +417,9 @@ out of the access sequence a handler already has to schedule.
 | **A** | Workspace and M68000 core | **complete** — 127/127 groups, 317,500/317,500 cases |
 | **B** | Bus/timing framework, MAME ROM-set loader | **complete** — first execution of real board code |
 | **C** | CPS-1 video: tilemaps, sprites, palettes, CPS-A/B registers, scanline renderer | **complete** — the largest piece, and where SF2 becomes visible |
-| D | Z80 and audio: YM2151, OKI MSM6295 ADPCM | deferrable; CPS-1 sound is a fire-and-forget latch |
+| D1 | Z80 audio CPU | **in progress** — the sound board's processor, against 1,604 vector files |
+| D2 | YM2151 FM, and the sound board's wiring | the latch reaches a chip; still silent |
+| D3 | OKI MSM6295 ADPCM, mixing, host audio | the one that ends "there is no sound" |
 | **E1** | Frontend: window, frame clock, keyboard, save states | **complete** — `--play` |
 | **E2** | Debugger: single-step, breakpoints, disassembly, register and memory views | **complete** — `F1`, in-window, and it does not perturb the machine |
 | **E3** | Graphics viewers: tile browser, tilemap and palette views, layer toggles | **complete** — `F9`, four views, and the mask subtracts only |
@@ -426,7 +429,14 @@ E was split because its three surfaces are independent and only the first change
 what the project *is* rather than what can be inspected about it. E3 came last for
 a reason rather than by preference: a tile browser's value is mostly in stopping
 the machine at the frame you care about, which is E2's stepping — so E3 waited for
-it, and then took it. **D or F next**; D is the one that ends "there is no sound."
+it, and then took it.
+
+**D is split for the same reason, and the number that settled it is 1,604.** That
+is how many vector files the Z80 suite has, against the 68000's 127 — and the
+68000 took 16,462 lines and a spec of its own. A Z80 core, an FM synthesizer, and
+a host audio path are three unrelated subsystems; asking one review pass to gate
+all three is what the original decomposition was written to avoid. **D1 is next**,
+and it is silent by design: D3 is the one that ends "there is no sound."
 
 WASM and netplay are not stages. They are constraints on A–D: no threads, no
 wall-clock access, no host I/O in the core, a frame-stepped API, and complete
