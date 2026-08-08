@@ -11,3 +11,4 @@ publish = false
 [dependencies]
 machine = { path = "../machine" }
 romset = { path = "../romset" }
+frontend = { path = "../frontend" }

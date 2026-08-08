@@ -15,6 +15,16 @@
 //! `--ppm` writes the last frame out as a file, which is a picture you can look at
 //! without this program having to draw one.
 
+// Exercised only by its own tests until Task 7 adds `--play` and the `display`
+// module that calls it. Scoped to the non-test build, so the tests still hold every
+// item to the `-D warnings` gate — and `not(test)` rather than a blanket allow so
+// this stops compiling silently the moment the tests stop covering something.
+//
+// ⚠️ Remove this attribute in Task 7. If it is still here once `--play` exists, it
+// is hiding an item nothing calls.
+#[cfg_attr(not(test), allow(dead_code))]
+mod loop_;
+
 use machine::video;
 use machine::Trace;
 use std::process::ExitCode;
