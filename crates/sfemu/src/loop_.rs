@@ -1507,6 +1507,112 @@ mod tests {
         assert_eq!(ram_on, m.board.ram, "nor write a word of its memory");
     }
 
+    /// And the same claim for **all sixteen** mask combinations, not just one.
+    ///
+    /// E3's spec asks for every combination, and one subtracted layer is not that: a
+    /// mask wired to something with a side effect could be inert for the sprites and
+    /// not for scroll 2, and the test above would pass.
+    ///
+    /// Driven through the keys rather than by setting `m.video.enable`, which would be
+    /// vacuous — the loop assigns `gfx.mask()` every tick and would overwrite it before
+    /// the first frame. So the script walks the layers view: `Enter` on a row to
+    /// subtract it, `]` to move on. **Every run is the same 24 ticks whatever the
+    /// subset**, because a row that is not being subtracted spends its press on a
+    /// released tick instead of on `Enter` — a comparison between runs of different
+    /// lengths would be comparing frame counts, not inertness.
+    #[test]
+    fn no_mask_combination_changes_the_machine() {
+        let (o, _s, _p) = opts("everymask");
+        let mut m = machine();
+        let start = m.snapshot();
+
+        /// The 24-tick script that subtracts the rows in `bits`, one bit per row.
+        ///
+        /// Released ticks throughout: every key here is edge-triggered, so two
+        /// consecutive held ticks are one press.
+        fn script(bits: u8) -> Vec<(KeySet, u64)> {
+            let mut s = vec![Fake::held(&[Key::GfxToggled]), Fake::held(&[])];
+            // Tiles → Tilemap → Palette → Layers.
+            for _ in 0..3 {
+                s.push(Fake::held(&[Key::GfxView]));
+                s.push(Fake::held(&[]));
+            }
+            for row in 0..4 {
+                // The press, or a released tick standing in for it, so the length
+                // does not depend on `bits`.
+                s.push(if bits & (1 << row) != 0 {
+                    Fake::held(&[Key::Enter])
+                } else {
+                    Fake::held(&[])
+                });
+                s.push(Fake::held(&[]));
+                s.push(Fake::held(&[Key::BracketRight]));
+                s.push(Fake::held(&[]));
+            }
+            s
+        }
+
+        // The baseline: the same tick count with nothing subtracted, which `bits == 0`
+        // is exactly — the script still walks to the layers view and moves the row
+        // selection, so the two runs differ in the mask and in nothing else.
+        let base = (m.board.trace.acks, m.board.trace.vblanks);
+        let mut d = Fake::new(script(0));
+        let s_off = run(&mut m, &mut d, &o);
+        let want = (
+            m.total_cycles,
+            m.cpu.d,
+            m.cpu.a,
+            m.cpu.pc,
+            m.line,
+            m.board.trace.acks - base.0,
+            m.board.trace.vblanks - base.1,
+        );
+        let want_ram = m.board.ram.clone();
+        assert_ne!(want.0, 0, "the premise: the machine ran");
+        assert_eq!(s_off.frames, 24, "and the script is 24 ticks long");
+        assert_eq!(
+            m.video.enable,
+            machine::video::compose::LayerMask::all(),
+            "the premise: the baseline subtracted nothing"
+        );
+
+        for bits in 1u8..16 {
+            m.restore(&start);
+            // `restore` leaves `enable` alone — it is not machine state — so each run
+            // starts from the identity by hand.
+            m.video.enable = machine::video::compose::LayerMask::all();
+            let base = (m.board.trace.acks, m.board.trace.vblanks);
+            let mut d = Fake::new(script(bits));
+            let s = run(&mut m, &mut d, &o);
+            // Row 0 is the sprites, then the three scrolls in order.
+            assert_eq!(
+                m.video.enable,
+                machine::video::compose::LayerMask {
+                    sprites: bits & 1 == 0,
+                    scroll1: bits & 2 == 0,
+                    scroll2: bits & 4 == 0,
+                    scroll3: bits & 8 == 0,
+                },
+                "the premise: {bits:04b} reached the mask it names"
+            );
+            assert_eq!(s.frames, s_off.frames, "the same frames were asked for");
+            assert_eq!(
+                want,
+                (
+                    m.total_cycles,
+                    m.cpu.d,
+                    m.cpu.a,
+                    m.cpu.pc,
+                    m.line,
+                    m.board.trace.acks - base.0,
+                    m.board.trace.vblanks - base.1,
+                ),
+                "mask {bits:04b} moved the machine"
+            );
+            assert_eq!(want_ram, m.board.ram, "mask {bits:04b} wrote its memory");
+        }
+    }
+
     /// **The criterion that matters most:** watching the machine does not change it.
     ///
     /// A tool that observes the bug must not be part of it. `peek_word` taking `&self`
