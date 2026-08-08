@@ -21,7 +21,11 @@ use machine::video::palette::entry_to_rgb;
 /// Red in bits 16-23, green in 8-15, blue in 0-7, and the top byte zero. The
 /// windowing library ignores the top byte; leaving it zero rather than 0xFF is the
 /// convention `minifb`'s own `from_u8_rgb` example uses.
-fn argb(entry: u16) -> u32 {
+///
+/// `pub(crate)` for the graphics viewer's palette swatches: a swatch and the game's
+/// own pixels must be the same colour, and that is guaranteed by calling this rather
+/// than by writing the shift a second time.
+pub(crate) fn argb(entry: u16) -> u32 {
     let [r, g, b] = entry_to_rgb(entry);
     (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
 }

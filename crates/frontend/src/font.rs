@@ -259,6 +259,23 @@ pub fn fill_rect(buf: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32
     }
 }
 
+/// A filled cell with a one-pixel border, for a colour swatch.
+///
+/// Clipped like [`fill_rect`]. A swatch under 3 pixels in either axis is all border:
+/// the interior is `w.saturating_sub(2)` wide, so a 1×1 swatch is one border pixel
+/// rather than an underflow.
+pub fn swatch(buf: &mut [u32], x: usize, y: usize, w: usize, h: usize, fill: u32, border: u32) {
+    fill_rect(buf, x, y, w, h, border);
+    fill_rect(
+        buf,
+        x + 1,
+        y + 1,
+        w.saturating_sub(2),
+        h.saturating_sub(2),
+        fill,
+    );
+}
+
 /// Reads `n` characters back off the buffer at `(x, y)`, for the overlay's tests.
 ///
 /// This is how a panel test asserts what a panel *shows* rather than re-running the
@@ -288,6 +305,32 @@ pub(crate) fn read_text(buf: &[u32], x: usize, y: usize, n: usize, fg: u32) -> S
 /// against a cell of noise must fail, and both of those would let it pass.
 #[cfg(test)]
 pub(crate) const NOT_A_GLYPH: char = '\u{FFFD}';
+
+/// Whether `needle` appears on any glyph row of `buf`, in `fg`.
+///
+/// Scans every candidate baseline *and* every horizontal phase, so a test asserting
+/// some text is present does not also have to know which row and column it landed on
+/// — that is what the `read_text` assertions against exact coordinates are for.
+/// `ADVANCE` phases is enough: a panel's columns are `x0 + i * ADVANCE`, so starting
+/// the scan at `x0 % ADVANCE` reads exactly its cells, whatever `x0` is.
+///
+/// Lives here rather than in `overlay`'s tests because `gfxpanels` reads its views
+/// back the same way, and a second glyph scanner is a second answer.
+#[cfg(test)]
+pub(crate) fn panel_contains(buf: &[u32], needle: &str, fg: u32) -> bool {
+    (0..HEIGHT.saturating_sub(GLYPH_H)).any(|y| {
+        (0..ADVANCE).any(|phase| {
+            let cols = (WIDTH - phase) / ADVANCE;
+            read_text(buf, phase, y, cols, fg).contains(needle)
+        })
+    })
+}
+
+/// An empty frame.
+#[cfg(test)]
+pub(crate) fn frame() -> Vec<u32> {
+    vec![0u32; WIDTH * HEIGHT]
+}
 
 /// One cell of [`read_text`].
 #[cfg(test)]
@@ -517,6 +560,44 @@ mod tests {
         // Entirely outside is a no-op.
         fill_rect(&mut buf, WIDTH, HEIGHT, 4, 4, 0x22);
         assert!(!buf.contains(&0x22));
+    }
+
+    /// A swatch is its fill, inside its border.
+    ///
+    /// `fill_rect` alone is not enough: two adjacent swatches of similar colours are
+    /// one indistinguishable block, and the palette view draws 3072 of them.
+    #[test]
+    fn a_swatch_is_a_fill_inside_a_border() {
+        let mut buf = vec![0u32; WIDTH * HEIGHT];
+        swatch(&mut buf, 10, 20, 5, 4, 0x0011_2233, 0x00FF_FFFF);
+        // The border is the outermost ring.
+        assert_eq!(buf[20 * WIDTH + 10], 0x00FF_FFFF, "top-left corner");
+        assert_eq!(buf[20 * WIDTH + 14], 0x00FF_FFFF, "top-right corner");
+        assert_eq!(buf[23 * WIDTH + 10], 0x00FF_FFFF, "bottom-left corner");
+        assert_eq!(buf[21 * WIDTH + 10], 0x00FF_FFFF, "left edge");
+        assert_eq!(buf[20 * WIDTH + 12], 0x00FF_FFFF, "top edge");
+        // The fill is what the border encloses.
+        assert_eq!(buf[21 * WIDTH + 11], 0x0011_2233, "the interior");
+        assert_eq!(buf[22 * WIDTH + 13], 0x0011_2233, "the interior");
+        // And nothing outside.
+        assert_eq!(buf[19 * WIDTH + 10], 0, "one row above");
+        assert_eq!(buf[20 * WIDTH + 15], 0, "one column right");
+        assert_eq!(buf[24 * WIDTH + 10], 0, "one row below");
+    }
+
+    /// A swatch too small for a border is all border, not a panic.
+    ///
+    /// The palette view's swatches are about 5×4 and a narrower window would make
+    /// them 1×1. An interior computed as `w - 2` would underflow.
+    #[test]
+    fn a_swatch_smaller_than_its_border_is_all_border() {
+        let mut buf = vec![0u32; WIDTH * HEIGHT];
+        swatch(&mut buf, 0, 0, 1, 1, 0x0011_2233, 0x00FF_FFFF);
+        assert_eq!(buf[0], 0x00FF_FFFF, "a 1x1 swatch is its border");
+        swatch(&mut buf, 0, 2, 2, 2, 0x0011_2233, 0x00FF_FFFF);
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            assert_eq!(buf[(2 + dy) * WIDTH + dx], 0x00FF_FFFF, "2x2 is all border");
+        }
     }
 
     /// The recogniser reads back what was drawn.

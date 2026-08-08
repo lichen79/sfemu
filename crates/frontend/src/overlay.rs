@@ -343,7 +343,7 @@ fn draw_status(buf: &mut [u32], m: &Cps1) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::font::{read_text, GLYPH_H};
+    use crate::font::{frame, panel_contains, read_text};
     use machine::config::BoardConfig;
     use machine::timing::Timing;
 
@@ -377,27 +377,6 @@ mod tests {
         // stale exactly here, inside a handler, which is when you read it.
         m.cpu.a[7] = 0x00FF_7FF0;
         m
-    }
-
-    /// Whether `needle` appears on any glyph row of `buf`, in `fg`.
-    ///
-    /// Scans every candidate baseline *and* every horizontal phase, so a test
-    /// asserting some text is present does not also have to know which row and column
-    /// it landed on — that is what the `read_text` assertions against exact
-    /// coordinates are for. `ADVANCE` phases is enough: a panel's columns are
-    /// `x0 + i * ADVANCE`, so starting the scan at `x0 % ADVANCE` reads exactly its
-    /// cells, whatever `x0` is.
-    fn panel_contains(buf: &[u32], needle: &str, fg: u32) -> bool {
-        (0..HEIGHT.saturating_sub(GLYPH_H)).any(|y| {
-            (0..ADVANCE).any(|phase| {
-                let cols = (WIDTH - phase) / ADVANCE;
-                read_text(buf, phase, y, cols, fg).contains(needle)
-            })
-        })
-    }
-
-    fn frame() -> Vec<u32> {
-        vec![0u32; WIDTH * HEIGHT]
     }
 
     /// The register panel shows the registers, read back off the pixels.
