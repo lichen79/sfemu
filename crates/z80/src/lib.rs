@@ -33,6 +33,9 @@ pub mod bus;
 pub mod cpu;
 pub mod decode;
 pub mod flags;
+pub mod ops;
+#[cfg(test)]
+pub mod testbus;
 
 pub use bus::Bus;
 pub use cpu::Z80;

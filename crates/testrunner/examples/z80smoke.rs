@@ -16,8 +16,26 @@
 
 use std::path::PathBuf;
 
-/// The opcodes Task 5 implements — the useful default before Task 7 lands.
-const DEFAULT: &[&str] = &["00", "27", "2f", "37", "3f", "76", "f3", "fb"];
+/// The base-page opcodes the core implements so far, as of Task 7.
+///
+/// Kept as a literal list rather than derived from the decoder: a default that
+/// asked the decoder what it handled would report "all green" on exactly the
+/// opcodes the decoder had wrongly claimed.
+const DEFAULT: &[&str] = &[
+    "00", "01", "02", "03", "04", "05", "06", "08", "09", "0a", "0b", "0c", "0d", "0e", "11", "12",
+    "13", "14", "15", "16", "19", "1a", "1b", "1c", "1d", "1e", "21", "22", "23", "24", "25", "26",
+    "27", "29", "2a", "2b", "2c", "2d", "2e", "2f", "31", "32", "33", "34", "35", "36", "37", "39",
+    "3a", "3b", "3c", "3d", "3e", "3f", "40", "41", "42", "43", "44", "45", "46", "47", "48", "49",
+    "4a", "4b", "4c", "4d", "4e", "4f", "50", "51", "52", "53", "54", "55", "56", "57", "58", "59",
+    "5a", "5b", "5c", "5d", "5e", "5f", "60", "61", "62", "63", "64", "65", "66", "67", "68", "69",
+    "6a", "6b", "6c", "6d", "6e", "6f", "70", "71", "72", "73", "74", "75", "76", "77", "78", "79",
+    "7a", "7b", "7c", "7d", "7e", "7f", "80", "81", "82", "83", "84", "85", "86", "87", "88", "89",
+    "8a", "8b", "8c", "8d", "8e", "8f", "90", "91", "92", "93", "94", "95", "96", "97", "98", "99",
+    "9a", "9b", "9c", "9d", "9e", "9f", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9",
+    "aa", "ab", "ac", "ad", "ae", "af", "b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9",
+    "ba", "bb", "bc", "bd", "be", "bf", "c1", "c5", "c6", "ce", "d1", "d5", "d6", "d9", "de", "e1",
+    "e5", "e6", "eb", "ee", "f1", "f3", "f5", "f6", "f9", "fb", "fe",
+];
 
 fn main() {
     // Anchored to the manifest so the tool works from any directory, matching

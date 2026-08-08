@@ -28,10 +28,23 @@ pub struct Z80 {
     pub iy: u16,
     pub sp: u16,
     pub pc: u16,
-    /// The internal address latch.
+    /// The internal address latch, often called `MEMPTR`.
     ///
     /// Not architecturally visible and absent from most documentation, but it
-    /// drives the address pins during some T-states, so the suite compares it.
+    /// drives the address pins during some T-states, so the suite compares it —
+    /// which makes its update rules mandatory rather than decorative, and they were
+    /// measured rather than looked up. As of the base page:
+    ///
+    /// | instruction | latch |
+    /// |---|---|
+    /// | `LD A,(rr)`, `LD A,(nn)` | `addr + 1` |
+    /// | `LD (rr),A`, `LD (nn),A` | low byte of `addr + 1`, high byte **the byte written** |
+    /// | `LD (nn),HL`, `LD HL,(nn)` | `nn + 1` — one increment, whichever direction |
+    /// | `ADD HL,rr` | the **old** `HL` plus one, not the sum |
+    ///
+    /// Every other base-page instruction leaves it alone. Each row was wrong in
+    /// its own way before being fixed, and each cost 1,000 of 1,000 cases on its
+    /// own file.
     pub wz: u16,
     /// The shadow `AF`, as a packed pair — `EX AF,AF'` swaps it wholesale, so
     /// there is no reason to hold two more bytes.
@@ -227,46 +240,7 @@ impl Z80 {
 mod tests {
     use super::*;
     use crate::flags;
-
-    /// A 64 KiB bus for the core's own tests.
-    ///
-    /// Deliberately not the test harness's recording bus: that lives in
-    /// `testrunner`, which depends on this crate. These tests must run under
-    /// `cargo test -p z80` with nothing else built.
-    struct Mem {
-        ram: [u8; 0x1_0000],
-        ports_out: Vec<(u16, u8)>,
-        port_in_value: u8,
-    }
-
-    impl Mem {
-        fn at(pc: u16, prog: &[u8]) -> Self {
-            let mut m = Mem {
-                ram: [0; 0x1_0000],
-                ports_out: Vec::new(),
-                port_in_value: 0xFF,
-            };
-            for (i, b) in prog.iter().enumerate() {
-                m.ram[usize::from(pc) + i] = *b;
-            }
-            m
-        }
-    }
-
-    impl Bus for Mem {
-        fn read(&mut self, addr: u16) -> u8 {
-            self.ram[usize::from(addr)]
-        }
-        fn write(&mut self, addr: u16, val: u8) {
-            self.ram[usize::from(addr)] = val;
-        }
-        fn port_in(&mut self, _port: u16) -> u8 {
-            self.port_in_value
-        }
-        fn port_out(&mut self, port: u16, val: u8) {
-            self.ports_out.push((port, val));
-        }
-    }
+    use crate::testbus::Mem;
 
     /// The 16-bit pairs are the 8-bit registers, high byte first.
     ///
