@@ -144,6 +144,13 @@ fn translate(k: minifb::Key) -> Option<Key> {
         M::P => Key::P,
         M::Period => Key::Period,
         M::Escape => Key::Escape,
+        M::F1 => Key::F1,
+        M::F4 => Key::F4,
+        M::F6 => Key::F6,
+        M::F7 => Key::F7,
+        M::PageUp => Key::PageUp,
+        M::PageDown => Key::PageDown,
+        M::Home => Key::Home,
         _ => return None,
     })
 }
@@ -239,6 +246,75 @@ mod tests {
             manifests,
             vec![std::path::PathBuf::from("sfemu/Cargo.toml")],
             "only sfemu may depend on a windowing library"
+        );
+    }
+
+    /// Every frontend key is reachable from some keypress.
+    ///
+    /// `translate` ends in `_ => return None`, so it is **not** the total match the
+    /// plan for this work assumed: adding a `Key` variant compiles fine and produces
+    /// a key no keyboard can press. The failure is silent and total — the feature
+    /// simply does nothing, with every unit test in `frontend` green, because
+    /// `frontend` never sees a keyboard.
+    ///
+    /// The candidate list below is a second copy of the map, which is the thing this
+    /// project usually refuses. Justified here: the two copies run in opposite
+    /// directions, and what is asserted is that the *forward* map covers every
+    /// variant of `Key::ALL`. A copy that drifted would fail this, which is the
+    /// opposite of the usual duplicate-map problem, where drift is invisible.
+    #[test]
+    fn every_frontend_key_can_be_produced_by_a_keypress() {
+        use super::translate;
+        use frontend::Key;
+        use minifb::Key as M;
+        let candidates = [
+            M::Up,
+            M::Down,
+            M::Left,
+            M::Right,
+            M::A,
+            M::S,
+            M::D,
+            M::Z,
+            M::X,
+            M::C,
+            M::Key1,
+            M::Key2,
+            M::Key5,
+            M::Key6,
+            M::F1,
+            M::F2,
+            M::F3,
+            M::F4,
+            M::F5,
+            M::F6,
+            M::F7,
+            M::F8,
+            M::F12,
+            M::P,
+            M::Period,
+            M::Escape,
+            M::PageUp,
+            M::PageDown,
+            M::Home,
+        ];
+        for want in Key::ALL {
+            let n = candidates
+                .iter()
+                .filter(|&&c| translate(c) == Some(want))
+                .count();
+            assert_eq!(
+                n, 1,
+                "{want:?} must be produced by exactly one key, not {n}"
+            );
+        }
+        // And nothing is mapped that is not a `Key`: an unhandled key is `None`, not a
+        // panic, because `minifb` reports keys this program has no opinion about.
+        assert_eq!(translate(M::Q), None, "an unmapped key is None");
+        assert_eq!(
+            translate(M::F9),
+            None,
+            "including a neighbouring function key"
         );
     }
 

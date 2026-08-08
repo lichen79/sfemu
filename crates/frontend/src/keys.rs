@@ -82,6 +82,20 @@ pub enum Key {
     Period,
     /// Quit.
     Escape,
+    /// Show or hide the debugger overlay.
+    F1,
+    /// Step one *instruction*, which is not the same as `Period`'s one frame.
+    F4,
+    /// Move the scroll focus between the disassembly and the memory dump.
+    F6,
+    /// Set or clear a breakpoint at the instruction about to execute.
+    F7,
+    /// Scroll the focused panel back.
+    PageUp,
+    /// Scroll the focused panel forward.
+    PageDown,
+    /// Return the focused panel to following the machine.
+    Home,
 }
 
 impl Key {
@@ -90,7 +104,7 @@ impl Key {
     /// `tests::all_lists_every_key_exactly_once` fails if a variant is added and
     /// not listed here, which is what stops the tests that iterate this from
     /// quietly narrowing.
-    pub const ALL: [Key; 22] = [
+    pub const ALL: [Key; 29] = [
         Key::Up,
         Key::Down,
         Key::Left,
@@ -113,6 +127,13 @@ impl Key {
         Key::P,
         Key::Period,
         Key::Escape,
+        Key::F1,
+        Key::F4,
+        Key::F6,
+        Key::F7,
+        Key::PageUp,
+        Key::PageDown,
+        Key::Home,
     ];
 
     /// This key's bit in a [`KeySet`].
@@ -144,6 +165,13 @@ impl Key {
             Key::P => 19,
             Key::Period => 20,
             Key::Escape => 21,
+            Key::F1 => 22,
+            Key::F4 => 23,
+            Key::F6 => 24,
+            Key::F7 => 25,
+            Key::PageUp => 26,
+            Key::PageDown => 27,
+            Key::Home => 28,
         }
     }
 }
@@ -207,6 +235,24 @@ pub struct Actions {
     pub screenshot: bool,
     /// Close the window.
     pub quit: bool,
+    /// Show or hide the debugger overlay.
+    pub overlay_toggled: bool,
+    /// Step one instruction.
+    ///
+    /// Distinct from [`Self::step`], which is one *frame*. Both are needed and they
+    /// are not interchangeable: a frame is 167,680 cycles, which is where a bug is,
+    /// while an instruction is where you can see it.
+    pub step_instruction: bool,
+    /// Move the scroll focus to the other panel.
+    pub focus_cycled: bool,
+    /// Set or clear a breakpoint at the instruction about to execute.
+    pub breakpoint_toggled: bool,
+    /// Scroll the focused panel back.
+    pub scroll_up: bool,
+    /// Scroll the focused panel forward.
+    pub scroll_down: bool,
+    /// Return the focused panel to following the machine.
+    pub follow_reset: bool,
 }
 
 /// The keyboard, frame to frame.
@@ -262,6 +308,17 @@ impl Controls {
             load: edge(Key::F8),
             screenshot: edge(Key::F12),
             quit: edge(Key::Escape),
+            overlay_toggled: edge(Key::F1),
+            step_instruction: edge(Key::F4),
+            focus_cycled: edge(Key::F6),
+            breakpoint_toggled: edge(Key::F7),
+            // The scroll keys are edge-triggered like the rest, not repeating. A held
+            // `PageDown` walking sixty pages a second is not a usable way to find an
+            // address, and auto-repeat would need a timer — which would put a clock in
+            // the one crate that deliberately has none.
+            scroll_up: edge(Key::PageUp),
+            scroll_down: edge(Key::PageDown),
+            follow_reset: edge(Key::Home),
         };
         self.was = now;
         actions
@@ -282,6 +339,9 @@ mod tests {
         assert_eq!(a.inputs.in2(), 0xFF);
         assert!(!a.pause_toggled && !a.step && !a.reset);
         assert!(!a.save && !a.load && !a.screenshot && !a.quit);
+        assert!(!a.overlay_toggled && !a.step_instruction && !a.focus_cycled);
+        assert!(!a.breakpoint_toggled && !a.scroll_up && !a.scroll_down);
+        assert!(!a.follow_reset);
     }
 
     /// Each game key clears exactly its own port bit, with the expected values as
@@ -407,16 +467,20 @@ mod tests {
 
     /// Every control key is edge-triggered, not just the one above.
     ///
-    /// Checked as a table over all seven, because the natural implementation is one
+    /// Checked as a table over all fourteen, because the natural implementation is one
     /// `edge` helper per action and the natural mistake is to forget it on one of
-    /// them — which then works exactly once out of seven, in whichever action the
+    /// them — which then works exactly once out of fourteen, in whichever action the
     /// author tested by hand.
+    ///
+    /// The debugger's seven are in the same table as the original seven rather than a
+    /// table of their own: they are the same kind of thing, and a separate table is a
+    /// second place to forget to add a row.
     #[test]
-    fn all_seven_control_actions_are_edge_triggered() {
+    fn every_control_action_is_edge_triggered() {
         /// Reads one action's flag. Named because clippy calls the inline array
         /// type too complex, and it is: a table of key-and-accessor pairs.
         type Reader = fn(&Actions) -> bool;
-        let cases: [(Key, Reader); 7] = [
+        let cases: [(Key, Reader); 14] = [
             (Key::P, |a| a.pause_toggled),
             (Key::Period, |a| a.step),
             (Key::F3, |a| a.reset),
@@ -424,7 +488,40 @@ mod tests {
             (Key::F8, |a| a.load),
             (Key::F12, |a| a.screenshot),
             (Key::Escape, |a| a.quit),
+            (Key::F1, |a| a.overlay_toggled),
+            (Key::F4, |a| a.step_instruction),
+            (Key::F6, |a| a.focus_cycled),
+            (Key::F7, |a| a.breakpoint_toggled),
+            (Key::PageUp, |a| a.scroll_up),
+            (Key::PageDown, |a| a.scroll_down),
+            (Key::Home, |a| a.follow_reset),
         ];
+        // Every key that is not a game input and not the test switch must be in the
+        // table. Without this, adding a key and forgetting the row leaves the new
+        // action untested and every assertion below still passes.
+        let game = [
+            Key::Up,
+            Key::Down,
+            Key::Left,
+            Key::Right,
+            Key::A,
+            Key::S,
+            Key::D,
+            Key::Z,
+            Key::X,
+            Key::C,
+            Key::Num1,
+            Key::Num2,
+            Key::Num5,
+            Key::Num6,
+            Key::F2,
+        ];
+        for k in Key::ALL {
+            assert!(
+                game.contains(&k) || cases.iter().any(|&(c, _)| c == k),
+                "{k:?} is neither a game input nor in the edge-trigger table"
+            );
+        }
         for (k, get) in cases {
             let mut c = Controls::new();
             let held = KeySet::from_keys(&[k]);
@@ -522,7 +619,7 @@ mod tests {
     fn all_lists_every_key_exactly_once() {
         assert_eq!(
             Key::ALL.len(),
-            22,
+            29,
             "add new keys to ALL, and to this literal"
         );
         for (i, a) in Key::ALL.iter().enumerate() {
