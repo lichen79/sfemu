@@ -19,6 +19,7 @@
 //! `frontend`.
 
 use frontend::debug::Debugger;
+use frontend::gfx::GfxViewer;
 use frontend::keys::{Actions, Controls, KeySet};
 use frontend::{pens_to_argb, FramePacer};
 use machine::Cps1;
@@ -97,12 +98,15 @@ const BOARD: u32 = frontend::BOARD_SF2;
 /// 5. reset, pause, save, load;
 /// 6. apply the debugger's keys — before the frames, so a breakpoint set this tick is
 ///    honoured by this tick's frames rather than the next one's;
-/// 7. run the frames this tick owes, **stopping mid-frame at a breakpoint**, and step
+/// 7. apply the graphics viewer's keys, and hand its layer mask to `Video` — before
+///    the render below, so this tick's frame is the masked one;
+/// 8. run the frames this tick owes, **stopping mid-frame at a breakpoint**, and step
 ///    one instruction if `F4` asked;
-/// 8. render and present — **every** iteration, including a paused one, or the
-///    window goes black the moment you pause. The overlay is drawn *after*
-///    [`pens_to_argb`], because it is ARGB and the pens are not;
-/// 9. screenshot, then the title.
+/// 9. render and present — **every** iteration, including a paused one, or the
+///    window goes black the moment you pause. The overlays are drawn *after*
+///    [`pens_to_argb`], because they are ARGB and the pens are not, and the graphics
+///    viewer goes over the debugger rather than under it;
+/// 10. screenshot, then the title.
 pub fn run(m: &mut Cps1, d: &mut impl Display, o: &LoopOpts) -> Summary {
     let mut pacer = FramePacer::cps1();
     let mut controls = Controls::new();
@@ -111,6 +115,7 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, o: &LoopOpts) -> Summary {
     let mut summary = Summary::default();
     let mut title = String::new();
     let mut dbg = Debugger::new();
+    let mut gfx = GfxViewer::new();
 
     while d.is_open() {
         let elapsed = d.elapsed_ns();
@@ -151,6 +156,12 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, o: &LoopOpts) -> Summary {
         // tick's frames, not by the next tick's. `dbg` reads the machine and never
         // writes it — see `frontend::debug`.
         dbg.update(&a, m);
+
+        gfx.update(&a, m);
+        // The mask is a view setting the loop applies, not something `frontend`
+        // reaches into the machine to set: every `frontend` entry point takes
+        // `&Cps1`. Before `render`, so this tick's frame is the masked one.
+        m.video.enable = gfx.mask();
 
         // A step is one frame regardless of the clock, which is what makes it a
         // step. Checked before `paused` because stepping only means anything while
@@ -202,6 +213,9 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, o: &LoopOpts) -> Summary {
         // they would be run through the palette and come out as whatever colours
         // those indices happen to name.
         dbg.draw(&mut buf, m);
+        // Over the debugger, not under it: both are opaque, and this one is the
+        // whole screen while E2's are corners of it.
+        gfx.draw(&mut buf, m);
         if let Err(e) = d.present(&buf) {
             note(&mut summary, format!("cannot present a frame: {e}"));
             break;
@@ -337,6 +351,10 @@ mod tests {
         /// The first buffer, in full. Only the first: 86,016 pixels a tick is a lot
         /// to keep, and one is enough to ask whether it was rendered.
         first: Option<Vec<u32>>,
+        /// And the last, for a claim that takes several ticks to set up: reaching a
+        /// graphics view and subtracting a layer is five key presses, and the frame
+        /// that shows it is the one after them. Two frames, not sixty.
+        last: Option<Vec<u32>>,
         titles: Vec<String>,
     }
 
@@ -348,6 +366,7 @@ mod tests {
                 tick: 0,
                 presented: Vec::new(),
                 first: None,
+                last: None,
                 titles: Vec::new(),
             }
         }
@@ -369,6 +388,7 @@ mod tests {
             if self.first.is_none() {
                 self.first = Some(buf.to_vec());
             }
+            self.last = Some(buf.to_vec());
             Ok(())
         }
         fn held_keys(&self) -> KeySet {
@@ -1290,6 +1310,113 @@ mod tests {
         let mut game: Vec<u32> = Vec::new();
         pens_to_argb(&m.video, &mut game);
         assert_eq!(shown, game, "not a pixel of the game is disturbed");
+    }
+
+    /// The viewer draws over E2's panels, not under them.
+    ///
+    /// Both overlays are opaque and they overlap; the order decides which you can
+    /// read. The video viewer wins, because it is the whole screen and E2's panels
+    /// are corners of it — the other order would leave the viewer with a register
+    /// panel punched out of its top-left, which is where its own labels are.
+    #[test]
+    fn the_video_viewer_draws_over_the_debugger() {
+        let (o, _s, _p) = opts("viewer-over-debugger");
+        // The pixel both halves read: the top-left corner of E2's register panel,
+        // which the viewer's box covers. The corner itself and not a pixel inside it
+        // — `overlay::PAD` is one pixel, so the first glyph of `D0 ...` starts at
+        // `(REGS_X + 1, REGS_Y + 1)` and that pixel is 0x00D0D0D0 text, not the
+        // panel's background at all.
+        let at = frontend::overlay::REGS_Y * WIDTH + frontend::overlay::REGS_X;
+
+        // Each run in its own scope, so its machine is dropped before the next one is
+        // built: a `Cps1` is 525 KB on the stack, and two live at once overflows a
+        // test thread. A shadowing `let` would *not* do it — the first binding lives
+        // to the end of the block either way.
+        let shown = {
+            // One tick, both overlays on. A tick reads its keys before it renders, so
+            // the frame this tick presents already has both.
+            let mut m = machine_that_draws();
+            let mut d = Fake::new(vec![Fake::held(&[Key::F1, Key::GfxToggled])]);
+            run(&mut m, &mut d, &o);
+            d.first.expect("a tick presents")
+        };
+        // What must be there is the viewer's background, not the debugger's.
+        assert_ne!(
+            shown[at], 0x0000_0020,
+            "the debugger's background is on top"
+        );
+
+        // And the premise, or a viewer that drew nothing would pass: with the
+        // viewer off, that pixel *is* the debugger's background.
+        let e2 = {
+            let mut m = machine_that_draws();
+            let mut d = Fake::new(vec![Fake::held(&[Key::F1])]);
+            run(&mut m, &mut d, &o);
+            d.first.expect("a tick presents")
+        };
+        assert_eq!(
+            e2[at], 0x0000_0020,
+            "the premise: E2 draws there when the viewer does not"
+        );
+    }
+
+    /// The mask reaches `Video`, and the frame changes.
+    ///
+    /// The end-to-end claim of this task: a key press in `sfemu` subtracts a layer
+    /// from the pixels the window is given. Everything else in this module tests a
+    /// decision; this tests the wire.
+    #[test]
+    fn subtracting_a_layer_changes_the_presented_frame() {
+        let (o, _s, _p) = opts("mask-wired");
+        // Scoped, so this machine is gone before the second is built: 525 KB each and
+        // a test thread's stack is 2 MB.
+        //
+        // Twelve ticks, matching the script below tick for tick: both runs must render
+        // the same number of frames, or the two pictures differ because the machines
+        // are at different points and the mask is not what the comparison sees.
+        let full = {
+            let mut m = machine_that_draws();
+            let mut d = Fake::new(Fake::idle(12));
+            run(&mut m, &mut d, &o);
+            d.last.expect("a tick presents")
+        };
+
+        // Now: show the viewer, cycle to the layers view, subtract the selected
+        // row, and hide the viewer again — the box would otherwise cover the whole
+        // frame and every pixel would differ for the wrong reason. Hiding it also
+        // exercises "a hidden viewer keeps its mask".
+        //
+        // Three `GfxView` presses because the cycle is tiles → tilemap → palette →
+        // layers. If Task 3 chose another order this count is wrong, and the
+        // assertion below is what says so.
+        //
+        // A released tick between each: every one of these keys is edge-triggered, so
+        // three consecutive held ticks are one press and would leave the viewer on the
+        // tilemap view, where `Enter` changes the layer being *browsed* and masks
+        // nothing. Written without them first, and that is exactly what happened.
+        let mut m = machine_that_draws();
+        let mut d = Fake::new(vec![
+            Fake::held(&[Key::GfxToggled]),
+            Fake::held(&[]),
+            Fake::held(&[Key::GfxView]),
+            Fake::held(&[]),
+            Fake::held(&[Key::GfxView]),
+            Fake::held(&[]),
+            Fake::held(&[Key::GfxView]),
+            Fake::held(&[]),
+            Fake::held(&[Key::Enter]),
+            Fake::held(&[]),
+            Fake::held(&[Key::GfxToggled]),
+            Fake::held(&[]),
+        ]);
+        run(&mut m, &mut d, &o);
+        let masked = d.last.expect("a tick presents");
+        assert_ne!(
+            m.video.enable,
+            machine::video::compose::LayerMask::all(),
+            "the presses reached the layers view and subtracted a row"
+        );
+        assert_ne!(masked, full, "subtracting a layer changed the picture");
     }
 
     /// **The criterion that matters most:** watching the machine does not change it.
