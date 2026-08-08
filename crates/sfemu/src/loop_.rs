@@ -807,6 +807,68 @@ mod tests {
         );
     }
 
+    /// A saved state names the board it came from.
+    ///
+    /// Nothing else here can see [`BOARD`]. `save` and `load` both use it, so a
+    /// round trip agrees with itself whatever the constant is — the file could be
+    /// tagged `SF1\0` and every other test in this module would still pass. The tag
+    /// exists so that loading one board's state into another build is *refused*,
+    /// which is a claim about the bytes on disk and has to be read off the bytes.
+    ///
+    /// Read at the documented offset rather than by searching the file: the board
+    /// field's position is the format's, and `frontend`'s own
+    /// `the_header_is_laid_out_as_documented` is what pins the offset to 8.
+    #[test]
+    fn a_saved_state_is_tagged_with_this_build_s_board() {
+        let (o, _s, _p) = opts("board-tag");
+        let mut d = Fake::new(vec![Fake::held(&[Key::F5])]);
+        let s = run(&mut machine(), &mut d, &o);
+        assert!(s.notices.is_empty(), "{:?}", s.notices);
+
+        let bytes = std::fs::read(&o.state_path).expect("F5 must write the file");
+        let tag = u32::from_le_bytes(bytes[8..12].try_into().expect("four bytes"));
+        assert_eq!(
+            tag,
+            frontend::BOARD_SF2,
+            "the file must name the board this build runs, not {tag:#010x}"
+        );
+        // And in the form the format documents: big-endian ASCII, so a hex dump of
+        // the file reads `SF2\0` rather than four unrelated bytes.
+        assert_eq!(&tag.to_be_bytes(), b"SF2\0");
+    }
+
+    /// A state tagged for another board is refused, and the machine keeps running.
+    ///
+    /// The other half of the same claim: the tag is not decoration, it is a check
+    /// `load` applies. Written by hand rather than by encoding under a different
+    /// constant, because [`BOARD`] is the only board this build has.
+    #[test]
+    fn another_boards_state_is_refused_by_the_loop() {
+        let (o, _s, _p) = opts("board-refuse");
+        let mut m = machine();
+        m.run_frame();
+        let mut bytes = frontend::encode(&m.snapshot(), BOARD);
+        // `SF1\0` — a board that does not exist yet, which is exactly the file this
+        // check exists to reject once it does.
+        bytes[8..12].copy_from_slice(&0x5346_3100_u32.to_le_bytes());
+        std::fs::write(&o.state_path, &bytes).expect("temp dir is writable");
+
+        let before = (m.total_cycles, m.cpu.d[0], m.line);
+        let mut d = Fake::new(vec![(KeySet::from_keys(&[Key::F8]), 0)]);
+        let s = run(&mut m, &mut d, &o);
+        assert_eq!(s.notices.len(), 1, "{:?}", s.notices);
+        assert!(
+            s.notices[0].contains("board"),
+            "the notice must say it is the board: {}",
+            s.notices[0]
+        );
+        assert_eq!(
+            (m.total_cycles, m.cpu.d[0], m.line),
+            before,
+            "and the running machine is untouched"
+        );
+    }
+
     /// F12 writes a screenshot.
     #[test]
     fn a_screenshot_is_written_as_a_ppm() {

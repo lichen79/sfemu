@@ -75,9 +75,15 @@ pub struct MachineState {
     pub obj: ObjLatch,
 }
 
-/// Hand-written rather than derived, for the reason [`boxed_copy`] documents: the
-/// derived `Clone` would route the two large arrays through `Box::clone` and
-/// overflow the stack.
+/// Hand-written rather than derived: the derived `Clone` would route the two large
+/// arrays through `Box::clone`, which materialises the whole array as a temporary on
+/// the stack before boxing it. For `gfxram` that is 192 KB and it overflows a test
+/// thread's stack — an abort, not a failure. The private `boxed_copy` helper this
+/// uses goes through the heap instead, and its own comment records the case that
+/// found it.
+///
+/// The reason is spelled out here rather than linked, because the helper is
+/// `pub(crate)`: a reader of these docs cannot follow the link.
 impl Clone for MachineState {
     fn clone(&self) -> Self {
         Self {

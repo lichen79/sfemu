@@ -201,10 +201,7 @@ fn run(args: Vec<String>) -> Result<String, Fault> {
         // The window is opened *after* the ROM set loads, so a bad path reports the
         // load error rather than flashing a window onto a machine that never booted.
         let mut win = display::Window::open("sfemu").map_err(Fault::Failed)?;
-        let opts = loop_::LoopOpts {
-            state_path: args.state.clone(),
-            shot_path: default_shot_path(&args.path),
-        };
+        let opts = loop_opts(&args);
         let summary = loop_::run(&mut m, &mut win, &opts);
         return Ok(play_report(&summary));
     }
@@ -225,6 +222,20 @@ fn run(args: Vec<String>) -> Result<String, Fault> {
         Cpu::of(&m),
         Frame::of(&m.video),
     ))
+}
+
+/// The two paths the loop writes to, from the parsed arguments.
+///
+/// Split out of [`run`] for the same reason [`parse_args`] is: everything else in
+/// `run` needs a ROM set, so a `LoopOpts` built inline could only be checked by a
+/// test that owns one. And it is worth checking — the struct has two same-typed
+/// fields, so swapping them compiles, and the symptom is F5 overwriting your
+/// screenshot with a save state.
+fn loop_opts(args: &Args) -> loop_::LoopOpts {
+    loop_::LoopOpts {
+        state_path: args.state.clone(),
+        shot_path: default_shot_path(&args.path),
+    }
 }
 
 /// Where F12 writes.
@@ -923,6 +934,25 @@ mod tests {
             PathBuf::from("/a/b/sf2.ppm"),
             "and the screenshot lands beside it too"
         );
+    }
+
+    /// The loop is handed the state path as the state path.
+    ///
+    /// `LoopOpts` has two `PathBuf` fields, so swapping them compiles and the
+    /// symptom is F5 writing a save state over your screenshot. Distinct extensions
+    /// on purpose: with both derived from the same stem, a swap would be invisible.
+    #[test]
+    fn the_loop_is_given_the_state_path_and_the_shot_path_the_right_way_round() {
+        let args = Args {
+            path: "/a/b/sf2.zip".to_string(),
+            frames: 60,
+            ppm: None,
+            play: true,
+            state: PathBuf::from("/tmp/mine.sfs"),
+        };
+        let o = loop_opts(&args);
+        assert_eq!(o.state_path, PathBuf::from("/tmp/mine.sfs"));
+        assert_eq!(o.shot_path, PathBuf::from("/a/b/sf2.ppm"));
     }
 
     /// `--state` without `--play` is an error naming both flags.

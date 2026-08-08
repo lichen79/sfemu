@@ -18,9 +18,10 @@
 //! honest statement is that this file is verified by running it, and the commit that
 //! added it says so.
 //!
-//! The one thing that *is* checked without a display, in `main.rs`: a bad ROM path
-//! with `--play` reports the load error and exits, rather than opening a window onto
-//! a machine that never booted.
+//! Two things *are* checked. In `main.rs`: a bad ROM path with `--play` reports the
+//! load error and exits, rather than opening a window onto a machine that never
+//! booted. And here, in the one test below: that `minifb` is named in code in this
+//! file alone.
 
 use crate::loop_::Display;
 use frontend::keys::{Key, KeySet};
@@ -145,4 +146,120 @@ fn translate(k: minifb::Key) -> Option<Key> {
         M::Escape => Key::Escape,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// `minifb` is named in code in this file and nowhere else.
+    ///
+    /// The whole testability argument rests on it: a `use minifb::Key` in `frontend`
+    /// would put the key map — the thing most worth testing — behind the display
+    /// boundary, and the compiler would not object. Nothing else in this project
+    /// enforces it, so this does.
+    ///
+    /// A test that walks the source tree is unusual, and justified: asserting a `use`
+    /// is *absent* cannot be done any other way. What the type system can express is
+    /// already expressed — `frontend` does not depend on `minifb`, so a `use` there
+    /// would not compile — but `sfemu` does, and nothing stops a later `use minifb`
+    /// in `loop_.rs` or `main.rs` from quietly moving a decision out of reach.
+    ///
+    /// # Comments are allowed to name it
+    ///
+    /// `frontend::keys` and `frontend::pixels` both explain themselves by reference
+    /// to `minifb` — "a `minifb::Key` here would make this module part of the display
+    /// boundary" is the clearest statement of the rule in the project, and a check
+    /// that forbade it would delete the documentation to protect the constraint. So
+    /// the check is on *code* lines: any line whose first non-space characters are
+    /// `//` is prose.
+    ///
+    /// The heuristic's limit, stated rather than hidden: a `/* */` block comment
+    /// naming `minifb` would be reported as code. That is a false positive, which
+    /// fails loudly and is fixed by rewording — the failure this test exists to
+    /// catch cannot hide behind it.
+    #[test]
+    fn the_windowing_library_is_named_in_one_file() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/sfemu has two ancestors")
+            .join("crates");
+        assert!(root.is_dir(), "the crates directory must exist: {root:?}");
+
+        let mut offenders = Vec::new();
+        let mut checked = 0usize;
+        let mut manifests = Vec::new();
+        walk(&root, &mut |path| {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let is_rs = name.ends_with(".rs");
+            let is_manifest = name == "Cargo.toml";
+            if !is_rs && !is_manifest {
+                return;
+            }
+            checked += 1;
+            let text = std::fs::read_to_string(path).expect("a source file this crate can read");
+            let rel = path.strip_prefix(&root).unwrap_or(path).to_path_buf();
+            for (n, line) in text.lines().enumerate() {
+                if !line.contains("minifb") {
+                    continue;
+                }
+                if is_manifest {
+                    manifests.push(rel.clone());
+                    continue;
+                }
+                // Prose may name it; code may not.
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                offenders.push(format!("{}:{}: {}", rel.display(), n + 1, line.trim()));
+            }
+        });
+
+        assert!(
+            checked > 20,
+            "the walk must have found the tree: {checked} files"
+        );
+        // This file names it, and no other. Compared as a whole list rather than by
+        // counting: a count of one passes for the wrong one file.
+        let mine: Vec<_> = offenders
+            .iter()
+            .filter(|o| o.starts_with("sfemu/src/display.rs:"))
+            .collect();
+        assert!(
+            !mine.is_empty(),
+            "the premise: this file names `minifb` in code, so the check can fail"
+        );
+        assert_eq!(
+            offenders.len(),
+            mine.len(),
+            "`minifb` must be named in code only in sfemu/src/display.rs, found:\n{}",
+            offenders.join("\n")
+        );
+        // And the dependency edge itself is sfemu's alone.
+        assert_eq!(
+            manifests,
+            vec![std::path::PathBuf::from("sfemu/Cargo.toml")],
+            "only sfemu may depend on a windowing library"
+        );
+    }
+
+    /// Calls `f` for every file under `dir`, recursively.
+    ///
+    /// Skips `target` — a build directory holds vendored sources that would make this
+    /// check report someone else's `use minifb` as ours. It is git-ignored and not
+    /// normally under `crates/`, but a stray one would turn a real check into a
+    /// permanent failure.
+    fn walk(dir: &std::path::Path, f: &mut impl FnMut(&std::path::Path)) {
+        let entries = std::fs::read_dir(dir).expect("a directory this crate can read");
+        for e in entries {
+            let path = e.expect("a readable directory entry").path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) == Some("target") {
+                    continue;
+                }
+                walk(&path, f);
+            } else {
+                f(&path);
+            }
+        }
+    }
 }

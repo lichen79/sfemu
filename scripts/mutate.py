@@ -23,7 +23,7 @@ import sys
 # against `frontend`, which is where this harness started. Naming the crate
 # matters: scoring a mutation of `machine` against `frontend`'s tests would report
 # SURVIVE for every mutant, since those tests never load the mutated code.
-CRATES: dict[str, str] = {"snapshot": "machine", "loop": "sfemu"}
+CRATES: dict[str, str] = {"snapshot": "machine", "loop": "sfemu", "wiring": "sfemu"}
 
 # name -> (file, [(mutant-name, old, new, expectation), ...])
 SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
@@ -440,6 +440,17 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
                 "        if a.quit && false {\n            break;\n        }",
                 "KILL",
             ),
+            # The board tag written into the file. A whole-crate mutant rather than a
+            # per-function one: `save` and `load` share the constant, so a round trip
+            # agrees with itself whatever it says, and only a test that reads the
+            # bytes off disk can tell. This one survived until
+            # `a_saved_state_is_tagged_with_this_build_s_board` was written.
+            (
+                "states-tagged-for-another-board",
+                "const BOARD: u32 = frontend::BOARD_SF2;",
+                "const BOARD: u32 = 0x5346_3100;",
+                "KILL",
+            ),
             # CONTROL: the title's exact wording. Nothing pins the phrasing, and
             # nothing should -- the tests look for "paused", "halted", and the drop
             # count, not for a sentence.
@@ -451,10 +462,38 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
             ),
         ],
     ),
+    # The wiring, not the logic. A separate set because it mutates a different file:
+    # what a whole-crate view sees that a per-module one cannot is that the modules
+    # can each be right and be plugged together wrong.
+    "wiring": (
+        "crates/sfemu/src/main.rs",
+        [
+            # Two same-typed fields swapped. Compiles; F5 then writes a save state
+            # over your screenshot and F12 a screenshot over your save.
+            (
+                "state-and-shot-paths-swapped",
+                "        state_path: args.state.clone(),\n        shot_path: default_shot_path(&args.path),",
+                "        state_path: default_shot_path(&args.path),\n        shot_path: args.state.clone(),",
+                "KILL",
+            ),
+            # CONTROL: the same two fields, written in the other order. A struct
+            # initializer's field order is not its layout, so this is observably
+            # identical -- and it is the right control for this set, because it is
+            # the one edit in this neighbourhood that *should* pass while the swap
+            # above must not.
+            (
+                "CONTROL-initializer-field-order",
+                "        state_path: args.state.clone(),\n        shot_path: default_shot_path(&args.path),",
+                "        shot_path: default_shot_path(&args.path),\n        state_path: args.state.clone(),",
+                "SURVIVE",
+            ),
+        ],
+    ),
 }
 
 
-def run(name: str) -> int:
+def run_rows(name: str) -> list[tuple[str, str, str]]:
+    """Applies every mutant of one set, returning (name, expectation, result)."""
     src, mutants = SETS[name]
     crate = CRATES.get(name, "frontend")
     backup = f"/tmp/mutate-{name}.orig"
@@ -476,7 +515,11 @@ def run(name: str) -> int:
             rows.append((mname, expect, "SURVIVE" if r.returncode == 0 else "KILL"))
     finally:
         shutil.copy(backup, src)
+    return rows
 
+
+def run(name: str) -> int:
+    rows = run_rows(name)
     bad = 0
     for mname, expect, got in rows:
         ok = got == expect
@@ -486,8 +529,38 @@ def run(name: str) -> int:
     return 1 if bad else 0
 
 
+def run_all() -> int:
+    """Every set, one after another, with a roll-up.
+
+    The point of running them together rather than one at a time: a set that has
+    started reporting NO-OP because the code it mutates was reworded is invisible
+    when you only run the set you are working on.
+    """
+    total = killed = survived = noop = bad = 0
+    for name in SETS:
+        print(f"=== {name} ===")
+        rows = run_rows(name)
+        for mname, expect, got in rows:
+            ok = got == expect
+            bad += not ok
+            total += 1
+            if got.startswith("NO-OP"):
+                noop += 1
+            elif got == "KILL":
+                killed += 1
+            else:
+                survived += 1
+            print(f"{'ok  ' if ok else 'BAD '} {mname:42} expect {expect:8} got {got}")
+        print()
+    print(f"total {total}  killed {killed}  survived {survived}  no-op {noop}")
+    print(f"{total - bad}/{total} as expected")
+    return 1 if bad else 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == "--all":
+        sys.exit(run_all())
     if len(sys.argv) != 2 or sys.argv[1] not in SETS:
-        print(f"usage: {sys.argv[0]} {{{','.join(SETS)}}}", file=sys.stderr)
+        print(f"usage: {sys.argv[0]} {{{','.join(SETS)},--all}}", file=sys.stderr)
         sys.exit(2)
     sys.exit(run(sys.argv[1]))
