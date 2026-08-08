@@ -273,6 +273,106 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
             ),
         ],
     ),
+    "state": (
+        "crates/frontend/src/state.rs",
+        [
+            # The five refusals, each defeated in turn. A codec that accepts
+            # everything is the failure mode a user only discovers when a state
+            # loads as garbage.
+            (
+                "crc-check-always-passes",
+                "    if found_crc != computed {",
+                "    if false && found_crc != computed {",
+                "KILL",
+            ),
+            (
+                "version-check-always-passes",
+                "    if bytes[7] != VERSION {",
+                "    if false && bytes[7] != VERSION {",
+                "KILL",
+            ),
+            (
+                "magic-check-always-passes",
+                "    if bytes[..7] != MAGIC[..7] {",
+                "    if false && bytes[..7] != MAGIC[..7] {",
+                "KILL",
+            ),
+            (
+                "board-check-always-passes",
+                "    if found_board != board {",
+                "    if false && found_board != board {",
+                "KILL",
+            ),
+            (
+                "declared-length-check-removed",
+                "    if bytes.len() < need {",
+                "    if false && bytes.len() < need {",
+                "KILL",
+            ),
+            # The three fields a save state is most likely to forget: two are
+            # private on `Cps1` and one is a one-frame delay, so all three are
+            # invisible to a whole-frame comparison. `machine`'s pass proved
+            # `snapshot` carries them; this proves the *bytes* do.
+            (
+                "carry-omitted-from-the-payload",
+                "    w.i64(s.carry);",
+                "    w.i64(0);",
+                "KILL",
+            ),
+            (
+                "obj-latch-omitted-from-the-payload",
+                "    w.words(s.obj.words());",
+                "    w.words(&[0u16; OBJ_WORDS]);",
+                "KILL",
+            ),
+            (
+                "vblank-pending-omitted-from-the-payload",
+                "    w.bool(s.vblank_pending);",
+                "    w.bool(false);",
+                "KILL",
+            ),
+            # Two adjacent same-width fields written in the other order. A
+            # divergence test cannot see this -- the guest never reads either --
+            # which is why `every_field_survives_the_round_trip` exists.
+            (
+                "two-adjacent-fields-swapped",
+                "    w.bool(s.inputs.start1);\n    w.bool(s.inputs.start2);",
+                "    w.bool(s.inputs.start2);\n    w.bool(s.inputs.start1);",
+                "KILL",
+            ),
+            (
+                "cpu-flag-bytes-swapped",
+                "    w.bool(s.cpu.halted);\n    w.bool(s.cpu.stopped);",
+                "    w.bool(s.cpu.stopped);\n    w.bool(s.cpu.halted);",
+                "KILL",
+            ),
+            # The forward polynomial instead of the reflected one: a CRC that is
+            # self-consistent, so only the spec's check value catches it.
+            (
+                "unreflected-crc-polynomial",
+                "crc = (crc >> 1) ^ (0xEDB8_8320 & mask);",
+                "crc = (crc >> 1) ^ (0x04C1_1DB7 & mask);",
+                "KILL",
+            ),
+            # A boolean read as `== 1` rather than `!= 0`. One character, and the
+            # documented permissiveness is gone.
+            (
+                "boolean-read-as-exactly-one",
+                "        self.u8() != 0\n",
+                "        self.u8() == 1\n",
+                "KILL",
+            ),
+            # CONTROL: the wording of a refusal, not its existence. Nothing
+            # asserts this text, and nothing should -- pinning a human-readable
+            # message makes every rewording a test failure.
+            (
+                "CONTROL-display-text-reworded",
+                'write!(f, "not a save state (wrong magic)")',
+                'write!(f, "this file is not a save state")',
+                "SURVIVE",
+            ),
+        ],
+    ),
 }
 
 

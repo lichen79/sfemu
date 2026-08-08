@@ -556,12 +556,39 @@ mod tests {
         for _ in 0..5_241 {
             m.run_scanline();
         }
-        m.board.inputs.p1.down = true;
-        m.board.inputs.p2.punch[2] = true;
-        m.board.inputs.coin1 = true;
-        m.board.inputs.dsw = [0x5A, 0xA5, 0x3C];
+        // Every control is set to the *opposite* of the one encoded next to it, and
+        // p2 is p1's complement. The payload is a run of one-byte booleans, so two
+        // adjacent fields written in the wrong order is invisible unless the two
+        // disagree — and the guest never reads a control, so no divergence test can
+        // see it either. An alternating fixture makes any adjacent swap show up in
+        // `every_field_survives_the_round_trip`.
+        let inputs = &mut m.board.inputs;
+        inputs.coin1 = true;
+        inputs.coin2 = false;
+        inputs.service = true;
+        inputs.start1 = false;
+        inputs.start2 = true;
+        inputs.test = false;
+        inputs.p1.right = true;
+        inputs.p1.left = false;
+        inputs.p1.down = true;
+        inputs.p1.up = false;
+        inputs.p1.punch = [true, false, true];
+        inputs.p1.kick = [false, true, false];
+        inputs.p2.right = false;
+        inputs.p2.left = true;
+        inputs.p2.down = false;
+        inputs.p2.up = true;
+        inputs.p2.punch = [false, true, false];
+        inputs.p2.kick = [true, false, true];
+        inputs.dsw = [0x5A, 0xA5, 0x3C];
         m.board.sound_latch = [0x12, 0x34];
         m.board.coin_ctrl = 0xBEEF;
+        // A vblank the CPU has not acknowledged yet. The program acknowledges
+        // promptly, so a snapshot taken at any quiet moment has this clear — and a
+        // codec that wrote a constant `false` would then be indistinguishable. This
+        // is the last thing the fixture does so the flag is still set.
+        m.board.assert_vblank();
         m
     }
 
@@ -712,6 +739,8 @@ mod tests {
         assert_eq!(d.inputs.in1(), s.inputs.in1(), "IN1");
         assert_eq!(d.inputs.in2(), s.inputs.in2(), "IN2");
         assert_eq!(d.inputs.dsw, s.inputs.dsw, "the DIP switches");
+        assert_eq!(d.inputs.start1, s.inputs.start1, "start1 specifically");
+        assert_eq!(d.inputs.start2, s.inputs.start2, "and start2");
     }
 
     /// The fixture's fields are actually distinctive.
@@ -730,11 +759,43 @@ mod tests {
         assert_ne!(s.cpu.prefetch, [0, 0], "the prefetch queue is primed");
         assert_ne!(s.inputs.in0(), 0xFF, "a coin is held");
         assert_ne!(s.inputs.in1(), 0xFFFF, "and a stick and a punch");
+        assert!(s.vblank_pending, "an unacknowledged vblank");
+        // Adjacent controls disagree, which is what makes a swapped pair visible.
+        assert_ne!(s.inputs.start1, s.inputs.start2, "start1 and start2");
+        assert_ne!(s.inputs.coin1, s.inputs.coin2, "coin1 and coin2");
+        assert_ne!(s.inputs.p1.right, s.inputs.p1.left, "p1 right and left");
+        assert_ne!(s.inputs.p1.down, s.inputs.p1.up, "p1 down and up");
+        assert_ne!(s.inputs.p1.punch[0], s.inputs.p1.punch[1], "p1 punches");
+        assert_ne!(s.inputs.p1.kick[0], s.inputs.p1.kick[1], "p1 kicks");
+        assert_ne!(s.inputs.p1.right, s.inputs.p2.right, "p1 against p2");
         assert_eq!(s.inputs.dsw, [0x5A, 0xA5, 0x3C], "the DIPs are not 0xFF");
         assert_eq!(s.sound_latch, [0x12, 0x34], "the latches are not zero");
         assert_ne!(s.coin_ctrl, 0, "nor the coin control");
         assert!(s.ram.iter().any(|&w| w != 0), "the program wrote RAM");
         assert!(s.obj.words().iter().any(|&w| w != 0), "and sprites latched");
+    }
+
+    /// The CPU's flag bytes survive individually.
+    ///
+    /// A running machine has `halted`, `stopped`, `in_exception`, and
+    /// `trace_pending` all false, so the fixture cannot distinguish them from each
+    /// other and a swapped pair among them would be invisible. The state is still
+    /// machine-produced — these are set on a real snapshot rather than on a
+    /// hand-built one — and the four are given distinct values.
+    #[test]
+    fn the_cpu_flag_bytes_are_distinguishable() {
+        let mut s = a_machine().snapshot();
+        s.cpu.halted = true;
+        s.cpu.stopped = false;
+        s.cpu.in_exception = true;
+        s.cpu.trace_pending = false;
+        s.cpu.pending_irq = 5;
+        let d = decode(&encode(&s, BOARD_SF2), BOARD_SF2).expect("valid");
+        assert!(d.cpu.halted, "halted");
+        assert!(!d.cpu.stopped, "stopped");
+        assert!(d.cpu.in_exception, "in_exception");
+        assert!(!d.cpu.trace_pending, "trace_pending");
+        assert_eq!(d.cpu.pending_irq, 5, "and the pending level is a level");
     }
 
     /// The encoded length is the documented size.
