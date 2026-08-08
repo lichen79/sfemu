@@ -170,6 +170,158 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
             ),
         ],
     ),
+    # E2 Task 4: the panels. The failure mode a debugger has is not a crash, it is
+    # showing you a plausible wrong number -- an address four bytes off, a shadow
+    # stack pointer, a gap rendered as data. Every mutant here is one of those.
+    "overlay": (
+        "crates/frontend/src/overlay.rs",
+        [
+            # The prefetch offset, which is the load-bearing arithmetic in this module.
+            # `pc` itself, and the offset in the wrong direction: both show an address
+            # that looks entirely reasonable.
+            (
+                "pc-not-adjusted-for-prefetch",
+                "    m.cpu.pc.wrapping_sub(4)",
+                "    m.cpu.pc",
+                "KILL",
+            ),
+            (
+                "prefetch-offset-added",
+                "    m.cpu.pc.wrapping_sub(4)",
+                "    m.cpu.pc.wrapping_add(4)",
+                "KILL",
+            ),
+            (
+                "prefetch-offset-one-word",
+                "    m.cpu.pc.wrapping_sub(4)",
+                "    m.cpu.pc.wrapping_sub(2)",
+                "KILL",
+            ),
+            # A7 from the shadow rather than the active pointer. Wrong precisely when
+            # you are inside an exception handler, which is when you are reading it.
+            (
+                "a7-read-from-the-shadow",
+                'let line = format!("D{i} {:08X} A{i} {:08X}", m.cpu.d[i], m.cpu.a[i]);',
+                'let line = format!("D{i} {:08X} A{i} {:08X}", m.cpu.d[i], if i == 7 { m.cpu.ssp } else { m.cpu.a[i] });',
+                "KILL",
+            ),
+            # The listing advancing by a constant rather than by the instruction's
+            # length: every line after the first lands mid-instruction and disassembles
+            # to something that was never there.
+            (
+                "listing-advances-by-a-word",
+                "        a = a.wrapping_add(insn.len);",
+                "        a = a.wrapping_add(2);",
+                "KILL",
+            ),
+            # The two markers, each defeated. A marker on every line is as useless as
+            # none, and a marker in the wrong colour is invisible on a dark panel.
+            (
+                "every-line-is-marked-as-executing",
+                "        let marker = if a == pc { '>' } else { ' ' };",
+                "        let marker = '>';",
+                "KILL",
+            ),
+            (
+                "breakpoints-are-never-marked",
+                "        let brk = if bp.contains(&a) { '*' } else { ' ' };",
+                "        let brk = ' ';",
+                "KILL",
+            ),
+            (
+                "the-breakpoint-marker-is-not-recoloured",
+                '        if brk == \'*\' {\n            draw_text(buf, x + ADVANCE, y + row * LINE, "*", BP);\n        }',
+                "",
+                "KILL",
+            ),
+            # The gap/all-ones distinction, from both sides. A dump that renders an
+            # undecoded address as data sends you looking for a chip that is not there;
+            # one that renders a decoded 0xFFFF as a gap loses the fact that something
+            # answered.
+            (
+                "a-gap-is-shown-as-data",
+                "                None => line.push_str(\"   --\"),",
+                "                None => line.push_str(\" FFFF\"),",
+                "KILL",
+            ),
+            (
+                "all-ones-is-shown-as-a-gap",
+                "                Some(v) => line.push_str(&format!(\" {v:04X}\")),",
+                "                Some(v) => line.push_str(if v == 0xFFFF { \"   --\" } else { &format!(\" {v:04X}\") }),",
+                "KILL",
+            ),
+            # The debugger reading through the CPU's path. This is the mutant Task 2's
+            # `&self` cannot prevent -- the signature stops `peek_word` from having side
+            # effects, not a caller from reaching for something else. `read16` needs
+            # `&mut`, which `draw` does not have, so the reachable form is a *panel*
+            # that stops using `peek_word`'s honest `None`.
+            (
+                "the-dump-invents-a-value-for-a-gap",
+                "            match m.peek_word(a) {",
+                "            match m.peek_word(a).or(Some(0)) {",
+                "KILL",
+            ),
+            # The status line: HALT and STOP are different machines, and confusing them
+            # sends you to the wrong question entirely.
+            (
+                "halted-and-stopped-confused",
+                '    let run = if m.cpu.halted {\n        "HALT"\n    } else if m.cpu.stopped {\n        "STOP"',
+                '    let run = if m.cpu.halted {\n        "STOP"\n    } else if m.cpu.stopped {\n        "HALT"',
+                "KILL",
+            ),
+            (
+                "a-halted-cpu-looks-like-it-is-running",
+                "    let run = if m.cpu.halted {",
+                "    let run = if false {",
+                "KILL",
+            ),
+            (
+                "flags-read-inverted",
+                "    let f = |bit: u16, c: char| if m.cpu.sr & bit != 0 { c } else { '-' };",
+                "    let f = |bit: u16, c: char| if m.cpu.sr & bit == 0 { c } else { '-' };",
+                "KILL",
+            ),
+            (
+                "two-flag-bits-swapped",
+                "        f(0x0004, 'Z'),\n        f(0x0002, 'V'),",
+                "        f(0x0002, 'Z'),\n        f(0x0004, 'V'),",
+                "KILL",
+            ),
+            # The layout. Two boxes on the same pixels hides one behind the other --
+            # invisible to a test that draws one panel at a time.
+            (
+                "the-disassembly-overlaps-the-top-band",
+                "const TOP_ROWS: usize = taller(REGS_ROWS, MEM_ROWS);",
+                "const TOP_ROWS: usize = REGS_ROWS;",
+                "KILL",
+            ),
+            (
+                "a-panel-runs-off-the-bottom",
+                "pub const STATUS_Y: usize = HEIGHT - LINE - 2 * PAD - 1;",
+                "pub const STATUS_Y: usize = HEIGHT - LINE;",
+                "KILL",
+            ),
+            # The off switch. An overlay that drew its background regardless would
+            # black out the game when switched off.
+            (
+                "panels-draw-even-when-disabled",
+                "    if p.regs {\n        draw_regs(buf, m);\n    }",
+                "    draw_regs(buf, m);",
+                "KILL",
+            ),
+            # CONTROL: the background colour. Nothing pins it and nothing should -- the
+            # tests read text in `FG`, `HI`, and `BP`, which is the contrast that
+            # matters; the exact dark behind it is taste. Legibility on a real display
+            # is the one criterion in this sub-project a test cannot settle, and the
+            # README says so.
+            (
+                "CONTROL-background-shade",
+                "const BG: u32 = 0x0000_0020;",
+                "const BG: u32 = 0x0010_0018;",
+                "SURVIVE",
+            ),
+        ],
+    ),
     "keys": (
         "crates/frontend/src/keys.rs",
         [

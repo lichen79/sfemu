@@ -31,6 +31,7 @@
 
 pub mod font;
 pub mod keys;
+pub mod overlay;
 pub mod pace;
 pub mod pixels;
 pub mod state;
