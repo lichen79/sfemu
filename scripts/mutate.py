@@ -19,6 +19,12 @@ import shutil
 import subprocess
 import sys
 
+# Which crate's tests each set is scored against. A set omitted here is scored
+# against `frontend`, which is where this harness started. Naming the crate
+# matters: scoring a mutation of `machine` against `frontend`'s tests would report
+# SURVIVE for every mutant, since those tests never load the mutated code.
+CRATES: dict[str, str] = {"snapshot": "machine"}
+
 # name -> (file, [(mutant-name, old, new, expectation), ...])
 SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
     "pace": (
@@ -188,11 +194,91 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
             ),
         ],
     ),
+    # Task 4: the snapshot. Every mutant here drops or corrupts one field, which is
+    # the whole failure mode a save state has -- and the reason the load-bearing test
+    # is a divergence test rather than `snapshot == snapshot`.
+    "snapshot": (
+        "crates/machine/src/cps1.rs",
+        [
+            # The three private fields, each dropped from `restore`.
+            ("carry-not-restored", "        self.carry = s.carry;\n", "", "KILL"),
+            (
+                "vblank-not-restored",
+                "        self.board.set_vblank_pending(s.vblank_pending);\n",
+                "",
+                "KILL",
+            ),
+            (
+                "obj-latch-not-restored",
+                "        self.video.set_obj_latch(&s.obj);\n",
+                "",
+                "KILL",
+            ),
+            # And each dropped from `snapshot`, which the divergence test must also
+            # catch: a state that never carried the field restores just as wrong.
+            ("carry-not-captured", "            carry: self.carry,", "            carry: 0,", "KILL"),
+            (
+                "vblank-not-captured",
+                "            vblank_pending: self.board.vblank_pending(),",
+                "            vblank_pending: false,",
+                "KILL",
+            ),
+            (
+                "obj-latch-not-captured",
+                "            obj: self.video.obj_latch().clone(),",
+                "            obj: video::sprites::ObjLatch::new(),",
+                "KILL",
+            ),
+            # The bulk memory, and the scheduler's coarse position.
+            ("ram-not-restored", "        self.board.ram.copy_from_slice(&s.ram[..]);\n", "", "KILL"),
+            (
+                "gfxram-not-restored",
+                "        self.board.gfxram.copy_from_slice(&s.gfxram[..]);\n",
+                "",
+                "KILL",
+            ),
+            ("line-not-restored", "        self.line = s.line;\n", "", "KILL"),
+            ("cpu-not-restored", "        self.cpu = s.cpu.clone();\n", "", "KILL"),
+            (
+                "total-cycles-not-restored",
+                "        self.total_cycles = s.total_cycles;\n",
+                "",
+                "KILL",
+            ),
+            # A probe, not a control. If held inputs survive being dropped, the fix is
+            # a test for restoring them -- not accepting the survivor.
+            (
+                "PROBE-inputs-not-captured",
+                "            inputs: self.board.inputs,",
+                "            inputs: crate::Inputs::idle(),",
+                "KILL",
+            ),
+            # A restore written in terms of `assert_vblank` would inflate the trace's
+            # vblank count on every load. This is why `set_vblank_pending` exists.
+            (
+                "restore-re-asserts-the-interrupt",
+                "        self.board.set_vblank_pending(s.vblank_pending);",
+                "        if s.vblank_pending {\n            self.board.assert_vblank();\n        }",
+                "KILL",
+            ),
+            # Control: the trace is deliberately absent from a state, and
+            # `a_snapshot_carries_no_rom_and_does_not_rewind_the_trace` is what pins
+            # that. Restoring `cps_b` twice is a no-op -- idempotent, observably
+            # identical, and exactly what a control should be.
+            (
+                "CONTROL-restore-cps-b-twice",
+                "        self.board.cps_b = s.cps_b;\n",
+                "        self.board.cps_b = s.cps_b;\n        self.board.cps_b = s.cps_b;\n",
+                "SURVIVE",
+            ),
+        ],
+    ),
 }
 
 
 def run(name: str) -> int:
     src, mutants = SETS[name]
+    crate = CRATES.get(name, "frontend")
     backup = f"/tmp/mutate-{name}.orig"
     shutil.copy(src, backup)
     rows = []
@@ -205,7 +291,7 @@ def run(name: str) -> int:
                 continue
             open(src, "w").write(text.replace(old, new, 1))
             r = subprocess.run(
-                ["cargo", "test", "-p", "frontend", "--quiet"],
+                ["cargo", "test", "-p", crate, "--quiet"],
                 capture_output=True,
                 text=True,
             )

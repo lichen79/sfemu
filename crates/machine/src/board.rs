@@ -25,9 +25,9 @@ use crate::trace::Trace;
 use m68k::Bus;
 
 /// Main RAM, 0xFF0000-0xFFFFFF: 64 KB = 32 K words (`cps1.cpp:593`).
-const RAM_WORDS: usize = 0x8000;
+pub(crate) const RAM_WORDS: usize = 0x8000;
 /// gfxram, 0x900000-0x92FFFF: 192 KB = 96 K words (`cps1.cpp:592`).
-const GFXRAM_WORDS: usize = 0x1_8000;
+pub(crate) const GFXRAM_WORDS: usize = 0x1_8000;
 /// Program ROM space, 0x000000-0x3FFFFF (`CODE_SIZE`, `cps1.cpp:4063`).
 const ROM_BYTES: usize = 0x40_0000;
 
@@ -39,7 +39,7 @@ const CPS_A_BASE: u32 = 0x80_0100;
 /// CPS-B register file base, 0x800140-0x80017F (`cps1.cpp:589`).
 const CPS_B_BASE: u32 = 0x80_0140;
 /// Both custom register files are 0x40 bytes = 32 words.
-const CPS_REGS: usize = 0x20;
+pub(crate) const CPS_REGS: usize = 0x20;
 
 /// What an unmapped read returns.
 ///
@@ -178,6 +178,17 @@ impl Board {
     /// acknowledge is detected.
     pub fn vblank_pending(&self) -> bool {
         self.vblank_pending
+    }
+
+    /// Sets the pending-interrupt line directly, for a save-state restore.
+    ///
+    /// ⚠️ **Not for the scheduler.** [`Board::assert_vblank`] is what a beam
+    /// reaching line 240 calls, and it also counts the vblank in the trace. This
+    /// sets the line without counting anything, which is right for a restore — the
+    /// vblank being restored was counted when it originally happened — and wrong
+    /// for everything else.
+    pub fn set_vblank_pending(&mut self, pending: bool) {
+        self.vblank_pending = pending;
     }
 
     /// The 68000's autovector-26 fetch, which on this board is the acknowledge

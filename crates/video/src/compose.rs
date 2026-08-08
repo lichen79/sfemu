@@ -246,6 +246,21 @@ impl Video {
         &self.pal
     }
 
+    /// The previous frame's object table, for a save state.
+    pub fn obj_latch(&self) -> &ObjLatch {
+        &self.obj
+    }
+
+    /// Restores the previous frame's object table.
+    ///
+    /// Sprites are delayed one frame (`cps1_v.cpp:3067-3068`), so this latch is
+    /// **state** and not a cache: a machine restored without it draws one frame of
+    /// the wrong sprites. Nothing else may call this — [`Video::latch_objects`] is
+    /// what a beam at vblank uses, and it reads the table the guest wrote.
+    pub fn set_obj_latch(&mut self, l: &ObjLatch) {
+        self.obj = l.clone();
+    }
+
     /// The frame as 8-bit RGB triples, `WIDTH * HEIGHT * 3` bytes.
     pub fn rgb(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(WIDTH * HEIGHT * 3);

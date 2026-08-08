@@ -24,6 +24,7 @@ pub mod board;
 pub mod config;
 pub mod cps1;
 pub mod inputs;
+pub mod snapshot;
 pub mod timing;
 pub mod trace;
 
@@ -39,5 +40,6 @@ pub use board::Board;
 pub use config::BoardConfig;
 pub use cps1::Cps1;
 pub use inputs::{Inputs, PlayerInput};
+pub use snapshot::MachineState;
 pub use timing::Timing;
 pub use trace::{Trace, UnmappedLog};

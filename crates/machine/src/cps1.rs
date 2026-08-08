@@ -2,6 +2,7 @@
 
 use crate::board::Board;
 use crate::config::BoardConfig;
+use crate::snapshot::MachineState;
 use crate::timing::Timing;
 use m68k::{decode::Decoder, M68k};
 use video::compose::Video;
@@ -154,6 +155,54 @@ impl Cps1 {
         for _ in 0..self.timing.lines_per_frame {
             self.run_scanline();
         }
+    }
+
+    /// Everything that decides the machine's future, copied out.
+    ///
+    /// Not the ROM, the graphics ROM, the decoder, or the [`Trace`](crate::Trace):
+    /// see [`MachineState`] for why each is absent.
+    pub fn snapshot(&self) -> MachineState {
+        MachineState {
+            cpu: self.cpu.clone(),
+            // `boxed_copy` and not `.clone()`: see its documentation.
+            ram: crate::snapshot::boxed_copy(&self.board.ram),
+            gfxram: crate::snapshot::boxed_copy(&self.board.gfxram),
+            cps_a: self.board.cps_a,
+            cps_b: self.board.cps_b,
+            sound_latch: self.board.sound_latch,
+            coin_ctrl: self.board.coin_ctrl,
+            vblank_pending: self.board.vblank_pending(),
+            inputs: self.board.inputs,
+            total_cycles: self.total_cycles,
+            line: self.line,
+            carry: self.carry,
+            obj: self.video.obj_latch().clone(),
+        }
+    }
+
+    /// Puts a snapshot back.
+    ///
+    /// The two large arrays are copied into the existing boxes rather than replacing
+    /// them, so loading a state does not allocate 208 KB per press of the load key.
+    ///
+    /// Leaves the ROM, the graphics ROM, the decoder, and the trace alone. The trace
+    /// especially: it records the session rather than the machine, and rewinding it
+    /// on every load would make a divergence test compare a run's counters against a
+    /// copy of themselves.
+    pub fn restore(&mut self, s: &MachineState) {
+        self.cpu = s.cpu.clone();
+        self.board.ram.copy_from_slice(&s.ram[..]);
+        self.board.gfxram.copy_from_slice(&s.gfxram[..]);
+        self.board.cps_a = s.cps_a;
+        self.board.cps_b = s.cps_b;
+        self.board.sound_latch = s.sound_latch;
+        self.board.coin_ctrl = s.coin_ctrl;
+        self.board.set_vblank_pending(s.vblank_pending);
+        self.board.inputs = s.inputs;
+        self.total_cycles = s.total_cycles;
+        self.line = s.line;
+        self.carry = s.carry;
+        self.video.set_obj_latch(&s.obj);
     }
 }
 
