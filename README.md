@@ -7,11 +7,12 @@ CPS-1 ROM set you own and `--play` opens a window:
 cargo run -p sfemu --release -- /path/to/your/sf2.zip --play
 ```
 
-Four sub-projects are complete: the **68000 core** (A), the **bus and timing
+Five sub-projects are complete: the **68000 core** (A), the **bus and timing
 framework with a MAME ROM-set loader** (B), the **CPS-1 scanline renderer** (C),
-and the **frontend** — window, frame clock, keyboard, and save states (E1). The
-Z80 and audio (D), the debugger (E2), the graphics viewers (E3), and the Street
-Fighter 1 driver (F) are not built yet: **there is no sound.**
+the **frontend** — window, frame clock, keyboard, and save states (E1) — and the
+**debugger** (E2): `F1` for an in-window overlay, `F4` to step one instruction,
+`F7` for a breakpoint. The Z80 and audio (D), the graphics viewers (E3), and the
+Street Fighter 1 driver (F) are not built yet: **there is no sound.**
 
 ## The 68000 core
 
@@ -51,6 +52,10 @@ Legal ways to obtain a ROM set you may use:
 - **Dumping a board you own.** The most defensible route, and the only one that
   gets you a set for hardware Capcom has not re-released.
 
+The same reasoning governs the debugger's font: it is **drawn in this repository**,
+as ASCII art in `frontend/src/font.rs`, because a typeface is someone's copyrighted
+work unless it demonstrably is not. Nothing to license, nothing to fetch.
+
 `testdata/` is gitignored, and no ROM or test data is ever committed. The test
 vectors are a separate matter: they are freely licensed, machine-generated, and
 contain no game code — but they are still fetched at runtime rather than vendored.
@@ -78,7 +83,7 @@ cargo run -p testrunner --bin report --release
 # Throughput. Read the caveat below before quoting a number from it.
 cargo bench -p m68k
 
-# Mutation testing: 71 mutants, each an exact string replacement, each with a
+# Mutation testing: 132 mutants, each an exact string replacement, each with a
 # declared KILL or SURVIVE. Every set carries at least one control that must
 # survive — a pass where everything dies is more likely a broken harness than a
 # thorough suite. Commit first: it edits files in place.
@@ -130,6 +135,12 @@ cargo run -p sfemu --release -- /path/to/your/sf2.zip 600 --ppm frame.ppm
 | `F5` / `F8` | Save state / load state |
 | `F12` | Screenshot, as a binary PPM |
 | `Esc` | Quit |
+| `F1` | Debugger overlay on / off |
+| `F4` | Step one **instruction** |
+| `F6` | Move the scroll focus: disassembly ⇄ memory |
+| `F7` | Set / clear a breakpoint at the instruction shown |
+| `PageUp` / `PageDown` | Scroll the focused panel |
+| `Home` | Follow the machine again (memory: go to the stack pointer) |
 
 Punches sit on the top row and kicks directly under them, matching a real
 six-button cabinet. **Player 2 is not mapped**, deliberately: two players on one
@@ -147,7 +158,48 @@ print as `notice` lines when the session ends.
 The title bar carries `[paused]`, `[CPU halted]`, and a dropped-frame count when
 there is one. `[CPU halted]` means the 68000 double bus faulted and the loop is
 still running so you can see it: that is a bug in this emulator or in the ROM set,
-and E2's debugger is the tool it wants.
+and `F1` is the tool it wants — the status panel says `HALT` and the registers show
+where it went.
+
+### Debugging it
+
+`F1` draws the debugger into the emulated framebuffer, over the paused game. Four
+panels, each independently toggleable in code and three of them on by default:
+
+- **Registers** — D0-D7 beside A0-A7, then PC, SR, the cycle count, and the frame
+  count. A7 comes from `a[7]`, never from the `usp`/`ssp` shadows, which are stale
+  inside an exception handler — which is where you are when you are reading it. The
+  PC shown is the *executing* instruction's, four bytes behind `cpu.pc`, because the
+  68000 prefetches two words.
+- **Disassembly** — eight instructions from the follow address, `>` on the
+  executing line and `*` on a breakpoint. It follows the machine until you scroll;
+  `Home` makes it follow again.
+- **Memory** — twelve rows of four words. Off by default: it needs an address to be
+  worth its width, and `F6` is how you ask for it.
+- **Status** — the flags `XNZVC`, the beam position, and `HALT` or `STOP` when the
+  CPU is one of those.
+
+`--` in the memory view means **nothing decodes at that address** — no chip
+answered. That is a different fact from `FFFF`, which means something answered and
+read as all ones, and the two are not conflated: conflating them sends you looking
+for a chip that is not there. $800020 genuinely reads `FFFF` and is decoded, which
+is what makes the distinction real rather than theoretical.
+
+**Nothing here is writable, and that is a design decision rather than a missing
+feature.** Every panel reads through `Cps1::peek_word`, which is `&self` and takes
+no side-effect path: a dump scrolled over the input latch at $800000 must not
+acknowledge an interrupt, and a listing pointed at $68 must not consume the vector
+it is there to explain. A debugger that perturbed the machine while you watched it
+would make every intermittent bug unreproducible, which is the class of bug you
+open a debugger for. `watching_the_machine_does_not_change_it` in
+`sfemu/src/loop_.rs` is the test that holds the line: four frames with the overlay
+on and four with it off, compared on cycles, every register, the beam, the
+interrupt trace counters, and all of RAM.
+
+`F4` steps one instruction; `.` still steps one whole frame. Both are needed and
+they are not interchangeable — a frame is 167,680 cycles, which is where a bug
+usually is, and an instruction is where you can see it. A breakpoint stops the
+machine *mid-frame*, at the instruction, not at the next frame boundary.
 
 ### Speed
 
@@ -169,10 +221,10 @@ they are dropped and counted, because a machine that fell a second behind should
 resync rather than fast-forward through a second of the game. Pausing owes nothing
 — the clock is only read on a running tick.
 
-### Three things only you can check
+### Four things only you can check
 
 Everything in this repository is tested without a display, which leaves exactly
-three claims no test here can make. Run it against your own ROM set and look:
+four claims no test here can make. Run it against your own ROM set and look:
 
 1. **Does the window show Street Fighter II?** A test can assert the framebuffer
    changed, that a save state round-trips, and that a pen becomes the right ARGB
@@ -182,6 +234,12 @@ three claims no test here can make. Run it against your own ROM set and look:
 3. **Do the controls respond?** The key map is tested against the board's
    documented port bits, which proves `A` sets jab and not that `A` reaches the
    game.
+4. **Is the debugger overlay legible on your display?** The font is 4×6 pixels,
+   scaled by whatever the window is. A test can prove that no two of the 95 glyphs
+   share a bitmap, that the sixteen hex digits are the bitmaps drawn here, that the
+   blank column between characters is really blank, and that each panel's pixels land
+   where the layout says. **None of that is "you can read it."** Distinguishing `8`
+   from `B` at a glance in a moving window is the claim, and it is yours to make.
 
 If the picture comes up wrong, `F12` gives you a frame to look at and the trace
 counters in the no-`--play` report give you the interrupts and bus activity behind
@@ -223,11 +281,12 @@ crates/machine/      the board: memory map, bus, interrupts, scheduler, inputs,
 crates/romset/       the MAME ROM-set loader: zip or a directory, CRC-checked,
                      interleaved into the regions the board wants.
 crates/frontend/     every frontend decision, with no window: frame pacing, the
-                     key map, pen-to-ARGB, the save-state file format.
+                     key map, pen-to-ARGB, the save-state file format, the
+                     debugger's state, and the 4x6 font drawn in this repository.
 crates/sfemu/        the binary. The only crate that names a windowing library,
                      and only in one file (a test enforces it).
 crates/testrunner/   dev-only harness for the external vector suite.
-scripts/mutate.py    the mutation harness: 71 mutants over the above, each one
+scripts/mutate.py    the mutation harness: 132 mutants over the above, each one
                      an exact string replacement with a declared expectation.
 docs/hardware/       what the vectors proved about the hardware, with evidence.
 docs/superpowers/    design specs and implementation plans.
@@ -288,14 +347,15 @@ out of the access sequence a handler already has to schedule.
 | **C** | CPS-1 video: tilemaps, sprites, palettes, CPS-A/B registers, scanline renderer | **complete** — the largest piece, and where SF2 becomes visible |
 | D | Z80 and audio: YM2151, OKI MSM6295 ADPCM | deferrable; CPS-1 sound is a fire-and-forget latch |
 | **E1** | Frontend: window, frame clock, keyboard, save states | **complete** — `--play` |
-| E2 | Debugger: single-step, breakpoints, disassembly, register and memory views | next |
-| E3 | Graphics viewers: tile browser, tilemap and palette views, layer toggles | after E2 |
+| **E2** | Debugger: single-step, breakpoints, disassembly, register and memory views | **complete** — `F1`, in-window, and it does not perturb the machine |
+| E3 | Graphics viewers: tile browser, tilemap and palette views, layer toggles | next |
 | F | Street Fighter 1 driver | a second board against a proven core |
 
 E was split because its three surfaces are independent and only the first changes
 what the project *is* rather than what can be inspected about it. E3 is last for a
 reason rather than by preference: a tile browser's value is mostly in stopping the
-machine at the frame you care about, which is E2's stepping.
+machine at the frame you care about, which is E2's stepping — now built, so E3 has
+what it was waiting for.
 
 WASM and netplay are not stages. They are constraints on A–D: no threads, no
 wall-clock access, no host I/O in the core, a frame-stepped API, and complete

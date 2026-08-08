@@ -596,7 +596,15 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
             # matters, which is what every_key_has_its_own_slot tests. Moving
             # Escape to another free bit changes nothing observable. Worth having
             # precisely because it looks like it should fail.
-            ("CONTROL-escape-moves-to-another-free-bit", "Key::Escape => 21,", "Key::Escape => 25,", "SURVIVE"),
+            #
+            # ⚠️ 30, and not 25, which is what this said until Task 5 gave bit 25 to
+            # `F7`. The control then *died*, correctly: it had quietly become a
+            # two-keys-share-a-bit mutant, which the suite is supposed to kill. This is
+            # the failure mode a control exists to expose in the harness itself, and it
+            # is why `--all` is run rather than one set at a time. 29 keys hold bits
+            # 0-28, so 30 is free and stays free unless a key is added -- at which
+            # point this control dies again and says so.
+            ("CONTROL-escape-moves-to-another-free-bit", "Key::Escape => 21,", "Key::Escape => 30,", "SURVIVE"),
         ],
     ),
     "pixels": (

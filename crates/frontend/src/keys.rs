@@ -179,7 +179,7 @@ impl Key {
 /// Which keys are held.
 ///
 /// A bitmask rather than a `Vec`, so [`Controls`] can keep last frame's set by
-/// copy and the edge detection is one `&`. Twenty-two keys fit a `u32` with room
+/// copy and the edge detection is one `&`. Twenty-nine keys fit a `u32` with room
 /// to spare.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KeySet {
