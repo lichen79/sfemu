@@ -7,12 +7,13 @@ CPS-1 ROM set you own and `--play` opens a window:
 cargo run -p sfemu --release -- /path/to/your/sf2.zip --play
 ```
 
-Five sub-projects are complete: the **68000 core** (A), the **bus and timing
+Six sub-projects are complete: the **68000 core** (A), the **bus and timing
 framework with a MAME ROM-set loader** (B), the **CPS-1 scanline renderer** (C),
-the **frontend** — window, frame clock, keyboard, and save states (E1) — and the
+the **frontend** — window, frame clock, keyboard, and save states (E1) — the
 **debugger** (E2): `F1` for an in-window overlay, `F4` to step one instruction,
-`F7` for a breakpoint. The Z80 and audio (D), the graphics viewers (E3), and the
-Street Fighter 1 driver (F) are not built yet: **there is no sound.**
+`F7` for a breakpoint — and the **graphics viewers** (E3): `F9` for a tile,
+tilemap, palette and layer browser, `F10` to cycle it. The Z80 and audio (D) and
+the Street Fighter 1 driver (F) are not built yet: **there is no sound.**
 
 ## The 68000 core
 
@@ -83,7 +84,7 @@ cargo run -p testrunner --bin report --release
 # Throughput. Read the caveat below before quoting a number from it.
 cargo bench -p m68k
 
-# Mutation testing: 132 mutants, each an exact string replacement, each with a
+# Mutation testing: 158 mutants, each an exact string replacement, each with a
 # declared KILL or SURVIVE. Every set carries at least one control that must
 # survive — a pass where everything dies is more likely a broken harness than a
 # thorough suite. Commit first: it edits files in place.
@@ -141,6 +142,10 @@ cargo run -p sfemu --release -- /path/to/your/sf2.zip 600 --ppm frame.ppm
 | `F7` | Set / clear a breakpoint at the instruction shown |
 | `PageUp` / `PageDown` | Scroll the focused panel |
 | `Home` | Follow the machine again (memory: go to the stack pointer) |
+| `F9` | Graphics viewer on / off |
+| `F10` | Cycle the view: tiles, tilemap, palette, layers |
+| `[` / `]` | Move within the view |
+| `Enter` | Act on the view — cycle its tile layout or layer, or toggle a layer |
 
 Punches sit on the top row and kicks directly under them, matching a real
 six-button cabinet. **Player 2 is not mapped**, deliberately: two players on one
@@ -201,6 +206,63 @@ they are not interchangeable — a frame is 167,680 cycles, which is where a bug
 usually is, and an instruction is where you can see it. A breakpoint stops the
 machine *mid-frame*, at the instruction, not at the next frame boundary.
 
+### Looking at the graphics
+
+`F1` answers questions about the 68000. `F9` answers the other half: the screen
+is wrong, and the question is *which stage* is wrong. `F10` cycles four views,
+one at a time, each filling the frame — and `F1`'s panels draw on top of it, so
+you can read a register beside the tile it produced.
+
+- **Tiles** — the graphics ROM as a grid, in greyscale. `Enter` cycles the four
+  layouts (8×8, 8×8-odd, 16×16, 32×32) and `[`/`]` page by exactly one screenful
+  of whichever is shown. *Is the tile in the ROM at all, and does it decode?*
+- **Tilemap** — one scroll layer's table around a cursor: the table base, the
+  signed scroll, eight by eight codes, the cursored code's colour scheme, flip
+  bits and tile group, the ROM offset the bank mapper gives it, and the tile
+  itself. `Enter` cycles the layer, `[`/`]` walk the cursor. Until you move it,
+  the cursor follows the tile the renderer fetches for the visible top-left
+  pixel. *Is the map pointing at the tile you meant?*
+- **Palette** — all 3072 entries as swatches, with the cursored one's raw hex and
+  its page, and `0BFF` named as the background pen. *Is the palette entry the
+  colour you meant?*
+- **Layers** — the four depths back to front: what the hardware enables, what you
+  have masked, which depth each layer draws at, and which feeds the sprite
+  occlusion mask. `[`/`]` select a row and `Enter` subtracts that layer from the
+  picture. *Is the layer even enabled, and is it where you think in the stack?*
+
+Three things the screen alone will not tell you:
+
+**Tiles are greyscale on purpose.** A colour scheme is the palette's reading of
+the ROM, and the palette has a view of its own. Tinting the browser would make a
+wrong decode and a wrong palette look the same, and telling those two apart is
+what the browser is for.
+
+**`----` in the tilemap view is the bank mapper saying no.** The tile is *absent*,
+not wrong: no bank range covers that code, so `draw_tilemap` skips it silently.
+That is the one failure the composed picture cannot show — which is why a viewer
+that printed the mapper's `None` as `0000` would be worse than useless, sending
+you to look at tile 0.
+
+**Turning a layer off changes the picture, not the machine.** The mask reaches
+`Video` and nothing else; the 68000 runs the same cycles, writes the same memory,
+and takes the same interrupts either way. `looking_at_the_video_does_not_change_the_machine`
+in `sfemu/src/loop_.rs` is the test that holds that line, and
+`the_layer_mask_is_not_machine_state` keeps the mask out of save states, because a
+mask that round-tripped would come back with someone else's layers subtracted. The
+consequence worth remembering: **an `F12` screenshot taken with a layer off is
+missing that layer.**
+
+And the asymmetry: **you cannot turn a layer *on*.** The mask subtracts only, and
+that is structural rather than a limitation not yet lifted — `Video::render`
+combines the hardware's answer and the mask with `&&`, hardware first. Forcing a
+layer on would draw a tilemap from a base register the game never set up, which is
+garbage that looks exactly like the tile-decode bug the viewer is there to rule
+out.
+
+`F9` hides the box without restoring the layers you subtracted: "show me the game
+with scroll 1 off" is the whole point of a layer mask, and it is unreachable if
+closing the box turns everything back on.
+
 ### Speed
 
 The frame budget is 16.768 ms — CPS-1 runs at 8,000,000 / (512 × 262) =
@@ -221,10 +283,10 @@ they are dropped and counted, because a machine that fell a second behind should
 resync rather than fast-forward through a second of the game. Pausing owes nothing
 — the clock is only read on a running tick.
 
-### Four things only you can check
+### Six things only you can check
 
 Everything in this repository is tested without a display, which leaves exactly
-four claims no test here can make. Run it against your own ROM set and look:
+six claims no test here can make. Run it against your own ROM set and look:
 
 1. **Does the window show Street Fighter II?** A test can assert the framebuffer
    changed, that a save state round-trips, and that a pen becomes the right ARGB
@@ -240,6 +302,13 @@ four claims no test here can make. Run it against your own ROM set and look:
    blank column between characters is really blank, and that each panel's pixels land
    where the layout says. **None of that is "you can read it."** Distinguishing `8`
    from `B` at a glance in a moving window is the claim, and it is yours to make.
+5. **Is a tile recognisable in `F9`'s browser?** A test can prove the pixels are
+   the ROM's pens, in greyscale, at the cells the layout says. Whether a 16×16 tile
+   in a 384-wide window reads as a character's fist is not a property of a buffer.
+6. **Are the palette swatches distinguishable?** 3072 swatches on a 384×224 frame
+   is about 5×4 pixels each. A test can prove every one holds the right colour
+   through the same conversion the game's own frame goes through; it cannot prove
+   two adjacent near-identical entries look different to you.
 
 If the picture comes up wrong, `F12` gives you a frame to look at and the trace
 counters in the no-`--play` report give you the interrupts and bus activity behind
@@ -275,18 +344,20 @@ performance guarantee.
 crates/m68k/         the CPU core: no dependencies, no unsafe, no clock access,
                      no globals. no_std-friendly. Optional serde and disasm.
 crates/video/        CPS-1 graphics: tiles, three layers, sprites, palettes,
-                     CPS-A/B registers, scanline renderer. No dependencies.
+                     CPS-A/B registers, scanline renderer, and the subtractive
+                     layer mask the viewer drives. No dependencies.
 crates/machine/      the board: memory map, bus, interrupts, scheduler, inputs,
                      snapshot and restore. Depends on m68k and video.
 crates/romset/       the MAME ROM-set loader: zip or a directory, CRC-checked,
                      interleaved into the regions the board wants.
 crates/frontend/     every frontend decision, with no window: frame pacing, the
                      key map, pen-to-ARGB, the save-state file format, the
-                     debugger's state, and the 4x6 font drawn in this repository.
+                     debugger's state, the graphics viewer's state and its four
+                     views, and the 4x6 font drawn in this repository.
 crates/sfemu/        the binary. The only crate that names a windowing library,
                      and only in one file (a test enforces it).
 crates/testrunner/   dev-only harness for the external vector suite.
-scripts/mutate.py    the mutation harness: 132 mutants over the above, each one
+scripts/mutate.py    the mutation harness: 158 mutants over the above, each one
                      an exact string replacement with a declared expectation.
 docs/hardware/       what the vectors proved about the hardware, with evidence.
 docs/superpowers/    design specs and implementation plans.
@@ -348,14 +419,14 @@ out of the access sequence a handler already has to schedule.
 | D | Z80 and audio: YM2151, OKI MSM6295 ADPCM | deferrable; CPS-1 sound is a fire-and-forget latch |
 | **E1** | Frontend: window, frame clock, keyboard, save states | **complete** — `--play` |
 | **E2** | Debugger: single-step, breakpoints, disassembly, register and memory views | **complete** — `F1`, in-window, and it does not perturb the machine |
-| E3 | Graphics viewers: tile browser, tilemap and palette views, layer toggles | next |
+| **E3** | Graphics viewers: tile browser, tilemap and palette views, layer toggles | **complete** — `F9`, four views, and the mask subtracts only |
 | F | Street Fighter 1 driver | a second board against a proven core |
 
 E was split because its three surfaces are independent and only the first changes
-what the project *is* rather than what can be inspected about it. E3 is last for a
-reason rather than by preference: a tile browser's value is mostly in stopping the
-machine at the frame you care about, which is E2's stepping — now built, so E3 has
-what it was waiting for.
+what the project *is* rather than what can be inspected about it. E3 came last for
+a reason rather than by preference: a tile browser's value is mostly in stopping
+the machine at the frame you care about, which is E2's stepping — so E3 waited for
+it, and then took it. **D or F next**; D is the one that ends "there is no sound."
 
 WASM and netplay are not stages. They are constraints on A–D: no threads, no
 wall-clock access, no host I/O in the core, a frame-stepped API, and complete
