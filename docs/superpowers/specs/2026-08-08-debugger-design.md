@@ -116,17 +116,22 @@ would not object. The test for this is behavioural rather than structural —
 `peek_word` over the whole vector table with an interrupt outstanding must leave
 `vblank_pending`, `trace.acks`, and `trace.unmapped_reads` all untouched.
 
-⚠️ **Duplicating the address map is the risk this introduces, and it is
-mitigated rather than eliminated.** `peek_word` and `read_word` must agree, or
-the debugger shows you a different machine than the one running. The mitigation
-is a test that walks a representative address from every range in the map plus
-both sides of every boundary, and requires the two to return the same value —
-run in a state where `read_word`'s side effects are inert (no interrupt pending),
-so the comparison is legal. The alternative, `read_word` delegating to
-`peek_word` plus bookkeeping, is better and is what this spec chooses where the
-ranges are pure; the I/O ranges cannot be shared because some of them (the
-DIP-switch selector, the CPS-B self-test) compute rather than store, and
-`peek_word` must reproduce that computation.
+⚠️ **Duplicating the address map would be the risk this introduces, and it turns
+out not to arise.** `peek_word` and `read_word` must agree, or the debugger shows
+you a different machine than the one running. This spec expected to duplicate the
+map and mitigate the drift with an agreement test, on the grounds that the I/O
+ranges — the DIP-switch selector, the CPS-B self-test — compute rather than
+store, so `peek_word` would have to reproduce the computation.
+
+**Implementation note (this section is what changed).** They do compute, but
+every one of those computations reads only `Board::inputs` and `Board::cfg`, so
+all of it is `&self`-safe. `peek_word` therefore holds the *whole* map and
+`read_word` delegates to it, adding only the bookkeeping. The two cannot
+disagree, and the agreement test remains as a **pin** — it fails if a later
+change ever splits them back into two maps — rather than as a mitigation for a
+live risk. `note_possible_ack` also became unconditional in the same change: the
+address it tests for is 0x68, which is in ROM space, so the ROM-range guard it
+sat behind could only ever be redundant with the test inside.
 
 ## Why nothing is writable
 
@@ -324,9 +329,11 @@ right pixels; it cannot prove you can read it.
 1. **The `run_scanline` refactor changes emulator behaviour.** Highest-severity
    risk in this spec, because `machine` carries the 127/127 suite and every
    board test. Mitigated by the divergence test and by re-running the suite.
-2. **`peek_word` drifts from `read_word`.** Mitigated by the agreement test;
-   accepted as an ongoing maintenance cost, and recorded in the module docs so a
-   later change to the memory map knows there are two places.
+2. ~~**`peek_word` drifts from `read_word`.**~~ **Eliminated in implementation,
+   not mitigated.** `read_word` delegates to `peek_word`, so there is one map and
+   nothing to drift. There is no ongoing maintenance cost and no second place for
+   a later change to the memory map to find. The agreement test stayed, as a pin
+   against a future split.
 3. **The overlay is unreadable at 384×224.** Cannot be settled here. The window
    is 3× by default and resizable, which is the mitigation; if it turns out
    unusable, the fix is a larger font or a scaled overlay, and both are local to
