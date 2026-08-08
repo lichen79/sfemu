@@ -8,3 +8,4 @@ description = "Dev-only harness driving m68k against the SingleStepTests suite"
 
 [dependencies]
 m68k = { path = "../m68k" }
+z80 = { path = "../z80" }
