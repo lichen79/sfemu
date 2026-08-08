@@ -51,14 +51,27 @@ pub struct Z80 {
     /// `EI` does not enable interrupts until *after* the following instruction,
     /// so an `EI`/`RET` pair cannot be interrupted between them. This is that
     /// one-instruction delay, and the suite carries it as a state field.
-    pub ei: u8,
-    /// Whether the last instruction wrote the flags.
     ///
-    /// `SCF` and `CCF` compute F3/F5 from `A` **or** from the previous flags
-    /// depending on this. It is the most commonly omitted piece of Z80 state and
-    /// the suite compares it on every case.
+    /// [`Z80::step`] clears it before dispatching, so `EI` is the only instruction
+    /// that ever leaves it set — an interrupt check therefore belongs before that
+    /// clear, where this field still reports the delay.
+    pub ei: u8,
+    /// The flags the last instruction wrote, or zero if it wrote none.
+    ///
+    /// **Not a boolean.** The suite carries the flag *value*: after a flag-writing
+    /// instruction `q == f`, and after any other instruction `q == 0`. Verified
+    /// over 32,080 cases from all 1,604 files — `q` is never anything else.
+    ///
+    /// `SCF` and `CCF` take F3/F5 from `A` ORed with the bits of `F` that the last
+    /// instruction did *not* write, which is `f & !q`. A one-bit version of this
+    /// field cannot express that, and treating it as one is why 995 of `3f.json`'s
+    /// 1,000 cases failed before it was fixed.
     pub q: u8,
-    /// Whether the last instruction was `LD A,I` or `LD A,R`.
+    /// The flags `LD A,I` or `LD A,R` just wrote, and zero after anything else.
+    ///
+    /// Like [`Z80::q`], the suite carries a value rather than a flag; unlike `q`,
+    /// only those two instructions ever set it. [`Z80::step`] clears it, so a
+    /// handler only ever has to set it.
     pub p: u8,
     /// Whether a `HALT` is in effect.
     ///
@@ -141,20 +154,24 @@ impl Z80 {
         if self.halted {
             // A halted CPU runs NOPs: it burns T-states and bumps R (the refresh
             // cycles continue, which is what kept DRAM alive) but does not fetch.
+            // Writing no flags, it clears `Q` like any other non-flag instruction.
             self.bump_r();
+            self.q = 0;
+            self.p = 0;
             return 4;
         }
-        // `EI`'s one-instruction delay expires at the *start* of the next
-        // instruction, so the pending mark is cleared before it runs rather than
-        // after — an interrupt check between the two would otherwise see the wrong
-        // state.
-        let was_pending = self.ei;
+        // Both one-instruction marks expire at the *start* of the instruction that
+        // follows, so they are cleared here rather than by each handler. Measured:
+        // over 32,080 cases from all 1,604 files, `p` is 1 only on `LD A,I`/`LD A,R`
+        // and `ei` only on `EI` — every other instruction ends with both at zero,
+        // whatever they started as.
+        //
+        // An interrupt check belongs *before* this line: `ei` set on entry is
+        // exactly the state in which an interrupt must not yet be accepted.
+        self.ei = 0;
+        self.p = 0;
         let op = self.fetch(bus);
-        let t = crate::decode::execute(self, bus, op);
-        if was_pending != 0 && self.ei == was_pending {
-            self.ei = 0;
-        }
-        t
+        crate::decode::execute(self, bus, op)
     }
 
     /// `BC` as one 16-bit value: `B` high, `C` low.
@@ -385,18 +402,19 @@ mod tests {
         assert_ne!(c.r, r_before, "but the refresh cycles keep running");
     }
 
-    /// `SCF` with `Q` set takes F3/F5 from `A`.
+    /// `SCF` after a flag writer takes F3/F5 from `A` alone.
     ///
-    /// Hand-computed: the previous instruction wrote the flags, so F3/F5 come from
-    /// `A` alone. `A = 0x28` has bits 5 and 3 set, so both appear; `A = 0x00` has
-    /// neither, so both clear even though the old `f` had them.
+    /// `Q` holds the flags the previous instruction wrote, so "it wrote all of them"
+    /// is `q == f`, not `q == 1`. With every bit of `F` accounted for, `f & !q` is
+    /// zero and only `A` contributes: `A = 0x28` gives both bits, and `A = 0x00`
+    /// gives neither even though the old `F` had them.
     #[test]
     fn scf_after_a_flag_writing_instruction_takes_f3_and_f5_from_a() {
         let mut c = Z80::new();
         c.pc = 0x100;
         c.a = 0x28;
         c.f = 0x00;
-        c.q = 1;
+        c.q = c.f;
         let mut m = Mem::at(0x100, &[0x37]);
         c.step(&mut m);
         assert_eq!(c.f & flags::C, flags::C, "SCF sets carry");
@@ -411,7 +429,7 @@ mod tests {
         c.pc = 0x100;
         c.a = 0x00;
         c.f = flags::F5 | flags::F3;
-        c.q = 1;
+        c.q = c.f;
         c.step(&mut m);
         assert_eq!(
             c.f & (flags::F5 | flags::F3),
@@ -441,6 +459,29 @@ mod tests {
             "Q clear means the old bits are ORed in, not replaced"
         );
         assert_eq!(c.f & flags::C, flags::C);
+    }
+
+    /// `Q` is a flag *value*, and `SCF` reads the bits it does not cover.
+    ///
+    /// The distinction the two tests above cannot draw. Here the previous
+    /// instruction wrote only C — `q = C` — so F3/F5 are still the old flags' to
+    /// contribute, and `A` has neither. A core treating `Q` as "any non-zero means
+    /// take F3/F5 from A alone" clears both bits and passes both tests above; it
+    /// fails 995 of `3f.json`'s 1,000 cases, which is how this was found.
+    #[test]
+    fn q_is_a_flag_value_not_a_boolean() {
+        let mut c = Z80::new();
+        c.pc = 0x100;
+        c.a = 0x00;
+        c.f = flags::F5 | flags::F3 | flags::C;
+        c.q = flags::C;
+        let mut m = Mem::at(0x100, &[0x37]);
+        c.step(&mut m);
+        assert_eq!(
+            c.f & (flags::F5 | flags::F3),
+            flags::F5 | flags::F3,
+            "the previous instruction wrote only C, so F3/F5 are still the old ones"
+        );
     }
 
     /// `SCF` and `CCF` leave S, Z and P/V alone.
@@ -637,21 +678,64 @@ mod tests {
         assert!(!c.iff1 && !c.iff2);
     }
 
-    /// `Q` is set by instructions that write flags and cleared by those that do not.
+    /// `Q` ends every instruction as either the flags it wrote or zero.
     ///
-    /// The protocol the whole `SCF`/`CCF` rule depends on. `NOP` writes no flags,
-    /// `SCF` does — so `Q` must differ after them, and a core that set `Q`
-    /// unconditionally would pass the `SCF` tests above and fail the suite.
+    /// The protocol the whole `SCF`/`CCF` rule depends on, and the invariant the
+    /// vectors enforce: measured over 32,080 cases from all 1,604 files, the final
+    /// `q` is never anything but `0` or `f`. `NOP` writes no flags so `Q` is zero;
+    /// `SCF` writes them all so `Q` is `F` — and asserting the *value* rather than
+    /// "nonzero" is what makes this catch a core that sets `Q` to a bit.
     #[test]
-    fn q_records_whether_the_instruction_wrote_the_flags() {
+    fn q_is_the_flags_written_or_zero() {
         let mut c = Z80::new();
         c.pc = 0x100;
-        c.q = 1;
-        let mut m = Mem::at(0x100, &[0x00, 0x37]);
+        c.q = 0xFF;
+        let mut m = Mem::at(0x100, &[0x00, 0x37, 0x2F, 0x27, 0xF3, 0xFB, 0x76]);
         c.step(&mut m);
         assert_eq!(c.q, 0, "NOP writes no flags");
+        for (op, writes) in [
+            ("SCF", true),
+            ("CPL", true),
+            ("DAA", true),
+            ("DI", false),
+            ("EI", false),
+            ("HALT", false),
+        ] {
+            c.step(&mut m);
+            if writes {
+                assert_eq!(c.q, c.f, "{op} writes flags, so Q is F");
+                assert_ne!(c.q, 0, "{op}'s flags are not all zero here");
+            } else {
+                assert_eq!(c.q, 0, "{op} writes no flags");
+            }
+        }
+    }
+
+    /// `P` and the `EI` mark are cleared by the next instruction, whatever it is.
+    ///
+    /// Both are one-instruction marks, and the vectors show them expiring at the
+    /// *start* of the instruction that follows: of 32,080 cases across all 1,604
+    /// files, `p` is 1 only on `LD A,I`/`LD A,R` and `ei` is 1 only on `EI`, however
+    /// they began. A `step` that cleared them afterwards instead would leave `EI`
+    /// itself reporting `ei = 0` and fail all 1,000 of `fb.json`.
+    #[test]
+    fn the_one_instruction_marks_expire_at_the_next_instruction() {
+        let mut c = Z80::new();
+        c.pc = 0x100;
+        c.p = 1;
+        c.ei = 1;
+        let mut m = Mem::at(0x100, &[0x00, 0xFB, 0x00]);
         c.step(&mut m);
-        assert_eq!(c.q, 1, "SCF does");
+        assert_eq!(c.p, 0, "NOP clears P");
+        assert_eq!(c.ei, 0, "and the pending EI");
+
+        c.step(&mut m);
+        assert_eq!(
+            c.ei, 1,
+            "EI leaves the mark set for the instruction after it"
+        );
+        c.step(&mut m);
+        assert_eq!(c.ei, 0, "which then clears it");
     }
 
     /// An operand read is not an M1 cycle, so it does not bump `R`.
