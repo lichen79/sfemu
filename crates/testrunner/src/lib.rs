@@ -11,3 +11,4 @@ pub mod binfmt;
 pub mod runner;
 pub mod testbus;
 pub mod z80fmt;
+pub mod z80json;
