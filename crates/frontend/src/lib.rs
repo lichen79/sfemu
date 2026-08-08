@@ -29,6 +29,7 @@
 #![warn(missing_docs)]
 #![deny(rustdoc::private_intra_doc_links)]
 
+pub mod font;
 pub mod keys;
 pub mod pace;
 pub mod pixels;

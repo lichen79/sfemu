@@ -82,6 +82,94 @@ SETS: dict[str, tuple[str, list[tuple[str, str, str, str]]]] = {
             ),
         ],
     ),
+    # E2 Task 3: the font. Two classes of mutant, and the second is the interesting
+    # one. The first is ordinary breakage -- wrong pixels, no clipping. The second is
+    # a *transposition*: two glyphs' bitmaps swapped. That survives
+    # `every_glyph_is_distinct` (they are still distinct) and it survives every panel
+    # test, because `read_text` inverts the same table and reads a transposed font
+    # back exactly as wrongly as it renders it. Only the hand-typed literals catch it,
+    # which is the entire reason they exist.
+    "font": (
+        "crates/frontend/src/font.rs",
+        [
+            (
+                "eight-and-b-transposed",
+                '    g!(".##.", "#..#", ".##.", "#..#", ".##.", "...."), // \'8\'',
+                '    g!("###.", "#..#", "###.", "#..#", "###.", "...."), // \'8\'',
+                "KILL",
+            ),
+            (
+                "one-pixel-wrong-in-a-hex-digit",
+                '    g!(".##.", "#..#", ".###", "...#", ".##.", "...."), // \'9\'',
+                '    g!(".##.", "#..#", ".###", "..##", ".##.", "...."), // \'9\'',
+                "KILL",
+            ),
+            # The art parser, from both ends: a mirrored row, and every row blank.
+            (
+                "art-parsed-right-to-left",
+                "            bits |= 1 << (GLYPH_W - 1 - i);",
+                "            bits |= 1 << i;",
+                "KILL",
+            ),
+            ("art-parses-to-nothing", "        if b[i] == b'#' {", "        if false {", "KILL"),
+            # The spacing. Without the blank column, `#..#` beside `#..#` is one
+            # eight-pixel shape and a hex dump reads as a hedge.
+            (
+                "no-gap-between-glyphs",
+                "pub const ADVANCE: usize = GLYPH_W + 1;",
+                "pub const ADVANCE: usize = GLYPH_W;",
+                "KILL",
+            ),
+            # Clipping, which is what stops a glyph at the right edge reappearing on
+            # the far left one row down -- a bug that reads as a fault in the *game*.
+            (
+                "no-horizontal-clip",
+                "                if px >= WIDTH {\n                    continue;\n                }",
+                "                let px = px % WIDTH;",
+                "KILL",
+            ),
+            (
+                "no-vertical-clip-in-fill-rect",
+                "    for py in y..(y + h).min(HEIGHT) {",
+                "    for py in y..(y + h) {",
+                "KILL",
+            ),
+            # The cursor advancing only for glyphs that were drawn, which slides the
+            # tail of a clipped string into the middle of the screen.
+            (
+                "cursor-does-not-advance-past-the-edge",
+                "        cx += ADVANCE;",
+                "        if cx < WIDTH {\n            cx += ADVANCE;\n        }",
+                "KILL",
+            ),
+            # Text painting its own background, which would leave a rectangle of it
+            # around every character on top of the game frame.
+            (
+                "text-paints-its-own-background",
+                "                if bits & (1 << (GLYPH_W - 1 - col)) == 0 {\n                    continue;\n                }",
+                "                let ink = bits & (1 << (GLYPH_W - 1 - col)) != 0;",
+                "KILL",
+            ),
+            # The out-of-range fallback: an unprintable character drawing nothing is
+            # indistinguishable from an empty string.
+            (
+                "unprintable-draws-a-space",
+                "        return GLYPHS['?' as usize - FIRST as usize];",
+                "        return GLYPHS[0];",
+                "KILL",
+            ),
+            # CONTROL: `LINE`, which nothing in this module uses -- it is `overlay.rs`
+            # that lays lines out, and Task 4 is what will pin it. Changing it here is
+            # observably identical to this module's tests, and saying so is more
+            # honest than pretending the font set covers it.
+            (
+                "CONTROL-line-height-unused-until-task-4",
+                "pub const LINE: usize = GLYPH_H + 1;",
+                "pub const LINE: usize = GLYPH_H + 2;",
+                "SURVIVE",
+            ),
+        ],
+    ),
     "keys": (
         "crates/frontend/src/keys.rs",
         [
