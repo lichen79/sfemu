@@ -12,3 +12,8 @@ publish = false
 machine = { path = "../machine" }
 romset = { path = "../romset" }
 frontend = { path = "../frontend" }
+
+# The window, and the only crates.io dependency in this workspace besides
+# romset's DEFLATE decoder. Reachable from `display.rs` alone: every decision a
+# frontend makes lives in `crates/frontend`, which has never heard of a window.
+minifb = "0.28"

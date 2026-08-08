@@ -15,21 +15,16 @@
 //! `--ppm` writes the last frame out as a file, which is a picture you can look at
 //! without this program having to draw one.
 
-// Exercised only by its own tests until Task 7 adds `--play` and the `display`
-// module that calls it. Scoped to the non-test build, so the tests still hold every
-// item to the `-D warnings` gate — and `not(test)` rather than a blanket allow so
-// this stops compiling silently the moment the tests stop covering something.
-//
-// ⚠️ Remove this attribute in Task 7. If it is still here once `--play` exists, it
-// is hiding an item nothing calls.
-#[cfg_attr(not(test), allow(dead_code))]
+mod display;
 mod loop_;
 
 use machine::video;
 use machine::Trace;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 /// What went wrong before the machine ever ran.
+#[derive(Debug)]
 enum Fault {
     /// No arguments: print the usage text.
     Usage,
@@ -60,6 +55,13 @@ fn usage() -> String {
     // The legal note is in the usage text and not only in the README because this
     // is where someone who does not have a ROM set arrives.
     "usage: sfemu <path-to-sf2.zip-or-directory> [frames] [--ppm <path>]\n\
+     \x20      sfemu <path-to-sf2.zip-or-directory> --play [--state <path>]\n\
+     \n\
+     Without `--play`, runs a fixed number of frames and reports what the\n\
+     board saw. With `--play`, opens a window: arrow keys and ASDZXC for\n\
+     player one, 5 to insert a coin, 1 to start, P to pause, . to step,\n\
+     F3 to reset, F5 and F8 to save and load, F12 for a screenshot,\n\
+     Escape to quit. A frame count is ignored with `--play`.\n\
      \n\
      The ROM set is yours to supply: this program neither bundles nor\n\
      downloads one. Legal sources include Capcom Arcade Stadium, Capcom\n\
@@ -80,6 +82,24 @@ struct Args {
     frames: u64,
     /// Where to write the last frame as a binary PPM, if anywhere.
     ppm: Option<String>,
+    /// Open a window and play, instead of running a fixed number of frames.
+    play: bool,
+    /// The save-state file, for F5 and F8. Only meaningful with [`Args::play`].
+    ///
+    /// Defaults to the ROM set's own path with its extension replaced by `.sfs`, so
+    /// a state lands next to the game it belongs to and two games do not share one.
+    state: PathBuf,
+}
+
+/// The save-state path implied by a ROM set's path.
+///
+/// `/a/b/sf2.zip` becomes `/a/b/sf2.sfs`. A directory of loose files — the other
+/// thing `romset` accepts — has no extension to replace, so `/a/b/sf2` becomes
+/// `/a/b/sf2.sfs` as well, which is the same rule and not a special case.
+fn default_state_path(rom: &str) -> PathBuf {
+    let mut p = PathBuf::from(rom);
+    p.set_extension("sfs");
+    p
 }
 
 /// Parses the command line.
@@ -90,9 +110,20 @@ struct Args {
 fn parse_args(args: Vec<String>) -> Result<Args, Fault> {
     let mut rest = Vec::new();
     let mut ppm = None;
+    let mut play = false;
+    let mut state = None;
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
-        if a == "--ppm" {
+        if a == "--play" {
+            play = true;
+        } else if a == "--state" {
+            let p = args
+                .next()
+                .ok_or_else(|| Fault::Failed("`--state` needs a path".to_string()))?;
+            if state.replace(p).is_some() {
+                return Err(Fault::Failed("`--state` given twice".to_string()));
+            }
+        } else if a == "--ppm" {
             // An absent value is an error rather than a silent no-op: a run asked
             // to write a frame and quietly writing none is the failure this whole
             // program's strictness exists to avoid.
@@ -121,7 +152,22 @@ fn parse_args(args: Vec<String>) -> Result<Args, Fault> {
     if let Some(extra) = rest.next() {
         return Err(Fault::Failed(format!("unexpected argument `{extra}`")));
     }
-    Ok(Args { path, frames, ppm })
+    // `--state` without `--play` is a mistake worth naming rather than ignoring:
+    // nothing but the window reads or writes a state, so the flag would have no
+    // effect at all and a user would be left wondering where their file went.
+    if state.is_some() && !play {
+        return Err(Fault::Failed(
+            "`--state` needs `--play`: only the window reads and writes states".to_string(),
+        ));
+    }
+    let state = state.map_or_else(|| default_state_path(&path), PathBuf::from);
+    Ok(Args {
+        path,
+        frames,
+        ppm,
+        play,
+        state,
+    })
 }
 
 /// Loads the set, runs `frames` frames, and returns the report.
@@ -150,6 +196,19 @@ fn run(args: Vec<String>) -> Result<String, Fault> {
         machine::Timing::cps1_10mhz(),
     );
     m.reset();
+
+    if args.play {
+        // The window is opened *after* the ROM set loads, so a bad path reports the
+        // load error rather than flashing a window onto a machine that never booted.
+        let mut win = display::Window::open("sfemu").map_err(Fault::Failed)?;
+        let opts = loop_::LoopOpts {
+            state_path: args.state.clone(),
+            shot_path: default_shot_path(&args.path),
+        };
+        let summary = loop_::run(&mut m, &mut win, &opts);
+        return Ok(play_report(&summary));
+    }
+
     for _ in 0..args.frames {
         m.run_frame();
     }
@@ -166,6 +225,31 @@ fn run(args: Vec<String>) -> Result<String, Fault> {
         Cpu::of(&m),
         Frame::of(&m.video),
     ))
+}
+
+/// Where F12 writes.
+///
+/// Beside the ROM set, like the state file, and `.ppm` because that is what
+/// [`ppm`] writes. One path rather than a numbered series: a screenshot you have to
+/// hunt for is worse than one you have to move, and the alternative is this program
+/// scanning a directory to find the next free number.
+fn default_shot_path(rom: &str) -> PathBuf {
+    let mut p = PathBuf::from(rom);
+    p.set_extension("ppm");
+    p
+}
+
+/// What a finished session printed on the way out.
+///
+/// Short, and printed rather than discarded because a session that dropped frames or
+/// could not write a state should say so once at the end — the title bar said it at
+/// the time, and the title bar is gone.
+fn play_report(s: &loop_::Summary) -> String {
+    let mut out = format!("frames        {}\ndropped       {}\n", s.frames, s.dropped);
+    for n in &s.notices {
+        out.push_str(&format!("notice        {n}\n"));
+    }
+    out
 }
 
 /// The last rendered frame as a binary PPM (`P6`).
@@ -537,6 +621,8 @@ mod tests {
                 path: "/some/sf2.zip".to_string(),
                 frames: 60,
                 ppm: None,
+                play: false,
+                state: PathBuf::from("/some/sf2.sfs"),
             })
         );
         assert_eq!(
@@ -545,6 +631,8 @@ mod tests {
                 path: "/some/sf2.zip".to_string(),
                 frames: 7,
                 ppm: None,
+                play: false,
+                state: PathBuf::from("/some/sf2.sfs"),
             }),
             "and an explicit count is taken as given"
         );
@@ -562,6 +650,8 @@ mod tests {
             path: "/some/sf2.zip".to_string(),
             frames: 7,
             ppm: Some("/tmp/f.ppm".to_string()),
+            play: false,
+            state: PathBuf::from("/some/sf2.sfs"),
         };
         assert_eq!(
             args(vec!["/some/sf2.zip", "7", "--ppm", "/tmp/f.ppm"]).ok(),
@@ -768,5 +858,152 @@ mod tests {
             !u.contains("http"),
             "no URL of any kind belongs in this program"
         );
+    }
+
+    /// `--play` parses, with and without `--state`.
+    #[test]
+    fn the_play_flag_parses_with_and_without_a_state_path() {
+        let args = |v: Vec<&str>| parse_args(v.into_iter().map(String::from).collect());
+        assert_eq!(
+            args(vec!["/some/sf2.zip", "--play"]).ok(),
+            Some(Args {
+                path: "/some/sf2.zip".to_string(),
+                frames: 60,
+                ppm: None,
+                play: true,
+                state: PathBuf::from("/some/sf2.sfs"),
+            }),
+        );
+        assert_eq!(
+            args(vec!["/some/sf2.zip", "--play", "--state", "/tmp/mine.sfs"]).ok(),
+            Some(Args {
+                path: "/some/sf2.zip".to_string(),
+                frames: 60,
+                ppm: None,
+                play: true,
+                state: PathBuf::from("/tmp/mine.sfs"),
+            }),
+            "an explicit state path wins over the derived one"
+        );
+        // Order-independent, like `--ppm`: a positional walk would misread this.
+        assert_eq!(
+            args(vec!["--play", "/some/sf2.zip"]).ok().map(|a| a.play),
+            Some(true),
+            "leading"
+        );
+    }
+
+    /// The default state path is derived from the ROM path.
+    ///
+    /// Literal expectations, not a re-derivation: computing the answer the same way
+    /// the code does would pass for any rule at all.
+    #[test]
+    fn the_default_state_path_sits_beside_the_rom_set() {
+        assert_eq!(
+            default_state_path("/a/b/sf2.zip"),
+            PathBuf::from("/a/b/sf2.sfs")
+        );
+        assert_eq!(
+            default_state_path("/a/b/sf2"),
+            PathBuf::from("/a/b/sf2.sfs"),
+            "a directory of loose files has no extension to replace"
+        );
+        assert_eq!(
+            default_state_path("sf2.zip"),
+            PathBuf::from("sf2.sfs"),
+            "a bare filename stays bare"
+        );
+        assert_eq!(
+            default_state_path("/a/b.c/sf2.zip"),
+            PathBuf::from("/a/b.c/sf2.sfs"),
+            "a dot in a directory name is not the extension"
+        );
+        assert_eq!(
+            default_shot_path("/a/b/sf2.zip"),
+            PathBuf::from("/a/b/sf2.ppm"),
+            "and the screenshot lands beside it too"
+        );
+    }
+
+    /// `--state` without `--play` is an error naming both flags.
+    #[test]
+    fn a_state_path_without_play_is_an_error() {
+        let args = |v: Vec<&str>| parse_args(v.into_iter().map(String::from).collect());
+        match args(vec!["/some/sf2.zip", "--state", "/tmp/s.sfs"]) {
+            Err(Fault::Failed(m)) => {
+                assert!(m.contains("--state"), "names the flag given: {m}");
+                assert!(m.contains("--play"), "and the one missing: {m}");
+            }
+            other => panic!("expected an error, got {:?}", other.is_ok()),
+        }
+        // And a missing value is an error rather than a silently ignored flag.
+        match args(vec!["/some/sf2.zip", "--play", "--state"]) {
+            Err(Fault::Failed(m)) => assert_eq!(m, "`--state` needs a path"),
+            other => panic!("expected an error, got {:?}", other.is_ok()),
+        }
+        match args(vec![
+            "/some/sf2.zip",
+            "--play",
+            "--state",
+            "/a",
+            "--state",
+            "/b",
+        ]) {
+            Err(Fault::Failed(m)) => assert_eq!(m, "`--state` given twice"),
+            other => panic!("expected an error, got {:?}", other.is_ok()),
+        }
+    }
+
+    /// A frame count with `--play` parses, and is ignored.
+    ///
+    /// Not an error: there is no reading of `sfemu set.zip 60 --play` under which the
+    /// user wants a window that closes after one second.
+    #[test]
+    fn a_frame_count_is_accepted_and_ignored_with_play() {
+        let args = |v: Vec<&str>| parse_args(v.into_iter().map(String::from).collect());
+        let a = args(vec!["/some/sf2.zip", "600", "--play"]).expect("this must parse");
+        assert!(a.play);
+        assert_eq!(
+            a.frames, 600,
+            "parsed, and `run` does not read it when playing"
+        );
+    }
+
+    /// A bad ROM path with `--play` reports the load error and does not open a window.
+    ///
+    /// The one thing about this feature a test without a display can check, and the
+    /// reason `Window::open` is called after `romset::load` rather than before.
+    #[test]
+    fn a_bad_rom_path_with_play_reports_the_load_error() {
+        match run(vec!["/nonexistent-rom-set".into(), "--play".into()]) {
+            Err(Fault::Failed(m)) => {
+                assert!(m.contains("/nonexistent-rom-set"), "names the path: {m}");
+                assert!(
+                    !m.contains("window"),
+                    "and it is the load that failed, not the window: {m}"
+                );
+            }
+            other => panic!("expected a load error, got {:?}", other.is_ok()),
+        }
+    }
+
+    /// The session report prints what the loop returned.
+    #[test]
+    fn the_play_report_prints_the_counts_and_every_notice() {
+        let s = loop_::Summary {
+            frames: 3_600,
+            dropped: 12,
+            notices: vec!["cannot write `/x/y.sfs`: nope".to_string()],
+        };
+        let r = play_report(&s);
+        assert!(r.contains("frames        3600"), "{r}");
+        assert!(r.contains("dropped       12"), "{r}");
+        assert!(
+            r.contains("notice        cannot write `/x/y.sfs`: nope"),
+            "{r}"
+        );
+        // A clean session says nothing extra.
+        let clean = play_report(&loop_::Summary::default());
+        assert!(!clean.contains("notice"), "{clean}");
     }
 }
