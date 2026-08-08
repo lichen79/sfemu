@@ -1,0 +1,17 @@
+[package]
+name = "z80"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Zilog Z80 CPU core"
+
+# Zero runtime dependencies, like `m68k`. `serde` is optional and off by default
+# so a save state can serialize the core in D2 without the emulator carrying
+# serde in the WASM path.
+[dependencies]
+serde = { version = "1", optional = true, default-features = false, features = ["derive"] }
+
+[features]
+default = ["std"]
+std = []
+serde = ["dep:serde"]

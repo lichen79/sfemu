@@ -8,6 +8,7 @@ members = [
     "crates/sfemu",
     "crates/testrunner",
     "crates/video",
+    "crates/z80",
 ]
 
 [workspace.package]
