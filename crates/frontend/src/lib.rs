@@ -29,6 +29,8 @@
 #![warn(missing_docs)]
 #![deny(rustdoc::private_intra_doc_links)]
 
+pub mod keys;
 pub mod pace;
 
+pub use keys::{Actions, Controls, Key, KeySet};
 pub use pace::{FramePacer, FRAME_NS, MAX_CATCH_UP};
