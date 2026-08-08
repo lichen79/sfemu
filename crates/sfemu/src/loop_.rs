@@ -18,6 +18,7 @@
 //! present. It holds no arithmetic, which is why every constant it uses comes from
 //! `frontend`.
 
+use frontend::debug::Debugger;
 use frontend::keys::{Actions, Controls, KeySet};
 use frontend::{pens_to_argb, FramePacer};
 use machine::Cps1;
@@ -94,10 +95,14 @@ const BOARD: u32 = frontend::BOARD_SF2;
 /// 4. hand the board its inputs — *level*-triggered, so this happens whether or not
 ///    a frame runs;
 /// 5. reset, pause, save, load;
-/// 6. run the frames this tick owes;
-/// 7. render and present — **every** iteration, including a paused one, or the
-///    window goes black the moment you pause;
-/// 8. screenshot, then the title.
+/// 6. apply the debugger's keys — before the frames, so a breakpoint set this tick is
+///    honoured by this tick's frames rather than the next one's;
+/// 7. run the frames this tick owes, **stopping mid-frame at a breakpoint**, and step
+///    one instruction if `F4` asked;
+/// 8. render and present — **every** iteration, including a paused one, or the
+///    window goes black the moment you pause. The overlay is drawn *after*
+///    [`pens_to_argb`], because it is ARGB and the pens are not;
+/// 9. screenshot, then the title.
 pub fn run(m: &mut Cps1, d: &mut impl Display, o: &LoopOpts) -> Summary {
     let mut pacer = FramePacer::cps1();
     let mut controls = Controls::new();
@@ -105,6 +110,7 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, o: &LoopOpts) -> Summary {
     let mut paused = false;
     let mut summary = Summary::default();
     let mut title = String::new();
+    let mut dbg = Debugger::new();
 
     while d.is_open() {
         let elapsed = d.elapsed_ns();
@@ -141,6 +147,11 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, o: &LoopOpts) -> Summary {
             load(m, o, &mut summary);
         }
 
+        // Before the frames: a breakpoint set on this tick must be honoured by this
+        // tick's frames, not by the next tick's. `dbg` reads the machine and never
+        // writes it — see `frontend::debug`.
+        dbg.update(&a, m);
+
         // A step is one frame regardless of the clock, which is what makes it a
         // step. Checked before `paused` because stepping only means anything while
         // paused, and checking `paused` first would make the branch unreachable.
@@ -151,16 +162,46 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, o: &LoopOpts) -> Summary {
         } else {
             pacer.tick(elapsed)
         };
+        // Counted separately from `frames`, which is what this tick *owed*. A frame the
+        // breakpoint cut in half is not a frame the machine ran, and a summary that said
+        // otherwise would make the frame count disagree with `total_cycles`.
+        let mut ran = 0u32;
         for _ in 0..frames {
-            m.run_frame();
+            if run_frame_to_breakpoint(m, &mut dbg) {
+                // A breakpoint stopped this frame part-way through. Pause, so the next
+                // tick does not immediately run on past it, and abandon the frames this
+                // tick still owed: they are host time the user is no longer watching.
+                paused = true;
+                // And the debt with them, for the same reason the pause key resets it:
+                // otherwise resuming with `P` replays whatever this tick had left.
+                pacer.reset();
+                break;
+            }
+            ran += 1;
         }
-        summary.frames += u64::from(frames);
+        summary.frames += u64::from(ran);
+
+        // One instruction, on F4's edge. Not inside the loop above and not conditional
+        // on `paused`: stepping while running is meaningless but harmless, and a guard
+        // would be a second place for the pause state to be interpreted.
+        if a.step_instruction {
+            m.step_instruction();
+            // The step moved the machine, so the breakpoint at the instruction just
+            // *arrived* at must not fire on the next tick as if it were fresh — you
+            // asked to be here.
+            dbg.note_stopped(m);
+        }
 
         // Outside the loop above: a paused iteration renders too. The frame does not
         // change, but the window is redrawn, and a windowing library that is not
         // given a buffer shows an undefined one.
         m.render();
         pens_to_argb(&m.video, &mut buf);
+        // After the conversion, never before: the overlay's pixels are already
+        // `0x00RRGGBB`, while `m.video`'s are CPS-1 pens. Drawn into the pen buffer
+        // they would be run through the palette and come out as whatever colours
+        // those indices happen to name.
+        dbg.draw(&mut buf, m);
         if let Err(e) = d.present(&buf) {
             note(&mut summary, format!("cannot present a frame: {e}"));
             break;
@@ -179,6 +220,34 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, o: &LoopOpts) -> Summary {
     }
 
     summary
+}
+
+/// Runs one frame, or stops early at a breakpoint. Returns whether it stopped.
+///
+/// Instruction by instruction rather than `Cps1::run_frame`, because a breakpoint that
+/// only stopped at frame boundaries would be the `.` key with extra steps: the whole
+/// point is to stop *at* the instruction, 167,680 cycles into the middle of a frame if
+/// that is where it is.
+///
+/// The cost is real and worth naming: this is a `should_break` call per instruction
+/// against a `Vec` of breakpoints, where `run_frame` is a tight loop. With no
+/// breakpoints set the check is a scan of an empty `Vec`, which is why the fast path is
+/// still a fast path — and `watching_the_machine_does_not_change_it` is what proves
+/// this path and `run_frame` reach the same machine.
+fn run_frame_to_breakpoint(m: &mut Cps1, dbg: &mut Debugger) -> bool {
+    let start_frames = m.board.trace.frames;
+    // `line` alone cannot say when a frame is done: a breakpoint on the very first
+    // instruction of line 0 leaves `line == 0`, which is where the frame started, and a
+    // loop watching for the wrap would run a whole extra frame. The frame counter moves
+    // exactly once per wrap.
+    while m.board.trace.frames == start_frames {
+        if dbg.should_break(m) {
+            dbg.note_stopped(m);
+            return true;
+        }
+        m.step_instruction();
+    }
+    false
 }
 
 /// The title bar.
@@ -391,6 +460,45 @@ mod tests {
         // renderer has anything to draw. Run it here rather than in the loop: the
         // test's point is a *paused* tick, which runs no frames at all.
         m.run_frame();
+        m
+    }
+
+    /// The address the breakpoint tests stop at: the top of the fixture's loop.
+    ///
+    /// It is also where `reset` leaves the machine, which is what makes `F7` — the only
+    /// way to reach the loop's own `Debugger` — able to set a breakpoint there.
+    const TARGET: u32 = 0x1000;
+
+    /// A machine whose loop body costs more than a scanline.
+    ///
+    /// Load-bearing for `a_breakpoint_stops_the_loop_mid_frame`: with a short loop the
+    /// machine returns to [`TARGET`] within a few dozen cycles, the beam is still on line
+    /// 0, and "it stopped mid-frame" cannot be told from "it stopped at a frame
+    /// boundary". The `dbra` delay loop is ~2,000 cycles, which is three scanlines.
+    ///
+    /// Interrupts stay masked — `reset` leaves the SR at supervisor level 7 and nothing
+    /// here unmasks them — so the only thing that moves the PC is this program.
+    ///
+    /// ```text
+    /// 1000  5240        addq.w #1,d0     <- TARGET
+    /// 1002  323C 00C8   move.w #200,d1
+    /// 1006  51C9 FFFE   dbra d1,$1006
+    /// 100A  60F4        bra $1000
+    /// ```
+    fn machine_with_a_long_loop() -> Cps1 {
+        let mut rom = vec![0u8; 0x2000];
+        rom[0..8].copy_from_slice(&[0x00, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00]);
+        // Both displacements are from the word *after* the opcode: the `dbra` at 0x1006
+        // counts from 0x1008 back to 0x1006, which is -2 = 0xFFFE; the `bra` at 0x100A
+        // counts from 0x100C back to 0x1000, which is -12 = 0xF4.
+        rom[0x1000..0x100C].copy_from_slice(&[
+            0x52, 0x40, // addq.w #1,d0
+            0x32, 0x3C, 0x00, 0xC8, // move.w #200,d1
+            0x51, 0xC9, 0xFF, 0xFE, // dbra d1,$1006
+            0x60, 0xF4, // bra $1000
+        ]);
+        let mut m = Cps1::new(&rom, BoardConfig::sf2(), Timing::cps1_10mhz());
+        m.reset();
         m
     }
 
@@ -933,6 +1041,382 @@ mod tests {
         assert_eq!(s.frames, 0, "the premise: no frame ran");
         assert!(m.board.inputs.coin1, "the coin reached the board anyway");
         assert_ne!(m.board.inputs.in1(), 0xFFFF, "and so did the stick");
+    }
+
+    /// `F4` steps one instruction per press, and no frames.
+    ///
+    /// The literals are measured, not derived: `move #$2000,sr` at 0x1000 costs 16
+    /// cycles and the `addq.w` at 0x1004 costs 4. Written out rather than compared
+    /// against a second machine stepped the same way, which would be asserting
+    /// `step_instruction` equals itself.
+    #[test]
+    fn f4_steps_one_instruction() {
+        let (o, _s, _p) = opts("step-insn");
+        let mut m = machine();
+        // Paused throughout: what is under test is that `F4` moves the machine by an
+        // *instruction*, and a running loop would move it by a frame at the same time.
+        let script = vec![
+            Fake::held(&[Key::P]),
+            Fake::held(&[Key::P, Key::F4]),
+            // Held for a second tick: one instruction per press, not per tick.
+            Fake::held(&[Key::P, Key::F4]),
+            Fake::held(&[Key::P]),
+            Fake::held(&[Key::P, Key::F4]),
+        ];
+        let mut d = Fake::new(script);
+        let s = run(&mut m, &mut d, &o);
+        assert_eq!(s.frames, 0, "the premise: no frame ran");
+        assert_eq!(m.total_cycles, 20, "16 for the `move`, 4 for the `addq`");
+        assert_eq!(
+            frontend::overlay::executing_pc(&m),
+            0x1006,
+            "and it is sitting at the third instruction"
+        );
+    }
+
+    /// A breakpoint stops the loop part-way through a frame, and says so in the title.
+    ///
+    /// Mid-frame is the whole point: a breakpoint that only stopped at frame boundaries
+    /// would be the `.` key with extra steps. The discriminator is the cycle count — a
+    /// loop that ran the frame and *then* stopped would be 167,680 cycles in, at line 0.
+    ///
+    /// The breakpoint is set through `F7`, which is the only way in: the loop owns its
+    /// `Debugger` and a test cannot reach inside it. So the machine is positioned on the
+    /// target instruction first, `F7` marks it, `F4` steps off it, and the frame that
+    /// follows comes back round to it.
+    #[test]
+    fn a_breakpoint_stops_the_loop_mid_frame() {
+        let (o, _s, _p) = opts("bp-midframe");
+        let mut m = machine_with_a_long_loop();
+        assert_eq!(
+            frontend::overlay::executing_pc(&m),
+            TARGET,
+            "the premise: reset leaves the machine on the instruction F7 will mark"
+        );
+
+        let script = vec![
+            // Zero elapsed on the two setting-up ticks, so neither owes a frame and the
+            // only frame in this test is the one the breakpoint cuts.
+            (KeySet::from_keys(&[Key::F7]), 0),
+            (KeySet::from_keys(&[Key::F4]), 0),
+            (KeySet::new(), FRAME_NS),
+        ];
+        let mut d = Fake::new(script);
+        let s = run(&mut m, &mut d, &o);
+
+        assert_eq!(
+            frontend::overlay::executing_pc(&m),
+            TARGET,
+            "it stopped at the breakpoint"
+        );
+        assert_ne!(m.line, 0, "mid-frame: the beam is not at a frame boundary");
+        assert!(
+            m.total_cycles < u64::from(m.timing.cycles_per_frame()),
+            "and well short of a whole frame: {} cycles",
+            m.total_cycles
+        );
+        assert_eq!(s.frames, 0, "a frame cut in half is not a frame that ran");
+        assert!(
+            d.titles.iter().any(|t| t.contains("paused")),
+            "and the loop is paused, which the title must say: {:?}",
+            d.titles
+        );
+    }
+
+    /// Resuming from a breakpoint makes progress, and not resuming makes none.
+    ///
+    /// Two runs of the same script, one with a `P` in it. The comparison is what makes
+    /// both halves testable at once: a loop that never paused would run its three
+    /// trailing ticks in the first script too, so the first total would be the *larger*
+    /// of the two. A loop that paused and could not resume would leave them equal.
+    #[test]
+    fn resuming_from_a_breakpoint_makes_progress() {
+        let (o, _s, _p) = opts("bp-resume");
+        let mut m = machine_with_a_long_loop();
+        // One machine, snapshotted and put back, rather than two: a `Cps1` is 525 KB on
+        // the stack and two live in one test thread overflows it.
+        let start = m.snapshot();
+
+        // Stop, then sit there for two more ticks.
+        let mut script = vec![
+            (KeySet::from_keys(&[Key::F7]), 0),
+            (KeySet::from_keys(&[Key::F4]), 0),
+        ];
+        script.extend(Fake::idle(3));
+        let mut d = Fake::new(script.clone());
+        run(&mut m, &mut d, &o);
+        let stopped = m.total_cycles;
+        assert!(stopped > 0, "the premise: the machine ran up to the stop");
+
+        // The same, but the third of those ticks presses `P`.
+        m.restore(&start);
+        script[3] = Fake::held(&[Key::P]);
+        let mut d = Fake::new(script);
+        run(&mut m, &mut d, &o);
+        assert!(
+            m.total_cycles > stopped,
+            "resuming must run on: {} cycles against {stopped} stopped",
+            m.total_cycles
+        );
+    }
+
+    /// Stepping *onto* a breakpoint and then resuming makes progress.
+    ///
+    /// `F4` arrives at an instruction that has a breakpoint on it. You asked to be
+    /// there, so resuming must run on — the loop notes the step as a stop for exactly
+    /// this reason. Without that note the resume tick runs **zero** instructions and
+    /// pauses again, which is a step key that can walk you into a place you cannot
+    /// leave without deleting the breakpoint.
+    ///
+    /// Found by mutation, not by reading: deleting the `note_stopped` after `F4`'s step
+    /// left every other test in this module green.
+    ///
+    /// The fixture is a two-instruction loop, so `F4` can walk right round it and land
+    /// back on the marked instruction in two presses:
+    ///
+    /// ```text
+    /// 1000  5240   addq.w #1,d0     4 cycles
+    /// 1002  60FC   bra $1000       10 cycles   (0x1004 - 4)
+    /// ```
+    ///
+    /// One `run` call, not two: the loop owns its `Debugger`, so the breakpoint `F7`
+    /// sets does not outlive the call that set it. Written as two calls first, where the
+    /// second ran with no breakpoints at all and the assertion failed for a reason that
+    /// had nothing to do with the claim.
+    #[test]
+    fn stepping_onto_a_breakpoint_and_resuming_makes_progress() {
+        let (o, _s, _p) = opts("step-onto-bp");
+        let mut rom = vec![0u8; 0x2000];
+        rom[0..8].copy_from_slice(&[0x00, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00]);
+        rom[0x1000..0x1004].copy_from_slice(&[0x52, 0x40, 0x60, 0xFC]);
+        let mut m = Cps1::new(&rom, BoardConfig::sf2(), Timing::cps1_10mhz());
+        m.reset();
+
+        // Zero elapsed on every set-up tick, so the only thing that moves the machine
+        // before the last one is `F4`. Three steps: 4 + 10 + 4 = 18 cycles, arriving
+        // back at 0x1002 with a breakpoint on it.
+        let mut d = Fake::new(vec![
+            (KeySet::from_keys(&[Key::F4]), 0),
+            // 0x1002 now, and `F7` marks it.
+            (KeySet::from_keys(&[Key::F7]), 0),
+            // Round the loop: 0x1002 -> 0x1000, then 0x1000 -> 0x1002, onto the mark.
+            (KeySet::from_keys(&[Key::F4]), 0),
+            (KeySet::new(), 0),
+            (KeySet::from_keys(&[Key::F4]), 0),
+            // And a tick that owes a frame. It must run.
+            (KeySet::new(), FRAME_NS),
+        ]);
+        run(&mut m, &mut d, &o);
+
+        // 32, not 18: the resume ran the `bra` and the `addq` and stopped when it came
+        // back round. 18 is exactly the mutant's answer — stepped onto the breakpoint
+        // and stuck there.
+        assert_eq!(
+            m.total_cycles, 32,
+            "the resume must leave the instruction it was stepped onto"
+        );
+        assert_eq!(
+            frontend::overlay::executing_pc(&m),
+            0x1002,
+            "and stop at the breakpoint again on the way round, not run the frame out"
+        );
+    }
+
+    /// The overlay reaches the presented buffer, drawn over the game's pixels.
+    ///
+    /// The presented buffer is the artifact — this is the only test that covers the
+    /// whole path: frame rendered, pens converted, overlay composed, handed to the
+    /// display.
+    ///
+    /// `frontend`'s own panel tests read the characters back off the pixels with
+    /// `font::read_text`, which this crate cannot: it is `#[cfg(test)]` and
+    /// crate-private to `frontend`. The equality against `overlay::draw` is the
+    /// available equivalent, and for *this* claim it is the better one — what Task 6
+    /// owns is the composition, so what is asserted is that the presented frame is
+    /// exactly the game's pixels with the overlay over them, drawn with the arguments
+    /// the loop is supposed to pass.
+    #[test]
+    fn the_overlay_reaches_the_presented_buffer() {
+        let (o, _s, _p) = opts("overlay-shown");
+        let mut m = machine_that_draws();
+        // Zero elapsed and one tick, so the machine does not move: the state it is in
+        // afterwards is the state the overlay was drawn from.
+        let mut d = Fake::new(vec![(KeySet::from_keys(&[Key::F1]), 0)]);
+        let s = run(&mut m, &mut d, &o);
+        assert_eq!(s.frames, 0, "the premise: the machine did not move");
+        let shown = d.first.expect("a tick presents");
+
+        let mut game: Vec<u32> = Vec::new();
+        pens_to_argb(&m.video, &mut game);
+        assert_ne!(
+            shown, game,
+            "the premise: the overlay changed the presented frame"
+        );
+
+        let mut expected = game.clone();
+        frontend::overlay::draw(
+            &mut expected,
+            &m,
+            frontend::overlay::Panels::on(),
+            frontend::overlay::executing_pc(&m),
+            0,
+            &[],
+        );
+        assert_eq!(
+            shown, expected,
+            "the game's pixels with the overlay over them, at the follow address"
+        );
+        // And the game really is underneath: this fixture's frame is not uniform, so an
+        // overlay that had replaced the frame rather than composed over it would fail
+        // the equality above — but only if the game's pixels are actually there.
+        assert!(
+            game.iter().any(|&px| px != game[0]),
+            "the premise: the game's frame is not one flat colour"
+        );
+    }
+
+    /// With the overlay off, the presented frame is the game's pixels exactly.
+    ///
+    /// The other half of the claim above, and the one that matters when the debugger is
+    /// not in use: an overlay that drew its background unconditionally would put a dark
+    /// box over the game of everyone who never presses `F1`.
+    #[test]
+    fn the_overlay_off_presents_an_unmodified_frame() {
+        let (o, _s, _p) = opts("overlay-off");
+        let mut m = machine_that_draws();
+        let mut d = Fake::new(vec![(KeySet::new(), 0)]);
+        run(&mut m, &mut d, &o);
+        let shown = d.first.expect("a tick presents");
+        let mut game: Vec<u32> = Vec::new();
+        pens_to_argb(&m.video, &mut game);
+        assert_eq!(shown, game, "not a pixel of the game is disturbed");
+    }
+
+    /// **The criterion that matters most:** watching the machine does not change it.
+    ///
+    /// A tool that observes the bug must not be part of it. `peek_word` taking `&self`
+    /// is necessary and not sufficient — the *loop* could still differ with the overlay
+    /// on, by drawing before the conversion, by consulting the machine differently, or
+    /// by spending a frame's worth of anything.
+    ///
+    /// Compared field by field rather than through `snapshot()`: a snapshot leaves out
+    /// the trace, and the trace is where a stray interrupt acknowledge would show.
+    #[test]
+    fn watching_the_machine_does_not_change_it() {
+        let (o, _s, _p) = opts("watching");
+        let mut m = machine();
+        // One machine, put back between the two runs — 525 KB on the stack means two do
+        // not fit in a test thread. `restore` leaves the trace alone deliberately, so
+        // the trace figures are compared as deltas from each run's own baseline.
+        let start = m.snapshot();
+        let base = (m.board.trace.acks, m.board.trace.vblanks);
+
+        let mut script = vec![Fake::held(&[Key::F1])];
+        script.extend(Fake::idle(3));
+        let mut d = Fake::new(script);
+        let s_on = run(&mut m, &mut d, &o);
+        let on = (
+            m.total_cycles,
+            m.cpu.d,
+            m.cpu.a,
+            m.cpu.pc,
+            m.line,
+            m.board.trace.acks - base.0,
+            m.board.trace.vblanks - base.1,
+        );
+        let ram_on = m.board.ram.clone();
+        assert_ne!(on.0, 0, "the premise: the machine ran");
+        // And the overlay really was on, or this compares two identical runs.
+        let first = d.first.expect("a tick presents");
+        assert!(
+            first.iter().any(|&px| px != first[0]),
+            "the premise: the overlay was drawn"
+        );
+
+        m.restore(&start);
+        let base = (m.board.trace.acks, m.board.trace.vblanks);
+        let mut d = Fake::new(Fake::idle(4));
+        let s_off = run(&mut m, &mut d, &o);
+
+        assert_eq!(s_on.frames, s_off.frames, "the same frames were asked for");
+        assert_eq!(s_on.frames, 4, "and there were some");
+        assert_eq!(
+            on,
+            (
+                m.total_cycles,
+                m.cpu.d,
+                m.cpu.a,
+                m.cpu.pc,
+                m.line,
+                m.board.trace.acks - base.0,
+                m.board.trace.vblanks - base.1,
+            ),
+            "the overlay must not move the machine"
+        );
+        assert_eq!(ram_on, m.board.ram, "nor write a word of its memory");
+    }
+
+    /// The debugger's stepping path reaches the same machine as `run_frame`.
+    ///
+    /// Every tick now runs its frames through [`run_frame_to_breakpoint`], one
+    /// instruction at a time, where before it called `Cps1::run_frame`. That is the
+    /// substitution this task made, and nothing else tests it: the two paths differing
+    /// would show as an emulator that runs one way under the debugger and another way
+    /// without it, with every other test in this module green either way.
+    #[test]
+    fn the_stepping_path_reaches_the_same_machine_as_run_frame() {
+        let (o, _s, _p) = opts("stepping-path");
+        let mut m = machine();
+        let start = m.snapshot();
+        // `restore` deliberately leaves the trace alone — a reset or a load is part of
+        // the session the trace records — so the trace figures are compared as deltas
+        // from each run's own baseline rather than as absolutes.
+        let base = (
+            m.board.trace.frames,
+            m.board.trace.acks,
+            m.board.trace.vblanks,
+        );
+
+        let mut d = Fake::new(Fake::idle(4));
+        let s = run(&mut m, &mut d, &o);
+        assert_eq!(s.frames, 4, "the premise: four frames ran");
+        let stepped = (
+            m.total_cycles,
+            m.cpu.d,
+            m.cpu.a,
+            m.cpu.pc,
+            m.line,
+            m.board.trace.frames - base.0,
+            m.board.trace.acks - base.1,
+            m.board.trace.vblanks - base.2,
+        );
+        let ram_stepped = m.board.ram.clone();
+        assert_ne!(stepped.0, 0, "and the machine moved");
+
+        m.restore(&start);
+        let base = (
+            m.board.trace.frames,
+            m.board.trace.acks,
+            m.board.trace.vblanks,
+        );
+        for _ in 0..4 {
+            m.run_frame();
+        }
+        assert_eq!(
+            stepped,
+            (
+                m.total_cycles,
+                m.cpu.d,
+                m.cpu.a,
+                m.cpu.pc,
+                m.line,
+                m.board.trace.frames - base.0,
+                m.board.trace.acks - base.1,
+                m.board.trace.vblanks - base.2,
+            ),
+            "instruction by instruction must reach where `run_frame` reaches"
+        );
+        assert_eq!(ram_stepped, m.board.ram, "down to the last word of memory");
     }
 
     /// A closed display runs nothing.
