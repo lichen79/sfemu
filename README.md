@@ -7,14 +7,17 @@ CPS-1 ROM set you own and `--play` opens a window:
 cargo run -p sfemu --release -- /path/to/your/sf2.zip --play
 ```
 
-Six sub-projects are complete: the **68000 core** (A), the **bus and timing
+Seven sub-projects are complete: the **68000 core** (A), the **bus and timing
 framework with a MAME ROM-set loader** (B), the **CPS-1 scanline renderer** (C),
-the **frontend** — window, frame clock, keyboard, and save states (E1) — the
-**debugger** (E2): `F1` for an in-window overlay, `F4` to step one instruction,
-`F7` for a breakpoint — and the **graphics viewers** (E3): `F9` for a tile,
-tilemap, palette and layer browser, `F10` to cycle it. The audio sub-projects
-(D1 the Z80, D2 the YM2151, D3 the samples and the speaker) and the Street
-Fighter 1 driver (F) are not built yet: **there is no sound.**
+the **Z80 audio CPU** (D1), the **frontend** — window, frame clock, keyboard, and
+save states (E1) — the **debugger** (E2): `F1` for an in-window overlay, `F4` to
+step one instruction, `F7` for a breakpoint — and the **graphics viewers** (E3):
+`F9` for a tile, tilemap, palette and layer browser, `F10` to cycle it.
+
+**There is still no sound.** D1 is the sound board's *processor* and nothing else:
+a Z80 with no chip attached, validated against 1,604,000 vector cases and wired to
+nothing. D2 gives it a YM2151 and D3 is the one that reaches a speaker. The Street
+Fighter 1 driver (F) is not built yet either.
 
 ## The 68000 core
 
@@ -37,6 +40,30 @@ Sub-project B is where that starts to matter, on a board deriving a chip select
 from FC.
 
 [sst]: https://github.com/SingleStepTests/m68000
+
+## The Z80 core
+
+Validated against the [SingleStepTests/z80][sstz] vector suite: **1,604 of 1,604
+files green, 1,604,000 of 1,604,000 cases.** Per case: every register including
+`IX`/`IY`, the shadow set, `I`, `R`, both interrupt flip-flops, `f` — with the two
+**undocumented** flag bits, which the vectors compare on every case, so they are
+neither optional nor a curiosity — every touched RAM byte, the T-state count, and
+the bus access sequence in order.
+
+Unlike `m68k`, this core carries per-instruction cycle costs. The 68000 obeys a
+measured law (every bus access is four cycles, so a count falls out of the access
+sequence); the Z80 obeys no such law — an opcode fetch is 4 T-states and a memory
+access 3, with per-instruction internal cycles — so each handler returns its own
+count, taken from the vectors rather than from a table someone typed.
+
+**What a green suite here does not establish.** No vector reaches interrupt
+acceptance: SingleStepTests drives instructions, and accepting an interrupt is not
+one. So `NMI`, the maskable modes, the `EI` arming delay and `RETN`'s flip-flop
+restore are covered by hand-written tests only — which is why `scripts/mutate.py`
+has a `z80int` set whose survivors would mean genuinely unverified behaviour, and
+why it is run rather than trusted.
+
+[sstz]: https://github.com/SingleStepTests/z80
 
 ## This project ships no ROMs, and never will
 
@@ -347,6 +374,9 @@ crates/m68k/         the CPU core: no dependencies, no unsafe, no clock access,
 crates/video/        CPS-1 graphics: tiles, three layers, sprites, palettes,
                      CPS-A/B registers, scanline renderer, and the subtractive
                      layer mask the viewer drives. No dependencies.
+crates/z80/          the sound board's CPU core, on m68k's terms: no
+                     dependencies, no unsafe, no clock access, no_std-friendly.
+                     Includes a disassembler cross-checked against the core.
 crates/machine/      the board: memory map, bus, interrupts, scheduler, inputs,
                      snapshot and restore. Depends on m68k and video.
 crates/romset/       the MAME ROM-set loader: zip or a directory, CRC-checked,
@@ -358,8 +388,10 @@ crates/frontend/     every frontend decision, with no window: frame pacing, the
 crates/sfemu/        the binary. The only crate that names a windowing library,
                      and only in one file (a test enforces it).
 crates/testrunner/   dev-only harness for the external vector suite.
-scripts/mutate.py    the mutation harness: 158 mutants over the above, each one
-                     an exact string replacement with a declared expectation.
+scripts/mutate.py    the mutation harness: 181 mutants over the above in 16 sets,
+                     each an exact string replacement with a declared
+                     expectation. 162 killed, 19 declared survivors (16 controls
+                     and 3 proven equivalents), 181/181 as expected.
 docs/hardware/       what the vectors proved about the hardware, with evidence.
 docs/superpowers/    design specs and implementation plans.
 testdata/            gitignored; fetched vectors.
@@ -407,8 +439,17 @@ follows throughout, both learned the hard way:
 
 The central result is the timing law: `cycles = 4 × (non-idle bus accesses) +
 (idle cycles)`, which holds in 317,500 of 317,500 cases. Every bus access is
-exactly four cycles, so there is no cycle table in this codebase — a count falls
-out of the access sequence a handler already has to schedule.
+exactly four cycles, so there is no cycle table in `m68k` — a count falls out of
+the access sequence a handler already has to schedule.
+
+**And a green suite is not a tested codebase.** All 1,604,000 Z80 cases would pass
+with every `#[test]` in the crate deleted, because the vectors live in a separate
+crate and exercise instructions rather than assertions. `scripts/mutate.py` is what
+measures the hand-written tests: each mutant is one exact string replacement with a
+declared expectation, and a kill records *which* test noticed — because a mutant
+killed only by a test with nothing to do with the mutated rule means the rule's own
+test asserts nothing. Every set carries a control that must survive, so a clean
+pass is distinguishable from a harness that reports success without running.
 
 ## Roadmap
 
@@ -417,7 +458,7 @@ out of the access sequence a handler already has to schedule.
 | **A** | Workspace and M68000 core | **complete** — 127/127 groups, 317,500/317,500 cases |
 | **B** | Bus/timing framework, MAME ROM-set loader | **complete** — first execution of real board code |
 | **C** | CPS-1 video: tilemaps, sprites, palettes, CPS-A/B registers, scanline renderer | **complete** — the largest piece, and where SF2 becomes visible |
-| D1 | Z80 audio CPU | **in progress** — the sound board's processor, against 1,604 vector files |
+| **D1** | Z80 audio CPU | **complete** — 1,604/1,604 files, 1,604,000/1,604,000 cases. Still silent: a CPU with no chip attached |
 | D2 | YM2151 FM, and the sound board's wiring | the latch reaches a chip; still silent |
 | D3 | OKI MSM6295 ADPCM, mixing, host audio | the one that ends "there is no sound" |
 | **E1** | Frontend: window, frame clock, keyboard, save states | **complete** — `--play` |
@@ -435,8 +476,8 @@ it, and then took it.
 is how many vector files the Z80 suite has, against the 68000's 127 — and the
 68000 took 16,462 lines and a spec of its own. A Z80 core, an FM synthesizer, and
 a host audio path are three unrelated subsystems; asking one review pass to gate
-all three is what the original decomposition was written to avoid. **D1 is next**,
-and it is silent by design: D3 is the one that ends "there is no sound."
+all three is what the original decomposition was written to avoid. **D1 is done**,
+and it was silent by design: D3 is the one that ends "there is no sound."
 
 WASM and netplay are not stages. They are constraints on A–D: no threads, no
 wall-clock access, no host I/O in the core, a frame-stepped API, and complete

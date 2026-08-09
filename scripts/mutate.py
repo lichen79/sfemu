@@ -11,8 +11,28 @@ enforces, all of it learned the hard way:
 - The pattern must occur **exactly once**. Zero or two matches is reported as
   NO-OP, not as a result: a mutant that did not apply tells you nothing, and
   silently counting it as a kill inflates the score.
+- A test run that fails without naming a single failing test is **NO-BUILD**, not
+  a kill. Same principle one step later: the mutation applied but the crate does
+  not compile, so nothing was measured. Kept as a verdict distinct from NO-OP
+  because the fault is in a different place -- NO-OP means the pattern no longer
+  matches the source, NO-BUILD means it matched and the result is not valid Rust.
+  This is not hypothetical: `overlay`'s `all-ones-is-shown-as-a-gap` was an E0716
+  from the day it was written and every run scored it KILL until the verdict
+  existed.
+- A KILL records **which tests** failed. "The crate went red" is what the vector
+  suites already say; a mutation pass is worth running for the name beside it,
+  because a mutant killed only by a test with nothing to do with the mutated rule
+  means the rule's own test asserts nothing.
 - Every set includes at least one **control** mutant that must SURVIVE. A pass
   where everything dies is more likely a broken harness than a thorough suite.
+- A set may span files: a mutant's optional fifth element names its own file.
+- A kill signal restores the tree. SIGTERM and SIGHUP raise, so the `finally`
+  clauses run; without that a run killed at a wall-clock cap leaves a live mutant
+  in tracked source with nothing announcing it, which happened once.
+
+Usage: `mutate.py <set>` for one set, `mutate.py --all` for every set. Prefer
+`--all` before a commit: a set nobody is working on is a set whose mutants have
+gone stale or stopped compiling, and only the roll-up looks at it.
 """
 
 import re
@@ -1758,7 +1778,13 @@ def run_all() -> int:
     started reporting NO-OP because the code it mutates was reworded is invisible
     when you only run the set you are working on.
     """
-    total = killed = survived = noop = bad = 0
+    # NO-OP and NO-BUILD are counted apart. They are both "nothing was measured",
+    # but they say different things about where the fault is: NO-OP means the
+    # pattern no longer matches the source, NO-BUILD means it matched and the
+    # result does not compile. Rolling them into one bucket made the roll-up
+    # report `no-op 1` for a mutant whose pattern was fine, which sent the first
+    # reading of it to the wrong file.
+    total = killed = survived = noop = nobuild = bad = 0
     for name in SETS:
         print(f"=== {name} ===")
         rows = run_rows(name)
@@ -1766,15 +1792,20 @@ def run_all() -> int:
             ok = verdict(got) == expect
             bad += not ok
             total += 1
-            if verdict(got) in ("NO-OP", "NO-BUILD"):
+            if verdict(got) == "NO-OP":
                 noop += 1
+            elif verdict(got) == "NO-BUILD":
+                nobuild += 1
             elif verdict(got) == "KILL":
                 killed += 1
             else:
                 survived += 1
             print(f"{'ok  ' if ok else 'BAD '} {mname:46} expect {expect:8} got {got}")
         print()
-    print(f"total {total}  killed {killed}  survived {survived}  no-op {noop}")
+    print(
+        f"total {total}  killed {killed}  survived {survived}  "
+        f"no-op {noop}  no-build {nobuild}"
+    )
     print(f"{total - bad}/{total} as expected")
     return 1 if bad else 0
 
