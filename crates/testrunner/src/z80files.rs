@@ -7,6 +7,35 @@
 /// The number of vector files the suite has.
 pub const EXPECTED: usize = 1604;
 
+/// How many cases each vector file holds.
+///
+/// Uniform across the suite, and a literal here rather than read from the first
+/// file: a count taken from the data agrees with whatever the data says, which is
+/// exactly the check the coverage tests exist to make.
+pub const CASES_PER_FILE: usize = 1000;
+
+/// The single fetch command, in one place.
+///
+/// Every loud failure quotes this. Duplicating the string across the harness is how
+/// one copy goes stale and sends a reader to a command that no longer exists.
+pub const FETCH_HINT: &str = "run `cargo run -q -p testrunner --release --bin fetchz80`";
+
+/// Where the converted vectors live.
+///
+/// `CARGO_MANIFEST_DIR` rather than the working directory: `cargo test` and
+/// `cargo run` are invoked from wherever the developer happens to be standing, and
+/// a relative path would make the suite pass or fail depending on that.
+#[must_use]
+pub fn dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/z80"))
+}
+
+/// The path of the file holding `name`'s cases.
+#[must_use]
+pub fn path_of(name: &str) -> std::path::PathBuf {
+    dir().join(format!("{}.z80bin", stem(name)))
+}
+
 /// The bytes that open a page instead of being an instruction.
 const PREFIXES: [u8; 4] = [0xCB, 0xDD, 0xED, 0xFD];
 
