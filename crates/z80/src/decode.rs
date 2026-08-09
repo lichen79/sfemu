@@ -740,11 +740,11 @@ pub fn index_page<B: Bus>(cpu: &mut Z80, bus: &mut B, use_iy: bool) -> u32 {
         0xFD => return 4 + index_page(cpu, bus, true),
         // `DD CB` is the double-prefix page, whose operand order is unique on the
         // chip -- displacement *before* the opcode -- so it cannot fall through to
-        // `cb_page`, which would read the displacement as its opcode. Task 12 fills
-        // it in; until then a panic, for the reason the base page's fallthrough was
-        // one: a wrong-but-plausible answer here would look like a flag bug spread
-        // across 512 vector files.
-        0xCB => unimplemented!("the DD CB / FD CB page is Task 12"),
+        // `cb_page`, which would read the displacement as its opcode.
+        // No `4 +`: unlike the prefix-restart arms above, the double-prefix page's
+        // costs are the whole instruction's, measured as 23 and 20 rather than
+        // derived from a base-page figure.
+        0xCB => return index_cb_page(cpu, bus, use_iy),
         _ => {}
     }
 
@@ -957,6 +957,96 @@ pub fn index_page<B: Bus>(cpu: &mut Z80, bus: &mut B, use_iy: bool) -> u32 {
         // tested path -- `dd_00` exists, and so does `dd_76`, which is HALT after a
         // wasted prefix -- not an error case.
         _ => 4 + execute(cpu, bus, op),
+    }
+}
+
+/// The `DD CB` and `FD CB` pages: 256 opcodes each, all of them on displaced memory.
+///
+/// The one place the Z80's encoding stops being systematic:
+///
+/// - **The displacement precedes the opcode** — prefix, `CB`, displacement, opcode —
+///   so the operand's address is known before the operation is. Every other
+///   multi-byte instruction on the chip reads its opcode first.
+/// - **The register field does not select the operand.** All eight encodings act on
+///   `(idx+d)`; seven of them *also* copy the result into the named register, and
+///   fields 4 and 5 copy into plain `H` and `L` rather than the index halves. Those
+///   seven are undocumented and upstream ships a file for each, which is why this
+///   page is 256 forms rather than the 32 Zilog lists.
+/// - **`BIT` produces no value**, so its eight encodings are genuinely identical,
+///   none writes a register, and it costs 20 rather than 23 — there is no write
+///   cycle.
+/// - `R` advances **twice** across the four bytes. Only the prefix and the `CB` are
+///   M1 cycles.
+///
+/// Measured over all 512 files: 23 T-states everywhere but `BIT`'s 20, `R` advancing
+/// 2 and `PC` 4 on every case, and the latch holding `idx+d` on every case of every
+/// quarter — this page has no stem that leaves `wz` alone, unlike the plain `CB` page
+/// where none writes it.
+pub fn index_cb_page<B: Bus>(cpu: &mut Z80, bus: &mut B, use_iy: bool) -> u32 {
+    let d = cpu.disp(bus);
+    // `imm`, not `fetch`: the final byte is not an M1 cycle and must not bump `R`.
+    // Two M1 cycles across four bytes, and the suite compares `R`.
+    let op = cpu.imm(bus);
+
+    let idx = if use_iy { cpu.iy } else { cpu.ix };
+    let addr = idx.wrapping_add(d as u16);
+    cpu.wz = addr;
+
+    let v = bus.read(addr);
+    let field = op & 7;
+    let bit = (op >> 3) & 7;
+
+    match op >> 6 {
+        // The rotates and shifts, `SLL` included.
+        0 => {
+            let r = bits::rot(cpu, bits::RotOp::from_index(bit), v);
+            bus.write(addr, r);
+            copy_to_field(cpu, field, r);
+            23
+        }
+        // BIT: no result, no write, no register copy, and 20 T-states.
+        1 => {
+            // F3/F5 from the address latch's *high* byte, so F3 is address bit 11 and
+            // F5 is bit 13. The low byte is wrong on 740-762 of 1,000 cases per file,
+            // and the tested byte on 743-764 — the two rules a core would try first.
+            bits::bit_test(cpu, bit, v, (cpu.wz >> 8) as u8);
+            20
+        }
+        // RES and SET.
+        _ => {
+            let r = if op >> 6 == 2 {
+                v & !(1 << bit)
+            } else {
+                v | (1 << bit)
+            };
+            bus.write(addr, r);
+            copy_to_field(cpu, field, r);
+            cpu.q = 0;
+            23
+        }
+    }
+}
+
+/// Copies a double-prefix result into the register the field names, if any.
+///
+/// Field 6 names `(HL)` in every other use of this encoding, and here it means
+/// "memory only" — the documented form. The other seven are the undocumented copies.
+///
+/// Deliberately **not** [`set_reg`]: that function's index 6 writes through `HL`,
+/// which would issue a second, stray memory write at an address this instruction
+/// never computed. Fields 4 and 5 are plain `H` and `L` for the same reason
+/// `LD H,(IX+d)` loads plain `H` — a displaced operand suppresses the index
+/// rewrite on the other side.
+fn copy_to_field(cpu: &mut Z80, field: u8, v: u8) {
+    match field {
+        0 => cpu.b = v,
+        1 => cpu.c = v,
+        2 => cpu.d = v,
+        3 => cpu.e = v,
+        4 => cpu.h = v,
+        5 => cpu.l = v,
+        6 => {} // memory only: the documented form
+        _ => cpu.a = v,
     }
 }
 
@@ -2734,5 +2824,201 @@ mod tests {
         c.q = c.f;
         run(&mut c, &[0x37]);
         assert_eq!(c.f & (F5 | F3), 0, "no prefix, so Q still masks F");
+    }
+
+    /// The displacement precedes the opcode.
+    ///
+    /// prefix, `CB`, **displacement**, opcode — the operand is read before the
+    /// instruction is known. Every other multi-byte instruction reads its opcode
+    /// first, so this is the one place the natural decode order is wrong. Swapping
+    /// the two reads would rotate the byte at `IX+6` and consume the same four
+    /// bytes, so `PC` alone cannot catch it: the *address* is the witness.
+    #[test]
+    fn the_displacement_comes_before_the_opcode_byte() {
+        let mut c = Z80::new();
+        c.ix = 0x2000;
+        c.f = 0;
+        c.pc = 0x100;
+        // DD CB 05 06 = RLC (IX+5)
+        let mut m = Mem::at(0x100, &[0xDD, 0xCB, 0x05, 0x06]);
+        m.ram[0x2005] = 0x81;
+        m.ram[0x2006] = 0x00; // where a swapped decode would work instead
+        assert_eq!(c.step(&mut m), 23);
+        assert_eq!(m.ram[0x2005], 0x03, "0x81 rotated left is 0x03");
+        assert_eq!(m.ram[0x2006], 0x00, "and IX+6 is untouched");
+        assert_eq!(c.f & C, C, "with bit 7 into carry");
+        assert_eq!(c.pc, 0x104, "and all four bytes consumed");
+    }
+
+    /// The register field addresses no operand and names a second destination.
+    ///
+    /// `DD CB 05 00` is `RLC (IX+5)` **and** `LD B,result`. All eight encodings
+    /// address the same memory; seven also write a register. Undocumented, and
+    /// upstream ships all 256 files — which is why this page is 256 and not 32.
+    ///
+    /// Fields 4 and 5 copy to **plain** `H` and `L`, not the index halves: measured
+    /// 0-wrong on `dd_cb____05`, and a core that used [`set_index`] there would
+    /// corrupt the pointer it was just told to read through.
+    #[test]
+    fn the_register_field_names_an_extra_destination_not_the_operand() {
+        let mut c = Z80::new();
+        c.ix = 0x2000;
+        c.b = 0xFF;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0xCB, 0x05, 0x00]);
+        m.ram[0x2005] = 0x81;
+        assert_eq!(c.step(&mut m), 23);
+        assert_eq!(m.ram[0x2005], 0x03, "memory still gets the result");
+        assert_eq!(c.b, 0x03, "and so does B");
+
+        // The documented form (field 6) writes memory only -- and writes it once. A
+        // `set_reg` here would take the `(HL)` path and write through HL as well.
+        let mut c = Z80::new();
+        c.ix = 0x2000;
+        c.b = 0xFF;
+        c.set_hl(0x3000);
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0xCB, 0x05, 0x06]);
+        m.ram[0x2005] = 0x81;
+        c.step(&mut m);
+        assert_eq!(c.b, 0xFF, "field 6 leaves the registers alone");
+        assert_eq!(m.ram[0x3000], 0x00, "and issues no stray write through HL");
+
+        // Field 5 is plain L, and the index is not disturbed.
+        let mut c = Z80::new();
+        c.ix = 0x2000;
+        c.l = 0xFF;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0xCB, 0x05, 0x05]);
+        m.ram[0x2005] = 0x81;
+        c.step(&mut m);
+        assert_eq!(c.l, 0x03, "plain L, not IXL");
+        assert_eq!(c.ix, 0x2000, "and IX is intact");
+    }
+
+    /// `SET` and `RES` copy to the register too; `BIT` has nothing to copy.
+    ///
+    /// `BIT` produces no value, so its eight encodings really are identical and none
+    /// writes a register. A core that applied the copy uniformly would clobber a
+    /// register on every `BIT (IX+d)` — and `BIT` is the one form software uses in
+    /// hot loops.
+    #[test]
+    fn set_and_res_copy_to_the_register_but_bit_writes_nothing() {
+        let mut c = Z80::new();
+        c.ix = 0x2000;
+        c.d = 0x00;
+        c.pc = 0x100;
+        // DD CB 00 C2 = SET 0,(IX+0), also into D
+        let mut m = Mem::at(0x100, &[0xDD, 0xCB, 0x00, 0xC2]);
+        m.ram[0x2000] = 0x00;
+        assert_eq!(c.step(&mut m), 23);
+        assert_eq!(m.ram[0x2000], 0x01);
+        assert_eq!(c.d, 0x01, "SET copies to the named register");
+
+        let mut c = Z80::new();
+        c.ix = 0x2000;
+        c.d = 0x77;
+        c.pc = 0x100;
+        // DD CB 00 42 = BIT 0,(IX+0) -- the field is 2 (D) and must be ignored
+        let mut m = Mem::at(0x100, &[0xDD, 0xCB, 0x00, 0x42]);
+        m.ram[0x2000] = 0x01;
+        assert_eq!(c.step(&mut m), 20, "BIT is 20, not 23 -- no write cycle");
+        assert_eq!(c.d, 0x77, "and D is untouched");
+        assert_eq!(m.ram[0x2000], 0x01, "memory is not rewritten either");
+        assert_eq!(c.f & Z, 0, "bit 0 was set");
+    }
+
+    /// `R` advances twice: `DD` and `CB` are M1 cycles, the other two bytes are not.
+    ///
+    /// Four bytes, two M1 cycles. A core that bumped `R` per byte would be off by
+    /// two — and the suite compares `R`, so this is caught rather than mysterious.
+    #[test]
+    fn the_double_prefix_bumps_the_refresh_counter_exactly_twice() {
+        let mut c = Z80::new();
+        c.r = 0;
+        c.ix = 0x2000;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0xCB, 0x00, 0x06]);
+        c.step(&mut m);
+        assert_eq!(c.r, 2, "two M1 cycles across four bytes");
+    }
+
+    /// `BIT b,(IX+d)`'s undocumented flags come from the **address**, not the byte.
+    ///
+    /// F3/F5 are bits 11 and 13 of `IX+d` — the internal address latch leaking onto
+    /// the flag register.
+    ///
+    /// The two addresses are chosen to disagree so a swapped pair of bits fails
+    /// rather than passing twice: `0x0800` has bit 11 set and bit 13 clear (F3 set,
+    /// F5 clear), and `0x2000` is its mirror. An address like `0x2800` would be
+    /// useless — it has *both* bits set, so it cannot tell the two flags apart. The
+    /// tested byte is `0xFF` in both, contributing both bits, so "took them from the
+    /// byte" is a third distinguishable outcome: measured wrong on 743–764 of 1,000
+    /// cases per file, as is the address's low byte.
+    #[test]
+    fn bit_of_displaced_memory_takes_f3_and_f5_from_the_address() {
+        let mut c = Z80::new();
+        c.ix = 0x0800;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0xCB, 0x00, 0x46]);
+        m.ram[0x0800] = 0xFF;
+        c.step(&mut m);
+        assert_eq!(c.wz, 0x0800, "the latch holds the displaced address");
+        assert_eq!(c.f & F3, F3, "bit 11 of 0x0800 is set");
+        assert_eq!(c.f & F5, 0, "bit 13 is clear");
+
+        // 0x2000: bit 13 set, bit 11 clear -- the mirror case.
+        let mut c = Z80::new();
+        c.ix = 0x2000;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0xCB, 0x00, 0x46]);
+        m.ram[0x2000] = 0xFF;
+        c.step(&mut m);
+        assert_eq!(c.f & F5, F5);
+        assert_eq!(c.f & F3, 0);
+    }
+
+    /// `SLL (IX+d)` exists and shifts a 1 into bit 0.
+    #[test]
+    fn sll_of_displaced_memory_shifts_a_one_in() {
+        let mut c = Z80::new();
+        c.ix = 0x2000;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0xCB, 0x00, 0x36]);
+        m.ram[0x2000] = 0x00;
+        c.step(&mut m);
+        assert_eq!(
+            m.ram[0x2000], 0x01,
+            "a 1, not a 0 -- that is what makes it SLL"
+        );
+    }
+
+    /// The double-prefix displacement is signed, and `FD CB` reaches `IY`.
+    ///
+    /// Two rules that the four-byte form makes easy to lose: the displacement is
+    /// read by [`Z80::disp`] and so is signed like every other one, and the index
+    /// choice has to survive being threaded through two dispatch levels.
+    #[test]
+    fn the_double_prefix_form_is_signed_and_honours_the_second_prefix() {
+        let mut c = Z80::new();
+        c.iy = 0x2010;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xFD, 0xCB, 0xFB, 0xC6]); // SET 0,(IY-5)
+        m.ram[0x200B] = 0x00;
+        m.ram[0x210B] = 0x00; // where an unsigned read would land
+        assert_eq!(c.step(&mut m), 23);
+        assert_eq!(m.ram[0x200B], 0x01, "IY-5, not IY+251");
+        assert_eq!(m.ram[0x210B], 0x00);
+        assert_eq!(c.wz, 0x200B);
+
+        // And DD CB with IY loaded is unaffected: the prefix, not the register, picks.
+        let mut c = Z80::new();
+        c.ix = 0x2000;
+        c.iy = 0x4000;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0xCB, 0x00, 0xC6]);
+        c.step(&mut m);
+        assert_eq!(m.ram[0x2000], 0x01, "DD chose IX");
+        assert_eq!(m.ram[0x4000], 0x00);
     }
 }

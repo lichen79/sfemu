@@ -16,9 +16,10 @@
 
 use std::path::PathBuf;
 
-/// The opcodes the core implements so far: as of Task 11, the 252 non-prefix
-/// base-page opcodes, all 256 of the `CB` page, the 80 `ED` opcodes that have a
-/// file, and the 252 plain stems of each index page.
+/// The opcodes the core implements so far: as of Task 12, every file upstream ships
+/// — the 252 non-prefix base-page opcodes, all 256 of the `CB` page, the 80 `ED`
+/// opcodes that have a file, and both index pages entire, 252 plain stems and 256
+/// double-prefix ones each. 1,604 files.
 ///
 /// Kept as a literal list rather than derived from the decoder: a default that
 /// asked the decoder what it handled would report "all green" on exactly the
@@ -89,13 +90,19 @@ fn cb_stems() -> Vec<String> {
 /// have a file, against 80 of 256 there. Confirmed against the directory — 252
 /// two-digit stems per prefix, and the four names above are the only ones missing.
 fn index_stems() -> Vec<String> {
-    let mut v = Vec::with_capacity(504);
+    let mut v = Vec::with_capacity(1016);
     for prefix in ["dd", "fd"] {
         for op in 0..=255u8 {
             if matches!(op, 0xCB | 0xDD | 0xED | 0xFD) {
                 continue;
             }
             v.push(format!("{prefix}_{op:02x}"));
+        }
+        // The double-prefix page, complete at 256: `dd_cb____NN`. The four underscores
+        // are upstream's — the name has a slot for the displacement byte, which the
+        // file varies per case rather than fixing per file.
+        for op in 0..=255u8 {
+            v.push(format!("{prefix}_cb____{op:02x}"));
         }
     }
     v
