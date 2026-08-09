@@ -33,6 +33,7 @@ pub mod bus;
 pub mod cpu;
 pub mod decode;
 pub mod flags;
+pub mod interrupt;
 pub mod ops;
 #[cfg(test)]
 pub mod testbus;

@@ -28,6 +28,9 @@ pub struct Mem {
     /// only returned a value would make that half untestable.
     pub ports_in: Vec<u16>,
     pub port_in_value: u8,
+    /// What [`Bus::irq_ack`] returns: the byte a device would put on the data bus
+    /// during acknowledge. `0xFF` by default, matching the trait's default.
+    pub irq_vector: u8,
 }
 
 impl Mem {
@@ -40,6 +43,7 @@ impl Mem {
             ports_out: Vec::new(),
             ports_in: Vec::new(),
             port_in_value: 0xFF,
+            irq_vector: 0xFF,
         }
     }
 
@@ -74,5 +78,8 @@ impl Bus for Mem {
     }
     fn port_out(&mut self, port: u16, val: u8) {
         self.ports_out.push((port, val));
+    }
+    fn irq_ack(&mut self) -> u8 {
+        self.irq_vector
     }
 }

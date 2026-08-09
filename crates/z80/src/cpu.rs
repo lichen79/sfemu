@@ -144,6 +144,19 @@ pub struct Z80 {
     /// because D2 runs the core continuously, where a halted CPU that forgot it
     /// would execute whatever follows the `HALT` instead of waiting.
     pub halted: bool,
+    /// The maskable interrupt request line.
+    ///
+    /// **Level-sensitive**, unlike [`Self::nmi`]: the device holds it asserted until
+    /// the CPU acknowledges, so a refused request stays pending and only acceptance
+    /// clears it. Not one of the suite's 26 fields — no vector case has an interrupt
+    /// pending — so the harness's state comparison must not include it.
+    pub irq: bool,
+    /// The non-maskable interrupt request line.
+    ///
+    /// **Edge-triggered**: acceptance consumes it. The asymmetry with [`Self::irq`]
+    /// is the chip's, and collapsing the two into one flag would either drop maskable
+    /// interrupts or re-enter the NMI handler forever.
+    pub nmi: bool,
 }
 
 impl Z80 {
@@ -169,6 +182,10 @@ impl Z80 {
         self.p = 0;
         self.wz = 0;
         self.halted = false;
+        // `irq` and `nmi` are deliberately **not** cleared: they are input pins, not
+        // state. A request asserted while the CPU is held in reset is still asserted
+        // when it comes out, so clearing them here would silently drop the first
+        // interrupt after every reset.
         self.set_af(0xFFFF);
         self.sp = 0xFFFF;
     }
@@ -245,6 +262,20 @@ impl Z80 {
         //
         // An interrupt check belongs *before* this line: `ei` set on entry is
         // exactly the state in which an interrupt must not yet be accepted.
+        //
+        // Clearing `ei` here — before dispatch, not after — is also what makes
+        // `EI; EI; NOP` behave: the second `EI` sets it again during dispatch and its
+        // own arming is not consumed by itself. Clearing it *after* dispatch would
+        // swallow the arming `EI` had just set, and interrupts would never come on.
+        //
+        // What must **not** happen here is promoting the expiring arming into
+        // `iff1`/`iff2`. `EI` sets both flip-flops immediately and sets `ei` as well;
+        // `ei` says only that the enable is one instruction old. Measured over the
+        // 1,518,000 cases outside the `EI`/`DI`/`RETN` pages: 759,299 begin with
+        // `ei` set, and treating that as "now enable the flip-flops" disagrees with
+        // the final state on 569,245 of them, while clearing `ei` and leaving both
+        // flip-flops alone is wrong on 0. `EI` itself ends with both set and `ei == 1`
+        // on 1,000 of 1,000 cases of `fb`, `dd_fb` and `fd_fb`.
         self.ei = 0;
         self.p = 0;
         let op = self.fetch(bus);

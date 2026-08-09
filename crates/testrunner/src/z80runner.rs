@@ -44,6 +44,12 @@ fn load(s: &State) -> Z80 {
         // Not a suite field: no case begins halted, so `false` is the only value
         // consistent with the vectors. See `Z80::halted`.
         halted: false,
+        // Nor are these: no case has an interrupt pending. Deasserted is the only
+        // value the vectors are consistent with, and it is what makes the whole
+        // 1,604,000 a test of instruction execution alone — a case that began with
+        // `irq` set would need a `service` call the format has no way to ask for.
+        irq: false,
+        nmi: false,
     }
 }
 

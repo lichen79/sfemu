@@ -31,4 +31,18 @@ pub trait Bus {
     /// Writes one byte to an I/O port. `port` is the full 16 bits, as for
     /// [`Bus::port_in`].
     fn port_out(&mut self, port: u16, val: u8);
+
+    /// The byte a device puts on the data bus during interrupt acknowledge.
+    ///
+    /// Defaults to `0xFF`, which in mode 0 is `RST 38h` — the same vector mode 1
+    /// uses, so a bus that does not implement this behaves sanely rather than
+    /// jumping somewhere arbitrary.
+    ///
+    /// A default method rather than a fifth required one: no vector case has an
+    /// interrupt pending, so the harness's recording bus and every D2 consumer would
+    /// otherwise implement a method the suite never exercises. The default is a real
+    /// documented behaviour, not a stub.
+    fn irq_ack(&mut self) -> u8 {
+        0xFF
+    }
 }
