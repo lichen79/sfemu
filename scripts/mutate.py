@@ -17,6 +17,7 @@ enforces, all of it learned the hard way:
 
 import re
 import shutil
+import signal
 import subprocess
 import sys
 
@@ -30,7 +31,12 @@ import sys
 # still fits a terminal line.
 NAMED_KILLERS = 2
 
-_FAILED = re.compile(r"^test (\S+) \.\.\. FAILED$", re.M)
+# Both of libtest's failure lines. `--quiet` prints `<name> --- FAILED` inline
+# among the progress dots; the verbose form is `test <name> ... FAILED`. Matching
+# only the verbose one made every real kill in the first `z80flags` run report
+# NO-BUILD -- a harness bug that reads exactly like twelve mutants that do not
+# compile, which is why NO-BUILD is a distinct verdict rather than a KILL.
+_FAILED = re.compile(r"^(?:test )?(\S+) (?:\.\.\.|---) FAILED$", re.M)
 
 # Which crate's tests each set is scored against. A set omitted here is scored
 # against `frontend`, which is where this harness started. Naming the crate
@@ -312,10 +318,18 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
                 "                None => line.push_str(\" FFFF\"),",
                 "KILL",
             ),
+            # ⚠️ This mutant did not compile until 2026-08-09 and was scored KILL by
+            # every run before then, because the harness read any non-zero exit as a
+            # kill. `push_str(if .. { ".." } else { &format!(..) })` is an E0716: the
+            # `format!` temporary is dropped at the end of the `if` while the borrow is
+            # still live. Found by the NO-BUILD verdict added with the z80 sets, which
+            # is the finding that verdict exists to produce -- a mutant that does not
+            # build measures nothing, and counting it as a kill inflates the score.
+            # The `match` form below has the same effect and does compile.
             (
                 "all-ones-is-shown-as-a-gap",
                 "                Some(v) => line.push_str(&format!(\" {v:04X}\")),",
-                "                Some(v) => line.push_str(if v == 0xFFFF { \"   --\" } else { &format!(\" {v:04X}\") }),",
+                "                Some(0xFFFF) => line.push_str(\"   --\"),\n                Some(v) => line.push_str(&format!(\" {v:04X}\")),",
                 "KILL",
             ),
             # The debugger reading through the CPU's path. This is the mutant Task 2's
@@ -1407,14 +1421,37 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
                 "KILL",
                 "crates/z80/src/ops/alu.rs",
             ),
-            # `BIT` computing real parity instead of copying Z. Agrees with the copy
-            # whenever the tested bit's value happens to give even parity of the
-            # masked byte -- which for a single-bit mask is *every zero result*, so
-            # only a `BIT` on a set bit can separate them.
+            # EQUIVALENT, and proven rather than asserted. Expected KILL when it was
+            # written, and it survived; the diagnosis is that `parity(masked)` and
+            # `masked == 0` are the same function on every input `bit_test` can
+            # receive. `masked` is `v & (1 << b)` with `b` from bits 3-5 of a CB
+            # opcode, so `b <= 7` and `masked` holds **at most one bit**: zero bits is
+            # both even parity and zero, one bit is both odd parity and non-zero.
+            # Checked exhaustively over all 256 x 8 = 2,048 reachable `(v, b)` pairs:
+            # 0 disagree. No test can separate them because no *input* can, so this is
+            # not a gap in `bit_tests_a_bit_and_copies_z_into_parity`.
+            #
+            # Kept in the set rather than deleted: the day `bit_test` is given a
+            # multi-bit mask -- a `BIT` over a nibble, say -- the two stop agreeing and
+            # this row stops surviving and says so. The mutant the *plan* meant is the
+            # row below, which is a real one.
             (
-                "bit-computes-real-parity",
+                "EQUIVALENT-bit-parity-of-a-single-bit-mask",
                 "        (cpu.f & C) | H | (f35 & (F5 | F3)) | if masked == 0 { Z | PV } else { 0 } | (masked & S);",
                 "        (cpu.f & C) | H | (f35 & (F5 | F3)) | if masked == 0 { Z } else { 0 } | (masked & S)\n            | if crate::flags::parity(masked) { PV } else { 0 };",
+                "SURVIVE",
+                "crates/z80/src/ops/bits.rs",
+            ),
+            # `BIT` taking P/V from the parity of the **operand** rather than copying Z.
+            # This is the honest form of the mutant above, and the plausible wrong
+            # implementation: it is what every logical operation on the chip does, so
+            # writing `sz53p`-style parity here reads as consistency. It disagrees with
+            # the copy whenever the operand's parity differs from "the tested bit is
+            # clear", which is most of the time.
+            (
+                "bit-takes-parity-from-the-operand",
+                "        (cpu.f & C) | H | (f35 & (F5 | F3)) | if masked == 0 { Z | PV } else { 0 } | (masked & S);",
+                "        (cpu.f & C) | H | (f35 & (F5 | F3)) | if masked == 0 { Z } else { 0 } | (masked & S)\n            | if crate::flags::parity(v) { PV } else { 0 };",
                 "KILL",
                 "crates/z80/src/ops/bits.rs",
             ),
@@ -1671,6 +1708,26 @@ def run_rows(name: str) -> list[tuple[str, str, str]]:
         for path, backup in backups.items():
             shutil.copy(backup, path)
     return rows
+
+
+def die_cleanly(signum, _frame):
+    """Turns a kill signal into an exception, so `finally` gets to run.
+
+    Measured, not hypothetical: a `--all` run was SIGTERM'd at a ten-minute
+    wall-clock cap and left `f1-only-ever-turns-the-overlay-on` applied in
+    `crates/frontend/src/debug.rs`. Nothing announced it -- the tree simply had a
+    live mutant in tracked source, which is the one state this harness exists to
+    never produce. `KeyboardInterrupt` unwinds through every `finally` and
+    restores every backup; the default SIGTERM handler does not unwind at all.
+
+    Ctrl-C already worked for the same reason. This makes SIGTERM and SIGHUP
+    behave like it.
+    """
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
+for _sig in (signal.SIGTERM, signal.SIGHUP):
+    signal.signal(_sig, die_cleanly)
 
 
 def verdict(got: str) -> str:
