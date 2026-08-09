@@ -37,5 +37,6 @@
 // each found only by someone running `cargo doc`. Denying it fails the build.
 #![deny(rustdoc::private_intra_doc_links)]
 
+pub mod operator;
 pub mod regs;
 pub mod tables;
