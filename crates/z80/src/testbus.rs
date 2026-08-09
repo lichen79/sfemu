@@ -22,6 +22,17 @@ pub struct Mem {
     /// way. The per-T-state vector trace compares this, so the unit tests must be
     /// able to as well.
     pub writes: Vec<(u16, u8)>,
+    /// Every `read`, in the order it happened.
+    ///
+    /// Exists for one job: measuring how many bytes an instruction *fetched*, which
+    /// is the property `disasm`'s reported length has to match. The rule is that the
+    /// fetch bytes are the maximal prefix of this log that runs `pc`, `pc+1`, `pc+2`
+    /// … consecutively — every operand byte is read before any data byte, on every
+    /// page. `PC`-delta cannot substitute: a branch sets `PC` to its target and a
+    /// repeating `LDIR` rewinds it, so both would report a length the instruction
+    /// does not have. See `disasm`'s
+    /// `every_opcode_reports_the_length_the_core_consumes`.
+    pub reads: Vec<u16>,
     pub ports_out: Vec<(u16, u8)>,
     /// The port addresses `port_in` was asked for. Logged as well as `ports_out`
     /// because the address is half of what an `IN` can get wrong, and a bus that
@@ -40,6 +51,7 @@ impl Mem {
         Mem {
             ram: [0; 0x1_0000],
             writes: Vec::new(),
+            reads: Vec::new(),
             ports_out: Vec::new(),
             ports_in: Vec::new(),
             port_in_value: 0xFF,
@@ -66,6 +78,7 @@ impl Default for Mem {
 
 impl Bus for Mem {
     fn read(&mut self, addr: u16) -> u8 {
+        self.reads.push(addr);
         self.ram[usize::from(addr)]
     }
     fn write(&mut self, addr: u16, val: u8) {

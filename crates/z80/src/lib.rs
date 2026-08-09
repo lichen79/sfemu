@@ -32,6 +32,7 @@
 pub mod bus;
 pub mod cpu;
 pub mod decode;
+pub mod disasm;
 pub mod flags;
 pub mod interrupt;
 pub mod ops;
