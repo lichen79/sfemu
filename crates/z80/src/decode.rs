@@ -418,13 +418,8 @@ pub fn execute<B: Bus>(cpu: &mut Z80, bus: &mut B, op: u8) -> u32 {
         }
         0xCB => cb_page(cpu, bus),
         0xED => ed_page(cpu, bus),
-        // Only the three index prefixes are left: DD, FD, and the double-prefix
-        // forms, which Tasks 11 and 12 fill in. Until then an unimplemented
-        // opcode is a panic *in development only*: it is unreachable once the suite
-        // is green, and a silent 4-T-state NOP here would make a missing instruction
-        // look like a flag bug across a hundred vector files. Task 12 deletes this
-        // arm and lets the compiler prove the match exhaustive.
-        other => unimplemented!("base opcode {other:#04X}"),
+        0xDD => index_page(cpu, bus, false),
+        0xFD => index_page(cpu, bus, true),
     }
 }
 
@@ -683,6 +678,298 @@ pub fn ed_page<B: Bus>(cpu: &mut Z80, bus: &mut B) -> u32 {
             cpu.q = 0;
             8
         }
+    }
+}
+
+/// The `DD` and `FD` pages: 252 opcodes each.
+///
+/// A prefix is a rule for the *next* instruction, not 252 new instructions:
+/// wherever it would use `HL`, use `IX`; wherever `(HL)`, use `(IX+d)` with a
+/// signed displacement read after the opcode. `FD` is the same rule with `IY`.
+///
+/// Two rules fall out of that and are the ones a core gets wrong:
+///
+/// - `H` and `L` become `IXH` and `IXL`, so `DD 44` is `LD B,IXH` — a real
+///   instruction with a real vector file. The prefix rewrites register operands,
+///   not just memory ones.
+/// - **Except** when the other operand is `(IX+d)`: `DD 66` is `LD H,(IX+d)` with
+///   a plain `H`, because one instruction cannot use `IX` as both a pointer and a
+///   register half.
+///
+/// `EX DE,HL` is untouched — it reaches `HL` by a path the encoding does not route
+/// through this substitution. And an opcode with no `HL` in it simply costs 4 extra
+/// T-states, which is a tested path (`DD 00`), not an error: every cost on this
+/// page is `4 + the base-page cost`, confirmed per stem over all 504 files.
+///
+/// # The latch on this page
+///
+/// 81 of the 252 stems write [`Z80::wz`] and 171 leave it alone. 34 of the 81 are
+/// fallthroughs, which take the base page's rules unchanged; the 47 that belong to
+/// this page follow three rules, each measured 0-wrong over 1,000 cases per file on
+/// both prefixes:
+///
+/// | instruction | latch |
+/// |---|---|
+/// | any `(IX+d)` form — loads, **stores**, ALU, `INC`/`DEC` | the computed `IX+d` |
+/// | `ADD IX,rr` | the **old** `IX` plus one, as `ADD HL,rr` |
+/// | `EX (SP),IX` | the **new** `IX` — the word that came off the stack |
+/// | `LD (nn),IX`, `LD IX,(nn)` | `nn + 1` |
+///
+/// The stores are the trap: `LD (IX+d),r` writes a byte to memory, and every other
+/// single-byte write on the chip puts that byte in the latch's high half — see
+/// `wz_after_write`. These do not. The address wins, on all 7,000 cases of the
+/// seven store stems.
+pub fn index_page<B: Bus>(cpu: &mut Z80, bus: &mut B, use_iy: bool) -> u32 {
+    // A prefix resets `Q`, because a prefix writes no flags — see [`Z80::q`]. Every
+    // arm below overwrites it, so this line is invisible to all of them but one:
+    // `SCF`/`CCF` reached through the fallthrough, whose F3/F5 come from
+    // `A | (f & !q)`. Clearing here degrades that to `A | f`, which is what the
+    // vectors show: on `dd_37`, `dd_3f` and `fd_37` the carried-over `Q` is wrong on
+    // 239, 230 and 223 of 1,000 cases and `A | f` on none. It is the one place the
+    // prefix changes an instruction's *result* rather than only its cost.
+    cpu.q = 0;
+    let op = cpu.fetch(bus);
+
+    // A prefix restarts the rule: DD FD 21 loads IY. Re-dispatching here is what
+    // makes that fall out rather than needing a special case. `ED` is not in this
+    // list: `DD ED` is not a page switch but two wasted M1 cycles followed by the
+    // `ED` page reached through the fallthrough, which is the same thing by a
+    // shorter route.
+    match op {
+        0xDD => return 4 + index_page(cpu, bus, false),
+        0xFD => return 4 + index_page(cpu, bus, true),
+        // `DD CB` is the double-prefix page, whose operand order is unique on the
+        // chip -- displacement *before* the opcode -- so it cannot fall through to
+        // `cb_page`, which would read the displacement as its opcode. Task 12 fills
+        // it in; until then a panic, for the reason the base page's fallthrough was
+        // one: a wrong-but-plausible answer here would look like a flag bug spread
+        // across 512 vector files.
+        0xCB => unimplemented!("the DD CB / FD CB page is Task 12"),
+        _ => {}
+    }
+
+    let idx = if use_iy { cpu.iy } else { cpu.ix };
+
+    /// Reads register `n` with `H`/`L` rewritten to the index halves.
+    ///
+    /// Index 6 never reaches here: every displaced form is handled by its own
+    /// branch, because it must read the displacement byte first.
+    macro_rules! ireg {
+        ($n:expr) => {
+            match $n {
+                4 => (idx >> 8) as u8,
+                5 => idx as u8,
+                n => reg(cpu, bus, n),
+            }
+        };
+    }
+
+    /// Reads the displacement and returns the address it points at.
+    macro_rules! displaced {
+        () => {{
+            let d = cpu.disp(bus);
+            idx.wrapping_add(d as u16)
+        }};
+    }
+
+    match op {
+        // The 8-bit loads. Destination 6 or source 6 means displaced memory, and
+        // that form suppresses the H/L rewrite on the other side. 0x76 is HALT,
+        // which sits in the middle of the block and falls through.
+        0x40..=0x7F if op != 0x76 => {
+            let (dst, src) = ((op >> 3) & 7, op & 7);
+            if dst == 6 {
+                let addr = displaced!();
+                // Plain `reg`: the source keeps H and L, not IXH and IXL.
+                let v = reg(cpu, bus, src);
+                bus.write(addr, v);
+                // The address, not `wz_after_write`'s byte-in-the-high-half rule
+                // that every other single-byte write on the chip follows.
+                cpu.wz = addr;
+                cpu.q = 0;
+                19
+            } else if src == 6 {
+                let addr = displaced!();
+                let v = bus.read(addr);
+                // Plain `set_reg`, for the same reason.
+                set_reg(cpu, bus, dst, v);
+                cpu.wz = addr;
+                cpu.q = 0;
+                19
+            } else {
+                let v = ireg!(src);
+                match dst {
+                    4 => set_index(cpu, use_iy, (idx & 0x00FF) | u16::from(v) << 8),
+                    5 => set_index(cpu, use_iy, (idx & 0xFF00) | u16::from(v)),
+                    n => set_reg(cpu, bus, n, v),
+                }
+                cpu.q = 0;
+                8
+            }
+        }
+        // LD (IX+d),n -- two operands, and the displacement comes first.
+        0x36 => {
+            let addr = displaced!();
+            let n = cpu.imm(bus);
+            bus.write(addr, n);
+            cpu.wz = addr;
+            cpu.q = 0;
+            19
+        }
+        // LD IXH,n and LD IXL,n. Without these the halves would fall through to the
+        // base page and load plain `H`/`L` -- and, `LD r,n` writing no flags and no
+        // latch, the only visible difference would be which register moved.
+        0x26 | 0x2E => {
+            let n = cpu.imm(bus);
+            let v = if op == 0x26 {
+                (idx & 0x00FF) | u16::from(n) << 8
+            } else {
+                (idx & 0xFF00) | u16::from(n)
+            };
+            set_index(cpu, use_iy, v);
+            cpu.q = 0;
+            11
+        }
+        // The 8-bit ALU against a register half or displaced memory.
+        0x80..=0xBF => {
+            let src = op & 7;
+            let (v, t) = if src == 6 {
+                let addr = displaced!();
+                cpu.wz = addr;
+                (bus.read(addr), 19)
+            } else {
+                (ireg!(src), 8)
+            };
+            alu_op(cpu, (op >> 3) & 7, v);
+            t
+        }
+        // INC/DEC of displaced memory: a read-modify-write, carry preserved.
+        0x34 | 0x35 => {
+            let addr = displaced!();
+            let v = bus.read(addr);
+            let r = if op == 0x34 {
+                alu::inc8(cpu, v)
+            } else {
+                alu::dec8(cpu, v)
+            };
+            bus.write(addr, r);
+            cpu.wz = addr;
+            23
+        }
+        // INC/DEC of a half. `alu::inc8` sets Q; the latch is untouched.
+        0x24 | 0x25 | 0x2C | 0x2D => {
+            let high = op < 0x2C;
+            let v = if high { (idx >> 8) as u8 } else { idx as u8 };
+            let r = if op & 1 == 0 {
+                alu::inc8(cpu, v)
+            } else {
+                alu::dec8(cpu, v)
+            };
+            set_index(
+                cpu,
+                use_iy,
+                if high {
+                    (idx & 0x00FF) | u16::from(r) << 8
+                } else {
+                    (idx & 0xFF00) | u16::from(r)
+                },
+            );
+            8
+        }
+        // The 16-bit forms: ADD IX,rr, with rr = 2 meaning IX itself rather than HL.
+        0x09 | 0x19 | 0x29 | 0x39 => {
+            let which = (op >> 4) & 3;
+            let operand = if which == 2 { idx } else { rp(cpu, which) };
+            let r = alu::add16(cpu, idx, operand);
+            set_index(cpu, use_iy, r);
+            // The old index plus one, as on the base page: the latch follows the
+            // addend into the ALU rather than the sum out of it.
+            cpu.wz = idx.wrapping_add(1);
+            15
+        }
+        0x21 => {
+            let nn = cpu.imm16(bus);
+            set_index(cpu, use_iy, nn);
+            cpu.q = 0;
+            14
+        }
+        0x22 => {
+            let nn = cpu.imm16(bus);
+            bus.write(nn, idx as u8);
+            bus.write(nn.wrapping_add(1), (idx >> 8) as u8);
+            cpu.wz = nn.wrapping_add(1);
+            cpu.q = 0;
+            20
+        }
+        0x2A => {
+            let nn = cpu.imm16(bus);
+            let lo = bus.read(nn);
+            let hi = bus.read(nn.wrapping_add(1));
+            set_index(cpu, use_iy, u16::from(hi) << 8 | u16::from(lo));
+            cpu.wz = nn.wrapping_add(1);
+            cpu.q = 0;
+            20
+        }
+        0x23 => {
+            set_index(cpu, use_iy, idx.wrapping_add(1));
+            cpu.q = 0;
+            10
+        }
+        0x2B => {
+            set_index(cpu, use_iy, idx.wrapping_sub(1));
+            cpu.q = 0;
+            10
+        }
+        0xE1 => {
+            let v = load::pop(cpu, bus);
+            set_index(cpu, use_iy, v);
+            cpu.q = 0;
+            14
+        }
+        0xE5 => {
+            load::push(cpu, bus, idx);
+            cpu.q = 0;
+            15
+        }
+        0xE3 => {
+            let v = load::pop(cpu, bus);
+            load::push(cpu, bus, idx);
+            set_index(cpu, use_iy, v);
+            // The *new* index -- the word that came off the stack. The one latch rule
+            // on the page that reads a result rather than an operand.
+            cpu.wz = v;
+            cpu.q = 0;
+            23
+        }
+        0xE9 => {
+            // JP (IX). No operand is fetched, so nothing reaches the latch -- as on
+            // the base page's `JP (HL)`.
+            cpu.pc = idx;
+            cpu.q = 0;
+            8
+        }
+        0xF9 => {
+            cpu.sp = idx;
+            cpu.q = 0;
+            10
+        }
+        // Everything else: the prefix cost 4 T-states and changed nothing. A real,
+        // tested path -- `dd_00` exists, and so does `dd_76`, which is HALT after a
+        // wasted prefix -- not an error case.
+        _ => 4 + execute(cpu, bus, op),
+    }
+}
+
+/// Writes `v` to `IX` or `IY`.
+///
+/// A function rather than a `&mut u16` taken at the top of [`index_page`]: the
+/// borrow would conflict with every `cpu` use in between, and threading the choice
+/// through as a bool keeps the two prefixes provably one code path.
+fn set_index(cpu: &mut Z80, use_iy: bool, v: u16) {
+    if use_iy {
+        cpu.iy = v;
+    } else {
+        cpu.ix = v;
     }
 }
 
@@ -2004,5 +2291,448 @@ mod tests {
             assert_eq!(c.q, 0, "ED {op:#04X}");
             assert_eq!(c.wz, SENTINEL, "ED {op:#04X}");
         }
+    }
+
+    /// `DD` makes `H` and `L` the halves of `IX`.
+    ///
+    /// `DD 44` is `LD B,IXH`. The prefix rewrites *register* operands, not only
+    /// memory ones — the part a core that treats `DD` as "add a displacement"
+    /// misses entirely. `H` is loaded with a third value so that "took IXH",
+    /// "took H" and "took IXL" are three distinguishable outcomes.
+    #[test]
+    fn a_dd_prefix_turns_h_and_l_into_the_halves_of_ix() {
+        let mut c = Z80::new();
+        c.ix = 0x1234;
+        c.h = 0x99;
+        c.l = 0x88;
+        assert_eq!(run(&mut c, &[0xDD, 0x44]), 8); // LD B,IXH
+        assert_eq!(c.b, 0x12, "IXH, not H and not IXL");
+
+        let mut c = Z80::new();
+        c.iy = 0x1234;
+        c.l = 0x88;
+        run(&mut c, &[0xFD, 0x4D]); // LD C,IYL
+        assert_eq!(c.c, 0x34, "and FD reaches IY's halves");
+
+        // Both halves at once: LD IXH,IXL leaves plain HL alone entirely.
+        let mut c = Z80::new();
+        c.ix = 0x1234;
+        c.h = 0x99;
+        c.l = 0x88;
+        run(&mut c, &[0xDD, 0x65]); // LD IXH,IXL
+        assert_eq!(c.ix, 0x3434, "the low half copied into the high one");
+        assert_eq!((c.h, c.l), (0x99, 0x88), "and HL untouched");
+    }
+
+    /// But a displaced-memory operand suppresses the rewrite on the other side.
+    ///
+    /// `DD 66` is `LD H,(IX+d)` — plain `H`, not `IXH`. One instruction cannot use
+    /// `IX` as both a pointer and a register half, so the memory form wins and the
+    /// register stays unprefixed. A core that rewrote both would load `IXH` here and
+    /// pass every non-displaced test.
+    #[test]
+    fn a_displaced_operand_leaves_the_other_register_unprefixed() {
+        let mut c = Z80::new();
+        c.ix = 0x2000;
+        c.h = 0x11;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0x66, 0x05]); // LD H,(IX+5)
+        m.ram[0x2005] = 0x7E;
+        assert_eq!(c.step(&mut m), 19);
+        assert_eq!(c.h, 0x7E, "H, not IXH");
+        assert_eq!(c.ix, 0x2000, "and IX is untouched");
+
+        // And the store direction: LD (IX+d),H writes plain H.
+        let mut c = Z80::new();
+        c.ix = 0x2000;
+        c.h = 0x42;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0x74, 0x03]);
+        assert_eq!(c.step(&mut m), 19);
+        assert_eq!(m.ram[0x2003], 0x42, "H, not IXH");
+    }
+
+    /// The displacement is **signed**.
+    ///
+    /// `0xFB` is −5, so `(IX-5)`. An unsigned read would address `IX+251` — off by
+    /// 256, which lands inside a nearby structure rather than crashing, and is
+    /// therefore the kind of bug that shows up as garbled sprites. Both candidate
+    /// addresses are seeded, so a wrong core reads a plausible byte rather than a
+    /// zero.
+    #[test]
+    fn the_displacement_is_a_signed_byte() {
+        let mut c = Z80::new();
+        c.ix = 0x2010;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0x7E, 0xFB]); // LD A,(IX-5)
+        m.ram[0x200B] = 0xAB;
+        m.ram[0x210B] = 0xCD; // where an unsigned read would land
+        assert_eq!(c.step(&mut m), 19);
+        assert_eq!(c.a, 0xAB, "IX-5, not IX+251");
+    }
+
+    /// `EX DE,HL` under a prefix still exchanges `HL`.
+    ///
+    /// The exception that shows the rule is about encoding rather than mnemonics:
+    /// `DD EB` reaches `HL` by a path the prefix does not intercept. A core that
+    /// substituted on the mnemonic would exchange `DE` with `IX` and be wrong in a
+    /// way no non-prefixed test can see.
+    #[test]
+    fn ex_de_hl_under_a_prefix_still_touches_hl() {
+        let mut c = Z80::new();
+        c.set_de(0xAAAA);
+        c.set_hl(0xBBBB);
+        c.ix = 0xCCCC;
+        run(&mut c, &[0xDD, 0xEB]);
+        assert_eq!(c.de(), 0xBBBB);
+        assert_eq!(c.hl(), 0xAAAA);
+        assert_eq!(c.ix, 0xCCCC, "IX is not involved");
+    }
+
+    /// A prefix on an opcode with no `HL` costs 4 extra T-states and does nothing.
+    ///
+    /// `DD 00` is a tested opcode with its own vector file, not an error case. So the
+    /// fallthrough is a real code path and must charge the prefix's M1 — which it
+    /// does by construction, since the prefix fetch already bumped `R`.
+    ///
+    /// `DD 76` is the same path reached the other way: `HALT` sits inside the
+    /// `0x40..=0x7F` load block, so only the `op != 0x76` guard sends it here. Its
+    /// 8 T-states are measured — `dd_76` shows 8 on all 1,000 cases — and without
+    /// the guard it would decode as `LD (IX+d),(IX+d)` and read a displacement byte
+    /// that is not there, advancing `PC` one too far.
+    #[test]
+    fn a_prefix_on_an_unaffected_opcode_only_costs_time() {
+        let mut c = Z80::new();
+        c.r = 0;
+        assert_eq!(run(&mut c, &[0xDD, 0x00]), 8, "4 for the prefix, 4 for NOP");
+        assert_eq!(c.pc, 0x102);
+        assert_eq!(c.r, 2, "two M1 cycles, so R advanced twice");
+
+        let mut c = Z80::new();
+        c.r = 0;
+        assert_eq!(run(&mut c, &[0xDD, 0x76]), 8, "HALT, after a wasted prefix");
+        assert_eq!(
+            c.pc, 0x102,
+            "past the prefix and the opcode, and no further"
+        );
+        assert!(c.halted);
+        assert_eq!(c.r, 2);
+    }
+
+    /// `INC (IX+d)` reads, modifies, writes — and preserves carry, as `INC` does.
+    #[test]
+    fn inc_of_displaced_memory_is_a_read_modify_write_at_twenty_three_tstates() {
+        let mut c = Z80::new();
+        c.ix = 0x2000;
+        c.f = C;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0x34, 0x02]);
+        m.ram[0x2002] = 0x7F;
+        assert_eq!(c.step(&mut m), 23);
+        assert_eq!(m.ram[0x2002], 0x80);
+        assert_eq!(c.f & PV, PV, "0x7F to 0x80 overflows");
+        assert_eq!(c.f & C, C, "and INC never touches carry");
+    }
+
+    /// `INC IXH` moves one half and leaves the other, and both `HL` bytes, alone.
+    #[test]
+    fn inc_of_an_index_half_moves_only_that_half() {
+        let mut c = Z80::new();
+        c.ix = 0x12FF;
+        c.h = 0x77;
+        c.l = 0x88;
+        assert_eq!(run(&mut c, &[0xDD, 0x24]), 8); // INC IXH
+        assert_eq!(c.ix, 0x13FF, "the low half does not carry into anything");
+        assert_eq!((c.h, c.l), (0x77, 0x88));
+
+        // And the low half wraps within itself rather than into the high one.
+        let mut c = Z80::new();
+        c.ix = 0x12FF;
+        run(&mut c, &[0xDD, 0x2C]); // INC IXL
+        assert_eq!(c.ix, 0x1200, "0xFF + 1 wraps to 0x00, no carry out");
+    }
+
+    /// `ADD IX,IX` doubles it, and `ADD IX,rr` uses the prefixed register.
+    #[test]
+    fn add_ix_uses_ix_on_both_sides_where_the_encoding_says_hl() {
+        let mut c = Z80::new();
+        c.ix = 0x1111;
+        c.set_hl(0x9999);
+        assert_eq!(run(&mut c, &[0xDD, 0x29]), 15); // ADD IX,IX
+        assert_eq!(c.ix, 0x2222, "IX + IX, not IX + HL");
+        assert_eq!(c.hl(), 0x9999);
+
+        let mut c = Z80::new();
+        c.ix = 0x0001;
+        c.set_bc(0x0002);
+        run(&mut c, &[0xDD, 0x09]); // ADD IX,BC
+        assert_eq!(
+            c.ix, 0x0003,
+            "BC stays BC; only the destination is prefixed"
+        );
+    }
+
+    /// `LD SP,IX` and `JP (IX)` and `PUSH IX`.
+    ///
+    /// Three instructions that read `HL` in the unprefixed encoding and must all
+    /// follow the substitution. `LD SP,HL` is the one most often missed, because it
+    /// is the only 16-bit register-to-register move on the chip.
+    #[test]
+    fn the_sixteen_bit_hl_instructions_all_substitute() {
+        let mut c = Z80::new();
+        c.ix = 0x1234;
+        c.set_hl(0x9999);
+        assert_eq!(run(&mut c, &[0xDD, 0xF9]), 10); // LD SP,IX
+        assert_eq!(c.sp, 0x1234);
+
+        let mut c = Z80::new();
+        c.ix = 0x4321;
+        c.set_hl(0x9999);
+        assert_eq!(run(&mut c, &[0xDD, 0xE9]), 8); // JP (IX)
+        assert_eq!(c.pc, 0x4321);
+
+        let mut c = Z80::new();
+        c.sp = 0x3000;
+        c.ix = 0xBEEF;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0xE5]); // PUSH IX
+        assert_eq!(c.step(&mut m), 15);
+        assert_eq!(c.sp, 0x2FFE);
+        assert_eq!(m.ram[0x2FFF], 0xBE, "the high byte goes first");
+        assert_eq!(m.ram[0x2FFE], 0xEF);
+    }
+
+    /// `LD IXH,n` and `LD IXL,n` write a half — the arm the plan omits.
+    ///
+    /// Without it these fall through to the base page and load plain `H`/`L`. Since
+    /// `LD r,n` writes no flags and no latch, *which register moved* is the only
+    /// visible difference, so both halves and both plain registers are seeded
+    /// distinctly. The cost is 11, not the base page's 7: `dd_26` shows 11 on all
+    /// 1,000 cases.
+    #[test]
+    fn a_prefixed_immediate_load_reaches_an_index_half() {
+        let mut c = Z80::new();
+        c.ix = 0x1234;
+        c.h = 0x77;
+        c.l = 0x88;
+        assert_eq!(run(&mut c, &[0xDD, 0x26, 0xAB]), 11); // LD IXH,0xAB
+        assert_eq!(c.ix, 0xAB34, "the high half only");
+        assert_eq!((c.h, c.l), (0x77, 0x88), "HL untouched");
+
+        let mut c = Z80::new();
+        c.iy = 0x1234;
+        c.l = 0x88;
+        assert_eq!(run(&mut c, &[0xFD, 0x2E, 0xCD]), 11); // LD IYL,0xCD
+        assert_eq!(c.iy, 0x12CD);
+        assert_eq!(c.l, 0x88);
+    }
+
+    /// A prefix followed by another prefix: the second one wins.
+    ///
+    /// `DD FD 21 nn nn` loads `IY`, not `IX`. Each prefix restarts the rule, and the
+    /// natural implementation — re-dispatching on the prefix — gets this for free;
+    /// a match arm that assumed the next byte is an opcode does not.
+    #[test]
+    fn the_last_prefix_before_the_opcode_is_the_one_that_applies() {
+        let mut c = Z80::new();
+        c.r = 0;
+        let t = run(&mut c, &[0xDD, 0xFD, 0x21, 0x34, 0x12]);
+        assert_eq!(c.iy, 0x1234, "the FD won");
+        assert_eq!(c.ix, 0x0000, "and the DD did nothing but cost time");
+        assert_eq!(t, 18, "4 for the discarded DD, then a 14-T-state LD IY,nn");
+        assert_eq!(c.r, 3, "three M1 cycles: DD, FD, 21");
+    }
+
+    /// Every displaced form latches the address it computed — the stores included.
+    ///
+    /// The stores are the trap. `LD (IX+d),r` writes one byte to memory, and every
+    /// other single-byte write on the chip puts that byte into the latch's high half
+    /// ([`wz_after_write`]); these put the address there instead. The written byte
+    /// and the address's high byte are chosen to differ, so the two rules give
+    /// different answers — with a matching pair they are indistinguishable, which is
+    /// how a core ships this bug.
+    #[test]
+    fn a_displaced_store_latches_its_address_not_the_byte_it_wrote() {
+        let mut c = Z80::new();
+        c.ix = 0x2040;
+        c.b = 0x99; // differs from 0x20, so the two candidate rules disagree
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0x70, 0x02]); // LD (IX+2),B
+        assert_eq!(c.step(&mut m), 19);
+        assert_eq!(m.ram[0x2042], 0x99);
+        assert_eq!(c.wz, 0x2042, "the address, not 0x9943");
+
+        // The load direction, the immediate form, and the read-modify-write form.
+        let mut c = Z80::new();
+        c.ix = 0x2040;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0x7E, 0x02]); // LD A,(IX+2)
+        c.step(&mut m);
+        assert_eq!(c.wz, 0x2042);
+
+        let mut c = Z80::new();
+        c.ix = 0x2040;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0x36, 0x02, 0x99]); // LD (IX+2),0x99
+        c.step(&mut m);
+        assert_eq!(c.wz, 0x2042, "the address, not 0x9943");
+
+        let mut c = Z80::new();
+        c.ix = 0x2040;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0x86, 0x02]); // ADD A,(IX+2)
+        c.step(&mut m);
+        assert_eq!(c.wz, 0x2042);
+
+        let mut c = Z80::new();
+        c.ix = 0x2040;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0x35, 0x02]); // DEC (IX+2)
+        c.step(&mut m);
+        assert_eq!(c.wz, 0x2042);
+    }
+
+    /// The three 16-bit latch rules, each of which reads a different thing.
+    ///
+    /// `ADD IX,rr` takes the **old** index plus one, so the sum must differ from the
+    /// operand. `EX (SP),IX` takes the **new** index — the only rule on the page that
+    /// reads a result rather than an operand — so the two indices must differ.
+    /// `LD (nn),IX` takes `nn + 1` rather than the base page's byte-in-the-high-half
+    /// rule, so the stored bytes must differ from `nn`'s.
+    #[test]
+    fn the_sixteen_bit_index_forms_each_latch_a_different_operand() {
+        let mut c = Z80::new();
+        c.ix = 0x2800;
+        c.set_bc(0x0100);
+        c.f = 0;
+        assert_eq!(run(&mut c, &[0xDD, 0x09]), 15); // ADD IX,BC
+        assert_eq!(c.ix, 0x2900);
+        assert_eq!(c.wz, 0x2801, "the old IX plus one, not the sum plus one");
+
+        let mut c = Z80::new();
+        c.sp = 0x3000;
+        c.ix = 0x1111;
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0xE3]); // EX (SP),IX
+        m.ram[0x3000] = 0x22;
+        m.ram[0x3001] = 0x44;
+        assert_eq!(c.step(&mut m), 23);
+        assert_eq!(c.ix, 0x4422);
+        assert_eq!(m.ram[0x3001], 0x11, "the old high byte goes back first");
+        assert_eq!(m.ram[0x3000], 0x11);
+        assert_eq!(c.wz, 0x4422, "the new IX, not the old one");
+
+        let mut c = Z80::new();
+        c.ix = 0x9988; // both bytes differ from 0x30 and 0x00
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0x22, 0x00, 0x30]); // LD (0x3000),IX
+        assert_eq!(c.step(&mut m), 20);
+        assert_eq!((m.ram[0x3000], m.ram[0x3001]), (0x88, 0x99));
+        assert_eq!(c.wz, 0x3001, "nn + 1: not nn + 2, and not 0x9901");
+
+        let mut c = Z80::new();
+        c.pc = 0x100;
+        let mut m = Mem::at(0x100, &[0xDD, 0x2A, 0x00, 0x30]); // LD IX,(0x3000)
+        m.ram[0x3000] = 0x88;
+        m.ram[0x3001] = 0x99;
+        assert_eq!(c.step(&mut m), 20);
+        assert_eq!(c.ix, 0x9988);
+        assert_eq!(c.wz, 0x3001);
+    }
+
+    /// The 171 stems that leave the latch alone, spot-checked across its shapes.
+    ///
+    /// `wz` persists between instructions — `BIT b,(HL)` reads it — so an arm that
+    /// writes it spuriously is a bug that surfaces two instructions later. The
+    /// sentinel makes "left alone" a positive assertion rather than the absence of
+    /// one, and these five are the forms most likely to write it by analogy with a
+    /// neighbour that does.
+    #[test]
+    fn the_register_only_index_forms_write_no_latch() {
+        for (prog, what) in [
+            (&[0xDD, 0x44u8] as &[u8], "LD B,IXH"),
+            (&[0xDD, 0x21, 0x34, 0x12], "LD IX,nn"),
+            (&[0xDD, 0x23], "INC IX"),
+            (&[0xDD, 0x24], "INC IXH"),
+            (&[0xDD, 0xE9], "JP (IX)"),
+            (&[0xDD, 0xF9], "LD SP,IX"),
+            (&[0xDD, 0xE5], "PUSH IX"),
+            (&[0xDD, 0x00], "NOP after a prefix"),
+        ] {
+            let mut c = Z80::new();
+            c.sp = 0x3000;
+            c.ix = 0x2040;
+            c.wz = SENTINEL;
+            run(&mut c, prog);
+            assert_eq!(c.wz, SENTINEL, "{what} writes no latch");
+        }
+    }
+
+    /// `Q` after an index instruction: the flag writers set it, the movers clear it.
+    ///
+    /// Measured over all 252 stems of both prefixes: `q == f` on exactly the 100
+    /// flag-writing stems and `q == 0` on the other 152, with no stem mixed. A core
+    /// that set `q = 1` on the writers — the shape the plan's text suggests — would
+    /// agree with the suite only where `f` happens to be 1, and `Q` is what the next
+    /// `SCF`/`CCF` reads, so the error surfaces on a later instruction.
+    #[test]
+    fn q_holds_the_flags_an_index_instruction_wrote_or_zero() {
+        // A flag writer: ADD IX,BC writes C, H, F3 and F5.
+        let mut c = Z80::new();
+        c.ix = 0x28FF;
+        c.set_bc(0x0001);
+        c.f = 0;
+        run(&mut c, &[0xDD, 0x09]);
+        assert_ne!(c.f, 0, "ADD IX,rr wrote flags");
+        assert_eq!(c.q, c.f, "so Q holds them -- a value, not a 1");
+
+        // And a mover: LD B,IXH writes none.
+        let mut c = Z80::new();
+        c.ix = 0x1234;
+        c.f = 0x5A;
+        run(&mut c, &[0xDD, 0x44]);
+        assert_eq!(c.f, 0x5A, "no flags written");
+        assert_eq!(c.q, 0);
+    }
+
+    /// A prefix resets `Q`, which changes what the `SCF` behind it computes.
+    ///
+    /// The only place on the page where the prefix alters a *result* rather than
+    /// only a cost. `SCF` takes F3/F5 from `A | (f & !q)` — see [`scf_ccf`] — so a
+    /// prefix that left `Q` alone would suppress the `f` term. The setup makes the
+    /// two answers differ: `f`'s F5 and F3 are set, `A`'s are clear, and `q == f`,
+    /// as it would be after any flag-writing instruction.
+    ///
+    /// Measured: on `dd_37`, `dd_3f` and `fd_37` a carried-over `Q` is wrong on 239,
+    /// 230 and 223 of 1,000 cases, and clearing it on none. The unprefixed `37` and
+    /// `3f` are unaffected either way, which is why 2,000 green cases on the base
+    /// page said nothing about this.
+    #[test]
+    fn a_prefix_resets_q_so_the_scf_behind_it_sees_no_previous_writer() {
+        for (prog, what) in [
+            (&[0xDD, 0x37u8] as &[u8], "SCF"),
+            (&[0xDD, 0x3F], "CCF"),
+            (&[0xFD, 0x37], "SCF under FD"),
+        ] {
+            let mut c = Z80::new();
+            c.a = 0x00; // contributes neither undocumented bit
+            c.f = F5 | F3;
+            c.q = c.f; // as after any flag writer
+            run(&mut c, prog);
+            assert_eq!(
+                c.f & (F5 | F3),
+                F5 | F3,
+                "{what}: the prefix cleared Q, so F's own bits still count"
+            );
+        }
+
+        // Unprefixed, the same setup gives the opposite answer -- which is what makes
+        // the assertion above a distinction rather than a restatement.
+        let mut c = Z80::new();
+        c.a = 0x00;
+        c.f = F5 | F3;
+        c.q = c.f;
+        run(&mut c, &[0x37]);
+        assert_eq!(c.f & (F5 | F3), 0, "no prefix, so Q still masks F");
     }
 }

@@ -16,9 +16,9 @@
 
 use std::path::PathBuf;
 
-/// The opcodes the core implements so far: as of Task 10, the 252 non-prefix
-/// base-page opcodes, all 256 of the `CB` page, and the 80 `ED` opcodes that have
-/// a file.
+/// The opcodes the core implements so far: as of Task 11, the 252 non-prefix
+/// base-page opcodes, all 256 of the `CB` page, the 80 `ED` opcodes that have a
+/// file, and the 252 plain stems of each index page.
 ///
 /// Kept as a literal list rather than derived from the decoder: a default that
 /// asked the decoder what it handled would report "all green" on exactly the
@@ -77,18 +77,44 @@ fn cb_stems() -> Vec<String> {
     (0..=255u8).map(|op| format!("cb_{op:02x}")).collect()
 }
 
+/// The 252 plain `dd_*` stems and the 252 `fd_*` ones.
+///
+/// Generated with one exclusion, and the exclusion is a rule rather than a list of
+/// gaps: a prefix byte is not an opcode, so `dd_cb`, `dd_dd`, `dd_ed` and `dd_fd`
+/// have no file of their own — the first is the double-prefix page, whose files are
+/// named `dd_cb____NN`, and the other three restart the prefix. That is the same
+/// reason [`DEFAULT`] omits those four stems from the base page.
+///
+/// So this page can be generated where [`ED`] could not: 252 of its 256 encodings
+/// have a file, against 80 of 256 there. Confirmed against the directory — 252
+/// two-digit stems per prefix, and the four names above are the only ones missing.
+fn index_stems() -> Vec<String> {
+    let mut v = Vec::with_capacity(504);
+    for prefix in ["dd", "fd"] {
+        for op in 0..=255u8 {
+            if matches!(op, 0xCB | 0xDD | 0xED | 0xFD) {
+                continue;
+            }
+            v.push(format!("{prefix}_{op:02x}"));
+        }
+    }
+    v
+}
+
 fn main() {
     // Anchored to the manifest so the tool works from any directory, matching
     // `fetchz80`. A relative path would silently look in the wrong place.
     let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/z80"));
     let args: Vec<String> = std::env::args().skip(1).collect();
     let generated = cb_stems();
+    let index = index_stems();
     let stems: Vec<&str> = if args.is_empty() {
         DEFAULT
             .iter()
             .copied()
             .chain(generated.iter().map(String::as_str))
             .chain(ED.iter().copied())
+            .chain(index.iter().map(String::as_str))
             .collect()
     } else {
         args.iter().map(String::as_str).collect()

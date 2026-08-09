@@ -114,6 +114,14 @@ pub struct Z80 {
     /// instruction did *not* write, which is `f & !q`. A one-bit version of this
     /// field cannot express that, and treating it as one is why 995 of `3f.json`'s
     /// 1,000 cases failed before it was fixed.
+    ///
+    /// **A prefix resets it**, because a prefix writes no flags. So `DD 37` and `37`
+    /// are the same `SCF` reached with a different `Q`, and give different F3/F5 for
+    /// the same `A` and `F`: on `dd_37`, `dd_3f` and `fd_37`, carrying `Q` across the
+    /// prefix is wrong on 239, 230 and 223 of 1,000 cases. The prefix pages'
+    /// dispatcher clears it on entry for that reason, and it is the only way a
+    /// prefix changes what the instruction behind it computes rather than only what
+    /// it costs.
     pub q: u8,
     /// **1** after `LD A,I` or `LD A,R`, and zero after anything else.
     ///
@@ -185,6 +193,19 @@ impl Z80 {
         let v = bus.read(self.pc);
         self.pc = self.pc.wrapping_add(1);
         v
+    }
+
+    /// Reads the signed displacement byte of an `(IX+d)` operand.
+    ///
+    /// Signed: `0xFB` is −5, giving `IX-5`. Reading it unsigned would address
+    /// `IX+251` — off by 256, which lands in whatever is nearby rather than
+    /// faulting, and shows up as garbled graphics rather than a crash.
+    ///
+    /// This is an operand read, not an M1 cycle, so `R` is **not** bumped — which
+    /// is the whole reason it delegates to [`Self::imm`] rather than
+    /// [`Self::fetch`].
+    pub fn disp<B: Bus>(&mut self, bus: &mut B) -> i8 {
+        self.imm(bus) as i8
     }
 
     /// Reads a little-endian 16-bit operand.
