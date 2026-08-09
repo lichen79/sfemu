@@ -676,9 +676,20 @@ mod tests {
 
     /// A CPU whose every pointer aims far away from the program.
     ///
-    /// Required by [`fetched`]: with `HL`, `SP`, `BC`, `DE` and both index registers
-    /// pointing near 0x4000 and 0x3000, and every operand byte 0x40, no data access
-    /// can land at `pc + n` and be mistaken for a fetch.
+    /// Load-bearing for [`fetched`], and measured to be: aiming any one of `SP`, `HL`,
+    /// `BC` or `DE` at 0x0101 instead makes
+    /// `every_opcode_reports_the_length_the_core_consumes` fail, because a data read
+    /// landing at `pc + n` extends the consecutive run and is counted as a fetch.
+    ///
+    /// The index registers need the same care but not the same value. A displaced
+    /// access goes to `ix + d`, and `d` is the filler byte, so it is `ix + 0x40` that
+    /// must miss the program: `ix = 0x00C3` — putting `ix + 0x40` at `pc + 3`, one
+    /// past a 3-byte `DD` instruction — fails on `dd 34` (`inc (ix+64)`) while
+    /// `ix = 0x0100` passes. 0x4000 keeps both the base and the displaced address
+    /// clear.
+    ///
+    /// The `HALT` case needs no arrangement: it reads nothing after its opcode, so the
+    /// run is 1 whatever the registers hold.
     fn far_from(pc: u16) -> Z80 {
         let mut c = Z80::new();
         c.pc = pc;
@@ -699,11 +710,16 @@ mod tests {
     /// a wrong first one, and it is the *rare* encodings that get lengths wrong, so a
     /// hand-picked list is exactly the wrong instrument.
     ///
-    /// The filler byte is 0x40 for a reason: every operand it forms points at
-    /// 0x4040-ish, far from the program, so [`fetched`] cannot mistake a data read
-    /// for an operand read. It also makes `B` non-zero, so `DJNZ` takes its branch,
-    /// and `BC` non-zero, so the repeating block forms repeat — both being the arms
-    /// with the unusual `PC`.
+    /// The filler byte's *value* is not load-bearing — 0x00, 0x01 and 0xFF all pass —
+    /// and saying otherwise would credit this test with a guard it does not have. What
+    /// matters is only that the filler and [`far_from`]'s index registers do not
+    /// combine to aim `ix + d` back at the program; see [`far_from`].
+    ///
+    /// Nor does this test need `DJNZ` to branch or `LDIR` to repeat: `B = 0` wraps to
+    /// 0xFF and branches anyway, and more to the point [`fetched`] never looks at `PC`,
+    /// so where the instruction *goes* is irrelevant to what it *read*. That
+    /// independence is the method's whole advantage over `PC`-delta, and it is why the
+    /// branch and repeat arms come along for free rather than needing a fixture.
     #[test]
     fn every_opcode_reports_the_length_the_core_consumes() {
         const F: u8 = 0x40;
@@ -731,6 +747,51 @@ mod tests {
             }
         }
         assert_eq!(checked, 1280, "five pages of 256");
+    }
+
+    /// [`fetched`]'s premise, stated as an assertion rather than left implicit.
+    ///
+    /// The read log measures a *consecutive run* from `pc`, so it is only a length if
+    /// no data access lands at the run's end. Every pointer in [`far_from`] therefore
+    /// has to miss the program — and one of them, the index pair, misses it only in
+    /// combination with the filler byte, because a displaced access goes to `ix + d`.
+    ///
+    /// Without this test the arrangement is a comment: moving `ix` to 0x0100 breaks
+    /// nothing (the displacement carries the access clear), so a later edit could set
+    /// `ix = 0x00C3` and turn the 1,280-case test into one that measures 4 where the
+    /// core consumed 3, on `dd 34` alone. This asserts the whole premise directly:
+    /// every read the core makes is either inside the instruction or well away from it.
+    #[test]
+    fn no_data_access_can_be_mistaken_for_a_fetch() {
+        const F: u8 = 0x40;
+        for op in 0..=255u8 {
+            for bytes in [
+                &[op, F, F, F, F][..],
+                &[0xED, op, F, F][..],
+                &[0xDD, op, F, F, F][..],
+                &[0xFD, op, F, F, F][..],
+                &[0xDD, 0xCB, F, op][..],
+            ] {
+                let mut m = Mem::at(0x100, bytes);
+                let (_, len) = disasm(|a| m.ram[usize::from(a)], 0x100);
+                let mut c = far_from(0x100);
+                c.step(&mut m);
+                // Reads past the fetch run are data. None may touch the program, which
+                // is what makes the run's end unambiguous. 0x110 is well past the
+                // longest program here.
+                for &a in m.reads.iter().skip(usize::from(len)) {
+                    assert!(
+                        !(0x0F0..=0x110).contains(&a),
+                        "{bytes:02X?} read data at ${a:04x}, inside the program: \
+                         the fetch run's end is no longer measurable"
+                    );
+                }
+                // And the run itself must be exactly the instruction, not a prefix of
+                // it: a short instruction followed by a data read at `pc + len` would
+                // pass the loop above only because the run swallowed the data byte.
+                assert_eq!(len, fetched(&m, 0x100), "on {bytes:02X?}");
+            }
+        }
     }
 
     /// The same, for `FD`, which shares its code path with `DD` through one argument.
