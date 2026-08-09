@@ -98,6 +98,30 @@ power tables, with the OPM's own LFO, noise and DAC round-trip.
   64 clocks per sample was written and **verified to produce a timer-A IRQ and to
   clear it on a `0x14` bit-4 write** (`irq=1 status=01` → `irq=0 status=00`).
 
+- **The lazy `prepare()` gate is semantics, not an optimisation** — measured, and
+  the one finding here that would have produced a quietly wrong core. ymfm calls
+  `prepare()` only when `m_modified_channels != 0` or every 4,096 samples
+  (`ymfm_fm.ipp:1287`), and `fm_operator::prepare` *consumes* the CSM key-on flag
+  (`m_keyon_live &= ~(1 << KEYON_CSM)`, `ymfm_fm.ipp:434`). Calling it every
+  sample therefore eats CSM triggers one sample after they arrive. With CSM off,
+  eager and lazy agree bit-for-bit over 40,000 samples; with CSM on
+  (`0x14` bit 7) and a host that actually fires timers, they **diverge** —
+  39,737 non-silent samples of 40,000 against 15,775. So the Rust port
+  reproduces the gate and its 4,096 counter exactly, and the CSM test is the one
+  that pins it.
+
+  A corollary about measurement discipline: the first version of this comparison
+  used a host that recorded timer deadlines but never called
+  `engine_timer_expired`. No timer ever fired, so CSM never triggered and the
+  CSM-on and CSM-off hashes came out identical — a passing comparison of nothing.
+  The divergence only appeared once the host fired timers. The suite's generator
+  host must fire them for the same reason.
+- **The active-channel mask is a pure optimisation**, tested separately and in the
+  opposite direction: deleting `chanmask &= m_active_channels`
+  (`ymfm_fm.ipp`, `fm_engine_base::output`) changes no sample over the same
+  40,000, with CSM on or off. The Rust port may therefore sum all eight channels
+  unconditionally, and does — one less piece of state to restore in a save.
+
 So D2's suite is **generated, not downloaded**: a small C++ program links ymfm,
 runs a deterministic script of register writes, and writes a binary vector file
 that the Rust side replays sample for sample. This is the same shape as D1 — a
@@ -254,6 +278,39 @@ a test deriving its expectation from the thing under test proves nothing:
   a test that writes all four operators the same passes on both.
 - The **eight connection algorithms**, each as an explicit modulator/carrier
   routing, written from the OPM documentation's diagrams.
+- The **four lookup tables, split by provenance** — because three are formulas and
+  one is a chip dump, and treating them alike is how 768 typed numbers get a
+  plausible wrong entry nobody finds. Each was fitted against ymfm's own table on
+  2026-08-09:
+  - **Sine** (256 entries): `round(-log2(sin((i + 0.5) × π / 512)) × 256)`,
+    **0 of 256 mismatched**. Computed, not transcribed.
+  - **Power** (256 entries): `round(2^(-(i + 1) / 256) × 2048) - 1024`, **0 of 256
+    mismatched**. Note the `i + 1` and the `- 1024`: the obvious
+    `2^(-i/256) × 2048` misses all 256 entries, and truncation instead of rounding
+    misses 139. Computed, with those two near-misses recorded as the reason the fit
+    is asserted rather than assumed.
+  - **Envelope increment** (64 entries of packed nibbles, `ymfm_fm.ipp:145`):
+    transcribed, but it is 64 values with visible structure and its own checksum
+    (sum `35,716,092,092`, FNV `0x7e8ea9566fb1810d`).
+  - **Phase step** (768 entries, `ymfm_fm.ipp:230`): **must be transcribed
+    verbatim.** ymfm's own comment says the computed table "differs in a few spots
+    from the data verified from an actual chip" and that the table is David Viens'
+    analysis. Measured: it diverges from a pure exponential by up to **106 units**,
+    its consecutive deltas are quantised to 32/64/96/128/160, and its span is
+    1.99615 rather than the formula's 1.99820. **No formula reproduces it**, so the
+    transcription is gated by a checksum test rather than by reading: 768 entries,
+    sum `46,015,744`, first `41,568` (`0xA260`), last `82,976` (`0x14420`), FNV-1a
+    over little-endian `u32` `0x3b0f96a47792bdb3`. The sine and power tables get
+    the same treatment for free — sum `65,406` / FNV `0x690166972613166b`, and sum
+    `115,543` / FNV `0xc284cffe0e133896` — so a `const fn` that is subtly wrong
+    fails on the checksum rather than on one obscure note.
+
+  The FNV-1a used above is the standard 64-bit one (offset basis
+  `0xcbf29ce484222325`, prime `0x100000001b3`) over each entry's little-endian
+  bytes at the width named. It is **new to this repository** — `grep` finds no
+  existing FNV in `crates/` or `scripts/` — so D2 adds exactly one implementation,
+  in `crates/ym2151/src/tables.rs`, and the generator's determinism check reuses it
+  rather than growing a second.
 - The **timer periods**: timer A is `1024 - value` and timer B is
   `16 × (256 - value)`, both in units of `OPERATORS × prescale` = 64 input clocks
   (`ymfm_fm.ipp:1481`). So timer A at value 1000 is 24 × 64 = 1,536 clocks.
@@ -447,11 +504,19 @@ The YM2151 has no error states. What it has instead:
    **proven** equivalent — with new sets for the sound-board decode and the
    fractional schedule.
 8. `crates/ym2151` has no dependencies. `crates/z80` is unchanged.
-9. SF2's sound program runs: with a user-supplied ROM set, the Z80 executes from
-   `audiocpu`, reads the command latch, and writes YM2151 registers — asserted as
-   trace counters over a bounded number of frames, in a test that skips loudly
-   with the ROM absent (the single documented exception, as `crates/sfemu/tests/boot.rs`
-   is for the 68000).
+   The four table checksums above hold, and the two computed tables are computed
+   rather than typed.
+9. **A CSM case in the suite.** The lazy-`prepare()` divergence is invisible with
+   CSM off, so at least one generated case enables `0x14` bit 7 with timer A
+   running and a host that fires it. Asserted as a premise on the generated data,
+   like the non-silence and IRQ-edge premises: a suite whose cases all have CSM off
+   cannot distinguish the two readings, and the wrong one is the natural way to
+   write it.
+10. SF2's sound program runs: with a user-supplied ROM set, the Z80 executes from
+    `audiocpu`, reads the command latch, and writes YM2151 registers — asserted as
+    trace counters over a bounded number of frames, in a test that skips loudly
+    with the ROM absent (the single documented exception, as
+    `crates/sfemu/tests/boot.rs` is for the 68000).
 
 **Still no sound.** D2's output is a buffer of samples nothing plays. That is not
 a defect in it.
@@ -482,7 +547,26 @@ a defect in it.
 - ymfm (`https://github.com/aaronsgiles/ymfm`), BSD-3-Clause, © 2021 Aaron Giles:
   `ymfm.h`, `ymfm_fm.h`, `ymfm_fm.ipp`, `ymfm_opm.h`, `ymfm_opm.cpp` — fetched,
   compiled and measured 2026-08-09. The OPM register map quoted in this document
-  is `ymfm_opm.h:47-101`.
+  is `ymfm_opm.h:47-101`. Specific citations used above: the OPM constants at
+  `ymfm_opm.h:107-124` (`CHANNELS = 8`, `OPERATORS = 32`, `DEFAULT_PRESCALE = 2`,
+  `EG_CLOCK_DIVIDER = 3`, `REG_MODE = 0x14`); the operator-to-slot map at
+  `ymfm_opm.cpp:117-138`; the tables at `ymfm_fm.ipp:46` (sine), `:86` (power),
+  `:145` (envelope increment), `:206-320` (phase step, with the chip-data comment);
+  `cache_operator_data` and `compute_phase_step` in `ymfm_opm.cpp`;
+  `clock_noise_and_lfo` at `ymfm_opm.cpp:173`; the envelope state machine at
+  `ymfm_fm.ipp` (`clock_envelope`, `start_attack`, `start_release`,
+  `clock_keystate`); the 4-op algorithm table in `fm_channel::output_4op`; the
+  lazy-`prepare()` gate at `ymfm_fm.ipp:1287` with the CSM key-on consumption at
+  `:434` and the CSM trigger at `:1516-1522`; and `ym2151::generate` in
+  `ymfm_opm.cpp` for the `roundtrip_fp` output stage.
+
+  **The reference is re-fetchable and the measurements are reproducible.** The
+  scratch copy used for the first half of this work was deleted by the OS mid-session
+  (`/tmp` is not durable on macOS); re-fetching the archive and re-running the fits
+  reproduced the 3,482-line count and every checksum above exactly. The generator
+  therefore fetches into a temporary directory each run and verifies what it got,
+  rather than assuming a copy is still there — the same reason the D1 fetcher
+  re-verifies rather than trusting `testdata/`.
 - MAME `src/mame/capcom/cps1.cpp` (BSD-3-Clause, copyright-holders Paul Leaman):
   `sub_map` at 631-642, `cps1_snd_bankswitch_w` at 292-295, `cps1_oki_pin7_w` at
   297-300, `cps1_soundlatch_w` at 302-308, the machine config at 3909-3947, and
