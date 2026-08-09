@@ -16,16 +16,17 @@
 
 use std::path::PathBuf;
 
-/// The opcodes the core implements so far: as of Task 9, the 252 non-prefix
-/// base-page opcodes and all 256 of the `CB` page.
+/// The opcodes the core implements so far: as of Task 10, the 252 non-prefix
+/// base-page opcodes, all 256 of the `CB` page, and the 80 `ED` opcodes that have
+/// a file.
 ///
 /// Kept as a literal list rather than derived from the decoder: a default that
 /// asked the decoder what it handled would report "all green" on exactly the
 /// opcodes the decoder had wrongly claimed.
 ///
 /// The `CB` stems are generated rather than listed, because that page is complete
-/// and uniform — `cb_00` through `cb_ff` with no gaps, which the base page cannot
-/// say. See [`cb_stems`].
+/// and uniform — `cb_00` through `cb_ff` with no gaps, which neither of the other
+/// two pages can say. See [`cb_stems`] and [`ED`].
 const DEFAULT: &[&str] = &[
     "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "0a", "0b", "0c", "0d", "0e", "0f",
     "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "1a", "1b", "1c", "1d", "1e", "1f",
@@ -43,6 +44,28 @@ const DEFAULT: &[&str] = &[
     "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9", "da", "db", "dc", "de", "df", "e0", "e1",
     "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9", "ea", "eb", "ec", "ee", "ef", "f0", "f1", "f2",
     "f3", "f4", "f5", "f6", "f7", "f8", "f9", "fa", "fb", "fc", "fe", "ff",
+];
+
+/// The 80 `ED` opcodes upstream ships a file for.
+///
+/// A literal list because the page is sparse: 176 of its 256 encodings do nothing
+/// but consume two M1 cycles, and no file exists for any of them. Generating
+/// `ed_00`–`ed_ff` would name 176 files that are not there, which — with missing
+/// data failing loudly, as it must — would abort the run on the first of them.
+///
+/// The membership rule is `0x40..=0x7F` plus the sixteen block opcodes, and it is
+/// written out rather than expressed as that rule for the same reason [`DEFAULT`]
+/// is: a generated list agrees with whatever the generator believes, and what is
+/// wanted here is agreement with the directory.
+const ED: &[&str] = &[
+    "ed_40", "ed_41", "ed_42", "ed_43", "ed_44", "ed_45", "ed_46", "ed_47", "ed_48", "ed_49",
+    "ed_4a", "ed_4b", "ed_4c", "ed_4d", "ed_4e", "ed_4f", "ed_50", "ed_51", "ed_52", "ed_53",
+    "ed_54", "ed_55", "ed_56", "ed_57", "ed_58", "ed_59", "ed_5a", "ed_5b", "ed_5c", "ed_5d",
+    "ed_5e", "ed_5f", "ed_60", "ed_61", "ed_62", "ed_63", "ed_64", "ed_65", "ed_66", "ed_67",
+    "ed_68", "ed_69", "ed_6a", "ed_6b", "ed_6c", "ed_6d", "ed_6e", "ed_6f", "ed_70", "ed_71",
+    "ed_72", "ed_73", "ed_74", "ed_75", "ed_76", "ed_77", "ed_78", "ed_79", "ed_7a", "ed_7b",
+    "ed_7c", "ed_7d", "ed_7e", "ed_7f", "ed_a0", "ed_a1", "ed_a2", "ed_a3", "ed_a8", "ed_a9",
+    "ed_aa", "ed_ab", "ed_b0", "ed_b1", "ed_b2", "ed_b3", "ed_b8", "ed_b9", "ed_ba", "ed_bb",
 ];
 
 /// `cb_00` through `cb_ff`.
@@ -65,6 +88,7 @@ fn main() {
             .iter()
             .copied()
             .chain(generated.iter().map(String::as_str))
+            .chain(ED.iter().copied())
             .collect()
     } else {
         args.iter().map(String::as_str).collect()

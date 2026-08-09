@@ -129,6 +129,62 @@ pub fn add16(cpu: &mut Z80, a: u16, b: u16) -> u16 {
     r
 }
 
+/// `ADC HL,rr`: the full flag set, unlike [`add16`].
+///
+/// S, Z and P/V are all written here and all *preserved* by `ADD HL,rr` — the same
+/// operation on the same data with different flags, distinguished only by which page
+/// the opcode sits on. H is still the carry out of bit 11 and F3/F5 still come from
+/// the high byte of the result.
+#[must_use]
+pub fn adc16(cpu: &mut Z80, a: u16, b: u16) -> u16 {
+    let carry_in = u32::from(cpu.f & C != 0);
+    let sum = u32::from(a) + u32::from(b) + carry_in;
+    let r = sum as u16;
+    let h = (a & 0x0FFF) + (b & 0x0FFF) + carry_in as u16 > 0x0FFF;
+    let ovf = (a ^ b) & 0x8000 == 0 && (a ^ r) & 0x8000 != 0;
+    cpu.f = (((r >> 8) as u8) & (S | F5 | F3))
+        | if r == 0 { Z } else { 0 }
+        | if h { H } else { 0 }
+        | if ovf { PV } else { 0 }
+        | if sum > 0xFFFF { C } else { 0 };
+    cpu.q = cpu.f;
+    r
+}
+
+/// `SBC HL,rr`: as [`adc16`], with N set and the borrow rules.
+#[must_use]
+pub fn sbc16(cpu: &mut Z80, a: u16, b: u16) -> u16 {
+    let borrow = i32::from(cpu.f & C != 0);
+    let diff = i32::from(a) - i32::from(b) - borrow;
+    let r = diff as u16;
+    let h = i32::from(a & 0x0FFF) - i32::from(b & 0x0FFF) - borrow < 0;
+    let ovf = (a ^ b) & 0x8000 != 0 && (a ^ r) & 0x8000 != 0;
+    cpu.f = (((r >> 8) as u8) & (S | F5 | F3))
+        | N
+        | if r == 0 { Z } else { 0 }
+        | if h { H } else { 0 }
+        | if ovf { PV } else { 0 }
+        | if diff < 0 { C } else { 0 };
+    cpu.q = cpu.f;
+    r
+}
+
+/// `NEG`: `0 - A`, with subtraction flags.
+///
+/// P/V is set for `A = 0x80` and no other value: −128 has no positive counterpart in
+/// eight bits. A single-value condition is the kind a core hard-codes to `false` and
+/// never notices.
+///
+/// Written as `sub(0, A)` rather than as its own flag expression, because that is
+/// exactly what it is — measured 0 wrong over 1,000 cases on each of the eight
+/// `NEG` encodings, which is the strongest available evidence that the two share
+/// one rule and should share one implementation.
+pub fn neg(cpu: &mut Z80) {
+    let a = cpu.a;
+    cpu.a = 0;
+    sub(cpu, a, false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +411,86 @@ mod tests {
         assert_eq!(c.f & (F5 | F3), F5 | F3, "F5/F3 from the high byte 0x28");
     }
 
+    /// 16-bit `ADC HL,rr` writes sign, zero and overflow where `ADD HL,rr` preserves
+    /// them.
+    ///
+    /// Two instructions, one operation, different flags — and `ADD` is on the base
+    /// page while `ADC` is on `ED`, which is the only clue in the encoding. A core
+    /// that routed both through [`add16`] would pass every `09`-family file and fail
+    /// every `ed_4a`-family one.
+    #[test]
+    fn adc16_writes_sign_zero_and_overflow_where_add16_preserves_them() {
+        let mut c = Z80::new();
+        c.f = 0;
+        let r = adc16(&mut c, 0x0000, 0x0000);
+        assert_eq!(r, 0);
+        assert_eq!(c.f & Z, Z, "ADC HL,rr sets Z -- ADD HL,rr never does");
+        assert_eq!(c.f & N, 0);
+
+        c.f = 0;
+        let r = adc16(&mut c, 0x7FFF, 0x0001);
+        assert_eq!(r, 0x8000);
+        assert_eq!(c.f & PV, PV, "and it reports signed overflow");
+        assert_eq!(c.f & S, S);
+        assert_eq!(c.f & H, H, "0x7FF + 1 carries out of bit 11");
+
+        c.f = C;
+        let r = adc16(&mut c, 0x0000, 0x0000);
+        assert_eq!(r, 1, "and it adds the carry in");
+        assert_eq!(c.f & Z, 0, "which is what stops the result being zero");
+    }
+
+    /// `SBC HL,rr` sets N and borrows.
+    #[test]
+    fn sbc16_sets_n_and_reports_a_borrow() {
+        let mut c = Z80::new();
+        c.f = 0;
+        let r = sbc16(&mut c, 0x0000, 0x0001);
+        assert_eq!(r, 0xFFFF);
+        assert_eq!(c.f & (N | C | S), N | C | S);
+
+        c.f = 0;
+        let r = sbc16(&mut c, 0x8000, 0x0001);
+        assert_eq!(r, 0x7FFF);
+        assert_eq!(c.f & PV, PV, "-32768 - 1 overflows");
+
+        c.f = C;
+        let r = sbc16(&mut c, 0x0002, 0x0001);
+        assert_eq!(r, 0x0000, "and the borrow comes in");
+        assert_eq!(c.f & Z, Z);
+    }
+
+    /// `NEG` is `0 - A`, and overflows only at 0x80.
+    ///
+    /// 0x80 is the one value with no positive counterpart in eight bits, so it is the
+    /// only input that sets P/V — a single-value condition, which is exactly the kind
+    /// a core implements as `false` and never notices.
+    #[test]
+    fn neg_overflows_only_at_the_most_negative_value() {
+        let mut c = Z80::new();
+        c.a = 0x80;
+        c.f = 0;
+        neg(&mut c);
+        assert_eq!(c.a, 0x80, "negating -128 gives -128");
+        assert_eq!(c.f & PV, PV, "which is the overflow");
+        assert_eq!(c.f & (N | C | S), N | C | S);
+
+        c.a = 0x01;
+        c.f = 0;
+        neg(&mut c);
+        assert_eq!(c.a, 0xFF);
+        assert_eq!(c.f & PV, 0, "and no other value does");
+        assert_eq!(c.f & C, C, "a non-zero A borrows");
+
+        c.a = 0x00;
+        c.f = 0;
+        neg(&mut c);
+        assert_eq!(c.a, 0x00);
+        assert_eq!(c.f & Z, Z);
+        assert_eq!(c.f & C, 0, "zero is the only A that does not borrow");
+        assert_eq!(c.f & N, N, "NEG is a subtraction whatever the operand");
+    }
+
     /// Every operation here leaves `Q` equal to the flags it wrote.
     ///
     /// The `SCF`/`CCF` rule reads `f & !q`, so a handler that set `q` to `1` — or
@@ -364,7 +500,7 @@ mod tests {
     #[test]
     fn every_operation_leaves_q_equal_to_the_flags_it_wrote() {
         type Op = (&'static str, fn(&mut Z80));
-        let ops: [Op; 11] = [
+        let ops: [Op; 14] = [
             ("ADD", |c| add(c, 0x28, false)),
             ("ADC", |c| add(c, 0x28, true)),
             ("SUB", |c| sub(c, 0x28, false)),
@@ -379,6 +515,15 @@ mod tests {
                 let r = add16(c, 0x2000, 0x0800);
                 c.set_hl(r);
             }),
+            ("ADC16", |c| {
+                let r = adc16(c, 0x2000, 0x0800);
+                c.set_hl(r);
+            }),
+            ("SBC16", |c| {
+                let r = sbc16(c, 0x3000, 0x0800);
+                c.set_hl(r);
+            }),
+            ("NEG", neg),
         ];
         for (name, run) in ops {
             let mut c = Z80::new();

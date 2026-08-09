@@ -33,7 +33,7 @@ pub struct Z80 {
     /// Not architecturally visible and absent from most documentation, but it
     /// drives the address pins during some T-states, so the suite compares it —
     /// which makes its update rules mandatory rather than decorative, and they were
-    /// measured rather than looked up. As of the base page:
+    /// measured rather than looked up. The base page:
     ///
     /// | instruction | latch |
     /// |---|---|
@@ -52,9 +52,34 @@ pub struct Z80 {
     /// way, because the operand reaches the latch before the condition is consulted.
     /// `JP (HL)` fetches no operand and so writes nothing.
     ///
-    /// Every other base-page instruction leaves it alone. Each row was wrong in
-    /// its own way before being fixed, and each cost 1,000 of 1,000 cases on its
-    /// own file.
+    /// The `CB` page writes it on **no** opcode, all 256 of them — though
+    /// `BIT b,(HL)` *reads* its high byte for F3/F5, which is the only place on the
+    /// chip where a stale latch is observable in the flags.
+    ///
+    /// The `ED` page:
+    ///
+    /// | instruction | latch |
+    /// |---|---|
+    /// | `IN r,(C)`, `IN (C)`, `OUT (C),r`, `OUT (C),0` | `BC + 1` — including the `OUT`s, unlike `OUT (n),A` |
+    /// | `ADC HL,rr`, `SBC HL,rr` | the **old** `HL` plus one, as `ADD HL,rr` |
+    /// | `LD (nn),rr`, `LD rr,(nn)` | `nn + 1`, both directions |
+    /// | `RETN`, `RETI` | the popped address |
+    /// | `RLD`, `RRD` | `HL + 1` |
+    /// | `CPI` | the latch's **own previous value** plus one |
+    /// | `CPD` | its own previous value minus one |
+    /// | `INI`, `INIR` | `BC + 1`, with `B` **before** the decrement |
+    /// | `IND`, `INDR` | `BC - 1`, likewise |
+    /// | `OUTI`, `OTIR` | `(BC - 0x100) + 1` — `B` **after** the decrement |
+    /// | `OUTD`, `OTDR` | `(BC - 0x100) - 1`, likewise |
+    /// | any repeating block form, while repeating | `PC + 1`, after the rewind |
+    /// | `NEG`, `IM n`, `LD I,A`, `LD R,A`, `LD A,I`, `LD A,R`, `LDI`, `LDD`, undefined | unchanged |
+    ///
+    /// `CPI` and `CPD` are the only instructions on the chip whose latch is a
+    /// function of its own previous value, so they are the only ones whose vector
+    /// cases cannot be satisfied by ignoring the incoming state.
+    ///
+    /// Every other instruction leaves it alone. Each row was wrong in its own way
+    /// before being fixed, and each cost 1,000 of 1,000 cases on its own file.
     pub wz: u16,
     /// The shadow `AF`, as a packed pair — `EX AF,AF'` swaps it wholesale, so
     /// there is no reason to hold two more bytes.
@@ -90,11 +115,19 @@ pub struct Z80 {
     /// field cannot express that, and treating it as one is why 995 of `3f.json`'s
     /// 1,000 cases failed before it was fixed.
     pub q: u8,
-    /// The flags `LD A,I` or `LD A,R` just wrote, and zero after anything else.
+    /// **1** after `LD A,I` or `LD A,R`, and zero after anything else.
     ///
-    /// Like [`Z80::q`], the suite carries a value rather than a flag; unlike `q`,
-    /// only those two instructions ever set it. [`Z80::step`] clears it, so a
-    /// handler only ever has to set it.
+    /// The marker for the hardware bug in those two instructions: an interrupt
+    /// arriving during either one clears P/V, so a program cannot trust the IFF2 it
+    /// just read. This field is what the suite carries to say the marker is set.
+    ///
+    /// **Unlike [`Z80::q`], this is not a flag value — it is the literal 1.** The
+    /// resemblance is the trap: `q` holds `f`, so a handler that wrote `p = f` by
+    /// analogy would agree with the suite only when `f` happens to be 1. Measured:
+    /// `p == 1` on 1,000 of 1,000 cases of both `ed_57` and `ed_5f`, and `p == f`
+    /// on 23 and 69 of them respectively — those being the cases where `f` is 1.
+    ///
+    /// [`Z80::step`] clears it, so a handler only ever has to set it.
     pub p: u8,
     /// Whether a `HALT` is in effect.
     ///

@@ -122,10 +122,41 @@ pub fn bit_test(cpu: &mut Z80, b: u8, v: u8, f35: u8) {
     cpu.q = cpu.f;
 }
 
+/// `RLD`: a twelve-bit left rotation through `A`'s low nibble and `(HL)`.
+///
+/// For packed BCD, where a digit has to move between bytes. `A`'s low nibble takes
+/// `(HL)`'s high nibble, `(HL)` shifts up a nibble, and `A`'s old low nibble becomes
+/// `(HL)`'s low. `A`'s **high** nibble never moves — which is what makes this a
+/// twelve-bit rotation and not a sixteen-bit one.
+///
+/// The flags describe `A` afterwards, with carry preserved, and the latch becomes
+/// `HL + 1`. Measured 0 wrong over 1,000 cases of `ed_6f`.
+pub fn rld<B: crate::Bus>(cpu: &mut Z80, bus: &mut B) {
+    let m = bus.read(cpu.hl());
+    let new_m = (m << 4) | (cpu.a & 0x0F);
+    cpu.a = (cpu.a & 0xF0) | (m >> 4);
+    bus.write(cpu.hl(), new_m);
+    cpu.wz = cpu.hl().wrapping_add(1);
+    cpu.f = (cpu.f & C) | crate::flags::sz53p(cpu.a);
+    cpu.q = cpu.f;
+}
+
+/// `RRD`: [`rld`] mirrored — `A`'s low nibble becomes `(HL)`'s high.
+pub fn rrd<B: crate::Bus>(cpu: &mut Z80, bus: &mut B) {
+    let m = bus.read(cpu.hl());
+    let new_m = (m >> 4) | (cpu.a << 4);
+    cpu.a = (cpu.a & 0xF0) | (m & 0x0F);
+    bus.write(cpu.hl(), new_m);
+    cpu.wz = cpu.hl().wrapping_add(1);
+    cpu.f = (cpu.f & C) | crate::flags::sz53p(cpu.a);
+    cpu.q = cpu.f;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::flags::N;
+    use crate::testbus::Mem;
 
     /// `RLCA` rotates left through carry and preserves S, Z and P/V.
     ///
@@ -377,5 +408,68 @@ mod tests {
         c.f = 0;
         bit_test(&mut c, 0, F5 | F3 | 0x01, 0x00);
         assert_eq!(c.f & (F5 | F3), 0);
+    }
+
+    /// `RLD` and `RRD` leave `A`'s high nibble alone.
+    ///
+    /// That is what makes the rotation twelve bits rather than sixteen, and it is the
+    /// part a core gets wrong by writing the obvious `(m >> 4) | (a << 4)` into `A`.
+    /// The values are hand-computed and chosen with a non-zero high nibble in `A`, so
+    /// a sixteen-bit rotation would visibly corrupt it: `A = 0x7A`, `(HL) = 0x31`
+    /// gives `A = 0x73` and `(HL) = 0x1A` for `RLD`.
+    #[test]
+    fn the_nibble_rotations_preserve_a_high_nibble() {
+        let mut c = Z80::new();
+        c.a = 0x7A;
+        c.set_hl(0x2000);
+        c.f = C;
+        c.wz = 0x5EED;
+        let mut m = Mem::new();
+        m.ram[0x2000] = 0x31;
+        rld(&mut c, &mut m);
+        assert_eq!(c.a, 0x73, "A's low nibble took (HL)'s high nibble");
+        assert_eq!(
+            m.ram[0x2000], 0x1A,
+            "and (HL) shifted up, taking A's old low"
+        );
+        assert_eq!(c.f & C, C, "carry is preserved");
+        assert_eq!(c.f & (H | N), 0);
+        assert_eq!(c.wz, 0x2001, "the latch takes HL + 1");
+
+        // RRD is the mirror: A = 0x84, (HL) = 0x20 gives A = 0x80, (HL) = 0x42.
+        let mut c = Z80::new();
+        c.a = 0x84;
+        c.set_hl(0x2000);
+        c.f = 0;
+        let mut m = Mem::new();
+        m.ram[0x2000] = 0x20;
+        rrd(&mut c, &mut m);
+        assert_eq!(c.a, 0x80, "A's high nibble is still 8");
+        assert_eq!(m.ram[0x2000], 0x42);
+        assert_eq!(c.f & S, S, "and the flags describe A, not (HL)");
+        assert_eq!(c.q, c.f);
+    }
+
+    /// The two rotations flag `A` and not the byte they wrote to memory.
+    ///
+    /// Chosen so the two differ in every flag that matters: `A` ends zero (Z and even
+    /// parity) while the memory byte ends 0xFF (S set, Z clear). A core that flagged
+    /// `new_m` would produce the exact opposite of every assertion here.
+    #[test]
+    fn the_nibble_rotations_flag_a_rather_than_the_byte_written() {
+        let mut c = Z80::new();
+        c.a = 0x0F;
+        c.set_hl(0x2000);
+        c.f = 0;
+        let mut m = Mem::new();
+        m.ram[0x2000] = 0xF0;
+        // RRD: A becomes 0x00 (high nibble 0, plus (HL)'s low nibble 0), and (HL)
+        // becomes 0x0F | 0xF0 = 0xFF.
+        rrd(&mut c, &mut m);
+        assert_eq!(c.a, 0x00);
+        assert_eq!(m.ram[0x2000], 0xFF);
+        assert_eq!(c.f & Z, Z, "A is zero");
+        assert_eq!(c.f & S, 0, "the 0xFF in memory does not set the sign");
+        assert_eq!(c.f & PV, PV, "and the parity is A's, which is even");
     }
 }
