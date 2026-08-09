@@ -8,6 +8,7 @@ members = [
     "crates/sfemu",
     "crates/testrunner",
     "crates/video",
+    "crates/ym2151",
     "crates/z80",
 ]
 
