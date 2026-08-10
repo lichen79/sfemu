@@ -55,6 +55,9 @@ use crate::timer::Timers;
 /// plain tick count. See [`advance_env_counter`].
 pub const EG_CLOCK_DIVIDER: u32 = 3;
 
+/// Every channel marked stale: `ymfm_fm.h`'s `ALL_CHANNELS` for an eight-channel chip.
+const ALL_CHANNELS: u8 = 0xFF;
+
 /// Advance the envelope counter by one sample, skipping the unused phase.
 ///
 /// ymfm: `else if (bitfield(++m_env_counter, 0, 2) == EG_CLOCK_DIVIDER) m_env_counter
@@ -115,6 +118,26 @@ pub struct Ym2151 {
     pub timers: Timers,
     /// The envelope counter, advanced by [`advance_env_counter`] each sample.
     env_counter: u32,
+    /// One bit per channel whose cached data is stale. Post-reset it is all eight —
+    /// `ymfm_fm.ipp:1190` constructs `m_modified_channels(ALL_CHANNELS)`, so the
+    /// first sample always prepares.
+    modified_channels: u8,
+    /// Samples since the last `prepare`, for the every-4,096 half of the gate.
+    ///
+    /// Only advanced on samples where nothing was modified: ymfm's `++` sits on the
+    /// right of a `||`, so a chip being written to every sample never increments it.
+    /// See [`Ym2151::clock_sample`].
+    prepare_counter: u32,
+    /// Test-only: prepare every sample, the way Task 5 did.
+    ///
+    /// The measured divergence cannot be asserted from inside this crate any other
+    /// way, and the alternative — asserting ymfm's hashes — would make the test depend
+    /// on a register script instead of on the property. Not compiled outside tests.
+    #[cfg(any(test, feature = "internals"))]
+    force_eager_prepare: bool,
+    /// Test-only: how many times the gate has opened.
+    #[cfg(any(test, feature = "internals"))]
+    prepare_count: u32,
 }
 
 impl Default for Ym2151 {
@@ -139,9 +162,32 @@ impl Ym2151 {
             noise: Noise::new(),
             timers: Timers::new(),
             env_counter: 0,
+            modified_channels: ALL_CHANNELS,
+            prepare_counter: 0,
+            #[cfg(any(test, feature = "internals"))]
+            force_eager_prepare: false,
+            #[cfg(any(test, feature = "internals"))]
+            prepare_count: 0,
         };
         chip.reset();
         chip
+    }
+
+    /// Test-only: prepare every sample, as Task 5's core did.
+    ///
+    /// Exists to assert the divergence the gate causes — see
+    /// `with_csm_on_eager_and_lazy_diverge`. The suite runner must never call this:
+    /// `testrunner` runs the real chip.
+    #[cfg(any(test, feature = "internals"))]
+    pub fn set_force_eager_prepare_for_test(&mut self, eager: bool) {
+        self.force_eager_prepare = eager;
+    }
+
+    /// Test-only: how many times the prepare gate has opened.
+    #[cfg(any(test, feature = "internals"))]
+    #[must_use]
+    pub fn prepare_count_for_test(&self) -> u32 {
+        self.prepare_count
     }
 
     /// How many input clocks one sample takes: `OPERATORS * DEFAULT_PRESCALE`.
@@ -165,6 +211,17 @@ impl Ym2151 {
         self.lfo.reset();
         self.noise.reset();
         self.env_counter = 0;
+        // Every channel is stale again, matching the constructor: the first sample
+        // after a reset must prepare, or a channel written before the reset would keep
+        // a cache the register file no longer backs.
+        self.modified_channels = ALL_CHANNELS;
+        self.prepare_counter = 0;
+        // The diagnostic counter too, so `reset_restores_the_constructed_state_exactly`
+        // compares the whole struct rather than the whole struct minus an exception.
+        #[cfg(any(test, feature = "internals"))]
+        {
+            self.prepare_count = 0;
+        }
     }
 
     /// The status register as the guest reads it.
@@ -190,6 +247,12 @@ impl Ym2151 {
     pub fn write(&mut self, addr: u8, val: u8) {
         self.regs.write(addr, val);
 
+        // "for now just mark all channels as modified" — `ymfm_fm.ipp:1412`, and the
+        // mode-register path at `:1563` does the same. Every write, not only the ones
+        // that change a cached field: a per-register map would be an optimisation, and
+        // the gate is semantics, so a wrong map would silently eat CSM key-ons.
+        self.modified_channels = ALL_CHANNELS;
+
         if addr == REG_MODE {
             self.timers.write_mode(val, &self.regs);
         } else if addr == REG_KEY_ON {
@@ -214,33 +277,71 @@ impl Ym2151 {
         }
     }
 
+    /// Whether the test-only eager override is on. Always false in a release build.
+    fn force_eager_prepare(&self) -> bool {
+        #[cfg(any(test, feature = "internals"))]
+        {
+            self.force_eager_prepare
+        }
+        #[cfg(not(any(test, feature = "internals")))]
+        {
+            false
+        }
+    }
+
     /// Advance one sample and return it.
     fn clock_sample(&mut self) -> (i16, i16) {
         // 1. The timers. A timer A overflow in CSM mode key-ons every channel, and
         //    that key-on must be consumed by this sample's `prepare`.
         let events = self.timers.clock(&self.regs);
         if events.timer_a_overflow && self.regs.csm() {
+            // `CSM_TRIGGER_MASK` is `ALL_CHANNELS` for the OPM (`ymfm_opm.h:119`), so
+            // every channel is keyed on and every channel is marked modified —
+            // `ymfm_fm.ipp:1516-1522`. The mark is what opens the gate below on this
+            // sample, which is the entire mechanism: without it the key-on sits in
+            // `keyon_live` until some later write happens to open the gate, by which
+            // time the trigger it represented is long past.
             for ch in &mut self.channels {
                 for op in &mut ch.ops {
                     op.set_keyon(true, KEYON_CSM);
                 }
             }
-            // TODO(task-9): also mark these channels modified. Task 9 adds the
-            // `modified_channels` field; until then `prepare` runs every sample, so
-            // the mark would have no effect.
+            self.modified_channels = ALL_CHANNELS;
         }
 
-        // 2. TODO(task-9): the lazy prepare gate — `if modified_channels != 0 ||
-        //    prepare_counter wrapped at 4,096`. This is *semantics*, not an
-        //    optimisation, because `Operator::prepare` consumes the CSM key-on bit
-        //    (`ymfm_fm.ipp:434`). Measured over 40,000 samples: with CSM off, eager
-        //    and lazy agree bit for bit (fnv `bfc97b4fa40cfcf1`, 575 non-silent both
-        //    ways); with CSM on they diverge — stock ymfm gives `322d488e3f59bdb5`
-        //    with 39,737 non-silent samples against eager's `ffbdd8b77349c3d5` with
-        //    15,775. Do not "fix" the eager call below before Task 9 lands: without
-        //    the gate the divergence is in the direction of *less* sound, not more.
-        for ch in 0..CHANNEL_COUNT {
-            self.channels[ch as usize].prepare(&self.regs, ch);
+        // 2. The gate. This is *semantics*, not an optimisation, because
+        //    `Operator::prepare` consumes the CSM key-on bit (`ymfm_fm.ipp:434`):
+        //    preparing every sample clears the flag one sample after the timer set it,
+        //    before the key-state clock ever sees it. Measured over 40,000 samples —
+        //    with CSM off, eager and lazy agree bit for bit (fnv `bfc97b4fa40cfcf1`,
+        //    575 non-silent both ways); with CSM on they diverge, stock ymfm giving
+        //    `322d488e3f59bdb5` with 39,737 non-silent samples against eager's
+        //    `ffbdd8b77349c3d5` with 15,775.
+        //
+        //    The counter is only advanced when nothing was modified. ymfm writes
+        //    `m_modified_channels != 0 || m_prepare_count++ >= 4096`, and `||`
+        //    short-circuits: a chip written to every sample never increments it. That
+        //    is why this is not `prepare_counter % 4_096 == 0` on a counter advanced
+        //    unconditionally — the two rules differ on exactly the traffic a real
+        //    driver produces.
+        let eager = self.force_eager_prepare();
+        let due = if self.modified_channels != 0 {
+            true
+        } else {
+            let count = self.prepare_counter;
+            self.prepare_counter = count.wrapping_add(1);
+            count >= 4_096
+        };
+        if eager || due {
+            for ch in 0..CHANNEL_COUNT {
+                self.channels[ch as usize].prepare(&self.regs, ch);
+            }
+            self.modified_channels = 0;
+            self.prepare_counter = 0;
+            #[cfg(any(test, feature = "internals"))]
+            {
+                self.prepare_count = self.prepare_count.wrapping_add(1);
+            }
         }
 
         // 3. The envelope counter. Every operator checks its low two bits, so this
@@ -667,5 +768,202 @@ mod tests {
         chip.write(0x08, 0x78 | 5);
         assert!(chip.channels[5].ops.iter().all(|op| op.keyon_live != 0));
         assert!(chip.channels[0].ops.iter().all(|op| op.keyon_live == 0));
+    }
+
+    /// A patch whose only note source is CSM: no key-on write at all.
+    ///
+    /// Decay and sustain rates fast enough that the note dies well inside timer A's
+    /// period, so the two readings of the gate differ in *how much* sound comes out
+    /// rather than only in its phase. With the CSM bit clear this patch is silent by
+    /// construction — nothing ever keys it on — which is what makes it a clean probe
+    /// of the CSM path and why `render_csm(_, false)` is not usable as a control.
+    fn csm_patch(chip: &mut Ym2151, csm: bool) {
+        chip.write(0x20, 0xC7); // channel 0, algorithm 7 — all four to the output
+        for op in 0..4u8 {
+            let off = op * 8;
+            chip.write(0x40 + off, 0x01); // detune/multiple
+            chip.write(0x60 + off, 0); // total level: full volume
+            chip.write(0x80 + off, 31); // attack rate: instant
+            chip.write(0xA0 + off, 20); // first decay
+            chip.write(0xC0 + off, 20); // second decay
+            chip.write(0xE0 + off, 0xFF); // D1L max, release fast
+        }
+        chip.write(0x28, 0x4A); // key code
+                                // Timer A value 1000 — period 24 samples. Written as the hardware sees it:
+                                // the top 8 bits at 0x10 and the low 2 at 0x11.
+        chip.write(0x10, (1000 >> 2) as u8);
+        chip.write(0x11, (1000 & 3) as u8);
+        chip.write(0x14, if csm { 0x81 } else { 0x01 });
+    }
+
+    /// Renders a CSM patch and returns (non-silent samples, fnv of the whole buffer).
+    fn render_csm(force_eager: bool, csm: bool) -> (usize, u64) {
+        let mut chip = Ym2151::new();
+        chip.set_force_eager_prepare_for_test(force_eager);
+        csm_patch(&mut chip, csm);
+        let mut buf = vec![(0i16, 0i16); 40_000];
+        chip.generate(&mut buf);
+        let flat: Vec<u16> = buf
+            .iter()
+            .flat_map(|&(l, r)| [l as u16, r as u16])
+            .collect();
+        (
+            buf.iter().filter(|&&(l, r)| l != 0 || r != 0).count(),
+            crate::tables::fnv1a_u16(&flat),
+        )
+    }
+
+    /// A CSM trigger reaches the key state, so a CSM-only patch makes sound at all.
+    ///
+    /// `prepare()` is what carries a CSM key-on into the envelope: `fm_operator::prepare`
+    /// calls `clock_keystate(m_keyon_live != 0)` and only *then* clears the CSM bit
+    /// (`ymfm_fm.ipp:425-436`), and `engine_timer_expired` marks every channel modified
+    /// alongside setting the bit (`:1516-1522`) so the gate opens on the trigger's own
+    /// sample. A core that keyed on without marking the channel would leave the flag
+    /// sitting in `keyon_live` until some unrelated write opened the gate, and this
+    /// patch — which never writes `0x08` at all — would be silent.
+    ///
+    /// **Measured, and corroborated by the suite at 1,000/1,000 including 125 CSM
+    /// cases:** sound starts at sample 23, which is timer A's first overflow for the
+    /// period this patch loads, and 6,148 of 40,000 samples are non-silent.
+    #[test]
+    fn csm_key_on_survives_to_be_acted_on() {
+        let (non_silent, _) = render_csm(false, true);
+        assert!(
+            non_silent > 1_000,
+            "a CSM-only patch must sound: {non_silent} of 40,000 non-silent"
+        );
+        // And the same patch with the CSM bit clear is silent, which is what makes the
+        // sound above attributable to CSM rather than to a stray key-on.
+        assert_eq!(
+            render_csm(false, false).0,
+            0,
+            "without the CSM bit nothing ever keys this patch on"
+        );
+    }
+
+    /// With CSM off, the gate makes no difference — which is why it is easy to miss.
+    ///
+    /// The contrast that makes the test above meaningful. If a core is silently eager,
+    /// this test still passes and only the CSM tests fail; that asymmetry is exactly
+    /// why the generated suite needs CSM cases.
+    #[test]
+    fn without_csm_the_gate_is_invisible() {
+        let render = |force_eager: bool| {
+            let mut chip = Ym2151::new();
+            chip.set_force_eager_prepare_for_test(force_eager);
+            chip.write(0x20, 0xC7);
+            for op in 0..4u8 {
+                let off = op * 8;
+                chip.write(0x40 + off, 0x01);
+                chip.write(0x60 + off, 0);
+                chip.write(0x80 + off, 31);
+                chip.write(0xA0 + off, 8);
+                chip.write(0xC0 + off, 8);
+                chip.write(0xE0 + off, 0x0F);
+            }
+            chip.write(0x28, 0x4A);
+            chip.write(0x08, 0x78);
+            let mut buf = vec![(0i16, 0i16); 40_000];
+            chip.generate(&mut buf);
+            let flat: Vec<u16> = buf
+                .iter()
+                .flat_map(|&(l, r)| [l as u16, r as u16])
+                .collect();
+            (
+                crate::tables::fnv1a_u16(&flat),
+                buf.iter().filter(|&&(l, r)| l != 0 || r != 0).count(),
+            )
+        };
+        let lazy = render(false);
+        assert_eq!(lazy, render(true), "identical with CSM off");
+        // And not identically silent: two silent renders agree trivially, which would
+        // make the equality above a claim that cannot fail.
+        assert!(lazy.1 > 0, "the patch must make sound: {lazy:?}");
+    }
+
+    /// And with CSM on, the two readings diverge — which is the whole point of the gate.
+    ///
+    /// **The direction here is the opposite of what the plan predicted, and the suite
+    /// settled it.** The plan expected eager preparation to *eat* CSM triggers and so
+    /// produce less sound. Measured, and confirmed by the vector suite passing
+    /// 1,000/1,000 with the lazy reading, it is the reverse: 6,148 non-silent samples
+    /// lazily against 39,977 eagerly.
+    ///
+    /// The reason is the *key-off* half. `prepare()` clocks the key state from
+    /// `keyon_live` and then clears the CSM bit, so an eager chip sees `true` on the
+    /// trigger's sample and `false` on the next — every trigger is a complete key
+    /// cycle, and `start_attack` re-zeroes the phase 1,666 times over this window,
+    /// giving continuous sound. Under the gate the chip only prepares when a channel is
+    /// marked, which for this patch is only on trigger samples; the key state therefore
+    /// goes true once and stays true, `clock_keystate` returns early, and the note
+    /// attacks once and then decays to silence between triggers. Eager is louder, and
+    /// wrong.
+    ///
+    /// **A core where this test passes trivially — where both readings agree — has no
+    /// gate**, which is the failure mode this whole task exists to prevent. Both the
+    /// count and the hash are compared, since a core could match the count by rendering
+    /// different audio of the same density.
+    #[test]
+    fn with_csm_on_eager_and_lazy_diverge() {
+        let lazy = render_csm(false, true);
+        let eager = render_csm(true, true);
+        assert_ne!(lazy.1, eager.1, "the two readings must not agree");
+        assert!(
+            eager.0 > lazy.0 * 2,
+            "eager re-attacks on every trigger: lazy {lazy:?}, eager {eager:?}"
+        );
+    }
+
+    /// `prepare()` runs at least every 4,096 samples even with nothing modified.
+    ///
+    /// The second half of the gate condition, and it is not decorative: it is what
+    /// re-caches operator data on a chip nobody is writing to. A core with only the
+    /// modified-channels half never re-caches at all.
+    #[test]
+    fn prepare_runs_at_least_every_four_thousand_ninety_six_samples() {
+        let mut chip = Ym2151::new();
+        chip.write(0x20, 0xC7);
+        for op in 0..4u8 {
+            let off = op * 8;
+            chip.write(0x40 + off, 0x01);
+            chip.write(0x80 + off, 31);
+            chip.write(0xE0 + off, 0x0F);
+        }
+        chip.write(0x28, 0x4A);
+        chip.write(0x08, 0x78);
+        // The writes above leave one channel marked, so sample 1 prepares. From there
+        // nothing is modified, so the periodic half must fire: 4,096 idle samples
+        // after that first prepare.
+        let mut buf = [(0i16, 0i16); 4_098];
+        chip.generate(&mut buf);
+        assert_eq!(
+            chip.prepare_count_for_test(),
+            2,
+            "the write's prepare, then the periodic one"
+        );
+    }
+
+    /// The gate is a gate: a quiet chip does not prepare every sample.
+    ///
+    /// Without this, a core that ignored `modified_channels` and prepared
+    /// unconditionally would pass `prepare_runs_at_least_every_...` — which only
+    /// asserts a floor — and every CSM test would then fail for a reason the counter
+    /// could have named directly.
+    #[test]
+    fn an_unwritten_chip_does_not_prepare_every_sample() {
+        let mut chip = Ym2151::new();
+        let mut buf = [(0i16, 0i16); 1_000];
+        chip.generate(&mut buf);
+        assert_eq!(
+            chip.prepare_count_for_test(),
+            1,
+            "only the post-reset prepare in 1,000 samples"
+        );
+
+        // And a write re-opens it exactly once.
+        chip.write(0x20, 0xC7);
+        chip.generate(&mut buf);
+        assert_eq!(chip.prepare_count_for_test(), 2, "the write's prepare");
     }
 }

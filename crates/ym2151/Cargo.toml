@@ -15,3 +15,7 @@ serde = { version = "1", optional = true, default-features = false, features = [
 default = ["std"]
 std = []
 serde = ["dep:serde"]
+# Exposes the prepare-gate accessors outside this crate's own tests. Off by default
+# and not enabled by anything in this workspace: `testrunner` runs the real chip, and
+# a suite that could force eager preparation could hide the very bug the gate fixes.
+internals = []
