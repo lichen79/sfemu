@@ -11,3 +11,7 @@ publish = false
 [dependencies]
 m68k = { path = "../m68k" }
 video = { path = "../video" }
+# The sound board. Both are dependency-free and `no_std`-shaped, like the two
+# above, so adding them does not weaken the edge the comment above protects.
+ym2151 = { path = "../ym2151" }
+z80 = { path = "../z80" }

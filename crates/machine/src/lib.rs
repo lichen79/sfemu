@@ -25,6 +25,7 @@ pub mod config;
 pub mod cps1;
 pub mod inputs;
 pub mod snapshot;
+pub mod sound;
 pub mod timing;
 pub mod trace;
 
