@@ -10,6 +10,9 @@
 pub mod binfmt;
 pub mod runner;
 pub mod testbus;
+pub mod ymfiles;
+pub mod ymfm;
+pub mod ymfmt;
 pub mod z80bus;
 pub mod z80files;
 pub mod z80fmt;
