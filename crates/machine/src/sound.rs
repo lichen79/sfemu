@@ -31,7 +31,10 @@ use ym2151::Ym2151;
 pub const UNMAPPED: u8 = 0xFF;
 
 /// Sound RAM, 0xD000-0xD7FF: 2 KB (`cps1.cpp:635`).
-const RAM_BYTES: usize = 0x800;
+///
+/// Public because [`crate::MachineState`] carries a copy of it, and a save-state
+/// codec has to name the array's length.
+pub const RAM_BYTES: usize = 0x800;
 /// First address of sound RAM.
 const RAM_BASE: u16 = 0xD000;
 
@@ -112,6 +115,56 @@ impl SoundBoard {
     /// The FM chip, for the scheduler to clock and the debugger to inspect.
     pub fn ym(&mut self) -> &mut Ym2151 {
         &mut self.ym
+    }
+
+    /// The FM chip without borrowing the board mutably, for a snapshot.
+    ///
+    /// [`SoundBoard::ym`] cannot serve: `Cps1::snapshot` takes `&self`.
+    #[must_use]
+    pub const fn ym_ref(&self) -> &Ym2151 {
+        &self.ym
+    }
+
+    /// Sound RAM, for a snapshot.
+    #[must_use]
+    pub const fn ram(&self) -> &[u8; RAM_BYTES] {
+        &self.ram
+    }
+
+    /// The address a write to 0xF000 latched, for a snapshot.
+    ///
+    /// **Part of the state, and the plan's field list left it out.** The Z80 writes
+    /// the address and the data as two separate instructions, so a state taken
+    /// between them — one instruction in a handful, which happens constantly in a
+    /// driver that writes the chip hundreds of times a frame — restores with the
+    /// wrong latched address and puts the next data byte in the wrong register.
+    /// `a_save_state_round_trips_the_sound_board` in `cps1.rs` is what would catch
+    /// its absence.
+    #[must_use]
+    pub const fn ym_addr(&self) -> u8 {
+        self.ym_addr
+    }
+
+    /// Puts the state a snapshot carries back, leaving the ROM and the diagnostic
+    /// counters alone.
+    ///
+    /// The counters are deliberately absent: they record the session rather than the
+    /// machine, for the same reason [`crate::Trace`] is not restored. Restoring them
+    /// would make a divergence test compare the first run's counters against a copy
+    /// of themselves.
+    pub fn restore(
+        &mut self,
+        ram: &[u8; RAM_BYTES],
+        bank: u8,
+        oki_pin7: bool,
+        ym: &Ym2151,
+        ym_addr: u8,
+    ) {
+        self.ram = *ram;
+        self.bank = bank & (BANKS - 1);
+        self.oki_pin7 = oki_pin7;
+        self.ym = ym.clone();
+        self.ym_addr = ym_addr;
     }
 
     /// The 68000 hands a byte to the Z80. `which` is 0 for the command byte and 1 for

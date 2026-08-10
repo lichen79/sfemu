@@ -4,12 +4,21 @@
 //!
 //! ```text
 //! offset  size  field
-//! 0       8     MAGIC          b"SFEMU\0\0\x01"; the last byte is the version
+//! 0       8     MAGIC          b"SFEMU\0\0\x02"; the last byte is the version
 //! 8       4     board          little-endian; BOARD_SF2 = b"SF2\0"
 //! 12      8     payload length little-endian
 //! 20      len   payload
 //! 20+len  4     CRC-32 of the payload, little-endian
 //! ```
+//!
+//! # Version 2 added the sound board
+//!
+//! Version 1 predates it. A version-1 file has no Z80, no sound RAM, no YM2151, and
+//! no sound schedule, so there is nothing to restore them from and no defensible
+//! default: a machine whose 68000 is mid-frame and whose Z80 is at its reset vector
+//! is not a state the hardware can be in. So a version-1 file is refused with
+//! [`StateError::Version`], which is what that variant is for — it names the version
+//! rather than calling the file damaged.
 //!
 //! The payload's field order is the list in [`encode`]'s source, read top to
 //! bottom, and **every reader and writer follows that list**. Booleans are one
@@ -37,14 +46,24 @@
 //! than against each other.
 
 use machine::m68k::M68k;
+use machine::sound::RAM_BYTES as SOUND_RAM_BYTES;
+use machine::timing::{RationalAccumulator, Z80_T_DEN, Z80_T_NUM};
 use machine::video::sprites::{ObjLatch, OBJ_WORDS};
+use machine::ym2151::state::{
+    StateReader as YmReader, StateWriter as YmWriter, STATE_BYTES as YM_BYTES,
+};
+use machine::ym2151::Ym2151;
+use machine::z80::Z80;
 use machine::{Inputs, MachineState, PlayerInput};
 
 /// The first eight bytes of every save state. The last byte is [`VERSION`].
-pub const MAGIC: [u8; 8] = *b"SFEMU\0\0\x01";
+pub const MAGIC: [u8; 8] = *b"SFEMU\0\0\x02";
 
 /// The format version, and the last byte of [`MAGIC`].
-pub const VERSION: u8 = 1;
+///
+/// 2 since the sound board joined the state — see the module docs on why a
+/// version-1 file is refused rather than filled in.
+pub const VERSION: u8 = 2;
 
 /// The board a state belongs to: `b"SF2\0"` big-endian, so it reads as ASCII in a
 /// hex dump.
@@ -59,6 +78,18 @@ const RAM_WORDS: usize = 0x8000;
 const GFXRAM_WORDS: usize = 0x1_8000;
 /// CPS-A and CPS-B each have this many registers.
 const CPS_REGS: usize = 0x20;
+
+/// The Z80's encoded size: 10 one-byte registers, 9 two-byte, then the flags.
+///
+/// **A hand count of the encoded fields, not `size_of::<Z80>()`**, which is 38 — the
+/// struct has a byte of alignment padding, and a format taking its size from the
+/// layout would change on a field reorder without any test noticing. That is this
+/// module's whole argument against serde.
+const Z80_BYTES: usize = 10          // a f b c d e h l i r
+    + 9 * 2                          // ix iy sp pc wz af_ bc_ de_ hl_
+    + 2                              // iff1 iff2
+    + 4                              // im ei q p
+    + 3; // halted irq nmi
 
 /// The payload's exact size, written out term by term.
 ///
@@ -84,7 +115,18 @@ const PAYLOAD: usize = 8 * 4      // d[0..8]
     + 8                            // total_cycles
     + 4                            // line
     + 8                            // carry
-    + OBJ_WORDS * 2;
+    + OBJ_WORDS * 2
+    // ---- the sound board, new in version 2 ----
+    + Z80_BYTES
+    + SOUND_RAM_BYTES
+    + 1                            // sound_bank
+    + 1                            // oki_pin7
+    + YM_BYTES
+    + 1                            // ym_addr
+    + 4 + 4 + 4                    // the Z80 accumulator: num, den, remainder
+    + 8                            // z80_debt
+    + 8                            // z80_total
+    + 4; // sample_acc
 
 /// Why a state was refused.
 ///
@@ -121,6 +163,20 @@ pub enum StateError {
         /// The CRC its payload actually has.
         computed: u32,
     },
+    /// The state's sound clock ratio is not this board's.
+    ///
+    /// A separate variant from [`Self::WrongBoard`] because it is a different
+    /// mistake: the file is for this game, and it is not damaged — its Z80's
+    /// fractional cycle debt is measured against a denominator this build does not
+    /// use, so resuming it would run the sound CPU at the wrong speed rather than
+    /// fail. Silently re-basing the remainder onto the new denominator would be the
+    /// decoder quietly changing the state it was given.
+    WrongSoundClock {
+        /// The ratio the file carries, as (numerator, denominator).
+        found: (u32, u32),
+        /// The ratio this build's board runs at.
+        expected: (u32, u32),
+    },
 }
 
 impl core::fmt::Display for StateError {
@@ -143,6 +199,13 @@ impl core::fmt::Display for StateError {
             Self::Corrupt { found, computed } => write!(
                 f,
                 "save state is damaged: CRC-32 {found:#010x}, computed {computed:#010x}"
+            ),
+            Self::WrongSoundClock {
+                found: (fnum, fden),
+                expected: (enum_, eden),
+            } => write!(
+                f,
+                "save state's sound clock is {fnum}/{fden}, but this board runs {enum_}/{eden}"
             ),
         }
     }
@@ -192,6 +255,56 @@ impl Writer {
         for &w in ws {
             self.u16(w);
         }
+    }
+    fn bytes(&mut self, bs: &[u8]) {
+        self.0.extend_from_slice(bs);
+    }
+    /// The sound Z80, field by field. See [`Z80_BYTES`].
+    ///
+    /// Written here rather than in `z80`, unlike the YM2151's: every field of a `Z80`
+    /// is public, so there is nothing the codec cannot reach and no reason to put a
+    /// byte layout inside a CPU core that has no other use for one.
+    fn z80(&mut self, c: &Z80) {
+        self.u8(c.a);
+        self.u8(c.f);
+        self.u8(c.b);
+        self.u8(c.c);
+        self.u8(c.d);
+        self.u8(c.e);
+        self.u8(c.h);
+        self.u8(c.l);
+        self.u8(c.i);
+        self.u8(c.r);
+        self.u16(c.ix);
+        self.u16(c.iy);
+        self.u16(c.sp);
+        self.u16(c.pc);
+        self.u16(c.wz);
+        self.u16(c.af_);
+        self.u16(c.bc_);
+        self.u16(c.de_);
+        self.u16(c.hl_);
+        self.bool(c.iff1);
+        self.bool(c.iff2);
+        self.u8(c.im);
+        self.u8(c.ei);
+        self.u8(c.q);
+        self.u8(c.p);
+        self.bool(c.halted);
+        self.bool(c.irq);
+        self.bool(c.nmi);
+    }
+    /// The FM chip, in [`YM_BYTES`] bytes of its own layout.
+    ///
+    /// The chip writes its own bytes: its register file, timers, and envelope counter
+    /// are private to it, and a setter per field would be a far wider hole in its
+    /// interface than one layout. See `machine::ym2151::state`.
+    fn ym(&mut self, chip: &Ym2151) {
+        let at = self.0.len();
+        self.0.resize(at + YM_BYTES, 0);
+        let mut w = YmWriter::new(&mut self.0[at..]);
+        chip.write_state(&mut w);
+        debug_assert_eq!(w.at(), YM_BYTES, "the chip's own layout size");
     }
     fn player(&mut self, p: &PlayerInput) {
         self.bool(p.right);
@@ -247,6 +360,54 @@ impl Reader<'_> {
         for w in out.iter_mut() {
             *w = self.u16();
         }
+    }
+    fn bytes(&mut self, out: &mut [u8]) {
+        let n = out.len();
+        out.copy_from_slice(self.take(n));
+    }
+    /// The sound Z80, in [`Writer::z80`]'s order.
+    fn z80(&mut self) -> Z80 {
+        // Field by field into a fresh CPU rather than a struct literal, so this reads
+        // as the same sequence the writer does. `Z80::new` is only a way to name one:
+        // every field below is overwritten.
+        let mut c = Z80::new();
+        c.a = self.u8();
+        c.f = self.u8();
+        c.b = self.u8();
+        c.c = self.u8();
+        c.d = self.u8();
+        c.e = self.u8();
+        c.h = self.u8();
+        c.l = self.u8();
+        c.i = self.u8();
+        c.r = self.u8();
+        c.ix = self.u16();
+        c.iy = self.u16();
+        c.sp = self.u16();
+        c.pc = self.u16();
+        c.wz = self.u16();
+        c.af_ = self.u16();
+        c.bc_ = self.u16();
+        c.de_ = self.u16();
+        c.hl_ = self.u16();
+        c.iff1 = self.bool();
+        c.iff2 = self.bool();
+        c.im = self.u8();
+        c.ei = self.u8();
+        c.q = self.u8();
+        c.p = self.u8();
+        c.halted = self.bool();
+        c.irq = self.bool();
+        c.nmi = self.bool();
+        c
+    }
+    /// The FM chip, from [`YM_BYTES`] bytes of its own layout.
+    fn ym(&mut self) -> Ym2151 {
+        let bytes = self.take(YM_BYTES);
+        let mut r = YmReader::new(bytes);
+        let chip = Ym2151::read_state_from(&mut r);
+        debug_assert_eq!(r.at(), YM_BYTES, "the chip's own layout size");
+        chip
     }
     fn player(&mut self) -> PlayerInput {
         PlayerInput {
@@ -317,6 +478,25 @@ pub fn encode(s: &MachineState, board: u32) -> Vec<u8> {
     w.u32(s.line);
     w.i64(s.carry);
     w.words(s.obj.words());
+
+    // The sound board.
+    w.z80(&s.z80);
+    w.bytes(&s.sound_ram[..]);
+    w.u8(s.sound_bank);
+    w.bool(s.oki_pin7);
+    w.ym(&s.ym);
+    w.u8(s.ym_addr);
+    // The accumulator's ratio as well as its remainder. The ratio is the board's,
+    // fixed by its crystals, so it is not information the state adds — it is what
+    // lets `decode` refuse a file written on a board with a different sound clock
+    // instead of resuming its fraction against the wrong denominator.
+    let (num, den) = s.z80_carry.ratio();
+    w.u32(num);
+    w.u32(den);
+    w.u32(s.z80_carry.remainder());
+    w.i64(s.z80_debt);
+    w.u64(s.z80_total);
+    w.u32(s.sample_acc);
 
     let payload = w.0;
     let mut out = Vec::with_capacity(HEADER + payload.len() + 4);
@@ -464,6 +644,29 @@ pub fn decode(bytes: &[u8], board: u32) -> Result<MachineState, StateError> {
     let mut obj = ObjLatch::new();
     r.words(obj.words_mut());
 
+    // The sound board, in `encode`'s order.
+    let z80 = r.z80();
+    let mut sound_ram = vec![0u8; SOUND_RAM_BYTES];
+    r.bytes(&mut sound_ram);
+    let sound_bank = r.u8();
+    let oki_pin7 = r.bool();
+    let ym = r.ym();
+    let ym_addr = r.u8();
+    // The ratio is checked, not adopted: a remainder is only meaningful against the
+    // denominator it was taken modulo. See `StateError::WrongSoundClock`.
+    let found_ratio = (r.u32(), r.u32());
+    let z80_rem = r.u32();
+    if found_ratio != (Z80_T_NUM, Z80_T_DEN) {
+        return Err(StateError::WrongSoundClock {
+            found: found_ratio,
+            expected: (Z80_T_NUM, Z80_T_DEN),
+        });
+    }
+    let z80_carry = RationalAccumulator::with_remainder(Z80_T_NUM, Z80_T_DEN, z80_rem);
+    let z80_debt = r.i64();
+    let z80_total = r.u64();
+    let sample_acc = r.u32();
+
     Ok(MachineState {
         cpu,
         ram: boxed(ram),
@@ -478,6 +681,16 @@ pub fn decode(bytes: &[u8], board: u32) -> Result<MachineState, StateError> {
         line,
         carry,
         obj,
+        z80,
+        sound_ram: boxed_bytes(sound_ram),
+        sound_bank,
+        oki_pin7,
+        ym,
+        ym_addr,
+        z80_carry,
+        z80_debt,
+        z80_total,
+        sample_acc,
     })
 }
 
@@ -491,10 +704,83 @@ fn boxed<const N: usize>(v: Vec<u16>) -> Box<[u16; N]> {
         .expect("the reader filled exactly N words")
 }
 
+/// [`boxed`] for the sound board's byte-wide RAM.
+fn boxed_bytes<const N: usize>(v: Vec<u8>) -> Box<[u8; N]> {
+    v.into_boxed_slice()
+        .try_into()
+        .expect("the reader filled exactly N bytes")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use machine::z80::Bus;
     use machine::{BoardConfig, Cps1, Timing};
+
+    /// A Z80 program that copies the 68000's command latch into sound RAM, forever.
+    ///
+    /// ```text
+    /// 0000  3A 08 F0    ld a,($F008)   the command latch
+    /// 0003  32 00 D0    ld ($D000),a   into the first byte of sound RAM
+    /// 0006  00          nop
+    /// 0007  18 F7       jr $0000
+    /// ```
+    ///
+    /// The same program `machine`'s `cps1::tests::sound_spin` uses, reproduced rather
+    /// than shared for the reason [`a_machine`]'s program is: a test module of another
+    /// crate is not reachable from here. Its `nop` is load-bearing there — it makes
+    /// the loop 42 T-states, whose remainder against a line's 229 walks the whole loop
+    /// — and it is kept here so the fixture's Z80 stops on each of the four
+    /// instructions in turn rather than on a fixed one, which is what makes the
+    /// restored `pc` and `z80_debt` take many values across the run.
+    ///
+    /// Padded to the full 0x18000 `audiocpu` region so a bank switch has a bank to
+    /// switch to.
+    fn sound_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x1_8000];
+        rom[0..9].copy_from_slice(&[0x3A, 0x08, 0xF0, 0x32, 0x00, 0xD0, 0x00, 0x18, 0xF7]);
+        // A byte only reachable through bank 1, so `sound_bank` is observable: the
+        // fixture selects bank 1, and a codec that dropped the bank would restore a
+        // machine reading 0x00 here instead.
+        rom[0x1_4000] = 0x5A;
+        rom
+    }
+
+    /// Puts the FM chip in a state no default can imitate: mid-note, LFO running,
+    /// both timers loaded and enabled.
+    ///
+    /// Written through the board's bus, as a driver does, so the address latch at
+    /// 0xF000 is exercised rather than bypassed — and the register file, the envelope
+    /// counter, the LFO waveform, and the timers all end up somewhere a reset chip is
+    /// not.
+    ///
+    /// **All four operators.** Algorithm 4's carriers are the operators at register
+    /// offsets 0x10 and 0x18, so leaving their attack rates at 0 — "never attack" —
+    /// makes the patch silent, and `machine`'s `ym2151` tests record that a silent
+    /// patch is what turns every sound assertion vacuous.
+    fn patch_the_chip(m: &mut Cps1) {
+        let mut w = |addr: u8, val: u8| {
+            m.sound.write(0xF000, addr);
+            m.sound.write(0xF001, val);
+        };
+        w(0x20, 0xC4); // algorithm 4, both outputs
+        w(0x28, 0x4A); // key code
+        for op in 0..4u8 {
+            let off = op * 8;
+            w(0x40 + off, 0x01); // detune 0, multiple 1
+            w(0x80 + off, 0x1F); // attack rate 31: immediate
+        }
+        w(0x18, 0x40); // LFO frequency
+        w(0x19, 0x7F); // AM depth (bit 7 clear)
+        w(0x19, 0xFF); // and PM depth (bit 7 set), the same register address
+        w(0x1B, 0x03); // LFO waveform 3: noise, which fills the 256-entry table
+        w(0x0F, 0x94); // noise enable, frequency 0x14
+        w(0x10, 0x40); // timer A high
+        w(0x11, 0x02); // timer A low
+        w(0x12, 0x37); // timer B
+        w(0x14, 0x0F); // load and enable both timers, IRQ on both
+        w(0x08, 0x78); // key on, all four operators of channel 0
+    }
 
     /// A machine whose state is distinctive in every field, and the state itself.
     ///
@@ -518,6 +804,14 @@ mod tests {
     /// 1100  5241             addq.w #1,d1       the vblank handler
     /// 1102  4E73             rte
     /// ```
+    ///
+    /// # It has a sound program, since version 2
+    ///
+    /// The machine is built with [`sound_spin`] rather than through `with_gfx`. A
+    /// board with no sound ROM reads [`machine::sound::UNMAPPED`] — 0xFF, `RST 38h` —
+    /// so its Z80 spins in a reset loop that writes nothing: sound RAM stays zero, the
+    /// stack is the only thing that moves, and every sound field a codec dropped
+    /// would restore to a value indistinguishable from the one it lost.
     fn a_machine() -> Cps1 {
         let mut rom = vec![0u8; 0x2000];
         rom[0..8].copy_from_slice(&[0x00, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00]);
@@ -539,8 +833,22 @@ mod tests {
         }
 
         let cfg = BoardConfig::sf2();
-        let mut m = Cps1::with_gfx(&rom, gfx, cfg, Timing::cps1_10mhz());
+        let mut m = Cps1::with_sound(&rom, gfx, sound_rom(), cfg, Timing::cps1_10mhz());
         m.reset();
+        // The sound board, before the run: the patch and the bank are what the Z80's
+        // 5,241 lines of copying then interleave with.
+        patch_the_chip(&mut m);
+        m.sound.write(0xF004, 0x01); // bank 1
+        m.sound.write(0xF006, 0x01); // OKI pin 7 high
+        m.sound.write(0xF000, 0x30); // an address latched with no data byte yet
+                                     // A byte for the Z80's copy loop to find, and a pattern across sound RAM. The
+                                     // loop only ever writes 0xD000, so without the pattern 2,047 of the 2,048
+                                     // bytes would be zero and a codec that wrote the region short would restore an
+                                     // identical machine.
+        m.board.sound_latch[0] = 0x5C;
+        for i in 0..SOUND_RAM_BYTES as u16 {
+            m.sound.write(0xD000 + i, (i as u8) ^ 0xA5);
+        }
         m.board.cps_a[machine::video::regs::OBJ_BASE] = 0x40;
         m.board.gfxram[0x2000] = machine::video::VISIBLE_X as u16;
         m.board.gfxram[0x2001] = machine::video::VISIBLE_Y as u16;
@@ -593,6 +901,16 @@ mod tests {
     }
 
     /// What a run does, for the divergence comparison. Same shape as `machine`'s.
+    ///
+    /// # The sound half
+    ///
+    /// `samples`, `z80_cycles`, `z80_pc`, `ym_status`, and `sound_ram` are here because
+    /// the video half cannot see the sound board at all: the 68000 never reads it, so
+    /// a save state that dropped the whole Z80 would still reproduce every pen. The
+    /// samples are the load-bearing one — they are a function of the register file, the
+    /// envelope phase, the LFO, and the noise LFSR together — and `ym_status` is what
+    /// makes the timers observable, since a timer's only visible effect is a status bit
+    /// and an IRQ.
     #[derive(Debug, PartialEq, Eq)]
     struct Fingerprint {
         pens: Vec<u16>,
@@ -602,10 +920,17 @@ mod tests {
         line: u32,
         d0: u32,
         d1: u32,
+        samples: Vec<(i16, i16)>,
+        z80_cycles: u64,
+        z80_pc: u16,
+        ym_status: u8,
+        sound_ram: Vec<u8>,
     }
 
     fn advance_and_fingerprint(m: &mut Cps1, lines: u32) -> Fingerprint {
         let (v0, a0) = (m.board.trace.vblanks, m.board.trace.acks);
+        let c0 = m.z80_cycles();
+        m.drain_samples();
         for _ in 0..lines {
             m.run_scanline();
         }
@@ -618,6 +943,15 @@ mod tests {
             line: m.line,
             d0: m.cpu.d[0],
             d1: m.cpu.d[1],
+            // Every 71st sample: a stride co-prime with the 128-sample timer periods
+            // and with a frame's sample count, so the kept samples are not one phase of
+            // a repeating envelope. The whole run is ~44,000 samples and comparing all
+            // of them makes the failure message unreadable.
+            samples: m.samples().iter().copied().step_by(71).collect(),
+            z80_cycles: m.z80_cycles() - c0,
+            z80_pc: m.z80.pc,
+            ym_status: m.sound.ym_ref().read_status(),
+            sound_ram: m.sound.ram().to_vec(),
         }
     }
 
@@ -775,6 +1109,305 @@ mod tests {
         assert!(s.obj.words().iter().any(|&w| w != 0), "and sprites latched");
     }
 
+    /// The fixture's *sound* fields are distinctive too.
+    ///
+    /// The same premise as above, for the half the video assertions cannot see. Every
+    /// sound comparison in `every_sound_field_survives_the_round_trip` is
+    /// decoded-against-original, so all of them pass for a reset sound board and a
+    /// codec that writes a reset one. These are the values that make them discriminate,
+    /// and each one names what a codec dropping it would restore instead.
+    #[test]
+    fn the_fixture_is_not_a_quiet_sound_board() {
+        let mut m = a_machine();
+        let s = m.snapshot();
+
+        assert_ne!(s.z80.pc, 0, "the Z80 is mid-loop, not at its reset vector");
+        assert_ne!(s.z80.sp, 0, "and its stack pointer has moved");
+        assert_ne!(s.z80_total, 0, "the sound CPU ran");
+        assert_ne!(
+            s.z80_debt, 0,
+            "and it is mid-line: a debt is owed or overspent"
+        );
+        assert_eq!(
+            s.sound_bank, 1,
+            "bank 1, so a dropped bank reads other bytes"
+        );
+        assert!(s.oki_pin7, "pin 7 high, so a dropped `false` is visible");
+        assert_eq!(s.ym_addr, 0x30, "an address latched with no data byte yet");
+        // The copy loop ran: sound RAM's first byte is the latch the fixture set
+        // before the run, not the 0xA5 the pattern put there. The latch itself is
+        // 0x12 by snapshot time — `a_machine` sets it last, after the run — so this
+        // also says the byte came from the Z80 rather than from a codec copying the
+        // 68000's latch into the sound side.
+        assert_eq!(
+            s.sound_ram[0], 0x5C,
+            "the Z80 copied the latch it was given"
+        );
+        assert_eq!(
+            s.sound_ram[1],
+            0x01 ^ 0xA5,
+            "and left the pattern beside it"
+        );
+        assert!(
+            s.sound_ram.iter().filter(|&&b| b != 0).count() > 2_000,
+            "sound RAM is patterned, not one written byte in 2,048 zeros"
+        );
+
+        // The chip. Its interior is private, so it is measured the way a driver sees
+        // it: its bytes against a reset chip's, and the sound it makes.
+        let reset = machine::ym2151::Ym2151::new();
+        assert_ne!(
+            s.ym.write_state_bytes().as_slice(),
+            reset.write_state_bytes().as_slice(),
+            "the chip is not a reset chip"
+        );
+        assert_ne!(s.sample_acc, 0, "and it is mid-sample");
+        m.drain_samples();
+        for _ in 0..64 {
+            m.run_scanline();
+        }
+        let sound = m.samples();
+        assert!(!sound.is_empty(), "64 lines produce samples");
+        assert!(
+            sound.iter().any(|&(l, r)| l != 0 || r != 0),
+            "and the patch makes sound, or every sample comparison is a comparison \
+             of silence against silence"
+        );
+        assert!(
+            sound.iter().any(|&(l, _)| l != sound[0].0),
+            "sound that changes, not one held level"
+        );
+    }
+
+    /// The sound board's fields survive the bytes, field by field.
+    ///
+    /// The round trip proves the machine's *future* survives, which is what matters;
+    /// this names which sound field is wrong when it does not. It is also what catches
+    /// the two adjacent one-byte fields the guest never reads back — `sound_bank` and
+    /// `oki_pin7` — whose swap no divergence test can see, since D2 has no OKI for pin
+    /// 7 to reach.
+    #[test]
+    fn every_sound_field_survives_the_round_trip() {
+        let s = a_machine().snapshot();
+        let d = decode(&encode(&s, BOARD_SF2), BOARD_SF2).expect("valid");
+
+        // `Z80` has `PartialEq`, so the whole CPU is one comparison — but name the
+        // registers a swap would hide: the eight one-byte registers are written as a
+        // run, and `assert_eq!` on the struct reports "not equal" without saying which.
+        assert_eq!(d.z80.a, s.z80.a, "a");
+        assert_eq!(d.z80.f, s.z80.f, "f");
+        assert_eq!((d.z80.b, d.z80.c), (s.z80.b, s.z80.c), "bc");
+        assert_eq!((d.z80.d, d.z80.e), (s.z80.d, s.z80.e), "de");
+        assert_eq!((d.z80.h, d.z80.l), (s.z80.h, s.z80.l), "hl");
+        assert_eq!((d.z80.i, d.z80.r), (s.z80.i, s.z80.r), "i and r");
+        assert_eq!((d.z80.ix, d.z80.iy), (s.z80.ix, s.z80.iy), "ix and iy");
+        assert_eq!(d.z80.sp, s.z80.sp, "sp");
+        assert_eq!(d.z80.pc, s.z80.pc, "pc");
+        assert_eq!(d.z80.wz, s.z80.wz, "wz");
+        assert_eq!(d.z80.af_, s.z80.af_, "af'");
+        assert_eq!(d.z80.bc_, s.z80.bc_, "bc'");
+        assert_eq!(d.z80.de_, s.z80.de_, "de'");
+        assert_eq!(d.z80.hl_, s.z80.hl_, "hl'");
+        assert_eq!(d.z80, s.z80, "and the whole CPU, flags included");
+
+        assert_eq!(&d.sound_ram[..], &s.sound_ram[..], "sound RAM");
+        assert_eq!(d.sound_bank, s.sound_bank, "the ROM bank");
+        assert_eq!(d.oki_pin7, s.oki_pin7, "OKI pin 7");
+        assert_eq!(d.ym_addr, s.ym_addr, "the latched YM2151 address");
+        // The chip through its own bytes: it has no `PartialEq` reachable from here
+        // that would cover its private interior, and its layout is what a save state
+        // actually carries.
+        assert_eq!(
+            d.ym.write_state_bytes().as_slice(),
+            s.ym.write_state_bytes().as_slice(),
+            "the FM chip"
+        );
+        assert_eq!(d.z80_carry.ratio(), s.z80_carry.ratio(), "the clock ratio");
+        assert_eq!(
+            d.z80_carry.remainder(),
+            s.z80_carry.remainder(),
+            "and the fraction it had carried"
+        );
+        assert_eq!(d.z80_debt, s.z80_debt, "the T-state debt");
+        assert_eq!(d.z80_total, s.z80_total, "the T-state total");
+        assert_eq!(d.sample_acc, s.sample_acc, "the sample accumulator");
+    }
+
+    /// The sound half is load-bearing in the fingerprint.
+    ///
+    /// `a_state_survives_a_round_trip_through_bytes` compares two fingerprints, and a
+    /// fingerprint that only reflected the video half would let a save state drop the
+    /// whole sound board and still pass. This resets the chip on the decoded state and
+    /// requires the run to differ — so the comparison is one that can fail for a sound
+    /// reason and not only for a video one.
+    #[test]
+    fn resetting_the_decoded_chip_changes_the_run() {
+        let mut m = a_machine();
+        let bytes = encode(&m.snapshot(), BOARD_SF2);
+
+        m.restore(&decode(&bytes, BOARD_SF2).expect("valid"));
+        let carried = advance_and_fingerprint(&mut m, 1_000);
+
+        let mut broken = decode(&bytes, BOARD_SF2).expect("valid");
+        broken.ym = machine::ym2151::Ym2151::new();
+        m.restore(&broken);
+        let reset = advance_and_fingerprint(&mut m, 1_000);
+
+        assert_ne!(
+            carried, reset,
+            "a state whose chip came back reset must run differently"
+        );
+        assert_eq!(
+            carried.pens, reset.pens,
+            "and the difference is entirely in the sound half: the 68000 never reads \
+             the sound board, so a fingerprint that noticed this in the pens would be \
+             noticing something else"
+        );
+    }
+
+    /// A version-1 file is refused, and told which version it is.
+    ///
+    /// Version 1 predates the sound board, so its payload has no Z80, no sound RAM,
+    /// and no chip — and there is no defensible default for them. The file is
+    /// well-formed and its CRC is valid; only the version byte differs, so this
+    /// exercises the version check rather than the CRC.
+    #[test]
+    fn a_version_one_file_is_refused() {
+        let mut bytes = encode(&a_machine().snapshot(), BOARD_SF2);
+        bytes[7] = 1;
+        assert_eq!(
+            crc32(&bytes[HEADER..HEADER + PAYLOAD]),
+            u32::from_le_bytes(bytes[HEADER + PAYLOAD..].try_into().unwrap()),
+            "the CRC covers only the payload, so it is still valid"
+        );
+        assert_eq!(
+            err(&bytes, BOARD_SF2),
+            StateError::Version { found: 1 },
+            "a version-1 state must be told it is a version-1 state"
+        );
+    }
+
+    /// A state written against a different sound clock is refused.
+    ///
+    /// The remainder is a fraction of the denominator it was taken modulo. A decoder
+    /// that adopted the file's numbers would run the sound CPU at the file's clock; one
+    /// that ignored them would resume a 1/2 remainder as 1/3,125. Both are wrong in a
+    /// way nothing else in the format would catch, so the ratio is checked.
+    ///
+    /// The offset is *found* rather than hand-computed, so a later field reordering
+    /// moves the test with the format instead of silently patching a `line` byte.
+    #[test]
+    fn a_state_from_another_sound_clock_is_refused() {
+        let bytes = encode(&a_machine().snapshot(), BOARD_SF2);
+        let mut wanted = Z80_T_NUM.to_le_bytes().to_vec();
+        wanted.extend_from_slice(&Z80_T_DEN.to_le_bytes());
+        let payload = &bytes[HEADER..HEADER + PAYLOAD];
+        let hits: Vec<usize> = payload
+            .windows(8)
+            .enumerate()
+            .filter(|(_, w)| *w == &wanted[..])
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the ratio appears exactly once in the payload"
+        );
+
+        let mut bad = bytes.clone();
+        let at = HEADER + hits[0];
+        bad[at + 4..at + 8].copy_from_slice(&(Z80_T_DEN * 2).to_le_bytes());
+        let crc = crc32(&bad[HEADER..HEADER + PAYLOAD]);
+        bad[HEADER + PAYLOAD..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            err(&bad, BOARD_SF2),
+            StateError::WrongSoundClock {
+                found: (Z80_T_NUM, Z80_T_DEN * 2),
+                expected: (Z80_T_NUM, Z80_T_DEN),
+            },
+            "a valid file with another board's sound clock is a clock error, not \
+             a corrupt file"
+        );
+        // And the unpatched original still loads, so the check is not refusing
+        // everything.
+        assert!(decode(&bytes, BOARD_SF2).is_ok());
+    }
+
+    /// Encoding a decoded state reproduces the bytes exactly.
+    ///
+    /// This is what catches a field the writer writes and the reader never reads back:
+    /// the decoded state carries `Z80::new()`'s or `Ym2151::new()`'s value for it, and
+    /// re-encoding puts that default where the original byte was. It covers every byte
+    /// of the payload at once, which a per-byte mutation test cannot afford to —
+    /// 268,500 decode-and-re-CRC round trips of a 262 KB file.
+    ///
+    /// It rests on `the_fixture_is_not_a_quiet_machine` and
+    /// `the_fixture_is_not_a_quiet_sound_board`: a field whose fixture value *is* the
+    /// default would round-trip byte-identically while being dropped. Those two tests
+    /// are why that is not the case here.
+    #[test]
+    fn re_encoding_a_decoded_state_reproduces_the_bytes() {
+        let first = encode(&a_machine().snapshot(), BOARD_SF2);
+        let decoded = decode(&first, BOARD_SF2).expect("valid");
+        let second = encode(&decoded, BOARD_SF2);
+        // Report the offset rather than dumping 262 KB twice.
+        let differs = (0..first.len().min(second.len())).find(|&i| first[i] != second[i]);
+        assert_eq!(
+            differs, None,
+            "byte {differs:?} changed: a field the encoder writes and the decoder \
+             does not read back"
+        );
+        assert_eq!(first.len(), second.len());
+    }
+
+    /// A flipped bit anywhere in the sound half changes the decoded state.
+    ///
+    /// The complement of the test above: that one proves the reader reads every byte;
+    /// this proves each byte it reads reaches a field the encoder writes again — a
+    /// reader that consumed a byte and discarded it passes the idempotence test above
+    /// and fails here.
+    ///
+    /// **Every 13th byte of the sound region, not all 4,039.** Each iteration decodes
+    /// and re-encodes a 262 KB file and re-runs two CRCs over it, so full coverage is
+    /// ~35× this test's cost for no new failure mode; 13 is co-prime with every field
+    /// width in the region, so the sampled offsets land inside fields of all sizes
+    /// rather than on 4-byte boundaries. The YM2151's own
+    /// `every_byte_of_the_layout_changes_the_decoded_chip` covers its 1,919 bytes
+    /// exhaustively.
+    #[test]
+    fn a_flipped_bit_in_the_sound_half_changes_the_decoded_state() {
+        let good = encode(&a_machine().snapshot(), BOARD_SF2);
+        // The sound half is the payload's tail: the video half's size is the version-1
+        // payload, so the region starts where that ended.
+        let sound_bytes = Z80_BYTES + SOUND_RAM_BYTES + 2 + YM_BYTES + 1 + 12 + 20;
+        let start = HEADER + PAYLOAD - sound_bytes;
+        assert_eq!(sound_bytes, 4_039, "the sound half's size, hand-counted");
+
+        let mut checked = 0;
+        for at in (start..HEADER + PAYLOAD).step_by(13) {
+            let mut bad = good.clone();
+            bad[at] ^= 0x01;
+            let crc = crc32(&bad[HEADER..HEADER + PAYLOAD]);
+            bad[HEADER + PAYLOAD..].copy_from_slice(&crc.to_le_bytes());
+            // A flipped ratio byte is refused rather than decoded, which is that
+            // field's own test above; every other byte must decode and differ.
+            if let Ok(d) = decode(&bad, BOARD_SF2) {
+                assert_ne!(
+                    encode(&d, BOARD_SF2),
+                    good,
+                    "payload byte {} decoded to a state indistinguishable from the \
+                     original: the decoder read that byte and threw it away",
+                    at - HEADER
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 300,
+            "and it checked {checked} bytes, not a handful"
+        );
+    }
+
     /// The CPU's flag bytes survive individually.
     ///
     /// A running machine has `halted`, `stopped`, `in_exception`, and
@@ -813,19 +1446,33 @@ mod tests {
     /// inputs  6 + 2*10 + 3                                =     29
     /// sched   8 total_cycles + 4 line + 8 carry           =     20
     /// obj     0x400 * 2                                   =   2048
+    /// ---- the sound board, new in version 2 ----
+    /// z80     10*1 + 9*2 + 2 iff + 4 (im ei q p) + 3      =     37
+    /// sndram  0x800                                       =   2048
+    /// bank    1 sound_bank + 1 oki_pin7                   =      2
+    /// ym      the chip's own layout                       =   1919
+    /// ymaddr  1                                           =      1
+    /// z80acc  4 num + 4 den + 4 remainder                 =     12
+    /// z80sch  8 debt + 8 total + 4 sample_acc             =     20
     ///                                                       ------
-    /// payload                                               264461
+    /// payload                                               268500
     /// header  8 magic + 4 board + 8 length                 =     20
     /// crc                                                  =      4
     ///                                                       ------
-    /// total                                                 264485
+    /// total                                                 268524
     /// ```
     #[test]
     fn the_encoded_length_is_the_documented_size() {
-        assert_eq!(PAYLOAD, 264_461, "the payload, term by term");
+        assert_eq!(PAYLOAD, 268_500, "the payload, term by term");
         let bytes = encode(&a_machine().snapshot(), BOARD_SF2);
-        assert_eq!(bytes.len(), 264_485, "20 header + payload + 4 CRC");
+        assert_eq!(bytes.len(), 268_524, "20 header + payload + 4 CRC");
         assert_eq!(HEADER, 20);
+        // The sound half is 4,039 of those bytes, and the YM2151 is most of it. Named
+        // here so a change to the chip's private layout shows up as a save-state size
+        // change rather than only as a mismatch inside `ym2151`.
+        assert_eq!(Z80_BYTES, 37, "a hand count, not size_of::<Z80>() = 38");
+        assert_eq!(SOUND_RAM_BYTES, 0x800);
+        assert_eq!(YM_BYTES, 1_919, "the chip's own documented size");
         // And the declared length in the header agrees with what follows it.
         let declared = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
         assert_eq!(declared as usize, PAYLOAD, "the header declares the truth");
@@ -835,7 +1482,7 @@ mod tests {
     #[test]
     fn the_header_is_laid_out_as_documented() {
         let bytes = encode(&a_machine().snapshot(), BOARD_SF2);
-        assert_eq!(&bytes[0..8], b"SFEMU\0\0\x01", "magic, version in byte 7");
+        assert_eq!(&bytes[0..8], b"SFEMU\0\0\x02", "magic, version in byte 7");
         assert_eq!(MAGIC[7], VERSION, "the version *is* the magic's last byte");
         assert_eq!(
             &bytes[8..12],
@@ -1041,7 +1688,7 @@ mod tests {
             &MAGIC[..],
             &MAGIC[..7],
             &[0xFFu8; 32][..],
-            &[0x00u8; 264_485][..],
+            &[0x00u8; 268_524][..],
         ] {
             let _ = decode(bad, BOARD_SF2);
         }

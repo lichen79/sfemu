@@ -46,6 +46,20 @@ pub use video;
 /// coupling the boundary exists to prevent.
 pub use m68k;
 
+/// The sound CPU crate, re-exported, for the same reason [`m68k`] is.
+///
+/// [`MachineState::z80`] is a [`z80::Z80`], so a save-state codec has to name the
+/// type and construct one to fill from a file.
+pub use z80;
+
+/// The FM chip crate, re-exported, for the same reason [`m68k`] is.
+///
+/// [`MachineState::ym`] is a [`ym2151::Ym2151`], and a codec needs both the type and
+/// [`ym2151::state::STATE_BYTES`] — the chip writes its own bytes, because its
+/// register file, timers, and envelope counter are private to it. See
+/// [`ym2151::state`] for why that layout lives there and not in the frontend.
+pub use ym2151;
+
 pub use board::Board;
 pub use config::BoardConfig;
 pub use cps1::Cps1;

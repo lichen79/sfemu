@@ -127,6 +127,43 @@ impl Channel {
         *self = Self::new();
     }
 
+    /// Appends this channel to a save state, in [`crate::state::CHANNEL_BYTES`]
+    /// bytes: four operators, four caches, then the feedback history.
+    pub fn write_state(&self, w: &mut crate::state::StateWriter<'_>) {
+        for op in &self.ops {
+            op.write_state(w);
+        }
+        for cache in &self.caches {
+            cache.write_state(w);
+        }
+        w.i16(self.feedback[0]);
+        w.i16(self.feedback[1]);
+        w.i16(self.feedback_in);
+    }
+
+    /// A channel read back from a save state. See [`Channel::write_state`].
+    #[must_use]
+    pub fn read_state(r: &mut crate::state::StateReader<'_>) -> Self {
+        let ops = [
+            Operator::read_state(r),
+            Operator::read_state(r),
+            Operator::read_state(r),
+            Operator::read_state(r),
+        ];
+        let caches = [
+            OpCache::read_state(r),
+            OpCache::read_state(r),
+            OpCache::read_state(r),
+            OpCache::read_state(r),
+        ];
+        Self {
+            ops,
+            caches,
+            feedback: [r.i16(), r.i16()],
+            feedback_in: r.i16(),
+        }
+    }
+
     /// The register operator index backing a slot, for `ch`.
     ///
     /// [`slot_of`] is an involution, so it converts in both directions: slot 1 is

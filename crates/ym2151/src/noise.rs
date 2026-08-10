@@ -60,6 +60,29 @@ impl Noise {
         *self = Self::new();
     }
 
+    /// Appends the noise generator to a save state, in
+    /// [`crate::state::NOISE_BYTES`] bytes.
+    pub fn write_state(&self, w: &mut crate::state::StateWriter<'_>) {
+        w.u32(self.lfsr);
+        w.u32(self.counter);
+        w.u32(self.state);
+    }
+
+    /// A noise generator read back from a save state.
+    ///
+    /// The LFSR is restored as written, including a zero. Zero is a state the real
+    /// register cannot reach — it is a lock-up — but it can only arrive here from a
+    /// damaged file the frontend's CRC-32 has already refused, and substituting the
+    /// seed would be a decoder quietly changing the state it was given.
+    #[must_use]
+    pub fn read_state(r: &mut crate::state::StateReader<'_>) -> Self {
+        Self {
+            lfsr: r.u32(),
+            counter: r.u32(),
+            state: r.u32(),
+        }
+    }
+
     /// The 17-bit shift register, extracted from its window in [`Noise::lfsr`].
     #[must_use]
     pub fn register(&self) -> u32 {

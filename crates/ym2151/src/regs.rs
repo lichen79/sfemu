@@ -172,6 +172,37 @@ impl Regs {
         self.file[reg as usize]
     }
 
+    /// Appends this register file to a save state, in
+    /// [`crate::state::REGS_BYTES`] bytes.
+    ///
+    /// The two depth fields are written separately rather than derived from `0x19`:
+    /// that address holds only the *last* value written to it, and its top bit says
+    /// which of the two fields that value went to. The other field's value is
+    /// unrecoverable from the file, so a codec that wrote only the 256 bytes would
+    /// lose whichever depth was set first — silently, since every register-comparison
+    /// test would still pass.
+    pub fn write_state(&self, w: &mut crate::state::StateWriter<'_>) {
+        for &b in &self.file {
+            w.u8(b);
+        }
+        w.u8(self.am_depth);
+        w.u8(self.pm_depth);
+    }
+
+    /// A register file read back from a save state. See [`Regs::write_state`].
+    #[must_use]
+    pub fn read_state(r: &mut crate::state::StateReader<'_>) -> Self {
+        let mut file = [0u8; 0x100];
+        for b in &mut file {
+            *b = r.u8();
+        }
+        Self {
+            file,
+            am_depth: r.u8(),
+            pm_depth: r.u8(),
+        }
+    }
+
     /// `count` bits starting at `start` of the byte at `reg + extra`.
     fn bits(&self, reg: u8, start: u32, count: u32, extra: u32) -> u32 {
         let byte = u32::from(self.file[(u32::from(reg) + extra) as usize & 0xFF]);

@@ -99,6 +99,37 @@ impl Lfo {
         *self = Self::new();
     }
 
+    /// Appends the LFO to a save state, in [`crate::state::LFO_BYTES`] bytes.
+    ///
+    /// The 256-entry waveform is 512 of those bytes and it is real state, not a
+    /// table: the LFO writes one entry per clock from the noise generator, so a chip
+    /// restored without it plays waveform 3 out of zeros until it has walked all 256
+    /// positions — up to 256 samples of the wrong sound after every load, and silent
+    /// in any driver that does not use waveform 3.
+    pub fn write_state(&self, w: &mut crate::state::StateWriter<'_>) {
+        w.u32(self.counter);
+        for &(am, pm) in &self.noise_waveform {
+            w.u8(am);
+            w.i8(pm);
+        }
+        w.u32(self.am);
+    }
+
+    /// An LFO read back from a save state. See [`Lfo::write_state`].
+    #[must_use]
+    pub fn read_state(r: &mut crate::state::StateReader<'_>) -> Self {
+        let counter = r.u32();
+        let mut noise_waveform = [(0u8, 0i8); 256];
+        for entry in &mut noise_waveform {
+            *entry = (r.u8(), r.i8());
+        }
+        Self {
+            counter,
+            noise_waveform,
+            am: r.u32(),
+        }
+    }
+
     /// The waveform position, bits 22-29 of the counter.
     #[must_use]
     pub fn position(&self) -> u32 {

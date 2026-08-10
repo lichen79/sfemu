@@ -122,6 +122,36 @@ impl Timers {
         self.irq
     }
 
+    /// Appends the timers to a save state, in [`crate::state::TIMERS_BYTES`] bytes.
+    ///
+    /// `total_clocks` is in here because timer B's period is measured against it
+    /// rather than against its own counter — it is the `delta` the private `period`
+    /// takes, and B advances only every 16th clock of it. A
+    /// restored chip missing it puts timer B's next overflow up to 16 samples out,
+    /// which is an IRQ in the wrong place and, in a driver that counts them, a tempo
+    /// that steps.
+    pub fn write_state(&self, w: &mut crate::state::StateWriter<'_>) {
+        w.u32(self.counter[0]);
+        w.u32(self.counter[1]);
+        w.bool(self.running[0]);
+        w.bool(self.running[1]);
+        w.u8(self.status);
+        w.bool(self.irq);
+        w.u32(self.total_clocks);
+    }
+
+    /// Timers read back from a save state. See [`Timers::write_state`].
+    #[must_use]
+    pub fn read_state(r: &mut crate::state::StateReader<'_>) -> Self {
+        Self {
+            counter: [r.u32(), r.u32()],
+            running: [r.bool(), r.bool()],
+            status: r.u8(),
+            irq: r.bool(),
+            total_clocks: r.u32(),
+        }
+    }
+
     /// One timer's period in samples, read from the registers now.
     ///
     /// `delta` is the free-running adjustment, which only timer B uses. The result is

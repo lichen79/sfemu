@@ -58,10 +58,11 @@ pub const Z80_T_DEN: u32 = 3_125;
 
 /// Input clocks per YM2151 sample. Exactly 64: the chip divides by 2 then by 32.
 ///
-/// This duplicates `ym2151::Ym2151::sample_clocks()`, which `machine` cannot call
-/// yet — it does not depend on `ym2151` until Task 10 wires the sound board. That
-/// task must assert the two agree: a second literal that silently disagreed with the
-/// chip would put every sample in the wrong place, and nothing here would notice.
+/// This duplicates `ym2151::Ym2151::sample_clocks()`. The copy exists because this
+/// module predates `machine`'s dependency on `ym2151`, and the two are held together
+/// by `the_sample_rate_is_fractional_per_line_and_per_frame`, which asserts they
+/// agree: a second literal that silently disagreed with the chip would put every
+/// sample in the wrong place, and nothing else here would notice.
 pub const YM_SAMPLE_CLOCKS: u32 = 64;
 
 /// Hands out `num / den` units per step without drifting.
@@ -88,6 +89,46 @@ impl RationalAccumulator {
     pub const fn new(num: u32, den: u32) -> Self {
         assert!(den != 0, "a zero denominator is a programming error");
         Self { num, den, rem: 0 }
+    }
+
+    /// An accumulator resumed mid-fraction, for a save state.
+    ///
+    /// # Why this exists at all
+    ///
+    /// [`RationalAccumulator::new`] zeroes the remainder, and the remainder is state:
+    /// dropping it puts a restored machine one T-state out within a line and then
+    /// permanently out of step. A save-state codec lives outside this crate — it
+    /// cannot reach the private field — so without this the only alternatives were
+    /// public fields, which would let any caller move the fraction, or a save state
+    /// that silently lost it.
+    ///
+    /// `rem` is taken modulo `den` rather than rejected: a remainder at or above the
+    /// denominator is arithmetically a whole unit that [`advance`](Self::advance)
+    /// would hand out on the next step anyway, and the value came from a file.
+    ///
+    /// # Panics
+    ///
+    /// If `den` is zero, for [`RationalAccumulator::new`]'s reason.
+    #[must_use]
+    pub const fn with_remainder(num: u32, den: u32, rem: u32) -> Self {
+        assert!(den != 0, "a zero denominator is a programming error");
+        Self {
+            num,
+            den,
+            rem: rem % den,
+        }
+    }
+
+    /// The ratio this accumulator hands out, as `(num, den)`.
+    ///
+    /// A save state carries the remainder, not the ratio — the ratio is the board's,
+    /// fixed by its crystals — but a codec has to write *something* it can read back,
+    /// and reconstructing from the board's constants while asserting these match is
+    /// what makes a state written for one clock refuse to restore silently into
+    /// another. See `frontend::state`'s Z80 accumulator field.
+    #[must_use]
+    pub const fn ratio(&self) -> (u32, u32) {
+        (self.num, self.den)
     }
 
     /// The whole units for this step, carrying the fraction forward.
@@ -364,6 +405,16 @@ mod tests {
     #[test]
     fn the_sample_rate_is_fractional_per_line_and_per_frame() {
         assert_eq!(YM_SAMPLE_CLOCKS, 64);
+        // **The assertion [`YM_SAMPLE_CLOCKS`]'s own doc says this module owes.** The
+        // constant is a second copy of the chip's figure, written before `machine`
+        // depended on `ym2151`; a copy that silently disagreed would put every sample
+        // in the wrong place and nothing else here would notice, because every other
+        // test in this file reads the copy rather than the chip.
+        assert_eq!(
+            YM_SAMPLE_CLOCKS,
+            ym2151::Ym2151::sample_clocks(),
+            "the constant and the chip must agree about the sample period"
+        );
         assert_eq!(
             Z80_HZ % YM_SAMPLE_CLOCKS,
             25,
@@ -415,5 +466,79 @@ mod tests {
     #[should_panic(expected = "a zero denominator")]
     fn a_zero_denominator_is_rejected() {
         let _ = RationalAccumulator::new(1, 0);
+    }
+
+    /// And `with_remainder` rejects one too, for the same reason.
+    #[test]
+    #[should_panic(expected = "a zero denominator")]
+    fn a_zero_denominator_is_rejected_with_a_remainder_too() {
+        let _ = RationalAccumulator::with_remainder(1, 0, 0);
+    }
+
+    /// A resumed accumulator continues the sequence rather than restarting it.
+    ///
+    /// The save state's requirement, asserted as behaviour and not as a getter
+    /// agreeing with a setter: run an accumulator part-way, rebuild one from its
+    /// reported remainder, and require the *next* steps to match. A
+    /// `with_remainder` that ignored `rem` passes a `remainder()` comparison — the
+    /// field is read back through the same accessor — and fails here.
+    #[test]
+    fn an_accumulator_resumes_where_the_remainder_says() {
+        let mut original = RationalAccumulator::new(Z80_T_NUM, Z80_T_DEN);
+        // 1,000 steps is not a multiple of the 3,125-step period, so the remainder
+        // here is not zero and the resumed copy has something to carry.
+        for _ in 0..1_000 {
+            original.advance();
+        }
+        let rem = original.remainder();
+        assert_ne!(rem, 0, "the premise: the fraction is mid-carry");
+
+        let mut resumed = RationalAccumulator::with_remainder(Z80_T_NUM, Z80_T_DEN, rem);
+        let want: Vec<u32> = (0..2_125).map(|_| original.advance()).collect();
+        let got: Vec<u32> = (0..2_125).map(|_| resumed.advance()).collect();
+        assert_eq!(got, want, "the same 2,125 steps to the end of the period");
+        // And the totals: 1,000 + 2,125 steps is one full period, so a resumed
+        // accumulator that had lost the fraction would be short by the carry.
+        assert_eq!(resumed.remainder(), 0, "back at the period boundary");
+
+        // The control: the same accumulator built with `new` diverges, which is what
+        // makes the remainder load-bearing rather than decorative.
+        let mut fresh = RationalAccumulator::new(Z80_T_NUM, Z80_T_DEN);
+        let plain: Vec<u32> = (0..2_125).map(|_| fresh.advance()).collect();
+        assert_ne!(plain, want, "dropping the remainder changes the sequence");
+    }
+
+    /// A remainder at or above the denominator folds rather than being rejected.
+    ///
+    /// The value comes from a file. `den + 7` is `7` — the same accumulator, one whole
+    /// unit already handed out — so folding it is arithmetic and not a guess.
+    #[test]
+    fn an_out_of_range_remainder_folds_into_the_period() {
+        let a = RationalAccumulator::with_remainder(7, 10, 13);
+        assert_eq!(a.remainder(), 3, "13 mod 10");
+        let b = RationalAccumulator::with_remainder(7, 10, 3);
+        assert_eq!(a, b, "and it is the same accumulator");
+        let exact = RationalAccumulator::with_remainder(7, 10, 10);
+        assert_eq!(exact.remainder(), 0);
+    }
+
+    /// `ratio` reports the ratio the accumulator was built with.
+    ///
+    /// The codec reconstructs from the board's constants and compares against this,
+    /// so a state written for one sound clock cannot restore into a board with
+    /// another.
+    #[test]
+    fn the_ratio_is_reported_as_it_was_given() {
+        assert_eq!(
+            RationalAccumulator::new(Z80_T_NUM, Z80_T_DEN).ratio(),
+            (715_909, 3_125)
+        );
+        // Not the Z80's, so a `ratio` returning the board's constants fails.
+        assert_eq!(RationalAccumulator::new(7, 2).ratio(), (7, 2));
+        assert_eq!(
+            RationalAccumulator::with_remainder(7, 2, 1).ratio(),
+            (7, 2),
+            "and a carried remainder does not change it"
+        );
     }
 }

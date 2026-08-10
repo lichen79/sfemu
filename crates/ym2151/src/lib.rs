@@ -43,6 +43,7 @@ pub mod lfo;
 pub mod noise;
 pub mod operator;
 pub mod regs;
+pub mod state;
 pub mod tables;
 pub mod timer;
 

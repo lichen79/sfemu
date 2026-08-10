@@ -27,8 +27,11 @@
 
 use crate::board::{CPS_REGS, GFXRAM_WORDS, RAM_WORDS};
 use crate::inputs::Inputs;
+use crate::sound::RAM_BYTES as SOUND_RAM_BYTES;
+use crate::timing::RationalAccumulator;
 use m68k::M68k;
 use video::sprites::ObjLatch;
+use ym2151::Ym2151;
 
 /// A complete save state.
 ///
@@ -73,6 +76,48 @@ pub struct MachineState {
     pub carry: i64,
     /// The previous frame's object table — the one-frame sprite delay.
     pub obj: ObjLatch,
+
+    // ------------------------------------------------------------ the sound board
+    /// The sound Z80, whole.
+    pub z80: z80::Z80,
+    /// Sound RAM.
+    ///
+    /// Boxed for the reason [`Self::ram`] is, at a twelfth of the size: a save-state
+    /// codec assembles one of these from a file, and 2 KB on a test thread's stack is
+    /// cheap to avoid.
+    pub sound_ram: Box<[u8; SOUND_RAM_BYTES]>,
+    /// The selected sound-ROM bank.
+    pub sound_bank: u8,
+    /// OKI pin 7, the MSM6295's rate divider select. D3 will read it; carried now so
+    /// that a state written today is not silently missing it when D3 lands.
+    pub oki_pin7: bool,
+    /// The YM2151, whole: register file, envelopes, phases, LFO, noise, and timers.
+    ///
+    /// Not just the register file. A chip restored with its registers but not its
+    /// envelope and phase counters sounds right for a few samples and then diverges,
+    /// which is why `the_ym2151_envelope_and_phase_survive_a_save_state` compares
+    /// produced samples rather than registers.
+    pub ym: Ym2151,
+    /// The address a write to 0xF000 latched, awaiting its data byte.
+    ///
+    /// The Z80 writes address and data as two instructions, so a state taken between
+    /// them needs this or the next data byte lands in the wrong register.
+    pub ym_addr: u8,
+    /// The Z80's T-state accumulator, remainder included.
+    ///
+    /// **The field most easily forgotten.** Its absence is invisible for exactly one
+    /// line, after which the two copies are one T-state apart and then diverge
+    /// permanently — see `the_accumulator_remainder_survives_a_save_state`.
+    pub z80_carry: RationalAccumulator,
+    /// T-states granted to the current line and not yet spent.
+    pub z80_debt: i64,
+    /// Z80 T-states since reset.
+    pub z80_total: u64,
+    /// Input clocks accrued toward the next YM2151 sample.
+    ///
+    /// Omitting it puts every later sample up to 63 input clocks out of place, which
+    /// is a click at the seam of every load.
+    pub sample_acc: u32,
 }
 
 /// Hand-written rather than derived: the derived `Clone` would route the two large
@@ -100,6 +145,19 @@ impl Clone for MachineState {
             line: self.line,
             carry: self.carry,
             obj: self.obj.clone(),
+            z80: self.z80.clone(),
+            // 2 KB, so a stack temporary is harmless here — but written the same way
+            // as the two above so that a reader does not have to work out which of
+            // the three is which.
+            sound_ram: Box::new(*self.sound_ram),
+            sound_bank: self.sound_bank,
+            oki_pin7: self.oki_pin7,
+            ym: self.ym.clone(),
+            ym_addr: self.ym_addr,
+            z80_carry: self.z80_carry,
+            z80_debt: self.z80_debt,
+            z80_total: self.z80_total,
+            sample_acc: self.sample_acc,
         }
     }
 }

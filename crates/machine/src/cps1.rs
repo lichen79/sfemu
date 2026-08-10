@@ -3,7 +3,8 @@
 use crate::board::Board;
 use crate::config::BoardConfig;
 use crate::snapshot::MachineState;
-use crate::timing::Timing;
+use crate::sound::SoundBoard;
+use crate::timing::{RationalAccumulator, Timing, YM_SAMPLE_CLOCKS, Z80_T_DEN, Z80_T_NUM};
 use m68k::{decode::Decoder, M68k};
 use video::compose::Video;
 
@@ -52,9 +53,58 @@ pub struct Cps1 {
     carry: i64,
     /// The video subsystem: the graphics ROM, the object latch, and the frame.
     pub video: Video,
+    /// The sound Z80.
+    ///
+    /// Beside [`Cps1::sound`] rather than inside it, for the reason the 68000 is
+    /// beside [`Cps1::board`]: `Z80::step(&mut bus)` borrows both at once.
+    pub z80: z80::Z80,
+    /// Everything on the Z80's bus, the YM2151 included.
+    pub sound: SoundBoard,
+    /// The Z80's T-states per scanline: 715,909/3,125, which is not an integer.
+    ///
+    /// See [`RationalAccumulator`]. Its *remainder* is machine state — a copy
+    /// restored without it runs one T-state ahead for one line and then diverges
+    /// permanently.
+    z80_carry: RationalAccumulator,
+    /// T-states granted but not yet spent, counting down.
+    ///
+    /// The Z80's equivalent of [`Cps1::carry`] and the same sign convention: a
+    /// positive value is budget remaining and the overshoot from an instruction that
+    /// ran past the line boundary carries forward as a negative one.
+    z80_debt: i64,
+    /// Total Z80 T-states since the last [`Cps1::reset`].
+    z80_total: u64,
+    /// Input clocks accrued toward the next YM2151 sample, `0..64`.
+    ///
+    /// Driven by T-states actually spent rather than by lines, so the sample rate
+    /// stays locked to the Z80 rather than drifting against it.
+    sample_acc: u32,
+    /// Samples produced and not yet drained by the host.
+    ///
+    /// **Output, not state.** A save state carrying a frame of audio would grow
+    /// every snapshot and make a divergence comparison depend on when it was taken;
+    /// see [`MachineState`].
+    samples: Vec<(i16, i16)>,
     /// Built once. `Decoder::new` fills a 65,536-entry table, so constructing one
     /// per step would dominate the run time.
-    dec: Decoder,
+    ///
+    /// # ⚠️ Boxed, and that is load-bearing
+    ///
+    /// A [`Decoder`] is 512 KB (`m68k::decode`'s own note measures it), and inline it
+    /// made `size_of::<Cps1>()` **529,360 bytes**. A debug build gives every frame in
+    /// a call chain its own copy of a returned value, so three frames — a test, a
+    /// fixture helper, and the constructor — needed about 1.6 MB of the 2 MB a test
+    /// thread gets, plus the 512 KB `Decoder::new` builds *on the stack* before the
+    /// move. Adding the sound board's fields took that over the line and eleven
+    /// previously green tests in this file started aborting with
+    /// `fatal runtime error: stack overflow` — which is a process abort rather than a
+    /// test failure, so it names an arbitrary test and takes the whole binary down.
+    ///
+    /// Boxed, a `Cps1` is 5,088 bytes and no chain of frames can overflow. The 512 KB
+    /// transient inside `Decoder::new` remains — `Box::new(Decoder::new())` does not
+    /// avoid it, as that note records — but it is one frame's worth rather than one
+    /// per caller, which is the difference between a fixed cost and a cliff.
+    dec: Box<Decoder>,
 }
 
 impl Cps1 {
@@ -72,6 +122,26 @@ impl Cps1 {
     /// `gfx` is the board's assembled graphics region, supplied by the caller. This
     /// crate holds no ROM.
     pub fn with_gfx(prog: &[u8], gfx: Vec<u8>, cfg: BoardConfig, timing: Timing) -> Self {
+        Self::with_sound(prog, gfx, Vec::new(), cfg, timing)
+    }
+
+    /// A machine with a sound program as well.
+    ///
+    /// `audiocpu` is the board's assembled sound region, supplied by the caller —
+    /// this crate holds no ROM. An empty one is not an error: every fetch then reads
+    /// [`crate::sound::UNMAPPED`], which is `RST 38h`, so the Z80 spins in a
+    /// deterministic loop rather than executing `NOP`s through the whole address
+    /// space. That is what the two constructors above hand it, and it is why they can
+    /// keep their three-and-four argument signatures — the callers in `frontend`,
+    /// `sfemu`, and this crate's own tests do not all have a sound ROM to give.
+    ///
+    pub fn with_sound(
+        prog: &[u8],
+        gfx: Vec<u8>,
+        audiocpu: Vec<u8>,
+        cfg: BoardConfig,
+        timing: Timing,
+    ) -> Self {
         Self {
             cpu: M68k::new(),
             board: Board::new(prog, cfg),
@@ -80,8 +150,41 @@ impl Cps1 {
             line: 0,
             carry: 0,
             video: Video::new(cfg.video, cfg.mapper, gfx),
-            dec: Decoder::new(),
+            z80: z80::Z80::new(),
+            sound: SoundBoard::new(audiocpu),
+            z80_carry: RationalAccumulator::new(Z80_T_NUM, Z80_T_DEN),
+            z80_debt: 0,
+            z80_total: 0,
+            sample_acc: 0,
+            samples: Vec::new(),
+            dec: Box::new(Decoder::new()),
         }
+    }
+
+    /// Total Z80 T-states since the last [`Cps1::reset`].
+    #[must_use]
+    pub const fn z80_cycles(&self) -> u64 {
+        self.z80_total
+    }
+
+    /// The T-state accumulator's carried fraction, in units of 1/3,125.
+    ///
+    /// Exposed for the save-state test: it is the field most easily left out of a
+    /// snapshot, and its absence is invisible for exactly one line.
+    #[must_use]
+    pub const fn z80_carry_remainder(&self) -> u32 {
+        self.z80_carry.remainder()
+    }
+
+    /// The samples produced since the last [`Cps1::drain_samples`].
+    #[must_use]
+    pub fn samples(&self) -> &[(i16, i16)] {
+        &self.samples
+    }
+
+    /// Discards the produced samples, which the host does once it has queued them.
+    pub fn drain_samples(&mut self) {
+        self.samples.clear();
     }
 
     /// Renders the current board state into [`Cps1::video`]'s framebuffer.
@@ -100,6 +203,23 @@ impl Cps1 {
         self.total_cycles = 0;
         self.line = 0;
         self.carry = 0;
+        // The sound side too, accumulators included. A `z80_carry` surviving a reset
+        // would make two runs from reset produce samples at different instants —
+        // the same determinism argument `reset_restores_the_schedule_exactly` makes
+        // for the 68000's carry, and `reset_restores_the_sound_schedule_exactly`
+        // makes it here.
+        //
+        // The Z80 and the chip are reset; sound RAM and the ROM bank are not. That
+        // is the same split as the 68000 side, where a reset does not clear main
+        // RAM, and it is MAME's: a machine reset propagates `device_reset` to every
+        // device, while RAM contents and the bank selection are untouched.
+        self.z80.reset();
+        self.sound.ym().reset();
+        self.z80_carry = RationalAccumulator::new(Z80_T_NUM, Z80_T_DEN);
+        self.z80_debt = 0;
+        self.z80_total = 0;
+        self.sample_acc = 0;
+        self.samples.clear();
     }
 
     /// The word at `addr` as a debugger sees it, or `None` if nothing decodes it.
@@ -167,6 +287,38 @@ impl Cps1 {
         self.carry -= i64::from(c);
         self.total_cycles += u64::from(c);
         if self.carry <= 0 {
+            // **The 68000's whole line first, then the Z80's** — MAME's interleave
+            // order, at scanline granularity. Running the Z80 first hands it a command
+            // latch one line stale, which is inaudible by ear, so the reference decides
+            // the order rather than judgement.
+            //
+            // # Why the budget is granted and spent here rather than at the line's
+            // start
+            //
+            // The plan grants `z80_carry.advance()` in the start-of-line block above
+            // and drains it after *every* 68000 step. That runs the Z80's entire line
+            // immediately after the line's **first** 68000 instruction, so a latch the
+            // 68000 writes anywhere later in the line is not visible to the Z80 until
+            // the next one — which contradicts the property the plan's own test states.
+            // Granting and spending at the line's end makes "the 68000 first, then the
+            // Z80" true for the whole line, and
+            // `a_latch_written_mid_line_reaches_the_z80_in_the_same_line` is what
+            // discriminates the two placements.
+            //
+            // A caller that only ever steps still gets it, which is the reason the
+            // 68000's own budget lives in this function: this block is in
+            // `step_instruction`, not in `run_scanline`.
+            //
+            // The loop cannot spin: every `step_sound` spends at least four T-states
+            // against a finite budget, a halted Z80 included. `z80_debt` carries the
+            // overshoot from the instruction that ran past the boundary, so the total
+            // never drifts above `Z80_T_NUM/Z80_T_DEN × lines` by more than one
+            // instruction.
+            self.z80_debt += i64::from(self.z80_carry.advance());
+            while self.z80_debt > 0 {
+                let t = self.step_sound();
+                self.z80_debt -= i64::from(t);
+            }
             // One sample per scanline, taken after the line has run so the PC is where
             // the program got to rather than where it started.
             self.board.trace.sample_pc(self.cpu.pc);
@@ -179,6 +331,47 @@ impl Cps1 {
             }
         }
         c
+    }
+
+    /// One unit of sound-board work: the latches, the interrupt, one Z80
+    /// instruction, and whatever samples its T-states paid for.
+    ///
+    /// **One copy of this body, deliberately**, for the reason
+    /// [`Cps1::step_instruction`] gives: a second copy for a debugger's stepping
+    /// path is a debugger that steps a machine subtly unlike the one that runs, and
+    /// the drift would appear later rather than at once.
+    ///
+    /// The order inside is not arbitrary:
+    ///
+    /// - **The latches are refreshed before the instruction**, so a byte the 68000
+    ///   wrote earlier in this line is visible to the Z80 in the same line.
+    /// - **The IRQ level is re-driven before every instruction**, not once per line,
+    ///   for the reason `step_instruction` re-drives IPL1: the YM2151 holds its line
+    ///   until the driver clears the status, and `ack_irq` clears only the CPU's own
+    ///   copy of it.
+    /// - **`service` is called before `step` and its zero return means "nothing
+    ///   accepted"** (`z80::interrupt`'s own note: a `0` "is how D2 will know not to
+    ///   charge the scheduler"), so a refused request costs nothing and the
+    ///   instruction runs instead.
+    /// - **Samples are accrued from T-states actually spent**, so the sample rate is
+    ///   locked to the Z80 rather than drifting against it.
+    fn step_sound(&mut self) -> u32 {
+        self.sound.set_latch(0, self.board.sound_latch[0]);
+        self.sound.set_latch(1, self.board.sound_latch[1]);
+        self.z80.irq = self.sound.ym_ref().irq();
+        let mut t = self.z80.service(&mut self.sound);
+        if t == 0 {
+            t = self.z80.step(&mut self.sound);
+        }
+        self.z80_total += u64::from(t);
+        self.sample_acc += t;
+        while self.sample_acc >= YM_SAMPLE_CLOCKS {
+            self.sample_acc -= YM_SAMPLE_CLOCKS;
+            let mut one = [(0i16, 0i16)];
+            self.sound.ym().generate(&mut one);
+            self.samples.push(one[0]);
+        }
+        t
     }
 
     /// Runs one scanline's worth of CPU, returning the cycles actually consumed.
@@ -228,6 +421,16 @@ impl Cps1 {
             line: self.line,
             carry: self.carry,
             obj: self.video.obj_latch().clone(),
+            z80: self.z80.clone(),
+            sound_ram: Box::new(*self.sound.ram()),
+            sound_bank: self.sound.bank(),
+            oki_pin7: self.sound.oki_pin7(),
+            ym: self.sound.ym_ref().clone(),
+            ym_addr: self.sound.ym_addr(),
+            z80_carry: self.z80_carry,
+            z80_debt: self.z80_debt,
+            z80_total: self.z80_total,
+            sample_acc: self.sample_acc,
         }
     }
 
@@ -254,12 +457,22 @@ impl Cps1 {
         self.line = s.line;
         self.carry = s.carry;
         self.video.set_obj_latch(&s.obj);
+        self.z80 = s.z80.clone();
+        self.sound
+            .restore(&s.sound_ram, s.sound_bank, s.oki_pin7, &s.ym, s.ym_addr);
+        self.z80_carry = s.z80_carry;
+        self.z80_debt = s.z80_debt;
+        self.z80_total = s.z80_total;
+        self.sample_acc = s.sample_acc;
+        // `samples` is deliberately untouched: it is output the host drains, not
+        // state, so a load must not retract audio already queued for playback.
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use z80::Bus;
 
     /// The longest instruction in [`spin`], in cycles.
     ///
@@ -357,17 +570,23 @@ mod tests {
 
     /// Runs `f` on a thread with an 8 MB stack.
     ///
-    /// A `Cps1` is 525 KB, almost all of it [`Decoder`]'s 512 KB dispatch table, and
-    /// `Decoder::new` builds that table *on the stack* before it lands in the struct
-    /// — `m68k::decode`'s own note measures the floor at 1 MB and records that
-    /// `Box::new` does not avoid it. So two live machines do not fit a test thread's
-    /// 2 MB, and elsewhere in this crate the answer is "one machine, not two".
+    /// `Decoder::new` builds a 512 KB dispatch table *on the stack* before it lands in
+    /// the struct — `m68k::decode`'s own note measures the floor at 1 MB and records
+    /// that `Box::new` does not avoid it. That transient is most of what a test
+    /// thread's 2 MB holds, so a test that constructs two machines is on the edge of
+    /// it.
     ///
-    /// A divergence test cannot take that answer: comparing two ways of running the
-    /// *same* program is the entire claim, and it needs both machines alive at once.
+    /// A divergence test has no way around constructing two: comparing two ways of
+    /// running the *same* program is the entire claim, and it needs both alive at once.
     /// Hence an explicit stack rather than a contorted single-machine version. The
     /// overflow it avoids is a process abort rather than a test failure, so getting
-    /// this wrong does not look like a bug in the thing under test.
+    /// this wrong does not look like a bug in the thing under test — it looks like an
+    /// arbitrary other test dying.
+    ///
+    /// [`Cps1::dec`] is boxed, which is what keeps the *struct* small (5 KB rather
+    /// than 529 KB) and means no chain of `Cps1`-returning frames can overflow on its
+    /// own. This wrapper covers what boxing cannot: the transient inside
+    /// `Decoder::new` itself.
     fn on_a_big_stack(f: impl FnOnce() + Send + 'static) {
         std::thread::Builder::new()
             .stack_size(8 << 20)
@@ -1053,5 +1272,571 @@ mod tests {
             !m.video.enable.sprites,
             "a restore must not reset the view's mask"
         );
+    }
+
+    // ------------------------------------------------------------- the sound board
+
+    /// A Z80 program that copies the 68000's command latch into sound RAM, forever.
+    ///
+    /// ```text
+    /// 0000  3A 08 F0    ld a,($f008)   the command latch
+    /// 0003  32 00 D0    ld ($d000),a   into the first byte of sound RAM
+    /// 0006  00          nop
+    /// 0007  18 F7       jr $0000
+    /// ```
+    ///
+    /// # Why a copy loop and not a `halt`
+    ///
+    /// `sound_ram[0]` is the artifact every test below reads: a `halt` would leave the
+    /// board's state a function of nothing, so an interleave that fed the Z80 stale
+    /// bytes would produce the same board as one that fed it fresh ones.
+    ///
+    /// # Why the `nop`
+    ///
+    /// Without it the loop is 13 + 13 + 12 = 38 T-states, and a line's 229 or 230
+    /// divides into it leaving a remainder that repeats with period 19 — short enough
+    /// that the loop's phase within a line is nearly constant. The `nop` makes it 42,
+    /// whose remainder against 229 walks the whole loop, so the line boundary lands on
+    /// each of the four instructions in turn. That is [`spin`]'s argument against
+    /// `bra.s -2`, on the sound side.
+    ///
+    /// Padded to the full 0x18000 `audiocpu` region so the banked window is present
+    /// and reads as zero rather than as [`crate::sound::UNMAPPED`]; nothing here
+    /// branches into it, and a short ROM is `sound.rs`'s test, not this one.
+    ///
+    /// Encodings verified against `z80::disasm::disasm` on 2026-08-10, which renders
+    /// them as the four lines quoted above — the `jr` as its resolved target `$0000`.
+    fn sound_spin() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x1_8000];
+        rom[0..9].copy_from_slice(&[0x3A, 0x08, 0xF0, 0x32, 0x00, 0xD0, 0x00, 0x18, 0xF7]);
+        rom
+    }
+
+    /// [`spin`] on the 68000 and [`sound_spin`] on the Z80.
+    ///
+    /// The 68000 never writes the latch here, so this is the fixture for everything
+    /// about the *schedule*: T-states per line, samples per frame, and the save state.
+    /// [`latching_machine`] is the one for the interleave.
+    ///
+    /// # Every caller runs inside [`on_a_big_stack`]
+    ///
+    /// Not because a `Cps1` is large — [`Cps1::dec`] is boxed, so one is 5 KB — but
+    /// because `Decoder::new` still builds its 512 KB table *on the stack* before the
+    /// move, which is most of what a 2 MB test thread has once the harness has taken
+    /// its share. Every divergence test in this crate is wrapped for that reason and
+    /// these are too, single-machine ones included: the failure mode is a process
+    /// abort that names an arbitrary test rather than the one that caused it, so it is
+    /// not worth leaving to a margin.
+    fn sound_machine() -> Cps1 {
+        let mut m = Cps1::with_sound(
+            &spin(),
+            Vec::new(),
+            sound_spin(),
+            BoardConfig::sf2(),
+            Timing::cps1_10mhz(),
+        );
+        m.reset();
+        m
+    }
+
+    /// [`spin`], but writing an ever-changing byte to the sound command latch.
+    ///
+    /// ```text
+    /// 1000  46FC 2700        move   #$2700,sr    supervisor, interrupt mask 7
+    /// 1004  33C0 0080 0180   move.w d0,$800180   the sound command latch
+    /// 100A  5240             addq.w #1,d0
+    /// 100C  60F6             bra    $1004
+    /// ```
+    ///
+    /// The loop is 16 + 4 + 10 = 30 cycles against a 640-cycle budget, so it writes
+    /// the latch about 45 times a line and **the byte is different on every line**.
+    /// That is what makes `a_latch_written_mid_line_reaches_the_z80_in_the_same_line`
+    /// able to fail: a Z80 fed the latch as it stood at the *start* of its line reads
+    /// a byte from the previous line, and the two are never equal.
+    ///
+    /// `move.w` and not `move.b`: `cps1_soundlatch_w` takes the low byte when the low
+    /// lane is asserted (`board.rs`, `cps1.cpp:300-306`), and a word write asserts
+    /// both lanes, so `d0`'s low byte reaches latch 0.
+    ///
+    /// Encodings verified against `m68k::disasm::disassemble` on 2026-08-10.
+    fn latching_machine() -> Cps1 {
+        let mut rom = vec![0u8; 0x2000];
+        rom[0..8].copy_from_slice(&[0x00, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00]);
+        rom[0x1000..0x100E].copy_from_slice(&[
+            0x46, 0xFC, 0x27, 0x00, // move #$2700,sr
+            0x33, 0xC0, 0x00, 0x80, 0x01, 0x80, // move.w d0,$800180
+            0x52, 0x40, // addq.w #1,d0
+            0x60, 0xF6, // bra $1004
+        ]);
+        let mut m = Cps1::with_sound(
+            &rom,
+            Vec::new(),
+            sound_spin(),
+            BoardConfig::sf2(),
+            Timing::cps1_10mhz(),
+        );
+        m.reset();
+        m
+    }
+
+    /// Keys on channel 0 with all four operators configured, so the chip makes sound.
+    ///
+    /// Written through the Z80's bus rather than into the chip directly, so the address
+    /// latch at 0xF000 is exercised the way a driver exercises it.
+    ///
+    /// **All four operators, not just the first.** `ym2151`'s
+    /// `two_chips_in_the_same_state_generate_the_same_samples` records what a
+    /// one-operator patch costs: algorithm 4's carriers are the operators at register
+    /// offsets 0x10 and 0x18, so leaving their attack rates at 0 — "never attack" —
+    /// makes the patch silent, and every "and there was sound to lose" assertion below
+    /// unsatisfiable.
+    fn ym_patch(m: &mut Cps1) {
+        let mut w = |addr: u8, val: u8| {
+            m.sound.write(0xF000, addr);
+            m.sound.write(0xF001, val);
+        };
+        // Algorithm 4, no feedback; key code and fraction for an audible note.
+        w(0x20, 0xC4);
+        w(0x28, 0x4A);
+        for op in 0..4u8 {
+            let off = op * 8;
+            w(0x40 + off, 0x01); // detune 0, multiple 1
+            w(0x80 + off, 0x1F); // attack rate 31: immediate
+        }
+        w(0x08, 0x78); // key on, all four operators of channel 0
+    }
+
+    /// A byte the 68000 writes mid-line is visible to the Z80 in the *same* line.
+    ///
+    /// **The interleave order, and the reason the Z80's budget is spent at the end of
+    /// a line rather than after the line's first 68000 instruction.** MAME runs the
+    /// 68000 and then the Z80; the plan's placement grants the budget in the
+    /// start-of-line block and drains it after every 68000 step, which spends the
+    /// Z80's whole line immediately after the line's *first* 68000 instruction and so
+    /// hands it the previous line's latch. Measured: with that placement `sound_ram[0]`
+    /// trails `sound_latch[0]` on every one of 64 lines.
+    ///
+    /// The `assert_ne!` on consecutive latches is what makes the equality
+    /// discriminating rather than two copies of one unchanging byte —
+    /// [`latching_machine`]'s loop writes the latch about 45 times a line, so the byte
+    /// at the end of one line is never the byte at the end of the next.
+    #[test]
+    fn a_latch_written_mid_line_reaches_the_z80_in_the_same_line() {
+        on_a_big_stack(|| {
+            let mut m = latching_machine();
+            let mut previous = None;
+            let mut seen = std::collections::BTreeSet::new();
+            for line in 0..64 {
+                m.run_scanline();
+                let latch = m.board.sound_latch[0];
+                assert_eq!(
+                    m.sound.ram()[0],
+                    latch,
+                    "line {line}: the Z80 copied a latch the 68000 has already moved past"
+                );
+                if let Some(p) = previous {
+                    assert_ne!(
+                        latch, p,
+                        "line {line}: the latch must change every line, or the equality \
+                         above cannot fail"
+                    );
+                }
+                previous = Some(latch);
+                seen.insert(latch);
+            }
+            assert!(
+                seen.len() > 8,
+                "and the byte took many values: {}",
+                seen.len()
+            );
+        });
+    }
+
+    /// A scanline advances the Z80 by its share of the line, and the share is exact.
+    ///
+    /// # The bound, derived rather than observed
+    ///
+    /// A line grants 229 or 230 T-states (715,909/3,125). One Z80 instruction can
+    /// overrun the boundary and its cost carries forward as debt, so a line spends
+    /// between `229 - 22` and `230 + 22`: the longest instruction on the chip is
+    /// `ex (sp),iy` at 23 T, and an instruction that starts within budget can leave at
+    /// most 22 of debt behind. Observed on this fixture: 223 to 239.
+    ///
+    /// # The exact claim
+    ///
+    /// The bound alone cannot tell a rational accumulator from a hardcoded 229, so the
+    /// load-bearing assertion is the identity **granted = spent + debt**, checked
+    /// against the accumulator's own arithmetic. Over a full period of 3,125 lines the
+    /// grant is 715,909 T *exactly* and the carried fraction closes to zero — which a
+    /// truncated 229 per line misses by 284 T a period, and a rounded 230 by 2,841.
+    #[test]
+    fn a_scanline_advances_the_z80_by_its_share_of_the_line() {
+        on_a_big_stack(|| {
+            let mut m = sound_machine();
+            let mut seen = std::collections::BTreeSet::new();
+            for line in 1..=3_125u64 {
+                let before = m.z80_cycles();
+                m.run_scanline();
+                let spent = m.z80_cycles() - before;
+                assert!(
+                    (207..=252).contains(&spent),
+                    "line {line} spent {spent} T: one line's worth, not a catch-up burst"
+                );
+                seen.insert(spent);
+                // The identity, on the first sixteen lines and then at the period's end.
+                // Not every line: `snapshot` copies 256 KB, and the claim is about the
+                // accumulator rather than about how often it is inspected.
+                if line <= 16 || line == 3_125 {
+                    let granted = (line * u64::from(Z80_T_NUM)
+                        - u64::from(m.z80_carry_remainder()))
+                        / u64::from(Z80_T_DEN);
+                    let debt = m.snapshot().z80_debt;
+                    assert_eq!(
+                        i64::try_from(m.z80_cycles()).expect("T-states fit an i64") + debt,
+                        i64::try_from(granted).expect("the grant fits an i64"),
+                        "after {line} lines: granted must equal spent plus the debt still \
+                         owed"
+                    );
+                }
+            }
+            assert!(
+                seen.len() > 1,
+                "the per-line spend varies, because the share is fractional: {seen:?}"
+            );
+            assert_eq!(
+                m.z80_carry_remainder(),
+                0,
+                "3,125 lines is the accumulator's whole period, so the fraction closes"
+            );
+            let granted =
+                i64::try_from(m.z80_cycles()).expect("T-states fit an i64") + m.snapshot().z80_debt;
+            assert_eq!(
+                granted,
+                i64::from(Z80_T_NUM),
+                "and a period grants 715,909 T exactly — 229 per line would be 284 short"
+            );
+        });
+    }
+
+    /// A frame produces 937 or 938 samples, and no T-state goes unaccounted for.
+    ///
+    /// 60,021.8 T per frame at 64 T per sample is 937.84 samples, so the count has to
+    /// vary: a frame that always produced 937 would run 0.16 samples a frame slow,
+    /// which is 9.6 a second and audible as a drifting pitch over a match.
+    ///
+    /// The exact claim is the second assertion — **every T-state the Z80 spent is
+    /// either in a sample or in the accumulator** — which a sample period of 32 or 128
+    /// breaks immediately, and which a per-frame integer count breaks as soon as the
+    /// remainder is dropped.
+    #[test]
+    fn a_frame_produces_nine_hundred_thirty_seven_or_eight_samples() {
+        on_a_big_stack(|| {
+            let mut m = sound_machine();
+            let mut seen = std::collections::BTreeSet::new();
+            let mut total = 0u64;
+            for _ in 0..64 {
+                m.drain_samples();
+                m.run_frame();
+                let n = m.samples().len();
+                assert!(
+                    (930..=945).contains(&n),
+                    "one frame's samples, not a burst or a gap: {n}"
+                );
+                seen.insert(n);
+                total += n as u64;
+            }
+            assert!(
+                seen.len() > 1,
+                "the count varies, because the rate is fractional: {seen:?}"
+            );
+            assert_eq!(
+                total * u64::from(YM_SAMPLE_CLOCKS) + u64::from(m.snapshot().sample_acc),
+                m.z80_cycles(),
+                "every T-state is either inside a sample or waiting in the accumulator"
+            );
+        });
+    }
+
+    /// A reset returns the sound schedule to where a fresh machine starts.
+    ///
+    /// The [`Cps1::reset`] counterpart of `reset_restores_the_schedule_exactly`, and
+    /// the same argument: a `z80_carry` remainder surviving a reset would make two runs
+    /// from reset produce samples at different instants, which is a per-run difference
+    /// in a system whose whole value is determinism.
+    ///
+    /// The reset is taken after **seven** lines, where the remainder is 1,988 — the
+    /// period is 3,125 lines, so any small count leaves it non-zero and there is no
+    /// coincidence to fall into.
+    #[test]
+    fn reset_restores_the_sound_schedule_exactly() {
+        on_a_big_stack(|| {
+            let mut m = sound_machine();
+            let first: Vec<u64> = (0..7)
+                .map(|_| {
+                    let before = m.z80_cycles();
+                    m.run_scanline();
+                    m.z80_cycles() - before
+                })
+                .collect();
+            assert_ne!(
+                m.z80_carry_remainder(),
+                0,
+                "seven lines into a 3,125-line period, so the fraction is mid-stream"
+            );
+            assert!(!m.samples().is_empty(), "and samples have been produced");
+
+            m.reset();
+            assert_eq!(m.z80_cycles(), 0);
+            assert_eq!(m.z80_carry_remainder(), 0);
+            assert!(m.samples().is_empty(), "a reset drops undrained audio");
+            let s = m.snapshot();
+            assert_eq!(s.z80_debt, 0);
+            assert_eq!(s.sample_acc, 0);
+
+            let second: Vec<u64> = (0..7)
+                .map(|_| {
+                    let before = m.z80_cycles();
+                    m.run_scanline();
+                    m.z80_cycles() - before
+                })
+                .collect();
+            assert_eq!(
+                first, second,
+                "a reset machine must run the same sound schedule as a fresh one; a \
+                 leftover remainder shows up as a different first line"
+            );
+        });
+    }
+
+    /// A save state round-trips the whole sound board, asserted by divergence.
+    ///
+    /// The state carries the Z80, sound RAM, the ROM bank, the OKI pin, the YM2151
+    /// entire, the address latch, and both accumulators. This runs a machine forward,
+    /// snapshots, restores into a *fresh* machine, runs both 2,000 scanlines further,
+    /// and requires every produced sample to match.
+    ///
+    /// **Divergence and not comparison.** `MachineState` has no `PartialEq` on purpose
+    /// — see its documentation — because `snapshot == snapshot` passes for a codec that
+    /// drops a field the comparison also ignores, which is precisely the mistake
+    /// available here: six of the fields this task added are read through private
+    /// accessors.
+    ///
+    /// The two whole-value comparisons at the end are a stronger net than the samples:
+    /// `SoundBoard` derives `PartialEq`, so they cover every register, envelope, phase
+    /// counter and timer. They are legitimate here because the fixture touches neither
+    /// the OKI nor an I/O port, so the two diagnostic counters `restore` deliberately
+    /// leaves alone are zero on both machines.
+    #[test]
+    fn a_save_state_round_trips_the_sound_board() {
+        on_a_big_stack(|| {
+            let mut a = sound_machine();
+            ym_patch(&mut a);
+            for _ in 0..600 {
+                a.run_scanline();
+            }
+            let state = a.snapshot();
+            let mut b = sound_machine();
+            b.restore(&state);
+
+            a.drain_samples();
+            b.drain_samples();
+            for _ in 0..2_000 {
+                a.run_scanline();
+                b.run_scanline();
+            }
+            assert!(!a.samples().is_empty(), "the run produced audio to compare");
+            assert!(
+                a.samples().iter().any(|&(l, r)| l != 0 || r != 0),
+                "and it was not silence, so there was something to lose"
+            );
+            assert_eq!(
+                a.samples(),
+                b.samples(),
+                "a restored machine must produce the same audio as the original"
+            );
+            assert_eq!(a.z80, b.z80, "and the same CPU state");
+            assert_eq!(a.sound, b.sound, "and the same board, chip included");
+            assert_eq!(a.z80_cycles(), b.z80_cycles());
+            assert_eq!(a.z80_carry_remainder(), b.z80_carry_remainder());
+        });
+    }
+
+    /// The T-state accumulator's remainder is part of the state.
+    ///
+    /// **The field most easily left out**, and the one whose absence is invisible for
+    /// exactly one line — after which the two copies are a T-state apart and then
+    /// diverge permanently. The snapshot is taken one line in, where the remainder is
+    /// 284 of 3,125, so a codec that drops it restores a zero rather than
+    /// coincidentally matching.
+    ///
+    /// Both halves are asserted: the restored value, and the future it produces. The
+    /// second is what makes this more than a test reading back the field it wrote —
+    /// 400 lines is long enough for a single dropped T-state to move a sample boundary.
+    #[test]
+    fn the_accumulator_remainder_survives_a_save_state() {
+        on_a_big_stack(|| {
+            let mut a = sound_machine();
+            a.run_scanline();
+            assert_eq!(
+                a.z80_carry_remainder(),
+                284,
+                "one line in, 715,909 mod 3,125 is carried"
+            );
+            let state = a.snapshot();
+            let mut b = sound_machine();
+            b.restore(&state);
+            assert_eq!(
+                b.z80_carry_remainder(),
+                a.z80_carry_remainder(),
+                "the fraction is state, not scratch"
+            );
+
+            a.drain_samples();
+            b.drain_samples();
+            for _ in 0..400 {
+                a.run_scanline();
+                b.run_scanline();
+            }
+            assert_eq!(
+                a.z80_cycles(),
+                b.z80_cycles(),
+                "and the two copies stay on the same T-state"
+            );
+            assert_eq!(a.samples(), b.samples());
+        });
+    }
+
+    /// The YM2151's envelopes and phases survive a save state, not just its registers.
+    ///
+    /// A snapshot carrying the register file alone restores a chip that sounds right
+    /// for a few samples and then diverges: the phase accumulators, the envelope
+    /// states and attenuations, the LFO's counter and the timers are all state the
+    /// registers do not determine. Asserted over produced samples rather than over the
+    /// register file, which is the only way that distinction is observable.
+    ///
+    /// The snapshot is taken **while the note is sounding**, so there are live
+    /// envelopes to lose.
+    #[test]
+    fn the_ym2151_envelope_and_phase_survive_a_save_state() {
+        on_a_big_stack(|| {
+            let mut a = sound_machine();
+            ym_patch(&mut a);
+            for _ in 0..400 {
+                a.run_scanline();
+            }
+            assert!(
+                a.samples().iter().any(|&(l, r)| l != 0 || r != 0),
+                "there is sound to lose"
+            );
+            let state = a.snapshot();
+
+            // A fresh machine with the *same registers* and nothing else, which is what
+            // a register-only codec would restore. It must not be able to pass.
+            let mut registers_only = sound_machine();
+            ym_patch(&mut registers_only);
+
+            let mut b = sound_machine();
+            b.restore(&state);
+
+            a.drain_samples();
+            b.drain_samples();
+            registers_only.drain_samples();
+            for _ in 0..400 {
+                a.run_scanline();
+                b.run_scanline();
+                registers_only.run_scanline();
+            }
+            assert_eq!(a.samples(), b.samples(), "the whole chip came back");
+            assert_ne!(
+                a.samples(),
+                registers_only.samples(),
+                "and the same registers alone are not enough to reproduce it, which is \
+                 what makes the assertion above load-bearing"
+            );
+        });
+    }
+
+    /// The YM2151's latched register address is part of the state.
+    ///
+    /// **The plan's field list left it out.** The Z80 writes the address to 0xF000 and
+    /// the data to 0xF001 as two separate instructions, so a state taken between them
+    /// — one instruction in a handful, in a driver that writes the chip hundreds of
+    /// times a frame — restores with the wrong latched address and puts the next data
+    /// byte in the wrong register.
+    ///
+    /// The address chosen is 0x08, key-on: the wrong register would key nothing on, and
+    /// the divergence is immediate rather than subtle.
+    #[test]
+    fn the_latched_ym_address_survives_a_save_state() {
+        on_a_big_stack(|| {
+            let mut a = sound_machine();
+            ym_patch(&mut a);
+            // Key off, then latch the key-on address and stop — mid-pair, exactly where
+            // a snapshot must carry it.
+            a.sound.write(0xF000, 0x08);
+            a.sound.write(0xF001, 0x00);
+            for _ in 0..64 {
+                a.run_scanline();
+            }
+            a.sound.write(0xF000, 0x08);
+            assert_eq!(
+                a.sound.ym_addr(),
+                0x08,
+                "the address is latched and waiting"
+            );
+
+            let state = a.snapshot();
+            let mut b = sound_machine();
+            b.restore(&state);
+            assert_eq!(b.sound.ym_addr(), 0x08);
+
+            // The data byte, written to both after the restore. It only keys the note on
+            // if the latched address came back.
+            a.sound.write(0xF001, 0x78);
+            b.sound.write(0xF001, 0x78);
+            a.drain_samples();
+            b.drain_samples();
+            for _ in 0..200 {
+                a.run_scanline();
+                b.run_scanline();
+            }
+            assert!(
+                a.samples().iter().any(|&(l, r)| l != 0 || r != 0),
+                "the data byte reached key-on, so there is sound to compare"
+            );
+            assert_eq!(a.samples(), b.samples());
+        });
+    }
+
+    /// Sound RAM, the ROM bank and the OKI pin are part of the state.
+    ///
+    /// Read back through the Z80's own bus rather than through the snapshot, so what
+    /// is asserted is the machine the guest sees. The bank especially: it selects which
+    /// 16 KB the Z80 executes, so a state that dropped it would resume a driver in the
+    /// wrong half of its own code.
+    #[test]
+    fn sound_ram_the_bank_and_the_oki_pin_are_part_of_the_state() {
+        on_a_big_stack(|| {
+            let mut a = sound_machine();
+            a.sound.write(0xD100, 0xA5);
+            a.sound.write(0xD7FF, 0x5A);
+            a.sound.write(0xF004, 0x01); // bank 1
+            a.sound.write(0xF006, 0x01); // OKI pin 7 high
+            let state = a.snapshot();
+
+            let mut b = sound_machine();
+            assert_eq!(b.sound.read(0xD100), 0x00, "a fresh board differs");
+            assert_eq!(b.sound.bank(), 0);
+            assert!(!b.sound.oki_pin7());
+
+            b.restore(&state);
+            assert_eq!(b.sound.read(0xD100), 0xA5);
+            assert_eq!(b.sound.read(0xD7FF), 0x5A);
+            assert_eq!(b.sound.bank(), 1);
+            assert!(b.sound.oki_pin7());
+            // Bank 1 is a different window on the ROM, which is what makes the bank
+            // more than a stored byte.
+            assert_eq!(b.sound.read(0x8000), a.sound.read(0x8000));
+        });
     }
 }

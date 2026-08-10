@@ -52,6 +52,10 @@ pub const KEYON_NORMAL: u8 = 0;
 pub const KEYON_CSM: u8 = 2;
 
 /// The envelope's four states, in the order [`OpCache::eg_rate`] indexes them.
+///
+/// The discriminants are part of the save-state format — [`EnvState::from_u8`] —
+/// so reordering these four variants changes the file format as well as the rate
+/// indexing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EnvState {
     /// Attenuation falls towards 0.
@@ -62,6 +66,26 @@ pub enum EnvState {
     Sustain,
     /// Attenuation rises towards silence after a key-off.
     Release,
+}
+
+impl EnvState {
+    /// The state a save state's byte names.
+    ///
+    /// The enum has no `Default`, deliberately — an envelope has no neutral state —
+    /// so a save state's byte is mapped explicitly. An out-of-range byte becomes
+    /// [`EnvState::Release`], the post-reset state: the four values this ever writes
+    /// are 0-3, so a fifth can only come from a damaged file, and the frontend's
+    /// CRC-32 has already refused those. Release is silent, which is the failure a
+    /// user can hear least.
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Attack,
+            1 => Self::Decay,
+            2 => Self::Sustain,
+            _ => Self::Release,
+        }
+    }
 }
 
 /// The per-operator values `prepare()` computes once and the sample loop reads.
@@ -208,6 +232,39 @@ impl OpCache {
         let step = step.wrapping_add(self.detune as u32);
         (step.wrapping_mul(self.multiple)) >> 1
     }
+
+    /// Appends this cache to a save state, in [`crate::state::OP_CACHE_BYTES`] bytes.
+    ///
+    /// The cache is derived data — [`OpCache::compute`] rebuilds it from the
+    /// registers — but it is not *only* derived: the chip's prepare gate means a
+    /// restored chip may run up to 4,096 samples before recomputing it, and until
+    /// then it plays whatever the cache holds. Carrying it is what makes a restored
+    /// chip's next sample identical rather than merely eventually identical.
+    pub fn write_state(&self, w: &mut crate::state::StateWriter<'_>) {
+        w.u32(self.phase_step);
+        w.u16(self.total_level);
+        w.u16(self.eg_sustain);
+        for &rate in &self.eg_rate {
+            w.u8(rate);
+        }
+        w.i32(self.detune);
+        w.u32(self.multiple);
+        w.u32(self.block_freq);
+    }
+
+    /// A cache read back from a save state. See [`OpCache::write_state`].
+    #[must_use]
+    pub fn read_state(r: &mut crate::state::StateReader<'_>) -> Self {
+        Self {
+            phase_step: r.u32(),
+            total_level: r.u16(),
+            eg_sustain: r.u16(),
+            eg_rate: [r.u8(), r.u8(), r.u8(), r.u8()],
+            detune: r.i32(),
+            multiple: r.u32(),
+            block_freq: r.u32(),
+        }
+    }
 }
 
 /// A raw rate plus its KSR adjustment, saturated at 63.
@@ -308,6 +365,28 @@ impl Operator {
     /// Return to the post-reset state.
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    /// Appends this operator to a save state, in
+    /// [`crate::state::OPERATOR_BYTES`] bytes.
+    pub fn write_state(&self, w: &mut crate::state::StateWriter<'_>) {
+        w.u32(self.phase);
+        w.u16(self.env_attenuation);
+        w.u8(self.env_state as u8);
+        w.bool(self.key_state);
+        w.u8(self.keyon_live);
+    }
+
+    /// An operator read back from a save state.
+    #[must_use]
+    pub fn read_state(r: &mut crate::state::StateReader<'_>) -> Self {
+        Self {
+            phase: r.u32(),
+            env_attenuation: r.u16(),
+            env_state: EnvState::from_u8(r.u8()),
+            key_state: r.bool(),
+            keyon_live: r.u8(),
+        }
     }
 
     /// The top 10 bits of the phase — the sine table index a channel modulates.

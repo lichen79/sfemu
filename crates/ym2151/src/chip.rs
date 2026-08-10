@@ -224,6 +224,81 @@ impl Ym2151 {
         }
     }
 
+    /// Appends the whole chip to a save state, in [`crate::state::STATE_BYTES`]
+    /// bytes.
+    ///
+    /// The order here **is** the format, and [`Ym2151::read_state_from`] reads the
+    /// same list in the same order. See [`crate::state`] for why the chip writes its
+    /// own bytes rather than exposing setters, and for what is deliberately left out.
+    pub fn write_state(&self, w: &mut crate::state::StateWriter<'_>) {
+        self.regs.write_state(w);
+        for ch in &self.channels {
+            ch.write_state(w);
+        }
+        self.lfo.write_state(w);
+        self.noise.write_state(w);
+        self.timers.write_state(w);
+        w.u32(self.env_counter);
+        w.u8(self.modified_channels);
+        w.u32(self.prepare_counter);
+    }
+
+    /// The chip's state as [`crate::state::STATE_BYTES`] bytes.
+    ///
+    /// A convenience over [`Ym2151::write_state`] for a caller that wants the array
+    /// rather than a cursor into a larger buffer. The frontend uses the cursor: its
+    /// payload is one buffer and a copy through here would be a second one.
+    #[must_use]
+    pub fn write_state_bytes(&self) -> [u8; crate::state::STATE_BYTES] {
+        let mut buf = [0u8; crate::state::STATE_BYTES];
+        self.write_state(&mut crate::state::StateWriter::new(&mut buf));
+        buf
+    }
+
+    /// Reads a chip back from a save state, in [`Ym2151::write_state`]'s order.
+    ///
+    /// The two `#[cfg(any(test, feature = "internals"))]` diagnostic fields are set
+    /// to their defaults rather than read: they are not in the format, because a
+    /// format that changed size with a feature flag would produce files one build
+    /// could write and another could not read.
+    #[must_use]
+    pub fn read_state_from(r: &mut crate::state::StateReader<'_>) -> Self {
+        let regs = Regs::read_state(r);
+        let mut channels = [Channel::new(); CHANNEL_COUNT as usize];
+        for ch in &mut channels {
+            *ch = Channel::read_state(r);
+        }
+        Self {
+            regs,
+            channels,
+            lfo: Lfo::read_state(r),
+            noise: Noise::read_state(r),
+            timers: Timers::read_state(r),
+            env_counter: r.u32(),
+            modified_channels: r.u8(),
+            prepare_counter: r.u32(),
+            #[cfg(any(test, feature = "internals"))]
+            force_eager_prepare: false,
+            #[cfg(any(test, feature = "internals"))]
+            prepare_count: 0,
+        }
+    }
+
+    /// A chip from exactly [`crate::state::STATE_BYTES`] bytes, or `None`.
+    ///
+    /// The length is checked here, once, so every getter inside the layout is
+    /// infallible — the same arrangement `frontend::state::decode` uses. A slice of
+    /// any other length is a caller passing the wrong bytes, not a chip.
+    #[must_use]
+    pub fn read_state(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != crate::state::STATE_BYTES {
+            return None;
+        }
+        Some(Self::read_state_from(&mut crate::state::StateReader::new(
+            bytes,
+        )))
+    }
+
     /// The status register as the guest reads it.
     ///
     /// BUSY is never set — see [`crate::timer`]'s module docs — and the OPM's
@@ -950,6 +1025,290 @@ mod tests {
     /// unconditionally would pass `prepare_runs_at_least_every_...` — which only
     /// asserts a floor — and every CSM test would then fail for a reason the counter
     /// could have named directly.
+    /// A patch that exercises every part of the chip a save state must carry.
+    ///
+    /// [`patch_lfo_feedback`] for the LFO, feedback, AM and PM; noise enabled so
+    /// waveform 3 is the LFO's source and the LFSR matters; both timers loaded so the
+    /// status register moves. A save state carrying only the register file would come
+    /// back sounding right for a handful of samples, which is why the tests below
+    /// compare 2,000.
+    fn a_busy_patch() -> Vec<(u8, u8)> {
+        let mut w = patch_lfo_feedback();
+        w.extend([
+            (0x0F, 0x94), // noise enable, frequency 0x14
+            (0x1B, 0x03), // LFO waveform 3 — the noise-fed table
+            (0x10, 0x30),
+            (0x11, 0x02),
+            (0x12, 0xF0),
+            (0x14, 0x0F), // load and enable both timers
+        ]);
+        w
+    }
+
+    /// How often [`render`] acknowledges the timers. See its docs.
+    const ACK_EVERY: usize = 128;
+
+    /// Everything a wrong restore would change, sample by sample.
+    ///
+    /// The samples **and** the status byte and IRQ line, for the reason the vector
+    /// suite records a status byte per sample: timer state is not audible at all, so
+    /// samples alone leave every timer field in the layout unverified.
+    ///
+    /// # Why it writes the mode register
+    ///
+    /// An overflow status bit stays set until the guest clears it, so a run that never
+    /// acknowledged would show a status of 3 from the first overflow to the last
+    /// sample — constant, and therefore blind to every timer field. Real drivers
+    /// acknowledge, so this does too: `0x14 = 0x3F` is "clear both status bits, keep
+    /// both timers loaded and enabled", and re-writing a load bit does not restart a
+    /// running timer (`timer::tests::re_writing_the_load_bit_does_not_restart_a_running_timer`).
+    /// The bits then re-appear at whatever sample the *carried* counters put the next
+    /// overflow at, which is the observable that makes them state.
+    fn render(chip: &mut Ym2151, n: usize) -> Vec<((i16, i16), u8, bool)> {
+        let mut out = Vec::with_capacity(n);
+        let mut one = [(0i16, 0i16); 1];
+        for i in 0..n {
+            if i % ACK_EVERY == ACK_EVERY - 1 {
+                chip.write(REG_MODE, 0x3F);
+            }
+            chip.generate(&mut one);
+            out.push((one[0], chip.read_status(), chip.irq()));
+        }
+        out
+    }
+
+    /// A chip mid-note, with its patch, its releases, and its timers all in flight.
+    ///
+    /// The odd counts are deliberate. 1,000 then 37 leaves the envelope counter
+    /// mid-phase (it advances one in three), the prepare gate part-way to 4,096, and
+    /// both timers part-way through a period — none of which a round count would
+    /// straddle.
+    fn a_chip_mid_note() -> Ym2151 {
+        let mut chip = Ym2151::new();
+        for (reg, val) in a_busy_patch() {
+            chip.write(reg, val);
+        }
+        let mut buf = [(0i16, 0i16); 1_000];
+        chip.generate(&mut buf);
+        // Key off, so the operators are in release and the envelope is moving.
+        chip.write(0x08, 0x00);
+        let mut tail = [(0i16, 0i16); 37];
+        chip.generate(&mut tail);
+        chip
+    }
+
+    /// **The load-bearing test of the save-state layout**: a decoded chip has the
+    /// same future.
+    ///
+    /// A divergence test rather than a comparison, for the reason
+    /// `machine::snapshot`'s docs give: `chip == chip` passes for a codec that drops a
+    /// field the comparison also ignores, and this chip has private fields a
+    /// comparison from outside could not see at all.
+    ///
+    /// So: reach a state mid-note, encode it, run 2,000 samples and record them,
+    /// decode, run the same 2,000, and require every sample, status byte, and IRQ
+    /// edge to match.
+    #[test]
+    fn a_decoded_chip_produces_the_same_samples() {
+        let mut a = a_chip_mid_note();
+        let bytes = a.write_state_bytes();
+
+        let first = render(&mut a, 2_000);
+        // The premises. A silent run would make the sample comparison vacuous, and a
+        // run whose status never changes would leave the timer half of the layout
+        // unverified — the two failure modes the suite's own generation measured.
+        assert!(
+            first.iter().any(|&((l, r), _, _)| l != 0 || r != 0),
+            "the fixture must make sound, or comparing samples proves nothing"
+        );
+        assert!(
+            first.iter().any(|&(_, s, _)| s != 0) && first.iter().any(|&(_, s, _)| s == 0),
+            "and the status must move, or the timer fields are unverified"
+        );
+
+        let mut b = Ym2151::read_state(&bytes).expect("a full-length state decodes");
+        let second = render(&mut b, 2_000);
+        assert_eq!(
+            first, second,
+            "a decoded chip must produce the same 2,000 samples"
+        );
+        assert_eq!(
+            a.write_state_bytes(),
+            b.write_state_bytes(),
+            "and the two chips must end in the same state"
+        );
+    }
+
+    /// And the comparison can fail.
+    ///
+    /// The test above is only meaningful if its fingerprint can tell two runs apart.
+    /// One sample of offset is the smallest difference it could miss.
+    #[test]
+    fn the_sample_fingerprint_distinguishes_runs_one_sample_apart() {
+        let mut a = a_chip_mid_note();
+        let bytes = a.write_state_bytes();
+        let aligned = render(&mut a, 2_000);
+
+        let mut b = Ym2151::read_state(&bytes).expect("a full-length state decodes");
+        b.generate(&mut [(0i16, 0i16); 1]);
+        let offset = render(&mut b, 2_000);
+        assert_ne!(
+            aligned, offset,
+            "if these matched, the divergence test above would prove nothing"
+        );
+    }
+
+    /// The bytes round-trip: decoding and re-encoding gives the same file.
+    ///
+    /// Not a whole-struct comparison, and that is not laziness: a decoded chip's two
+    /// `#[cfg(any(test, feature = "internals"))]` diagnostic fields are at their
+    /// defaults by design — they are not in the format — and this fixture's
+    /// `prepare_count` is not zero, so `decoded == original` cannot hold inside this
+    /// crate's own tests. Byte equality plus
+    /// `every_byte_of_the_layout_changes_the_decoded_chip` below is the same
+    /// guarantee without the exception: every byte survives, and every byte matters.
+    #[test]
+    fn the_layout_round_trips_through_bytes() {
+        let chip = a_chip_mid_note();
+        let bytes = chip.write_state_bytes();
+        let decoded = Ym2151::read_state(&bytes).expect("a full-length state decodes");
+        assert_eq!(decoded.write_state_bytes(), bytes);
+    }
+
+    /// Every byte of the layout is read, and reaches somewhere observable.
+    ///
+    /// Flips bit 0 of each of the 1,919 bytes in turn and requires the decoded chip to
+    /// differ. This is what catches a field the writer emits and the reader discards:
+    /// `the_layout_fills_every_byte` only checks the cursor's arithmetic, so a reader
+    /// that consumed a field's bytes and then assigned a default would pass it.
+    ///
+    /// Bit 0 specifically, because flipping it always changes the value: for the
+    /// one-byte booleans the writer only ever emits 0 or 1, so bit 0 is the bit that
+    /// carries them.
+    #[test]
+    fn every_byte_of_the_layout_changes_the_decoded_chip() {
+        let bytes = a_chip_mid_note().write_state_bytes();
+        let base = Ym2151::read_state(&bytes).expect("a full-length state decodes");
+        for i in 0..crate::state::STATE_BYTES {
+            let mut flipped = bytes;
+            flipped[i] ^= 0x01;
+            let other = Ym2151::read_state(&flipped).expect("still full length");
+            assert_ne!(
+                other, base,
+                "byte {i} of the layout is written but never read back"
+            );
+        }
+    }
+
+    /// Both LFO depths survive, though one register address holds them.
+    ///
+    /// `0x19` routes to AM depth or PM depth by its top bit and the register file
+    /// keeps only the *last* byte written there. A codec that wrote the 256-byte file
+    /// alone would silently lose whichever depth was written first — and every
+    /// register-comparison test would still pass, because the register file itself
+    /// round-trips perfectly.
+    #[test]
+    fn both_lfo_depths_survive_one_shared_register_address() {
+        let mut chip = Ym2151::new();
+        chip.write(0x19, 0x30); // AM depth 0x30
+        chip.write(0x19, 0x80 | 0x20); // then PM depth 0x20, overwriting the file byte
+        assert_eq!(chip.regs.lfo_am_depth(), 0x30, "the premise");
+        assert_eq!(chip.regs.lfo_pm_depth(), 0x20);
+        assert_eq!(
+            chip.regs.byte_at(0x19),
+            0xA0,
+            "and the file remembers only the second write"
+        );
+
+        let decoded =
+            Ym2151::read_state(&chip.write_state_bytes()).expect("a full-length state decodes");
+        assert_eq!(decoded.regs.lfo_am_depth(), 0x30, "AM depth survives");
+        assert_eq!(decoded.regs.lfo_pm_depth(), 0x20, "and so does PM depth");
+    }
+
+    /// The LFO's waveform-3 table is state, and it is load-bearing.
+    ///
+    /// The table is filled one entry per LFO clock from the noise generator, so a
+    /// chip restored without it plays waveform 3 out of zeros until it has walked all
+    /// 256 positions. The second half of this test is the part that matters: it zeroes
+    /// the table on an otherwise identical decoded chip and requires the samples to
+    /// differ, so "the field is carried" is backed by "the field is heard".
+    #[test]
+    fn the_lfo_noise_waveform_is_carried_and_audible() {
+        let chip = a_chip_mid_note();
+        assert!(
+            chip.lfo.noise_waveform.iter().any(|&(am, _)| am != 0),
+            "the premise: the fixture has filled part of the table"
+        );
+
+        let bytes = chip.write_state_bytes();
+        let mut decoded = Ym2151::read_state(&bytes).expect("a full-length state decodes");
+        assert_eq!(
+            decoded.lfo.noise_waveform, chip.lfo.noise_waveform,
+            "the table is carried entry for entry"
+        );
+
+        let with = render(&mut decoded, 400);
+        let mut without = Ym2151::read_state(&bytes).expect("a full-length state decodes");
+        without.lfo.noise_waveform = [(0, 0); 256];
+        let zeroed = render(&mut without, 400);
+        assert_ne!(
+            with, zeroed,
+            "a chip restored without the table sounds different, so carrying it is \
+             not bookkeeping"
+        );
+    }
+
+    /// The prepare gate's counter is state, and its absence is a silent 4,096-sample
+    /// stall.
+    ///
+    /// The gate opens when a channel is modified *or* the counter reaches 4,096. A
+    /// chip decoded with the counter at zero therefore runs up to 4,096 samples
+    /// longer before its next prepare — which, for a driver that writes registers
+    /// rarely, means a note whose cache is one load out of date.
+    ///
+    /// The counter is private, so the control zeroes its **bytes**: it is the last
+    /// four of the layout, which this test also pins.
+    #[test]
+    fn the_prepare_gate_counter_is_part_of_the_state() {
+        let mut chip = Ym2151::new();
+        let mut buf = [(0i16, 0i16); 4_000];
+        chip.generate(&mut buf);
+        assert_eq!(
+            chip.prepare_count_for_test(),
+            1,
+            "the premise: only the post-reset prepare so far, so the counter is at \
+             3,999 and the gate is 97 samples away"
+        );
+
+        let bytes = chip.write_state_bytes();
+        let mut decoded = Ym2151::read_state(&bytes).expect("a full-length state decodes");
+        let mut hundred = [(0i16, 0i16); 100];
+        decoded.generate(&mut hundred);
+        assert_eq!(
+            decoded.prepare_count_for_test(),
+            1,
+            "a decoded chip reaches 4,096 within the next 100 samples"
+        );
+
+        // The control: the same state with the counter's four bytes cleared.
+        let mut stalled = bytes;
+        let tail = crate::state::STATE_BYTES - 4;
+        assert_eq!(
+            &bytes[tail..],
+            &3_999u32.to_le_bytes(),
+            "the counter's bytes"
+        );
+        stalled[tail..].copy_from_slice(&0u32.to_le_bytes());
+        let mut stalled = Ym2151::read_state(&stalled).expect("a full-length state decodes");
+        stalled.generate(&mut hundred);
+        assert_eq!(
+            stalled.prepare_count_for_test(),
+            0,
+            "and one that lost the counter does not prepare at all in those 100"
+        );
+    }
+
     #[test]
     fn an_unwritten_chip_does_not_prepare_every_sample() {
         let mut chip = Ym2151::new();
