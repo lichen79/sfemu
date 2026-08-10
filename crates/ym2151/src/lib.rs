@@ -37,8 +37,13 @@
 // each found only by someone running `cargo doc`. Denying it fails the build.
 #![deny(rustdoc::private_intra_doc_links)]
 
+pub mod channel;
+pub mod chip;
 pub mod lfo;
 pub mod noise;
 pub mod operator;
 pub mod regs;
 pub mod tables;
+pub mod timer;
+
+pub use chip::Ym2151;
