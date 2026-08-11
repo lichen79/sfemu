@@ -2670,9 +2670,18 @@ git commit -m "test(oki): the vector-suite generator, built on MAME's decoder"
 - Consumes: `okifmt::Case`, `okifiles`, `oki::Oki`.
 - Produces: `okirunner::{Field, Mismatch, run_case}`.
 
+Four corrections this task's implementation forced on the plan, each against a measurement rather than against the plan's own transcription. Three of them were figures the plan had simply carried forward from a fixture that no longer existed:
+
+1. **`voices` and `status` are not the same mask, and the plan compared both against the post-step state.** `okifmt::Sample::voices` is who *sounded during* the sample — the set the generator's step loop iterates, captured before stepping — and `okifmt::Sample::status` is who is *still playing after* it. A voice whose phrase ends on this sample appears in the first and not the second. Measured across the committed suite: **they disagree at 1,907 of 512,000 samples, first at case 0 sample 127**, which is where Task 5's step ladder ends. So the runner reads `voices_playing()` **before** `step_2x_traced` and `status()` after, and the premise test asserts `status & 0x0F & !voices == 0` — subset — rather than the equality the plan wrote, which fails on correct data.
+2. **The plan's runner fixture could not have caught that.** Five samples with no phrase boundary in them make the two masks equal at every sample, so a runner reading the post-step mask for both passes every test. The plan's `corrupting_any_field_is_caught` even accepted either `Field::Status` or `Field::Voices` for the same corruption, on the grounds that "status and voices are the same bit in this case" — which is the defect, written down as a licence. The fixture here uses a deliberately short phrase (`0x1000..0x1001`, so `count = 4`) and records five samples, giving sample 3 `voices == 0x01` with `status == 0xF0`, and sample 4 both zero. Every field is now named exactly.
+3. **The clamp floor of 0.30 is five times below the measurement.** It came from a fixture with one unity-gain voice; Task 5 opens two in every case, and the measured figure is **0.998**. The premise test uses `genoki`'s floor of 0.90.
+4. **The ladder-audibility figure of 253,808 is a single-voice total and must not be asserted against the recorded mono.** The recorded mono is two voices summed and then clamped, so the measured minimum over the ladder window is **105,943**, not 253,808. Rather than assert either, `the_ladder_phrase_is_intact_in_every_case` asserts the ladder's **nibbles** — which depends on no decoding at all, and so cannot be satisfied by a core and a generator sharing a decoder bug.
+
+And one the plan got structurally wrong: an unreached write was reported as `Field::Status`, which conflates a corrupt file with a status divergence. It is `Field::UnreachedWrites` here.
+
 - [ ] **Step 1: Write `okirunner.rs`**
 
-Model on `ymrunner.rs`: return at the first divergence, and flag unreached writes as a corrupt file rather than a pass.
+Model on `ymrunner.rs`: return at the first divergence, and flag unreached writes as a corrupt file rather than a pass. The module docs must carry the `voices`-before/`status`-after measurement, because the ordering looks arbitrary and is not.
 
 ```rust
 //! Replays one OKI vector case against `oki`.
@@ -2682,6 +2691,19 @@ Model on `ymrunner.rs`: return at the first divergence, and flag unreached write
 //! expected values come from MAME's own decoder, recorded by `genoki` -- never
 //! from the code under test. Expected values derived from the thing under test
 //! cannot fail, and that pattern has shipped six times on this branch.
+//!
+//! # `voices` is read before the step, `status` after
+//!
+//! The two masks are not the same mask, and the difference is measured: they
+//! disagree at 1,907 of the suite's 512,000 samples, first at case 0 sample 127.
+//! [`crate::okifmt::Sample::voices`] is who *sounded during* the sample -- the
+//! set the generator's step loop iterates -- and
+//! [`crate::okifmt::Sample::status`] is who is *still playing after* it. A voice
+//! whose phrase ends on this sample appears in the first and not the second.
+//!
+//! So this reads [`Oki::voices_playing`] **before** [`Oki::step_2x_traced`] and
+//! [`Oki::status`] after. Comparing both against the post-step state, as this
+//! plan's first draft did, fails on correct data at every phrase boundary.
 
 use crate::okifmt::Case;
 use oki::Oki;
@@ -2691,9 +2713,9 @@ use oki::Oki;
 pub enum Field {
     /// The mono output sample.
     Mono,
-    /// The status byte.
+    /// The status byte, read after the sample.
     Status,
-    /// The playing-voice mask.
+    /// The mask of voices that sounded during the sample, read before it.
     Voices,
     /// The packed nibbles the voices consumed.
     ///
@@ -2701,6 +2723,9 @@ pub enum Field {
     /// wrong sample and the reverse is not true: reporting the sample first
     /// would send a reader looking in the decoder for an address-walk bug.
     Nibbles,
+    /// Not a field of a sample: the file scheduled writes past its last
+    /// recorded sample, so the case is not the case it claims to be.
+    UnreachedWrites,
 }
 
 impl core::fmt::Display for Field {
@@ -2710,6 +2735,7 @@ impl core::fmt::Display for Field {
             Self::Status => "status",
             Self::Voices => "voices",
             Self::Nibbles => "nibbles",
+            Self::UnreachedWrites => "writes consumed",
         })
     }
 }
@@ -2717,7 +2743,8 @@ impl core::fmt::Display for Field {
 /// Where and how a case diverged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mismatch {
-    /// The sample index.
+    /// The sample index. Equal to the case's sample count for
+    /// [`Field::UnreachedWrites`], which is past the last sample by definition.
     pub sample: usize,
     /// Which field.
     pub field: Field,
@@ -2743,7 +2770,7 @@ impl core::fmt::Display for Mismatch {
 ///
 /// Returns a [`Mismatch`] at the first field that disagrees. A case whose
 /// writes are not all consumed by the end of its samples is a corrupt file,
-/// reported as a divergence at the last sample so it cannot pass silently.
+/// reported as [`Field::UnreachedWrites`] so it cannot pass silently.
 pub fn run_case(case: &Case) -> Result<(), Mismatch> {
     let mut chip = Oki::new();
     let mut wi = 0usize;
@@ -2755,42 +2782,35 @@ pub fn run_case(case: &Case) -> Result<(), Mismatch> {
             chip.write(w.byte, &case.rom);
             wi += 1;
         }
+        // Before the step: these are the voices that will sound during it.
+        let got_voices = chip.voices_playing();
         // The nibbles come out of the same call that produces the sample, so
         // the core reports both and the runner checks the cause first.
         let (got_mono, got_nibbles) = chip.step_2x_traced(&case.rom);
+        let fail = |field, want: i64, got: i64| {
+            Err(Mismatch {
+                sample: n,
+                field,
+                want,
+                got,
+            })
+        };
         if got_nibbles != want.nibbles {
-            return Err(Mismatch {
-                sample: n,
-                field: Field::Nibbles,
-                want: i64::from(want.nibbles),
-                got: i64::from(got_nibbles),
-            });
+            return fail(
+                Field::Nibbles,
+                i64::from(want.nibbles),
+                i64::from(got_nibbles),
+            );
         }
-        if i64::from(got_mono) != i64::from(want.mono_2x) {
-            return Err(Mismatch {
-                sample: n,
-                field: Field::Mono,
-                want: i64::from(want.mono_2x),
-                got: i64::from(got_mono),
-            });
+        if got_mono != want.mono_2x {
+            return fail(Field::Mono, i64::from(want.mono_2x), i64::from(got_mono));
+        }
+        if got_voices != want.voices {
+            return fail(Field::Voices, i64::from(want.voices), i64::from(got_voices));
         }
         let got_status = chip.status();
         if got_status != want.status {
-            return Err(Mismatch {
-                sample: n,
-                field: Field::Status,
-                want: i64::from(want.status),
-                got: i64::from(got_status),
-            });
-        }
-        let got_voices = chip.voices_playing();
-        if got_voices != want.voices {
-            return Err(Mismatch {
-                sample: n,
-                field: Field::Voices,
-                want: i64::from(want.voices),
-                got: i64::from(got_voices),
-            });
+            return fail(Field::Status, i64::from(want.status), i64::from(got_status));
         }
     }
     if wi != case.writes.len() {
@@ -2798,7 +2818,7 @@ pub fn run_case(case: &Case) -> Result<(), Mismatch> {
         // the case is not the case it claims to be.
         return Err(Mismatch {
             sample: case.samples.len(),
-            field: Field::Status,
+            field: Field::UnreachedWrites,
             want: case.writes.len() as i64,
             got: wi as i64,
         });
@@ -2807,416 +2827,154 @@ pub fn run_case(case: &Case) -> Result<(), Mismatch> {
 }
 ```
 
-- [ ] **Step 2: Write `reportoki.rs`**
+- [ ] **Step 2: Write `okirunner.rs`'s own tests**
 
-Model on `reportym.rs`: `SHOWN = 20`, `CONTEXT = 4`, `--test suite` for the summary and `--case N` for a divergence table, ending with the inventory assertion.
+Nine tests, in a `#[cfg(test)] mod tests`. The fixture is recorded from the core, which is legitimate **here and nowhere else**: the point is to build a case the runner accepts, so that corrupting it must make the runner reject it. The suite's own expectations come from MAME.
 
-```rust
-//! Reports the OKI vector suite.
-
-use testrunner::{okifiles, okirunner};
-
-const SHOWN: usize = 20;
-const CONTEXT: usize = 4;
-
-fn main() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let cases = okifiles::load()?;
-    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        [] | ["--test", "suite"] => {
-            let mut passed = 0usize;
-            let mut shown = 0usize;
-            for (i, c) in cases.iter().enumerate() {
-                match okirunner::run_case(c) {
-                    Ok(()) => passed += 1,
-                    Err(m) => {
-                        if shown < SHOWN {
-                            println!("case {i}: {m}");
-                            shown += 1;
-                        }
-                    }
-                }
-            }
-            println!("cases: {passed}/{}", cases.len());
-            if passed != cases.len() {
-                return Err(format!("{} cases failed", cases.len() - passed));
-            }
-            assert_eq!(
-                passed,
-                okifiles::EXPECTED,
-                "every case passed but the total is short -- the file and the \
-                 inventory disagree about how many cases the suite holds"
-            );
-            Ok(())
-        }
-        ["--case", n] => {
-            let i: usize = n.parse().map_err(|e| format!("{n}: {e}"))?;
-            let c = cases.get(i).ok_or_else(|| format!("case {i} of {}", cases.len()))?;
-            match okirunner::run_case(c) {
-                Ok(()) => {
-                    println!("case {i} passes ({} samples)", c.samples.len());
-                    Ok(())
-                }
-                Err(m) => {
-                    println!("case {i} (seed {}, pin7 {}): {m}", c.seed, c.pin7);
-                    let from = m.sample.saturating_sub(CONTEXT);
-                    let to = (m.sample + CONTEXT + 1).min(c.samples.len());
-                    println!(
-                        "  {:>6}  {:>10}  {:>6}  {:>6}  {:>7}",
-                        "sample", "mono", "status", "voices", "nibbles"
-                    );
-                    for n in from..to {
-                        let s = c.samples[n];
-                        let mark = if n == m.sample { "->" } else { "  " };
-                        println!(
-                            "{mark}{n:>6}  {:>10}  {:>#6X}  {:>6}  {:>#7X}",
-                            s.mono_2x, s.status, s.voices, s.nibbles
-                        );
-                    }
-                    for w in c.writes.iter().filter(|w| {
-                        usize::from(w.at_sample) >= from && usize::from(w.at_sample) < to
-                    }) {
-                        println!("  write {:#04X} at sample {}", w.byte, w.at_sample);
-                    }
-                    Err(format!("case {i} diverges"))
-                }
-            }
-        }
-        _ => Err("usage: reportoki [--test suite | --case N]".into()),
-    }
-}
-```
-
-- [ ] **Step 3: Prove the runner can fail**
-
-A runner that returns `Ok(())` unconditionally passes 1000/1000 and tells you nothing. Add this to `okirunner.rs`, corrupting **each field in turn** — a single corrupted field would leave the other comparisons unexercised, which is how a missing `!=` ships.
+The phrase must be *short* — four nibbles, so it ends at sample 3 — or the fixture cannot distinguish `voices` from `status` and the two comparisons become interchangeable.
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::okifmt::{Case, Sample, Write_};
+    use crate::okifmt::{Sample, Write_};
 
-    /// A case the chip really does produce: one voice on phrase 1, two samples,
-    /// recorded by running the core and then asserting nothing about the values
-    /// themselves. That is legitimate here and nowhere else -- the point is to
-    /// build a case the runner accepts, so that corrupting it must make the
-    /// runner reject it. The suite's own expectations come from MAME.
     fn passing_case() -> Case {
         let mut rom = vec![0u8; 0x4000];
-        for (i, b) in [0x00u8, 0x10, 0x00, 0x00, 0x10, 0x7F].into_iter().enumerate() {
+        // Phrase 1: 0x1000..0x1001, so count = 2 * (0x1001 - 0x1000 + 1) = 4.
+        for (i, b) in [0x00u8, 0x10, 0x00, 0x00, 0x10, 0x01]
+            .into_iter()
+            .enumerate()
+        {
             rom[8 + i] = b;
         }
         let mut s: u64 = 0x1234_5678;
-        for a in 0x1000..0x2000 {
+        for byte in &mut rom[0x1000..0x2000] {
             s ^= s << 13;
             s ^= s >> 7;
             s ^= s << 17;
-            rom[a] = s as u8;
+            *byte = s as u8;
         }
-        let writes = vec![Write_ { at_sample: 0, byte: 0x81 }, Write_ { at_sample: 0, byte: 0x10 }];
-        let mut chip = oki::Oki::new();
+        let writes = vec![
+            Write_ { at_sample: 0, byte: 0x81 },
+            Write_ { at_sample: 0, byte: 0x10 },
+        ];
+        let mut chip = Oki::new();
         chip.write(0x81, &rom);
         chip.write(0x10, &rom);
-        let samples = (0..2)
+        let samples = (0..5)
             .map(|_| {
+                let voices = chip.voices_playing();
                 let (mono_2x, nibbles) = chip.step_2x_traced(&rom);
-                Sample { mono_2x, status: chip.status(), voices: chip.voices_playing(), nibbles }
+                Sample { mono_2x, status: chip.status(), voices, nibbles }
             })
             .collect();
         Case { seed: 0, pin7: true, writes, rom, samples }
     }
-
-    #[test]
-    fn a_case_the_core_reproduces_passes() {
-        assert_eq!(run_case(&passing_case()), Ok(()));
-    }
-
-    /// Every compared field, corrupted one at a time. A runner missing any one
-    /// comparison passes the suite while ignoring that field entirely.
-    #[test]
-    fn corrupting_any_field_is_caught() {
-        for field in [Field::Mono, Field::Status, Field::Voices, Field::Nibbles] {
-            let mut case = passing_case();
-            let s = &mut case.samples[1];
-            match field {
-                Field::Mono => s.mono_2x = s.mono_2x.wrapping_add(1),
-                Field::Status => s.status ^= 0x01,
-                Field::Voices => s.voices ^= 0x01,
-                Field::Nibbles => s.nibbles ^= 0x0F,
-            }
-            let err = run_case(&case).expect_err(&format!("corrupt {field} passed"));
-            assert_eq!(err.sample, 1, "corrupt {field} was reported at the wrong sample");
-            // Status and voices are the same bit in this case, so accept either
-            // for those two; mono and nibbles must be named exactly.
-            match field {
-                Field::Mono | Field::Nibbles => assert_eq!(err.field, field),
-                Field::Status | Field::Voices => assert!(
-                    err.field == Field::Status || err.field == Field::Voices,
-                    "expected status or voices, got {}",
-                    err.field
-                ),
-            }
-        }
-    }
-
-    /// A write scheduled past the recorded samples is a corrupt file, not a
-    /// pass: silently ignoring it would let a truncated case look clean.
-    #[test]
-    fn a_write_past_the_last_sample_is_a_divergence() {
-        let mut case = passing_case();
-        case.writes.push(Write_ { at_sample: 900, byte: 0x08 });
-        let err = run_case(&case).expect_err("an unreachable write must not pass");
-        assert_eq!(err.sample, case.samples.len());
-    }
-
-    /// The corrupting test above proves the comparisons fire; this proves the
-    /// fixture is not accidentally uniform, which would make one corruption
-    /// stand in for all of them.
-    #[test]
-    fn the_fixture_has_something_to_compare() {
-        let case = passing_case();
-        assert_ne!(case.samples[0].mono_2x, 0, "a silent fixture proves nothing");
-        assert_ne!(case.samples[0].nibbles, 0);
-        assert_eq!(case.samples[0].voices, 0x01);
-    }
-}
 ```
 
-`Field` must derive `Copy` and be usable in the `Display` above — it already does both. Add `oki` to `testrunner`'s `[dev-dependencies]` only if it is not already a plain dependency from Task 4; it is, so nothing to add.
+The tests, each named for the claim it makes:
 
-- [ ] **Step 4: Write the premise tests**
+- `a_case_the_core_reproduces_passes`.
+- `the_fixture_contains_a_phrase_boundary` — sample 3 has `voices == 0x01` and `status == 0xF0`, so `voices != status & 0x0F`; sample 4 has both zero. **This is the test that makes the two field comparisons independent**, and without it the rest of this module proves less than it appears to.
+- `the_fixture_has_something_to_compare` — sample 0's mono and nibbles are non-zero, so one corruption cannot stand in for all of them.
+- `corrupting_any_field_is_caught` — each of the four sample fields corrupted **at sample 3**, one at a time, each asserted to be reported under its own name and at that sample. No "accept either field" escape.
+- `the_nibbles_are_compared_before_the_sample` — both wrong, `Nibbles` reported.
+- `the_first_divergence_is_the_one_reported` — samples 1, 2 and 4 corrupted, sample 1 reported.
+- `a_writes_timing_is_honoured` — dropping the writes fails, and moving the data byte to sample 2 fails **at sample 0**, where the voice then does not sound.
+- `a_write_past_the_last_sample_is_a_divergence` — `Field::UnreachedWrites`, `want 3 got 2`.
+- `a_mismatch_prints_as_one_line` — the `Display` string, and all five field names distinct.
 
-Create `crates/testrunner/tests/okisuite.rs`, modelled on `ymsuite.rs`. These check that the suite exercises what it claims to — the only guard against the generator and the Rust chip sharing a misreading of `okim6295.cpp`.
+- [ ] **Step 3: Write `reportoki.rs`**
+
+Model on `reportym.rs`: `SHOWN = 20`, `CONTEXT = 4`, a summary and a `--case N` divergence table, ending with the inventory assertion. Two departures from `reportym`:
+
+- **Both `--test suite` and no argument are accepted, and an unrecognised argument exits 2.** `reportym` takes only the bare form, and this plan's own gate was written as `reportym -- --test suite` — which printed usage and **exited 0**. A gate step that runs nothing and reports success is worse than a missing gate step, and the hole went unnoticed for three tasks.
+- **The summary prints a first-divergence-by-field breakdown before the case list.** A wrong address walk fails on `nibbles` and a wrong decoder on `mono`, so the split names the file to open before any case is read. This is what the two-byte `nibbles` record exists for, and it was verified against real mutations in Step 5.
+
+`main` exits with a code rather than returning `Result`, so `load`'s error prints without the `Error: ` wrapper and a failing suite exits 1.
+
+- [ ] **Step 4: Write `crates/testrunner/tests/okisuite.rs`**
+
+Eleven tests. These check that the suite exercises what it claims to — the only guard against the generator and the Rust chip sharing a misreading of `okim6295.cpp`.
+
+`SHIFT` is **transcribed** from MAME's published table into this file rather than imported from `oki`:
 
 ```rust
-//! Premises about what the OKI suite exercises.
-//!
-//! The generator's protocol logic and `crates/oki/src/chip.rs` are the same
-//! reading of the same MAME file, so a misreading would agree with itself and
-//! the whole suite would pass. These tests are the check on that: they assert
-//! properties of the recorded data that a wrong reading would not produce.
-//!
-//! The tolerances are the generator's own measured floors, restated here so a
-//! suite regenerated with a quieter script fails loudly rather than testing
-//! less.
-
-use testrunner::okifiles;
-
-#[test]
-fn every_case_is_audible() {
-    let cases = okifiles::load().expect("the suite must be present");
-    let silent: Vec<usize> = cases
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.samples.iter().all(|s| s.mono_2x == 0))
-        .map(|(i, _)| i)
-        .collect();
-    assert!(
-        silent.is_empty(),
-        "{} cases are entirely silent: {:?}",
-        silent.len(),
-        &silent[..silent.len().min(10)]
-    );
-}
-
-/// The chip's own clamp is reachable and reached. If this fails, the suite
-/// does not test the clamp, and the clamp is the thing the D3 spec omitted.
-#[test]
-fn the_suite_reaches_the_chips_own_clamp() {
-    let cases = okifiles::load().expect("the suite must be present");
-    let clamped = cases
-        .iter()
-        .filter(|c| c.samples.iter().any(|s| s.mono_2x.abs() == 65_536))
-        .count();
-    let frac = clamped as f64 / cases.len() as f64;
-    assert!(
-        frac >= 0.30,
-        "only {clamped}/{} cases reach +-65536 ({frac:.3}); the clamp is untested",
-        cases.len()
-    );
-}
-
-/// Four voices must actually play at once somewhere, since that is the only
-/// way the sum exceeds one voice's range.
-#[test]
-fn the_suite_plays_all_four_voices_at_once() {
-    let cases = okifiles::load().expect("the suite must be present");
-    let all_four = cases
-        .iter()
-        .filter(|c| c.samples.iter().any(|s| s.voices == 0x0F))
-        .count();
-    assert!(all_four > 0, "no case ever has all four voices playing");
-    let per_voice: Vec<usize> = (0..4)
-        .map(|v| {
-            cases
-                .iter()
-                .filter(|c| c.samples.iter().any(|s| s.voices & (1 << v) != 0))
-                .count()
-        })
-        .collect();
-    assert!(
-        per_voice.iter().all(|&n| n > 0),
-        "some voice never plays: {per_voice:?}"
-    );
-}
-
-/// Voices must both start and stop, or the suite never tests the stop command
-/// or the end-of-phrase condition.
-#[test]
-fn voices_both_start_and_stop_within_a_case() {
-    let cases = okifiles::load().expect("the suite must be present");
-    let mut started = 0usize;
-    let mut stopped = 0usize;
-    for c in &cases {
-        let transitions: Vec<u8> = c.samples.iter().map(|s| s.voices).collect();
-        if transitions.windows(2).any(|w| w[1] & !w[0] != 0) {
-            started += 1;
-        }
-        if transitions.windows(2).any(|w| w[0] & !w[1] != 0) {
-            stopped += 1;
-        }
-    }
-    assert!(started > cases.len() / 2, "only {started} cases ever start a voice mid-case");
-    assert!(stopped > cases.len() / 2, "only {stopped} cases ever stop a voice");
-}
-
-/// The status byte's high nibble is always F, at every recorded sample. A
-/// reading that built the status differently would show up here.
-#[test]
-fn the_status_high_nibble_is_always_f() {
-    let cases = okifiles::load().expect("the suite must be present");
-    for (i, c) in cases.iter().enumerate() {
-        for (n, s) in c.samples.iter().enumerate() {
-            assert_eq!(s.status & 0xF0, 0xF0, "case {i} sample {n}");
-            assert_eq!(s.status & 0x0F, s.voices, "case {i} sample {n}");
-        }
-    }
-}
-
-/// The step index reaches **both** clamps, 0 and 48.
-///
-/// Measured against MAME's decoder: pseudorandom nibbles drive the index over
-/// 1..48 and **never** reach 0, so a random script would leave the lower clamp
-/// untested and this test would fail on correct data. The generator therefore
-/// reserves phrase 1 in every case for a deliberate ladder -- 16 bytes of nibble
-/// 7 then 48 of nibble 0 -- and this recomputes the index from the recorded
-/// nibbles to confirm it.
-///
-/// Recomputing rather than recording the index is the point: the file holds
-/// nibbles, and the index is derived from them by the same rule the core
-/// implements, so agreement here is a claim about the *data* -- that it contains
-/// a segment which crosses the range -- and not about the core.
-#[test]
-fn the_suite_drives_the_step_index_to_both_clamps() {
-    let cases = okifiles::load().expect("the suite must be present");
-    // MAME's table, indexed `nibble & 7`, from `okiadpcm.cpp`.
-    const SHIFT: [i8; 8] = [-1, -1, -1, -1, 2, 4, 6, 8];
-    // The ladder occupies voice 0 for exactly the first 128 samples of every
-    // case: it starts at sample 0, the generator never stops voice 0, and a
-    // running voice cannot be restarted. Confining the walk to that window is
-    // what makes it sound -- past sample 127 voice 0 may restart on a random
-    // phrase, and a restart on the sample right after the phrase ends leaves no
-    // gap in the `voices` mask to detect, so the decoder reset would be missed.
-    const LADDER: usize = 128;
-    let mut at_zero = 0usize;
-    let mut at_max = 0usize;
-    for (i, c) in cases.iter().enumerate() {
-        assert!(c.samples.len() >= LADDER, "case {i} is shorter than the ladder");
-        let mut step: i8 = 0;
-        let mut saw_zero = false;
-        let mut saw_max = false;
-        for (n, s) in c.samples.iter().take(LADDER).enumerate() {
-            assert!(s.voices & 1 != 0, "case {i}: voice 0 stopped at sample {n}");
-            let nibble = usize::from(s.nibbles & 0x0F);
-            step = (step + SHIFT[nibble & 7]).clamp(0, 48);
-            if step == 0 {
-                saw_zero = true;
-            }
-            if step == 48 {
-                saw_max = true;
-            }
-        }
-        at_zero += usize::from(saw_zero);
-        at_max += usize::from(saw_max);
-    }
-    assert_eq!(
-        (at_zero, at_max),
-        (cases.len(), cases.len()),
-        "the ladder is in every case, so every case must reach both clamps: \
-         {at_zero} reach 0 and {at_max} reach 48 of {}",
-        cases.len()
-    );
-}
-
-/// The ladder phrase is where the generator says it is, and it is audible.
-///
-/// Measured: the 128-sample ladder produces 253808 of total `|signal|`. A ladder
-/// that had been overwritten by the random fill would still cross the step range
-/// by luck, so check the shape too -- the first 16 samples all draw nibble 7.
-#[test]
-fn the_ladder_phrase_is_intact_in_every_case() {
-    let cases = okifiles::load().expect("the suite must be present");
-    for (i, c) in cases.iter().enumerate() {
-        let sevens = c
-            .samples
-            .iter()
-            .take(16)
-            .filter(|s| s.voices & 1 != 0 && s.nibbles & 0x0F == 7)
-            .count();
-        assert_eq!(sevens, 16, "case {i}: the ladder's first 16 nibbles are not all 7");
-    }
-}
-
-/// Both pin-7 states appear. The decoder does not care, but the record is what
-/// `machine`'s rate test reads, and a suite of one polarity would hide a
-/// numerator swap.
-#[test]
-fn both_pin_seven_states_appear() {
-    let cases = okifiles::load().expect("the suite must be present");
-    assert!(cases.iter().any(|c| c.pin7), "no case records pin 7 high");
-    assert!(cases.iter().any(|c| !c.pin7), "no case records pin 7 low");
-}
-
-/// The whole suite passes. This is the gate the report command runs; having it
-/// as a test too means `cargo test --workspace` catches a regression without
-/// anyone remembering to run the report.
-#[test]
-fn every_case_passes() {
-    let cases = okifiles::load().expect("the suite must be present");
-    let failures: Vec<String> = cases
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| testrunner::okirunner::run_case(c).err().map(|m| format!("case {i}: {m}")))
-        .collect();
-    assert!(
-        failures.is_empty(),
-        "{} of {} cases diverge:\n{}",
-        failures.len(),
-        cases.len(),
-        failures[..failures.len().min(20)].join("\n")
-    );
-}
+/// MAME's `s_index_shift`, indexed `nibble & 7`, from `okiadpcm.cpp`.
+/// Transcribed here rather than imported: see the module docs.
+const SHIFT: [i8; 8] = [-1, -1, -1, -1, 2, 4, 6, 8];
+const LADDER: usize = 128;
+const LADDER_SEVENS: usize = 32;
 ```
 
-- [ ] **Step 4: Wire up and run**
+A premise recomputed with the core's own table would agree with a wrong table. That is the whole reason this file exists.
 
-Add `okirunner` to `crates/testrunner/src/lib.rs`'s module list.
+The tests, with the measured figure each rests on:
 
-Run: `cargo test -p testrunner --release`
-Then: `cargo run -q --release -p testrunner --bin reportoki -- --test suite`
-Expected: `cases: 1000/1000`.
+| Test | Premise | Measured |
+| --- | --- | --- |
+| `every_case_is_audible` | no case is all zeros | 0 silent cases |
+| `the_suite_reaches_the_chips_own_clamp` | ≥ 0.90 of cases hit ±65536, **and none exceeds it** | 998/1000 |
+| `the_suite_plays_all_four_voices_at_once` | some sample has all four; every voice plays somewhere | 933 cases; per-voice `[1000, 1000, 988, 985]` |
+| `voices_both_start_and_stop_within_a_case` | more than half of cases do each | 1000 and 1000 |
+| `the_status_is_a_subset_of_the_voices_that_sounded` | high nibble F, low nibble a **subset**, and the two **do** differ somewhere | 1,907 differing samples |
+| `the_suite_drives_the_step_index_to_both_clamps` | every case reaches step 0 **and** 48, walked over the ladder window | 1000/1000 |
+| `the_ladder_phrase_is_intact_in_every_case` | 32 nibbles of 7 then 96 of 0, on the nibbles | exact |
+| `the_suite_reads_the_top_of_the_address_bus` | voice 1's first nibble is `rom[len - 64] >> 4` | exact, all cases |
+| `the_suite_uses_the_silent_volume_indices` | some start uses index 9..15 | 3,026 starts |
+| `both_pin_seven_states_appear` | both polarities recorded | 500 each |
+| `every_case_passes` | the suite passes under `cargo test` too | 1000/1000 |
+
+Three of these need their reasoning in the file, not just the assertion:
+
+- **The subset test asserts both halves.** Subset alone is satisfied by a status byte that is always `0xF0`, so it also asserts the two masks differ somewhere — which is what proves the suite contains a phrase ending mid-play, and hence that the runner's two reads are distinguishable at all.
+- **The step-index walk is confined to the first 128 samples.** Voice 0 runs the ladder there and the generator never stops it, so the window is sound. Past sample 127 voice 0 may restart on a random phrase, and a restart on the sample right after the phrase ends leaves no gap in the `voices` mask, so a missing decoder reset would go unseen.
+- **The clamp test also asserts nothing exceeds the bound.** A suite recorded without the chip's clamp would satisfy the 0.90 floor and still be wrong — the floor proves the bound is *reached*, not that it is *enforced*.
+
+Cross-check `the_suite_uses_the_silent_volume_indices` against `genoki`'s `scan_script`: both walk the script as a state machine, because which bytes are data bytes depends on what preceded them. A `windows(2)` pattern match miscounts, and in a generator-controlled fixture it miscounts *consistently*, which reads as a passing check.
+
+- [ ] **Step 5: Wire up, run, and falsify all three artifacts**
+
+Add `okirunner` to `crates/testrunner/src/lib.rs`'s module list, in alphabetical position.
+
+Run: `cargo test -p testrunner --release --test okisuite` → 11 passed.
+Then: `cargo run -q --release -p testrunner --bin reportoki -- --test suite` → `cases: 1000/1000`.
+Also check the bare form, `--case 137` (PASS), and `--bogus` (usage, exit 2).
 
 If cases fail, run `--case N` on the first one and fix `crates/oki`, **not the suite**. The suite is ground truth.
 
-- [ ] **Step 5: The full gate plus the new report, then commit**
+Then falsify all three artifacts, because a green run proves only that nothing disagreed:
 
-Add `cargo run -q --release -p testrunner --bin reportoki -- --test suite` to the gate from here on.
+**The report, against two temporary core mutations.** Back up the files first (`cp` to `/tmp`), restore both, and confirm `git diff --stat` is clean afterward. Measured:
+
+| Mutation | Result |
+| --- | --- |
+| `ADDRESS_MASK` `0x3_FFFF` → `0x1_FFFF` | `cases: 0/1000`, all first diverging on `nibbles` at sample 0 |
+| adpcm step clamp `clamp(0, ..)` → `clamp(1, ..)` | `cases: 93/1000`, all 907 first diverging on `mono` |
+
+The first is Task 5's top-of-ROM phrase — a premise this plan did not originally ask for — catching an address bug directly. The second's 93 survivors are cases where signal saturation makes `diff(0, n)` and `diff(1, n)` coincide. That the two separate cleanly by field is the field split earning its place.
+
+**The premise tests, against their own constants.** A premise that cannot fail is this branch's characteristic defect, and a premise file is exactly where one hides. Measured:
+
+| Mutation | Fails |
+| --- | --- |
+| `LADDER_SEVENS` 32 → 31 | `the_ladder_phrase_is_intact_in_every_case` |
+| `SHIFT[0]` −1 → 1 | `the_suite_drives_the_step_index_to_both_clamps` |
+| `LADDER` 128 → 200 | both of the above |
+
+Each mutation is caught by exactly the test that owns the constant, and no other test moves — which is what says the eleven tests are eleven claims rather than one claim restated.
+
+- [ ] **Step 6: The full gate plus the new report, then commit**
+
+Add `cargo run -q --release -p testrunner --bin reportoki -- --test suite` to the gate from here on. Expect **1,296** workspace tests: 1,276 before this task, plus 9 in `okirunner`'s own module and 11 in `okisuite.rs`. Both counts, not just the integration file's — the first draft of this line said 1,287, having counted the premise tests and forgotten the runner's, and a task that starts from a wrong baseline cannot tell an added test from a lost one.
 
 ```bash
 git add crates/testrunner
-git commit -m "test(oki): the suite runner, report and premise tests -- 1000/1000"
+git commit -m "feat(oki): replay the vector suite, report it, and check its premises"
 ```
+
+The commit message records the four plan corrections, both core mutations with their case counts, and all three premise-test mutations. A correction not written down is one the next task repeats.
 
 ---
 
