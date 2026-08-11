@@ -144,7 +144,8 @@ fn the_status_trace_carries_information() {
 
 /// The suite contains CSM cases.
 ///
-/// **This is Definition of Done item 9.** The lazy-`prepare()` divergence is
+/// **This is Definition of Done item 5** (item 9 when this comment was written; the
+/// list gained entries above it). The lazy-`prepare()` divergence is
 /// invisible with CSM off — eager and lazy agree bit-for-bit over 40,000 samples —
 /// and appears only with `0x14` bit 7 set and a host that fires timers. A suite with
 /// no CSM case cannot distinguish the two readings, so a Rust port that prepares
