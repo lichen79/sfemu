@@ -62,7 +62,15 @@ _FAILED = re.compile(r"^(?:test )?(\S+) (?:\.\.\.|---) FAILED$", re.M)
 # against `frontend`, which is where this harness started. Naming the crate
 # matters: scoring a mutation of `machine` against `frontend`'s tests would report
 # SURVIVE for every mutant, since those tests never load the mutated code.
-CRATES: dict[str, str] = {
+#
+# A value may be a **list** of crates, all passed to one `cargo test` invocation.
+# `ymsound` needs that and it is not a convenience: its subject spans two crates by
+# construction. The 1,000-case YM2151 suite lives in `testrunner/tests/ymsuite.rs`
+# while every hand-written chip test lives in `ym2151`, and the set's control mutant
+# is precisely the claim that *one dies to the suite and the other to a unit test*.
+# Scored against either crate alone, that control cannot be stated: against `ym2151`
+# the suite never runs, and against `testrunner` the unit test never does.
+CRATES: dict[str, str | list[str]] = {
     "snapshot": "machine",
     "peek": "machine",
     "peekcps1": "machine",
@@ -74,6 +82,10 @@ CRATES: dict[str, str] = {
     # how "which hand-written test kills this" gets asked at all.
     "z80flags": "z80",
     "z80int": "z80",
+    # Both, for the reason above. The cost is real -- `testrunner` reads the
+    # 1,000-case suite off disk for every mutant -- and it is what the set is for.
+    "ymsound": ["ym2151", "testrunner"],
+    "ymsched": "machine",
 }
 
 # How long one mutant's test run may take before it is declared killed. The whole
@@ -81,7 +93,7 @@ CRATES: dict[str, str] = {
 # headroom -- generous enough that a slow cold build is never mistaken for a hang.
 MUTANT_TIMEOUT_S = 120
 
-# name -> (default file, [(mutant-name, old, new, expectation[, file]), ...])
+# name -> (default file, [(mutant-name, old, new, expectation[, file[, extra]]), ...])
 #
 # A mutant may carry a **fifth** element naming its own file, overriding the set's
 # default. Added for the `z80flags` and `z80int` sets, whose subject is not a file
@@ -92,6 +104,25 @@ MUTANT_TIMEOUT_S = 120
 # worth seeing -- that one hand-written test is the only killer for a bit that
 # five files write. The field is trailing and optional, so every set above is
 # unchanged.
+#
+# A mutant may carry a **sixth** element: a list of `(file, old, new)` triples
+# applied *alongside* the main one, so one mutant can be several simultaneous edits.
+# Added for `ymsound`'s control, which is only meaningful as two edits at once --
+# forcing the prepare() gate eager while removing the suite's CSM cases. Applied
+# separately the first dies to the suite and the second changes nothing; applied
+# together they are the claim that the CSM cases are what make the suite able to see
+# the gate. Every extra edit obeys the same exactly-once rule as the main one, and a
+# NO-OP in any of them is a NO-OP for the whole mutant: a control that silently
+# applied half of itself would report SURVIVE and mean nothing.
+#
+# A mutant may carry a **seventh** element: its own crate or crate list, overriding
+# the set's. `ymsound` needs it to state its central claim as an actual
+# SURVIVE-versus-KILL discrepancy rather than as an argument about which test names
+# appear in two rows. The same eager-gate edit is scored twice -- against `testrunner`
+# alone with the suite's CSM cases skipped, where it must SURVIVE, and against
+# `ym2151` alone, where the unit test must KILL it. A pair of rows disagreeing is
+# evidence; two KILLs with different killers named is a paragraph asking to be
+# trusted.
 SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
     "pace": (
         "crates/frontend/src/pace.rs",
@@ -1653,19 +1684,344 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             ),
         ],
     ),
+    # D2 Task 13, first of two. The chip itself, across five files -- `tables.rs`,
+    # `operator.rs`, `channel.rs`, `noise.rs`, `timer.rs`, `chip.rs` -- for the reason
+    # `z80flags` spans five: the subject is the *chip's arithmetic*, and one set per
+    # file would score each against the same suite anyway while hiding what is worth
+    # seeing, which is that a table's own closed-form test is the only killer for a
+    # number 1,000 audio cases cannot see.
+    #
+    # Scored against `ym2151` **and** `testrunner` (see `CRATES`): several mutants
+    # here are audible only in the 1,000-case suite, and the set's last entry is the
+    # claim that one specific mutant is audible *only* there and one *only* in a unit
+    # test. Neither crate alone can state that.
+    "ymsound": (
+        "crates/ym2151/src/operator.rs",
+        [
+            # The two-bit slot swap. Every algorithm's carrier positions depend on it,
+            # so the identity makes algorithm 4's carriers the wrong operators.
+            (
+                "slot-of-is-the-identity",
+                "    ((op_index & 1) << 1) | ((op_index >> 1) & 1)",
+                "    op_index & 3",
+                "KILL",
+                "crates/ym2151/src/regs.rs",
+            ),
+            # The POW closed form. `- 1024` is what makes the table hold raw mantissas
+            # rather than pre-scaled ones; without it every entry is 1,024 too high and
+            # `attenuation_to_volume` returns silence-adjacent nonsense.
+            (
+                "pow-closed-form-loses-its-offset",
+                "            let want = (2f64.powf(-(f64::from(i) + 1.0) / 256.0) * 2048.0).round() - 1024.0;",
+                "            let want = (2f64.powf(-(f64::from(i) + 1.0) / 256.0) * 2048.0).round();",
+                "KILL",
+                "crates/ym2151/src/tables.rs",
+            ),
+            # One entry of the 768-value phase table, off by one. This is the mutant the
+            # checksum exists for: the audio difference is a fraction of a cent on one
+            # note, which no listener and no coverage premise would notice.
+            (
+                "phase-step-zero-off-by-one",
+                "pub static PHASE_STEP: [u32; 768] = [\n    41568,",
+                "pub static PHASE_STEP: [u32; 768] = [\n    41569,",
+                "KILL",
+                "crates/ym2151/src/tables.rs",
+            ),
+            # The attack-to-decay transition. `<= 0` on a `u16` is `== 0` in value but
+            # not in *reachability*: it is `attenuation == 0` written so that a signed
+            # port would transition early. Kept as the plan wrote it because the point
+            # is the boundary, and clippy's `-D warnings` would reject `<= 0` on an
+            # unsigned -- so the comparison is made against a widened i32 instead.
+            (
+                "attack-transition-on-le-zero",
+                "        if self.env_state == EnvState::Attack && self.env_attenuation == 0 {",
+                "        if self.env_state == EnvState::Attack && i32::from(self.env_attenuation) <= 1 {",
+                "KILL",
+            ),
+            # The documented rate-62/63 glitch, off by one: rate 62 would increment.
+            (
+                "attack-glitch-threshold-is-sixty-three",
+                "            if rate < 62 {",
+                "            if rate < 63 {",
+                "KILL",
+            ),
+            # Release wraps instead of clamping, so a fully decayed note comes back at
+            # full volume -- audible, and only if something drives release to the top.
+            (
+                "release-wraps-instead-of-clamping",
+                "            self.env_attenuation += increment as u16;\n            if self.env_attenuation >= 0x400 {\n                self.env_attenuation = 0x3FF;\n            }",
+                "            self.env_attenuation = (self.env_attenuation + increment as u16) & 0x3FF;",
+                "KILL",
+            ),
+            # MUL = 0 means a half, not zero. Read literally it silences every operator
+            # with the most common multiple setting there is.
+            (
+                "multiple-zero-is-zero",
+                "        let multiple = match regs.op_multiple(op) {\n            0 => 1,\n            mul => mul * 2,\n        };",
+                "        let multiple = regs.op_multiple(op) * 2;",
+                "KILL",
+            ),
+            # DT1's sign bit folded into the magnitude index, so setting 4 -- documented
+            # as a second no-op -- becomes a real detune and 6 detunes the wrong way.
+            (
+                "dt1-sign-bit-folded-into-the-magnitude",
+                "    let magnitude = i32::from(DETUNE[(key_code & 0x1F) as usize][(detune & 3) as usize]);\n    if detune & 4 != 0 {\n        -magnitude\n    } else {\n        magnitude\n    }",
+                "    i32::from(DETUNE[(key_code & 0x1F) as usize][(detune & 3) as usize])",
+                "KILL",
+                "crates/ym2151/src/tables.rs",
+            ),
+            # The envelope clock divider. 2 instead of 3 makes every envelope run at a
+            # different rate: no unit test names the divider, so this is the suite's.
+            (
+                "envelope-divider-is-two",
+                "pub const EG_CLOCK_DIVIDER: u32 = 3;",
+                "pub const EG_CLOCK_DIVIDER: u32 = 2;",
+                "KILL",
+                "crates/ym2151/src/chip.rs",
+            ),
+            # The YM3012 roundtrip removed. Below 513 it is an identity, so this is
+            # inaudible on a quiet case and wrong on every loud one -- the suite's.
+            (
+                "dac-roundtrip-removed",
+                "        (roundtrip_fp(left), roundtrip_fp(right))",
+                "        (left.clamp(-32768, 32767) as i16, right.clamp(-32768, 32767) as i16)",
+                "KILL",
+                "crates/ym2151/src/chip.rs",
+            ),
+            # The pan bits swapped: a channel panned hard left comes out hard right.
+            (
+                "pan-bits-swapped",
+                "        (\n            if left { result } else { 0 },\n            if right { result } else { 0 },\n        )",
+                "        (\n            if right { result } else { 0 },\n            if left { result } else { 0 },\n        )",
+                "KILL",
+                "crates/ym2151/src/channel.rs",
+            ),
+            # The divider applied to the phase instead of the envelope: every operator's
+            # pitch is then wrong by a third, and no unit test clocks a whole chip.
+            (
+                "divider-applied-to-the-phase",
+                "            self.channels[ch as usize].clock(&self.regs, ch, self.env_counter, lfo_pm);",
+                "            self.channels[ch as usize].clock(&self.regs, ch, self.env_counter, lfo_pm / 3);",
+                "KILL",
+                "crates/ym2151/src/chip.rs",
+            ),
+            # The LFSR's tap moved from 14 to 13. The period test is what pins it: a
+            # moved tap still makes noise, and noise that sounds like noise is the
+            # hardest wrong thing in this chip to hear.
+            (
+                "noise-lfsr-tap-moved",
+                "            self.lfsr |= ((self.lfsr >> 17) & 1) ^ ((self.lfsr >> 14) & 1) ^ 1;",
+                "            self.lfsr |= ((self.lfsr >> 17) & 1) ^ ((self.lfsr >> 13) & 1) ^ 1;",
+                "KILL",
+                "crates/ym2151/src/noise.rs",
+            ),
+            # Timer A's period off by one, which is the difference between `1024 - v`
+            # and `1023 - v` and shows up as a status bit one sample early.
+            (
+                "timer-a-period-off-by-one",
+                "            1024 - regs.timer_a_value()",
+                "            1023 - regs.timer_a_value()",
+                "KILL",
+                "crates/ym2151/src/timer.rs",
+            ),
+            # The IRQ line drops when *either* status bit clears rather than both, so a
+            # driver clearing timer A loses an interrupt timer B is still asserting.
+            (
+                "irq-drops-on-either-status-bit",
+                "        self.irq = self.status & IRQ_MASK != 0;",
+                "        self.irq = self.status & IRQ_MASK == IRQ_MASK;",
+                "KILL",
+                "crates/ym2151/src/timer.rs",
+            ),
+            # The prepare() gate forced eager, scored against the **suite alone**. This
+            # is Definition of Done item 5 stated as a measurement: with the CSM cases
+            # present, the 1,000-case suite by itself sees the gate.
+            (
+                "prepare-gate-forced-eager-vs-the-suite",
+                "        let eager = self.force_eager_prepare();",
+                "        let eager = true;",
+                "KILL",
+                "crates/ym2151/src/chip.rs",
+                [],
+                "testrunner",
+            ),
+            # The same edit against the **unit tests alone**, which must also see it.
+            # Two rows rather than one because a single run against both crates cannot
+            # distinguish "the suite caught it" from "a unit test did".
+            (
+                "prepare-gate-forced-eager-vs-the-unit-tests",
+                "        let eager = self.force_eager_prepare();",
+                "        let eager = true;",
+                "KILL",
+                "crates/ym2151/src/chip.rs",
+                [],
+                "ym2151",
+            ),
+            # CONTROL, and the load-bearing one for Definition of Done item 5: the same
+            # eager gate, with the suite's CSM cases skipped, scored against the suite
+            # alone. It must **SURVIVE** -- which is the whole claim, stated as a
+            # discrepancy against the row two above rather than as an argument about
+            # which killer names appear where. A suite with no CSM case cannot see the
+            # gate at all, so an eager port would pass at 1,000/1,000 while being wrong,
+            # and `with_csm_on_eager_and_lazy_diverge` is the only thing standing there.
+            #
+            # Expressed as two simultaneous edits because either alone says nothing: the
+            # gate edit alone dies to the suite (the row above), and the CSM skip alone
+            # changes no result.
+            (
+                "CONTROL-eager-gate-is-invisible-to-a-suite-without-csm",
+                "        let eager = self.force_eager_prepare();",
+                "        let eager = true;",
+                "SURVIVE",
+                "crates/ym2151/src/chip.rs",
+                [
+                    # In `the_suite_passes`, not in `run_case`: skipping the cases
+                    # inside the runner would also change what
+                    # `the_runner_reports_a_deliberately_corrupted_sample` measures, and
+                    # a control killed by the runner's own test would be a control
+                    # killed for a reason that has nothing to do with CSM coverage.
+                    (
+                        "crates/testrunner/tests/ymsuite.rs",
+                        "    for (i, case) in v.cases.iter().enumerate() {\n        let r = ymrunner::run_case(case);",
+                        "    for (i, case) in v.cases.iter().enumerate() {\n        if case.writes.iter().any(|w| w.reg == 0x14 && w.val & 0x80 != 0) {\n            continue;\n        }\n        let r = ymrunner::run_case(case);",
+                    )
+                ],
+                "testrunner",
+            ),
+        ],
+    ),
+    # D2 Task 13, second of two: the machine's side -- the Z80's rational clock, the
+    # sample accumulator, the save state's sound fields, and the sound board's map.
+    "ymsched": (
+        "crates/machine/src/cps1.rs",
+        [
+            # The rational accumulator replaced by the truncated integer it exists to
+            # avoid. 229 per line is 284 T short over a 3,125-line period.
+            (
+                "rational-clock-truncated-to-229",
+                "pub const Z80_T_NUM: u32 = 715_909;",
+                "pub const Z80_T_NUM: u32 = 715_625;",
+                "KILL",
+                "crates/machine/src/timing.rs",
+            ),
+            # The remainder discarded each line, which is the same truncation reached a
+            # different way: every line grants 229 and the fraction never accumulates.
+            (
+                "accumulator-remainder-reset-each-line",
+                "        let total = self.num + self.rem;\n        self.rem = total % self.den;\n        total / self.den",
+                "        let total = self.num + self.rem;\n        self.rem = 0;\n        total / self.den",
+                "KILL",
+                "crates/machine/src/timing.rs",
+            ),
+            # The remainder dropped from the save state. Invisible for exactly one line
+            # after a load, then permanent divergence.
+            (
+                "remainder-dropped-from-the-save-state",
+                "        self.z80_carry = s.z80_carry;",
+                "",
+                "KILL",
+            ),
+            # The interleave order swapped: the Z80's line runs before the 68000's.
+            (
+                "z80-stepped-before-the-68000",
+                "            self.z80_debt += i64::from(self.z80_carry.advance());\n            while self.z80_debt > 0 {\n                self.step_sound();\n            }\n            // One sample per scanline",
+                "            // One sample per scanline",
+                "KILL",
+            ),
+            # The sample accumulator driven by lines rather than T-states, so the sample
+            # rate is locked to the beam and drifts against the chip.
+            (
+                "samples-accrued-per-line-not-per-t-state",
+                "        self.sample_acc += t;",
+                "        self.sample_acc += 1;",
+                "KILL",
+            ),
+            # The banked window widened to six banks. SF2's `audiocpu` is 0x18000, so
+            # banks 2-5 read past the region and answer 0xFF -- `RST 38h` again.
+            (
+                "banked-window-is-six-banks",
+                "const BANKS: u8 = 2;",
+                "const BANKS: u8 = 6;",
+                "KILL",
+                "crates/machine/src/sound.rs",
+            ),
+            # The bank register taking the whole byte rather than bit 0.
+            (
+                "bank-register-uses-the-whole-byte",
+                "            0xF004 => self.bank = val & (BANKS - 1),",
+                "            0xF004 => self.bank = val,",
+                "KILL",
+                "crates/machine/src/sound.rs",
+            ),
+            # The two command latches aliased, so every command byte is also a fade
+            # value and the driver's timer byte is whatever the last command was.
+            (
+                "the-two-latches-aliased",
+                "                if addr == 0xF008 {\n                    self.latches[0]\n                } else {\n                    self.latches[1]\n                }",
+                "                self.latches[0]",
+                "KILL",
+                "crates/machine/src/sound.rs",
+            ),
+            # The chip dropped from the save state: a load restores the driver's idea
+            # of the chip and not the chip, so every envelope resumes mid-air.
+            (
+                "ym2151-dropped-from-the-save-state",
+                "        self.sound\n            .restore(&s.sound_ram, s.sound_bank, s.oki_pin7, &s.ym, s.ym_addr);",
+                "        self.sound.restore(\n            &s.sound_ram,\n            s.sound_bank,\n            s.oki_pin7,\n            &ym2151::Ym2151::new(),\n            s.ym_addr,\n        );",
+                "KILL",
+            ),
+            # Sound RAM sized 4 KB instead of 2. The map's window is 0xD000-0xD7FF, so
+            # the extra 2 KB is unreachable through the bus and only the save state's
+            # array length changes -- which is what makes this worth a mutant.
+            (
+                "sound-ram-is-four-kilobytes",
+                "pub const RAM_BYTES: usize = 0x800;",
+                "pub const RAM_BYTES: usize = 0x1000;",
+                "KILL",
+                "crates/machine/src/sound.rs",
+            ),
+            # CONTROL: `Debug` dropped from `SoundTrace`. Nothing formats it in a
+            # passing run -- the assertion messages that would are on paths only a
+            # failure takes -- so this compiles and changes no behaviour.
+            #
+            # Checked against every other mutant in both sets for the overlap the plan
+            # warns about: nothing else here touches `SoundTrace`'s derives or the
+            # suite's case selection, and the `ymsound` control's second edit is in
+            # `testrunner`, which this set does not score against.
+            (
+                "CONTROL-sound-trace-loses-its-copy-derive",
+                "#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]\npub struct SoundTrace {",
+                "#[derive(Debug, Clone, PartialEq, Eq, Default)]\npub struct SoundTrace {",
+                "SURVIVE",
+                "crates/machine/src/sound.rs",
+            ),
+        ],
+    ),
 }
 
 
 def run_rows(name: str) -> list[tuple[str, str, str]]:
     """Applies every mutant of one set, returning (name, expectation, result)."""
     default_src, mutants = SETS[name]
-    crate = CRATES.get(name, "frontend")
+
+    def args_for(crates) -> list[str]:
+        """`-p a -p b`, so one run scores a subject spanning crates."""
+        if isinstance(crates, str):
+            crates = [crates]
+        return [a for c in crates for a in ("-p", c)]
+
+    default_args = args_for(CRATES.get(name, "frontend"))
     # One backup per file the set touches, taken before the first mutant is applied
     # and restored in `finally` whatever happens. Keyed by path so a set spanning
     # five files cannot restore one of them from another's copy -- and `shutil.copy`
     # throughout, never `git checkout`, because a checkout would take uncommitted
     # work in those files with it.
+    #
+    # The sixth element's files count too. Missing them would leave a control's
+    # second edit applied after the mutant that made it, which is the one state this
+    # harness exists to never produce.
     files = {m[4] if len(m) > 4 else default_src for m in mutants}
+    files |= {f for m in mutants if len(m) > 5 for f, _, _ in m[5]}
     backups = {}
     for i, src in enumerate(sorted(files)):
         backups[src] = f"/tmp/mutate-{name}-{i}.orig"
@@ -1675,12 +2031,23 @@ def run_rows(name: str) -> list[tuple[str, str, str]]:
         for mutant in mutants:
             mname, old, new, expect = mutant[:4]
             src = mutant[4] if len(mutant) > 4 else default_src
-            text = open(backups[src]).read()
-            n = text.count(old)
-            if n != 1:
-                rows.append((mname, expect, f"NO-OP ({n} matches)"))
+            # Every edit this mutant makes, the main one first. The main one is
+            # spelled as a triple here so the loops below have one shape; a mutant
+            # with no sixth element produces exactly the single edit it always did.
+            edits = [(src, old, new)] + list(mutant[5] if len(mutant) > 5 else [])
+            crate_args = args_for(mutant[6]) if len(mutant) > 6 else default_args
+            # Count first, write second. All-or-nothing: a mutant whose second edit
+            # no longer matches must report NO-OP rather than apply its first half
+            # and be scored, because half a mutant is a different mutant.
+            counts = [(f, o, n2, open(backups[f]).read().count(o)) for f, o, n2 in edits]
+            missed = [(f, c) for f, _, _, c in counts if c != 1]
+            if missed:
+                where = ", ".join(f"{f.rsplit('/', 1)[-1]}:{c}" for f, c in missed)
+                rows.append((mname, expect, f"NO-OP ({where} matches)"))
                 continue
-            open(src, "w").write(text.replace(old, new, 1))
+            for f, o, n2, _ in counts:
+                text = open(f).read()
+                open(f, "w").write(text.replace(o, n2, 1))
             # A timeout, because a mutant can hang rather than fail. Measured, not
             # hypothetical: dropping the cycle charge in `Cps1::step_instruction`
             # leaves `run_scanline`'s `while self.line == line` spinning forever, so
@@ -1695,7 +2062,7 @@ def run_rows(name: str) -> list[tuple[str, str, str]]:
             # hangs means the timeout is too short rather than the mutant fatal.
             try:
                 r = subprocess.run(
-                    ["cargo", "test", "-p", crate, "--quiet"],
+                    ["cargo", "test", *crate_args, "--quiet"],
                     capture_output=True,
                     text=True,
                     timeout=MUTANT_TIMEOUT_S,
@@ -1721,8 +2088,10 @@ def run_rows(name: str) -> list[tuple[str, str, str]]:
                 # got away without this because every iteration rewrote the whole
                 # file from the pristine backup; across files it would leave mutant
                 # N applied while mutant N+1 ran, and the two together are a third
-                # mutant whose result belongs to neither.
-                shutil.copy(backups[src], src)
+                # mutant whose result belongs to neither. Every file this mutant
+                # wrote, not only `src`, for the same reason one file over.
+                for f, _, _ in edits:
+                    shutil.copy(backups[f], f)
             rows.append((mname, expect, got))
     finally:
         for path, backup in backups.items():
