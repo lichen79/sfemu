@@ -3293,16 +3293,46 @@ git commit -m "feat(machine): the OKI sample-rate ratio, asserted from the clock
 - Modify: `crates/machine/src/sound.rs`
 - Modify: `crates/machine/Cargo.toml`
 - Modify: `crates/machine/src/lib.rs`
+- Modify: `crates/machine/src/cps1.rs` (the `restore` caller **and** a D2 test the new default breaks — see correction 1)
 
 **Interfaces:**
-- Consumes: `oki::Oki` from Task 3, `timing::oki_per_ym` from Task 7.
-- Produces: `SoundBoard::{oki_ref, oki_rom, set_oki_rom, oki_step_2x, oki_divisor}`; `SoundBoard::new` and `restore` gain the OKI. `0xF002` reads the real status.
+- Consumes: `oki::Oki` from Task 3, `timing::{OKI_DIV_PIN7_HIGH, OKI_DIV_PIN7_LOW}` from Task 7. **Not `oki_per_ym`** — the ratio is Task 9's, and the board only needs the divisor.
+- Produces: `SoundBoard::{oki_ref, oki_rom, set_oki_rom, oki_step_2x, oki_divisor, set_audio_stats}`; `SoundTrace` gains `oki_clamps`, `audio_drops`, `audio_underruns`; `SoundBoard::new` and `restore` gain the OKI. `0xF002` reads the real status. `machine` re-exports `oki`.
 
 **The D2 defect this fixes.** `SoundBoard::new` (`sound.rs:137-148`) sets `oki_pin7: false`, but MAME constructs the chip `PIN7_HIGH` (`cps1.cpp:3946`), and `device_reset()` stops the voices **without touching `m_pin7_state`** (`okim6295.cpp:143-148`). That is a 25% pitch error until the driver's first `0xF006` write. **Assert the fix through the divisor it implies, not through the boolean** — a test that reads back the same flag the constructor set passes a half-done fix.
 
+#### Two corrections this task forced on the plan, and two tests added
+
+**1. Flipping the default breaks a D2 test the plan did not name.** `sound_ram_the_bank_and_the_oki_pin_are_part_of_the_state` in `cps1.rs` drives the pin **high** and then asserts `!b.sound.oki_pin7()` on a fresh board before restoring. With the default now high, both halves are wrong: the fresh-board assertion fails outright, and the restore would be asserting a state that was already there — the exact shape of a test that cannot fail. It drives the pin **low** instead, away from the default, and reads `oki_divisor()` alongside the flag, so the state has to be carried *and* used. The plan's file list also has to gain `crates/machine/src/cps1.rs`, which it named only for the `restore` signature.
+
+**2. `the_board_counts_the_chips_own_clipping`'s figures are right and one derived claim is not.** The measured 61-of-64 and the unclamped peak of 262,016 both reproduce exactly. But the ADPCM ramp needs several nibbles to saturate — the first sample of four fresh voices is 1,920, not 65,536 — so anywhere a clip is wanted after a start, a phrase has to be stepped rather than a single sample. The extended `clearing_the_trace_zeroes_the_counters_and_nothing_else` does that, and asserts *every* counter is non-zero before the clear: with three new fields, a clear that missed one would otherwise be satisfied by a field that was already default.
+
+**Two tests added beyond the plan's eight**, each written because the obvious mutation survived every other test in the file. This is the falsification pass earning its place twice in one task:
+
+1. `the_two_host_audio_counters_are_not_interchangeable`. Swapping the two assignments inside `set_audio_stats` left **156 tests green**. They are two `u32`s arriving through one call, so nothing but distinct values tells them apart, and the symptom is a debug panel blaming a full ring for an empty one — opposite fixes. It also asserts the bus cannot move either counter, which is true because the ring is not on the Z80's bus at all.
+2. `setting_the_sample_rom_does_not_stop_a_playing_voice`. Adding `self.oki.reset()` to `set_oki_rom` **also** left everything green, because every other test sets the ROM before starting a voice. The order that breaks is a save-state load: `restore` puts the voices back, and a host that then re-supplied the ROM would silence a state that was mid-phrase.
+
+**And the extra test the probe justified**, which the plan had as prose only: `a_sum_that_lands_on_the_clamp_without_clamping_is_not_counted`. `oki_step_2x`'s doc comment claims the flag and `sample.abs() == CLAMP_2X` are not interchangeable; that is a testable claim, and the state is reachable. Two voices at volume index 0 with signals 1 and 2047 sum to exactly `1·32 + 2047·32 = 65536` **unclamped**. Built through `Oki::restore` with `Adpcm::restore(-1, 0)` and `Adpcm::restore(2045, 0)` over a zeroed ROM, whose nibble 0 clocks −1→1 and 2045→2047. Counting by value fails exactly this test and no other.
+
 - [ ] **Step 1: Write the failing tests**
 
-Two existing tests change. `the_oki_is_a_counted_stub` (line 554) asserts `b.read(0xF002) == 0x00`; `oki_pin_seven_latches_bit_zero` (line 565) asserts `!b.oki_pin7()` on a fresh board. Replace both:
+Two existing tests in `sound.rs` change. `the_oki_is_a_counted_stub` (line 554) asserts `b.read(0xF002) == 0x00`; `oki_pin_seven_latches_bit_zero` (line 565) asserts `!b.oki_pin7()` on a fresh board. Replace both. A third, `sound_ram_the_bank_and_the_oki_pin_are_part_of_the_state` in `cps1.rs`, changes for the reason correction 1 above gives.
+
+`timing` is not in scope inside `sound.rs`'s test module, so the paths below are `crate::timing::`. The sample-ROM boilerplate — a phrase header at bytes 8..14 and 0x80 filled bytes at 0x1000 — is repeated in five of these tests, so it is a `sample_rom(fill: u8)` helper beside `rom()` rather than copied:
+
+```rust
+    /// A sample ROM holding one phrase at 0x1000..0x107F, filled with `fill`.
+    ///
+    /// Phrase 1's header lives at bytes 8..14 -- `phrase * 8` -- as two 24-bit
+    /// big-endian addresses, start then stop.
+    fn sample_rom(fill: u8) -> Vec<u8> {
+        let mut r = vec![0u8; 0x4000];
+        r[8..14].copy_from_slice(&[0x00, 0x10, 0x00, 0x00, 0x10, 0x7F]);
+        r[0x1000..0x1080].fill(fill);
+        r
+    }
+```
+
 
 ```rust
     /// The OKI answers with a real status byte now: F0 idle, and one bit per
@@ -3314,12 +3344,7 @@ Two existing tests change. `the_oki_is_a_counted_stub` (line 554) asserts `b.rea
         assert_eq!(b.trace().oki_writes, 0, "a status read is not a write");
 
         // Without a sample ROM the chip cannot start anything, so give it one.
-        let mut sample_rom = vec![0u8; 0x4000];
-        sample_rom[8..14].copy_from_slice(&[0x00, 0x10, 0x00, 0x00, 0x10, 0x7F]);
-        for a in 0x1000..0x1080 {
-            sample_rom[a] = 0x77;
-        }
-        b.set_oki_rom(sample_rom);
+        b.set_oki_rom(sample_rom(0x77));
 
         b.write(0xF002, 0x81);
         b.write(0xF002, 0x10);
@@ -3337,7 +3362,7 @@ Two existing tests change. `the_oki_is_a_counted_stub` (line 554) asserts `b.rea
     #[test]
     fn a_fresh_board_is_at_the_divisor_mame_constructs_with() {
         let b = SoundBoard::new(rom());
-        assert_eq!(b.oki_divisor(), timing::OKI_DIV_PIN7_HIGH);
+        assert_eq!(b.oki_divisor(), crate::timing::OKI_DIV_PIN7_HIGH);
         assert_eq!(b.oki_divisor(), 132);
     }
 
@@ -3347,14 +3372,18 @@ Two existing tests change. `the_oki_is_a_counted_stub` (line 554) asserts `b.rea
     fn oki_pin_seven_selects_the_divisor_from_bit_zero() {
         let mut b = SoundBoard::new(rom());
         b.write(0xF006, 0x00);
-        assert_eq!(b.oki_divisor(), timing::OKI_DIV_PIN7_LOW, "bit 0 clear is the slow rate");
+        assert_eq!(
+            b.oki_divisor(),
+            crate::timing::OKI_DIV_PIN7_LOW,
+            "bit 0 clear is the slow rate"
+        );
         b.write(0xF006, 0x01);
-        assert_eq!(b.oki_divisor(), timing::OKI_DIV_PIN7_HIGH);
+        assert_eq!(b.oki_divisor(), crate::timing::OKI_DIV_PIN7_HIGH);
         // Only bit 0 matters.
         b.write(0xF006, 0xFE);
-        assert_eq!(b.oki_divisor(), timing::OKI_DIV_PIN7_LOW);
+        assert_eq!(b.oki_divisor(), crate::timing::OKI_DIV_PIN7_LOW);
         b.write(0xF006, 0xFF);
-        assert_eq!(b.oki_divisor(), timing::OKI_DIV_PIN7_HIGH);
+        assert_eq!(b.oki_divisor(), crate::timing::OKI_DIV_PIN7_HIGH);
     }
 
     /// A command byte reaches the chip through the bus, not just the counter.
@@ -3362,29 +3391,31 @@ Two existing tests change. `the_oki_is_a_counted_stub` (line 554) asserts `b.rea
     /// on the chip must produce the same samples.
     #[test]
     fn a_bus_write_reaches_the_chip_itself() {
-        let mut sample_rom = vec![0u8; 0x4000];
-        sample_rom[8..14].copy_from_slice(&[0x00, 0x10, 0x00, 0x00, 0x10, 0x7F]);
+        let mut samples_rom = sample_rom(0);
         let mut s: u64 = 0x1234_5678;
-        for a in 0x1000..0x1080 {
+        for byte in &mut samples_rom[0x1000..0x1080] {
             s ^= s << 13;
             s ^= s >> 7;
             s ^= s << 17;
-            sample_rom[a] = s as u8;
+            *byte = s as u8;
         }
 
         let mut b = SoundBoard::new(rom());
-        b.set_oki_rom(sample_rom.clone());
+        b.set_oki_rom(samples_rom.clone());
         b.write(0xF002, 0x81);
         b.write(0xF002, 0x10);
         let through_bus: Vec<i32> = (0..16).map(|_| b.oki_step_2x()).collect();
 
         let mut direct = oki::Oki::new();
-        direct.write(0x81, &sample_rom);
-        direct.write(0x10, &sample_rom);
-        let straight: Vec<i32> = (0..16).map(|_| direct.step_2x(&sample_rom)).collect();
+        direct.write(0x81, &samples_rom);
+        direct.write(0x10, &samples_rom);
+        let straight: Vec<i32> = (0..16).map(|_| direct.step_2x(&samples_rom)).collect();
 
         assert_eq!(through_bus, straight);
-        assert!(through_bus.iter().any(|&s| s != 0), "the comparison must be of something");
+        assert!(
+            through_bus.iter().any(|&s| s != 0),
+            "the comparison must be of something"
+        );
     }
 
     /// The board counts how often the chip clipped its own sum, and it is
@@ -3397,11 +3428,8 @@ Two existing tests change. `the_oki_is_a_counted_stub` (line 554) asserts `b.rea
         // Four voices at volume index 0 on a saturating ramp. Measured against
         // MAME's decoder: the unclamped peak is exactly 4 x 2047 x 32 = 262016,
         // four times the clamp, and 61 of these 64 samples clip.
-        let mut sample_rom = vec![0u8; 0x4000];
-        sample_rom[8..14].copy_from_slice(&[0x00, 0x10, 0x00, 0x00, 0x10, 0x7F]);
-        sample_rom[0x1000..0x1080].fill(0x77);
         let mut b = SoundBoard::new(rom());
-        b.set_oki_rom(sample_rom);
+        b.set_oki_rom(sample_rom(0x77));
         assert_eq!(b.trace().oki_clamps, 0);
         for byte in [0x81, 0x10, 0x81, 0x20, 0x81, 0x40, 0x81, 0x80] {
             b.write(0xF002, byte);
@@ -3414,11 +3442,55 @@ Two existing tests change. `the_oki_is_a_counted_stub` (line 554) asserts `b.rea
         }
         assert_eq!(clipped_samples, 61, "measured: 61 of 64 samples clip");
         assert_eq!(
-            b.trace().oki_clamps as usize, clipped_samples,
+            b.trace().oki_clamps as usize,
+            clipped_samples,
             "the counter must track the samples that were clamped"
         );
         b.clear_trace();
         assert_eq!(b.trace().oki_clamps, 0);
+    }
+
+    /// The counter and a value comparison are **not** interchangeable, and the
+    /// state where they disagree is reachable.
+    ///
+    /// This is the claim `oki_step_2x`'s doc comment makes in prose, asserted:
+    /// two voices at volume index 0 whose signals are 1 and 2047 sum to exactly
+    /// `1 * 32 + 2047 * 32 = 65536` — the clamp's value, arrived at without the
+    /// clamp biting. A board that counted `sample.abs() == CLAMP_2X` would call
+    /// this a clip. Nothing in the *output* distinguishes the two cases, which
+    /// is why the chip has to report the flag.
+    ///
+    /// The signals are set up one step early and clocked into place by the
+    /// step itself: nibble 0 over a zeroed ROM adds 2, so -1 becomes 1 and
+    /// 2045 saturates at 2047.
+    #[test]
+    fn a_sum_that_lands_on_the_clamp_without_clamping_is_not_counted() {
+        use oki::chip::{Voice, VOLUME_TABLE};
+        use oki::Adpcm;
+
+        let loudest = VOLUME_TABLE[0];
+        assert_eq!(loudest, 0x20, "volume index 0 is unity gain, 32/32");
+        let quiet = Voice::restore(Adpcm::restore(-1, 0), true, 0, 0, 64, loudest);
+        let loud = Voice::restore(Adpcm::restore(2045, 0), true, 0, 0, 64, loudest);
+        let silent = Voice::restore(Adpcm::new(), false, 0, 0, 0, 0);
+        let chip = oki::Oki::restore([quiet, loud, silent, silent], None);
+
+        let mut b = SoundBoard::new(rom());
+        // A zeroed ROM is nibble 0 everywhere, which is the +2 step above.
+        b.set_oki_rom(vec![0u8; 0x4000]);
+        b.restore(&[0; RAM_BYTES], 0, true, &Ym2151::new(), 0, chip);
+
+        let sample = b.oki_step_2x();
+        assert_eq!(
+            sample,
+            oki::chip::CLAMP_2X,
+            "the sum must land exactly on the clamp, or there is nothing to tell apart"
+        );
+        assert_eq!(
+            b.trace().oki_clamps,
+            0,
+            "the clamp did not bite, so nothing may be counted"
+        );
     }
 
     /// A quiet machine reports no clipping at all, so a non-zero count on the
@@ -3426,19 +3498,79 @@ Two existing tests change. `the_oki_is_a_counted_stub` (line 554) asserts `b.rea
     /// clamp: 2047 x 2 = 4094, far below 65536.
     #[test]
     fn a_quiet_machine_reports_no_clipping() {
-        let mut sample_rom = vec![0u8; 0x4000];
-        sample_rom[8..14].copy_from_slice(&[0x00, 0x10, 0x00, 0x00, 0x10, 0x7F]);
-        sample_rom[0x1000..0x1080].fill(0x77);
         let mut b = SoundBoard::new(rom());
-        b.set_oki_rom(sample_rom);
+        b.set_oki_rom(sample_rom(0x77));
         b.write(0xF002, 0x81);
         b.write(0xF002, 0x18); // voice 0, volume index 8
         let mut energy = 0i64;
         for _ in 0..64 {
             energy += i64::from(b.oki_step_2x().abs());
         }
-        assert!(energy > 0, "it must be audible, or the absence of clipping is trivial");
+        assert!(
+            energy > 0,
+            "it must be audible, or the absence of clipping is trivial"
+        );
         assert_eq!(b.trace().oki_clamps, 0);
+    }
+
+    /// Handing the board a sample ROM is not a reset of the chip.
+    ///
+    /// **Also written because the mutation survived**: adding `self.oki.reset()` to
+    /// `set_oki_rom` left every other test in this file green, because they all set
+    /// the ROM before starting a voice. The order that breaks is the one a save-state
+    /// load uses — [`SoundBoard::restore`] puts the voices back, and a host that then
+    /// re-supplied the ROM would silence a state that was mid-phrase.
+    #[test]
+    fn setting_the_sample_rom_does_not_stop_a_playing_voice() {
+        let mut b = SoundBoard::new(rom());
+        b.set_oki_rom(sample_rom(0x77));
+        b.write(0xF002, 0x81);
+        b.write(0xF002, 0x10);
+        for _ in 0..4 {
+            b.oki_step_2x();
+        }
+        let mid_phrase = b.oki_ref().clone();
+        assert_eq!(b.read(0xF002), 0xF1, "the premise: a voice is playing");
+
+        b.set_oki_rom(sample_rom(0x77));
+        assert_eq!(b.read(0xF002), 0xF1, "and it still is");
+        assert_eq!(
+            b.oki_ref(),
+            &mid_phrase,
+            "the chip's position in the phrase is untouched"
+        );
+    }
+
+    /// The host's two ring counters land in their own fields, and nowhere else.
+    ///
+    /// **Written because the obvious mutation survived every other test in this
+    /// file**: swapping the two assignments inside `set_audio_stats` left 156 tests
+    /// green. They are two `u32`s arriving through one call, so nothing but distinct
+    /// values distinguishes them, and the symptom of the swap is a debug panel that
+    /// blames a full ring for an empty one — the two have opposite fixes.
+    ///
+    /// The other half of the claim is that these counters come only from here: the
+    /// bus cannot move them, because the ring is not on the Z80's bus at all.
+    #[test]
+    fn the_two_host_audio_counters_are_not_interchangeable() {
+        let mut b = SoundBoard::new(rom());
+        b.set_audio_stats(7, 11);
+        assert_eq!(b.trace().audio_drops, 7, "drops is the first argument");
+        assert_eq!(b.trace().audio_underruns, 11);
+        // Not accumulated: the host reports totals, so a second call replaces.
+        b.set_audio_stats(2, 3);
+        assert_eq!((b.trace().audio_drops, b.trace().audio_underruns), (2, 3));
+        // And nothing the guest does touches either one.
+        b.set_oki_rom(sample_rom(0x77));
+        for a in 0..=0xFFFFu16 {
+            let _ = b.read(a);
+            b.write(a, 0x5A);
+        }
+        assert_eq!(
+            (b.trace().audio_drops, b.trace().audio_underruns),
+            (2, 3),
+            "the ring is not on the Z80's bus"
+        );
     }
 
     /// `peek_byte` must agree with the bus at F002 without starting or
@@ -3446,10 +3578,7 @@ Two existing tests change. `the_oki_is_a_counted_stub` (line 554) asserts `b.rea
     #[test]
     fn peeking_the_oki_status_moves_nothing() {
         let mut b = SoundBoard::new(rom());
-        let mut sample_rom = vec![0u8; 0x4000];
-        sample_rom[8..14].copy_from_slice(&[0x00, 0x10, 0x00, 0x00, 0x10, 0x7F]);
-        sample_rom[0x1000..0x1080].fill(0x55);
-        b.set_oki_rom(sample_rom);
+        b.set_oki_rom(sample_rom(0x55));
         b.write(0xF002, 0x81);
         b.write(0xF002, 0x10);
         let before = b.clone();
@@ -3508,7 +3637,7 @@ In `crates/machine/src/sound.rs`:
     pub audio_underruns: u32,
 ```
 
-  Extend the existing `clearing_the_trace_zeroes_the_counters_and_nothing_else` to cover all three.
+  Extend the existing `clearing_the_trace_zeroes_the_counters_and_nothing_else` to cover all three, and **assert every counter is non-zero before the clear**. Three new fields is three new ways for `clear_trace` to miss one, and a clear asserted against a field that was already default proves nothing. `oki_clamps` needs a phrase stepped, not a sample — see correction 2 — and the two audio counters come from `set_audio_stats`. Both boards in that test are driven identically, the OKI included, so the only difference remains the counters the reads move.
 
 - Add `oki: Oki` and `oki_rom: Vec<u8>` to `SoundBoard`, and extend the hand-written `Debug` (do not print the ROM's contents — print its length).
 - `new`: `oki: Oki::new()`, `oki_rom: Vec::new()`, and **`oki_pin7: true`** with a comment naming `cps1.cpp:3946` and the fact that `device_reset` leaves it alone.
@@ -3580,19 +3709,43 @@ In `crates/machine/src/sound.rs`:
     }
 ```
 
-- `restore`: take the chip's voices and pending command too. Widen the signature to `restore(&mut self, ram, bank, oki_pin7, ym, ym_addr, oki: Oki)` and update the one caller in `cps1.rs`.
+- `restore`: take the chip's voices and pending command too. Widen the signature to `restore(&mut self, ram, bank, oki_pin7, ym, ym_addr, oki: Oki)` and update the one caller in `cps1.rs`. The sample ROM is **not** restored, for the reason the program ROM is not: a save state carries the machine, not the ROM set it was loaded from. Until Task 10 widens `MachineState`, the `cps1.rs` caller passes `oki::Oki::new()` — say so in a comment there, or the next reader takes a reset chip for a restored one.
+- Do **not** add `self.oki.reset()` to `set_oki_rom`. It reads as tidy and is wrong: `restore` puts the voices back, and a host re-supplying the ROM afterwards would silence a state that was mid-phrase. `setting_the_sample_rom_does_not_stop_a_playing_voice` is what holds that.
 
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p machine`
 Expected: PASS. `peeking_agrees_with_the_bus_and_moves_no_counter` (which walks all 65,536 addresses) must still pass — if it fails at `0xF002`, the peek is calling something that mutates.
 
-- [ ] **Step 5: The full gate, then commit**
+- [ ] **Step 5: Falsify the fix against mutations**
+
+A green run proves nothing disagreed. Back up `sound.rs` to `/tmp` first, restore after each, and confirm `git diff --stat` is clean. Measured, with the tests that caught each:
+
+| Mutation | Fails |
+| --- | --- |
+| `oki_pin7: true` → `false` | 2 — the divisor test and the cps1 state test |
+| clamps counted by value, not the flag | 1 — the exact-boundary test, and no other |
+| the `0xF002` write does not reach the chip | 6 |
+| `peek_byte` at `0xF002` returns `STATUS_IDLE` | 1 |
+| `read` at `0xF002` returns `STATUS_IDLE` | 1 |
+| `oki_divisor`'s two branches swapped | 3 |
+| `restore` drops its `oki` argument | 1 |
+| clamps never counted | 2 |
+| `set_audio_stats`'s two arguments swapped | **0 until its killer was written** |
+| `set_oki_rom` also resets the chip | **0 until its killer was written** |
+
+The last two are the point of the pass: two tests exist because of them. Note the shape both share — a change nothing observed, in code every other test drove in only one order.
+
+- [ ] **Step 6: The full gate, then commit**
+
+Expect 1,312 workspace tests: 1,304 plus ten new tests, minus the two D2 tests replaced.
 
 ```bash
-git add crates/machine crates/oki
+git add crates/machine
 git commit -m "feat(machine): the real OKI on the sound board, at MAME's pin-7 default"
 ```
+
+The commit message records both plan corrections, both added tests with the mutation that forced each, and the exact-boundary test — because a correction not written down is one the next task repeats.
 
 ---
 
