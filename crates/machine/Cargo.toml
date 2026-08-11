@@ -11,7 +11,10 @@ publish = false
 [dependencies]
 m68k = { path = "../m68k" }
 video = { path = "../video" }
-# The sound board. Both are dependency-free and `no_std`-shaped, like the two
-# above, so adding them does not weaken the edge the comment above protects.
+# The sound board. All three are dependency-free and `no_std`-shaped, like the
+# two above, so adding them does not weaken the edge the comment above protects.
+# `oki` is admitted on the same terms, and must stay dependency-free: its
+# `serde` feature is off here, and turning it on would pull serde into `machine`.
+oki = { path = "../oki" }
 ym2151 = { path = "../ym2151" }
 z80 = { path = "../z80" }

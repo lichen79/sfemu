@@ -502,8 +502,16 @@ impl Cps1 {
         self.carry = s.carry;
         self.video.set_obj_latch(&s.obj);
         self.z80 = s.z80.clone();
-        self.sound
-            .restore(&s.sound_ram, s.sound_bank, s.oki_pin7, &s.ym, s.ym_addr);
+        // The chip is rebuilt rather than restored in place: Task 10 widens
+        // `MachineState` to carry its voices, and until then a load resets it.
+        self.sound.restore(
+            &s.sound_ram,
+            s.sound_bank,
+            s.oki_pin7,
+            &s.ym,
+            s.ym_addr,
+            oki::Oki::new(),
+        );
         self.z80_carry = s.z80_carry;
         self.z80_debt = s.z80_debt;
         self.z80_total = s.z80_total;
@@ -1942,6 +1950,12 @@ mod tests {
     /// is asserted is the machine the guest sees. The bank especially: it selects which
     /// 16 KB the Z80 executes, so a state that dropped it would resume a driver in the
     /// wrong half of its own code.
+    ///
+    /// The pin is driven **low** here, not high: a fresh board is already high, as
+    /// MAME constructs it, so restoring a high pin onto a fresh board would assert a
+    /// state that was never loaded. Read through the divisor as well as the flag —
+    /// 165 against 132 is the audible difference, and the flag alone would pass a
+    /// board that carried the bit and ignored it.
     #[test]
     fn sound_ram_the_bank_and_the_oki_pin_are_part_of_the_state() {
         on_a_big_stack(|| {
@@ -1949,19 +1963,21 @@ mod tests {
             a.sound.write(0xD100, 0xA5);
             a.sound.write(0xD7FF, 0x5A);
             a.sound.write(0xF004, 0x01); // bank 1
-            a.sound.write(0xF006, 0x01); // OKI pin 7 high
+            a.sound.write(0xF006, 0x00); // OKI pin 7 low, away from the default
             let state = a.snapshot();
 
             let mut b = sound_machine();
             assert_eq!(b.sound.read(0xD100), 0x00, "a fresh board differs");
             assert_eq!(b.sound.bank(), 0);
-            assert!(!b.sound.oki_pin7());
+            assert!(b.sound.oki_pin7(), "and is at MAME's construction default");
+            assert_eq!(b.sound.oki_divisor(), crate::timing::OKI_DIV_PIN7_HIGH);
 
             b.restore(&state);
             assert_eq!(b.sound.read(0xD100), 0xA5);
             assert_eq!(b.sound.read(0xD7FF), 0x5A);
             assert_eq!(b.sound.bank(), 1);
-            assert!(b.sound.oki_pin7());
+            assert!(!b.sound.oki_pin7());
+            assert_eq!(b.sound.oki_divisor(), crate::timing::OKI_DIV_PIN7_LOW);
             // Bank 1 is a different window on the ROM, which is what makes the bank
             // more than a stored byte.
             assert_eq!(b.sound.read(0x8000), a.sound.read(0x8000));

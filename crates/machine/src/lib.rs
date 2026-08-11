@@ -60,6 +60,13 @@ pub use z80;
 /// [`ym2151::state`] for why that layout lives there and not in the frontend.
 pub use ym2151;
 
+/// The ADPCM chip crate, re-exported, for the same reason [`m68k`] is.
+///
+/// [`MachineState`] carries the chip's voices and its half-delivered command, so a
+/// save-state codec has to name [`oki::Voice`] and [`oki::VOICES`] and construct a
+/// [`oki::Oki`] to fill from a file.
+pub use oki;
+
 pub use board::Board;
 pub use config::BoardConfig;
 pub use cps1::Cps1;
