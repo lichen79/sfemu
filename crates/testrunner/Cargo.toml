@@ -8,5 +8,6 @@ description = "Dev-only harness driving m68k against the SingleStepTests suite"
 
 [dependencies]
 m68k = { path = "../m68k" }
+oki = { path = "../oki" }
 ym2151 = { path = "../ym2151" }
 z80 = { path = "../z80" }
