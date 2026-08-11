@@ -64,10 +64,15 @@ fn the_sound_program_drives_the_ym2151() {
     // theoretical one — `sfemu`'s own main loop still builds with `with_gfx`, so a
     // test copied from it would assert a fetch count produced entirely by `RST 38h`.
     let audiocpu = set.region("audiocpu").expect("and an audiocpu region");
+    // The ADPCM samples too, for the same reason: an absent sample ROM starts no
+    // voice, so a driver that plays effects perfectly would still produce a mix with
+    // the OKI term at zero and nothing here would say so.
+    let okirom = set.region("oki").expect("and an oki region");
     let mut m = machine::Cps1::with_sound(
         prog,
         gfx.to_vec(),
         audiocpu.to_vec(),
+        okirom.to_vec(),
         machine::BoardConfig::sf2(),
         machine::Timing::cps1_10mhz(),
     );
@@ -76,7 +81,7 @@ fn the_sound_program_drives_the_ym2151() {
     // A bounded run: 120 frames is two seconds, long enough for the driver to
     // initialise the chip and start a track, short enough to stay a unit test. The
     // samples are never drained, so `samples()` below holds the whole run — about
-    // 110,000 stereo pairs, which is 440 KB and fine for a test.
+    // 110,000 mono samples, which is 220 KB and fine for a test.
     for _ in 0..120 {
         m.run_frame();
     }
@@ -94,7 +99,7 @@ fn the_sound_program_drives_the_ym2151() {
         t.ym_writes
     );
     assert!(
-        m.samples().iter().any(|&(l, r)| l != 0 || r != 0),
+        m.samples().iter().any(|&s| s != 0),
         "and the chip produced non-silent samples out of {}",
         m.samples().len()
     );

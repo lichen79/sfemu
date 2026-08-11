@@ -611,6 +611,9 @@ mod tests {
             &rom,
             Vec::new(),
             audiocpu,
+            // No sample ROM: the panels this fixture drives read the YM's channels
+            // and the trace counters, and the OKI's own rows are Task 10's.
+            Vec::new(),
             BoardConfig::sf2(),
             Timing::cps1_10mhz(),
         );

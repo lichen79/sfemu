@@ -307,6 +307,18 @@ impl SoundBoard {
         &self.oki
     }
 
+    /// Stop every voice and drop a half-delivered command: the chip's own reset.
+    ///
+    /// A narrow door rather than a `&mut Oki` accessor, for the reason
+    /// [`SoundBoard::oki_ref`] gives — a debug panel must not be able to start a
+    /// voice. The machine calls this from [`crate::Cps1::reset`], because MAME's
+    /// machine reset propagates `device_reset` to the chip (`okim6295.cpp:143-148`),
+    /// which stops the voices. Note what it leaves alone: [`SoundBoard::oki_pin7`],
+    /// for the same citation, and the sample ROM, which is not state.
+    pub fn reset_oki(&mut self) {
+        self.oki.reset();
+    }
+
     /// Produce one OKI output sample in the 2x domain.
     ///
     /// Counts the samples the chip clipped, from the chip's own report rather than by

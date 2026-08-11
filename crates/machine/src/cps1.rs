@@ -4,7 +4,9 @@ use crate::board::Board;
 use crate::config::BoardConfig;
 use crate::snapshot::MachineState;
 use crate::sound::SoundBoard;
-use crate::timing::{RationalAccumulator, Timing, YM_SAMPLE_CLOCKS, Z80_T_DEN, Z80_T_NUM};
+use crate::timing::{
+    oki_per_ym, RationalAccumulator, Timing, YM_SAMPLE_CLOCKS, Z80_T_DEN, Z80_T_NUM,
+};
 use m68k::{decode::Decoder, M68k};
 use video::compose::Video;
 
@@ -79,12 +81,27 @@ pub struct Cps1 {
     /// Driven by T-states actually spent rather than by lines, so the sample rate
     /// stays locked to the Z80 rather than drifting against it.
     sample_acc: u32,
+    /// OKI samples accrued per YM tick, under one — see [`oki_per_ym`].
+    ///
+    /// Its *remainder* is machine state for `z80_carry`'s reason: dropping it
+    /// puts a restored machine a fraction of an ADPCM sample out and the phrase
+    /// drifts from there.
+    oki_acc: RationalAccumulator,
+    /// The OKI's last output, in the 2x domain, held between chip steps.
+    ///
+    /// Most YM ticks advance the chip by zero samples, so the mix reuses this — the
+    /// way a sample-and-hold DAC does. State, not scratch: a restore that zeroed it
+    /// would put one silent sample into the middle of a phrase.
+    oki_last: i32,
     /// Samples produced and not yet drained by the host.
+    ///
+    /// **Mono `i16`, not a stereo pair.** CPS-1 has one speaker — see [`mix`], which
+    /// is where the YM's two channels and the OKI become this one number.
     ///
     /// **Output, not state.** A save state carrying a frame of audio would grow
     /// every snapshot and make a divergence comparison depend on when it was taken;
     /// see [`MachineState`].
-    samples: Vec<(i16, i16)>,
+    samples: Vec<i16>,
     /// Built once. `Decoder::new` fills a 65,536-entry table, so constructing one
     /// per step would dominate the run time.
     ///
@@ -122,7 +139,7 @@ impl Cps1 {
     /// `gfx` is the board's assembled graphics region, supplied by the caller. This
     /// crate holds no ROM.
     pub fn with_gfx(prog: &[u8], gfx: Vec<u8>, cfg: BoardConfig, timing: Timing) -> Self {
-        Self::with_sound(prog, gfx, Vec::new(), cfg, timing)
+        Self::with_sound(prog, gfx, Vec::new(), Vec::new(), cfg, timing)
     }
 
     /// A machine with a sound program as well.
@@ -135,13 +152,25 @@ impl Cps1 {
     /// keep their three-and-four argument signatures — the callers in `frontend`,
     /// `sfemu`, and this crate's own tests do not all have a sound ROM to give.
     ///
+    /// `okirom` is the ADPCM chip's sample ROM, a **different chip on a different
+    /// bus** from `audiocpu`. An empty one is not an error either, and it is quieter
+    /// than an empty sound program: every phrase header then reads as
+    /// `start == stop == 0`, which the chip refuses, so no voice ever starts and the
+    /// OKI contributes silence. That is what the two constructors above hand it —
+    /// which is exactly why a test that asserts on OKI output must not.
     pub fn with_sound(
         prog: &[u8],
         gfx: Vec<u8>,
         audiocpu: Vec<u8>,
+        okirom: Vec<u8>,
         cfg: BoardConfig,
         timing: Timing,
     ) -> Self {
+        let mut sound = SoundBoard::new(audiocpu);
+        sound.set_oki_rom(okirom);
+        // The chip's rate follows the pin-7 state the board starts at, which MAME
+        // constructs high — see `SoundBoard::new`.
+        let (num, den) = oki_per_ym(sound.oki_pin7());
         Self {
             cpu: M68k::new(),
             board: Board::new(prog, cfg),
@@ -151,11 +180,13 @@ impl Cps1 {
             carry: 0,
             video: Video::new(cfg.video, cfg.mapper, gfx),
             z80: z80::Z80::new(),
-            sound: SoundBoard::new(audiocpu),
+            sound,
             z80_carry: RationalAccumulator::new(Z80_T_NUM, Z80_T_DEN),
             z80_debt: 0,
             z80_total: 0,
             sample_acc: 0,
+            oki_acc: RationalAccumulator::new(num, den),
+            oki_last: 0,
             samples: Vec::new(),
             dec: Box::new(Decoder::new()),
         }
@@ -176,15 +207,23 @@ impl Cps1 {
         self.z80_carry.remainder()
     }
 
-    /// The samples produced since the last [`Cps1::drain_samples`].
+    /// The mono samples produced since the last [`Cps1::drain_samples`].
+    ///
+    /// One per YM2151 tick, at 55,930 Hz. Mono because the board is: see [`mix`].
     #[must_use]
-    pub fn samples(&self) -> &[(i16, i16)] {
+    pub fn samples(&self) -> &[i16] {
         &self.samples
     }
 
-    /// Discards the produced samples, which the host does once it has queued them.
-    pub fn drain_samples(&mut self) {
-        self.samples.clear();
+    /// Takes the produced samples, which the host does once it has queued them.
+    ///
+    /// Returns them rather than dropping them: a host that has to queue the audio
+    /// needs the buffer, and a `drain` that only cleared it forced every caller to
+    /// copy the slice out first. The buffer moves to the caller, so the machine
+    /// allocates a fresh one — about 2 KB a frame, against the 120 KB the frame's
+    /// pixels already cost.
+    pub fn drain_samples(&mut self) -> Vec<i16> {
+        core::mem::take(&mut self.samples)
     }
 
     /// Renders the current board state into [`Cps1::video`]'s framebuffer.
@@ -209,16 +248,23 @@ impl Cps1 {
         // for the 68000's carry, and `reset_restores_the_sound_schedule_exactly`
         // makes it here.
         //
-        // The Z80 and the chip are reset; sound RAM and the ROM bank are not. That
-        // is the same split as the 68000 side, where a reset does not clear main
-        // RAM, and it is MAME's: a machine reset propagates `device_reset` to every
-        // device, while RAM contents and the bank selection are untouched.
+        // The Z80 and both chips are reset; sound RAM, the ROM bank and the OKI's
+        // pin-7 state are not. That is the same split as the 68000 side, where a
+        // reset does not clear main RAM, and it is MAME's: a machine reset propagates
+        // `device_reset` to every device, while RAM contents, the bank selection and
+        // `m_pin7_state` are untouched (`okim6295.cpp:143-148`).
         self.z80.reset();
         self.sound.ym().reset();
+        self.sound.reset_oki();
         self.z80_carry = RationalAccumulator::new(Z80_T_NUM, Z80_T_DEN);
         self.z80_debt = 0;
         self.z80_total = 0;
         self.sample_acc = 0;
+        // The rate survives, because the pin does; the *phase* does not, for
+        // `z80_carry`'s reason.
+        let (num, den) = oki_per_ym(self.sound.oki_pin7());
+        self.oki_acc = RationalAccumulator::new(num, den);
+        self.oki_last = 0;
         self.samples.clear();
     }
 
@@ -375,7 +421,21 @@ impl Cps1 {
             self.sample_acc -= YM_SAMPLE_CLOCKS;
             let mut one = [(0i16, 0i16)];
             self.sound.ym().generate(&mut one);
-            self.samples.push(one[0]);
+            // One YM tick advances the OKI by its ratio, which is well under one
+            // sample — so most ticks step the chip zero times and `oki_last` carries
+            // the level, the way a sample-and-hold DAC does.
+            let (num, den) = oki_per_ym(self.sound.oki_pin7());
+            if self.oki_acc.ratio() != (num, den) {
+                // A pin-7 write is a numerator swap: the two ratios share a
+                // denominator, so the carried remainder keeps its units and the phase
+                // does not jump. See `timing::OKI_PER_YM_DEN`.
+                self.oki_acc =
+                    RationalAccumulator::with_remainder(num, den, self.oki_acc.remainder());
+            }
+            for _ in 0..self.oki_acc.advance() {
+                self.oki_last = self.sound.oki_step_2x();
+            }
+            self.samples.push(mix(one[0].0, one[0].1, self.oki_last));
         }
         t
     }
@@ -503,7 +563,10 @@ impl Cps1 {
         self.video.set_obj_latch(&s.obj);
         self.z80 = s.z80.clone();
         // The chip is rebuilt rather than restored in place: Task 10 widens
-        // `MachineState` to carry its voices, and until then a load resets it.
+        // `MachineState` to carry its voices, and until then a load resets it. The
+        // OKI's rate accumulator and held sample are left alone for the same reason —
+        // there is nothing in the state to put back yet, and zeroing them would be a
+        // second wrong answer rather than a safer one.
         self.sound.restore(
             &s.sound_ram,
             s.sound_bank,
@@ -519,6 +582,29 @@ impl Cps1 {
         // `samples` is deliberately untouched: it is output the host drains, not
         // state, so a load must not retract audio already queued for playback.
     }
+}
+
+/// Collapse the YM2151's stereo pair and the OKI's 2x-domain sum into CPS-1's
+/// single mono output.
+///
+/// CPS-1 has one speaker (`cps1.cpp:3935`: `SPEAKER(config, "mono")`), with the
+/// two YM channels at 0.35 each and the OKI at 0.30. Over a denominator of 20
+/// those are 7, 7 and 6 — and the OKI term is **3 rather than 6** because
+/// `oki_2x` is already twice the stream value, which is the widest form in which
+/// a voice's `signal * volume` product is an exact integer.
+///
+/// No saturation, and that is a measured claim rather than an omission: the chip
+/// clamps its own sum to ±[`oki::chip::CLAMP_2X`] before this sees it, which
+/// bounds the numerator at ±655,360 = 20 × 32,768. See
+/// `the_mix_never_needs_saturation`.
+///
+/// The truncating divide deviates from MAME's f32 chain by at most 0.952 LSB —
+/// under one, so no dither or rounding term is worth the drift it would add. See
+/// `the_mix_is_mames_weights_within_one_lsb`.
+#[must_use]
+pub fn mix(ym_l: i16, ym_r: i16, oki_2x: i32) -> i16 {
+    let numerator = 7 * (i32::from(ym_l) + i32::from(ym_r)) + 3 * oki_2x;
+    (numerator / 20) as i16
 }
 
 #[cfg(test)]
@@ -1384,6 +1470,11 @@ mod tests {
             &spin(),
             Vec::new(),
             sound_spin(),
+            // No sample ROM: every phrase then has `start == stop == 0`, which the
+            // chip refuses, so the OKI contributes silence and these tests observe
+            // the YM and the schedule alone. [`oki_machine`] is the fixture for the
+            // chip's own contribution.
+            Vec::new(),
             BoardConfig::sf2(),
             Timing::cps1_10mhz(),
         );
@@ -1424,6 +1515,8 @@ mod tests {
             &rom,
             Vec::new(),
             sound_spin(),
+            // No sample ROM: this is the fixture for the interleave, not the audio.
+            Vec::new(),
             BoardConfig::sf2(),
             Timing::cps1_10mhz(),
         );
@@ -1456,6 +1549,48 @@ mod tests {
             w(0x80 + off, 0x1F); // attack rate 31: immediate
         }
         w(0x08, 0x78); // key on, all four operators of channel 0
+    }
+
+    /// A sample ROM with one phrase of loud ADPCM at 0x1000, for the mix tests.
+    ///
+    /// `0x77` is the largest positive step nibble repeated, so the decoder ramps to
+    /// near full scale within a few dozen samples and the peak assertions in
+    /// `a_playing_oki_voice_is_audible_in_the_mono_samples` have something to bound.
+    /// The phrase is 0x4000 samples long — far more than any test runs — so no voice
+    /// ends mid-test and the "it is still playing" premises hold.
+    fn oki_rom() -> Vec<u8> {
+        let mut r = vec![0u8; 0x8000];
+        // Phrase 1's header at bytes 8..14: two 24-bit big-endian addresses.
+        r[8..14].copy_from_slice(&[0x00, 0x10, 0x00, 0x00, 0x30, 0x00]);
+        r[0x1000..0x3001].fill(0x77);
+        r
+    }
+
+    /// Start phrase 1 on voice 0 at unity gain, through the Z80's bus.
+    ///
+    /// Two writes, as the chip's protocol demands: `0x81` latches the phrase, then
+    /// `0x10` is `vvvv gggg` — voice mask 1, volume index 0, which is 32/32.
+    fn start_the_oki_phrase(m: &mut Cps1) {
+        m.sound.write(0xF002, 0x81);
+        m.sound.write(0xF002, 0x10);
+    }
+
+    /// [`sound_machine`] with a sample ROM and one voice playing, YM unpatched.
+    ///
+    /// The YM is deliberately left silent so the OKI is the *only* source: a mix
+    /// that dropped the OKI term would otherwise still produce audio.
+    fn oki_machine() -> Cps1 {
+        let mut m = Cps1::with_sound(
+            &spin(),
+            Vec::new(),
+            sound_spin(),
+            oki_rom(),
+            BoardConfig::sf2(),
+            Timing::cps1_10mhz(),
+        );
+        m.reset();
+        start_the_oki_phrase(&mut m);
+        m
     }
 
     /// A byte the 68000 writes mid-line is visible to the Z80 in the *same* line.
@@ -1771,7 +1906,7 @@ mod tests {
             }
             assert!(!a.samples().is_empty(), "the run produced audio to compare");
             assert!(
-                a.samples().iter().any(|&(l, r)| l != 0 || r != 0),
+                a.samples().iter().any(|&s| s != 0),
                 "and it was not silence, so there was something to lose"
             );
             assert_eq!(
@@ -1861,7 +1996,7 @@ mod tests {
                 a.run_scanline();
             }
             assert!(
-                a.samples().iter().any(|&(l, r)| l != 0 || r != 0),
+                a.samples().iter().any(|&s| s != 0),
                 "there is sound to lose"
             );
             let state = a.snapshot();
@@ -1937,7 +2072,7 @@ mod tests {
                 b.run_scanline();
             }
             assert!(
-                a.samples().iter().any(|&(l, r)| l != 0 || r != 0),
+                a.samples().iter().any(|&s| s != 0),
                 "the data byte reached key-on, so there is sound to compare"
             );
             assert_eq!(a.samples(), b.samples());
@@ -2064,9 +2199,7 @@ mod tests {
             let n = running.samples().len().min(stepping.samples().len());
             assert!(n > 100, "there are samples to compare: {n}");
             assert!(
-                running.samples()[..n]
-                    .iter()
-                    .any(|&(l, r)| l != 0 || r != 0),
+                running.samples()[..n].iter().any(|&s| s != 0),
                 "and they are not silence, so there is something to lose"
             );
             assert_eq!(&running.samples()[..n], &stepping.samples()[..n]);
@@ -2111,6 +2244,261 @@ mod tests {
                 (t.oki_writes, t.port_accesses),
                 (m.sound.oki_writes(), m.sound.port_accesses()),
                 "and they are the board's own counts, not a second tally"
+            );
+        });
+    }
+
+    /// The mix is MAME's weights as exact integers: 0.35 each for the two YM
+    /// channels and 0.30 for the OKI, over a common denominator of 20. The OKI
+    /// term is 3 rather than 6 because `oki_2x` is already doubled.
+    ///
+    /// Asserted against the float chain rather than against a restatement of the
+    /// formula — a test computing `(7 * (l + r) + 3 * oki) / 20` and comparing it
+    /// to `mix` would pass for any weights at all, including the wrong ones.
+    #[test]
+    fn the_mix_is_mames_weights_within_one_lsb() {
+        let mut worst = 0.0f64;
+        let mut worst_at = (0i16, 0i16, 0i32);
+        for l in (-32768..=32767).step_by(1021) {
+            for r in (-32768..=32767).step_by(1021) {
+                for oki in (-65_536..=65_536).step_by(2039) {
+                    let l = l as i16;
+                    let r = r as i16;
+                    let float =
+                        0.35 * f64::from(l) + 0.35 * f64::from(r) + 0.30 * (f64::from(oki) / 2.0);
+                    let dev = (float - f64::from(mix(l, r, oki))).abs();
+                    if dev > worst {
+                        worst = dev;
+                        worst_at = (l, r, oki);
+                    }
+                }
+            }
+        }
+        assert!(
+            worst < 1.0,
+            "worst deviation {worst} LSB at {worst_at:?}; measured bound is 0.952"
+        );
+    }
+
+    /// The mix never leaves `i16`, so it needs no saturation — because the chip
+    /// clamps its own sum first. The corners exactly, then a stride over the
+    /// interior against both YM extremes.
+    #[test]
+    fn the_mix_never_needs_saturation() {
+        let numerator = |l: i32, r: i32, o: i32| 7 * (l + r) + 3 * o;
+        assert_eq!(numerator(32767, 32767, 65_536), 655_346);
+        assert_eq!(numerator(-32768, -32768, -65_536), -655_360);
+        assert_eq!(
+            20 * 32768,
+            655_360,
+            "the bound is exactly 20 times full scale"
+        );
+
+        for l in [i16::MIN, -1, 0, 1, i16::MAX] {
+            for r in [i16::MIN, -1, 0, 1, i16::MAX] {
+                for o in [-65_536, -1, 0, 1, 65_536] {
+                    let want = i64::from(numerator(i32::from(l), i32::from(r), o)) / 20;
+                    assert_eq!(i64::from(mix(l, r, o)), want, "{l} {r} {o}");
+                    assert!((-32768..=32767).contains(&want));
+                }
+            }
+        }
+        for l in (-32768..=32767).step_by(509) {
+            for o in (-65_536..=65_536).step_by(1021) {
+                let l = l as i16;
+                let n = numerator(i32::from(l), i32::from(i16::MAX), o);
+                assert!(n / 20 <= 32767);
+                let n = numerator(i32::from(l), i32::from(i16::MIN), o);
+                assert!(n / 20 >= -32768);
+            }
+        }
+    }
+
+    /// Silence in is silence out, and the OKI alone at full scale is loud but not
+    /// full scale — 3 × 65536 / 20 = 9830, about 30% as MAME weights it.
+    #[test]
+    fn the_mix_weights_the_two_sources_as_documented() {
+        assert_eq!(mix(0, 0, 0), 0);
+        assert_eq!(mix(0, 0, 65_536), 9830, "0.30 of full scale");
+        assert_eq!(mix(i16::MAX, i16::MAX, 0), 22_936, "0.70 of full scale");
+        // The OKI's clamp is the ±65536 the chip applies, and the mix consumes the
+        // 2x domain: 65,534 is one stream LSB below the clamp and must not move the
+        // output, which is what pins the divisor at 20 rather than at 10.
+        assert_eq!(mix(0, 0, 65_534), 9830);
+    }
+
+    /// A playing OKI voice reaches the mix, weighted rather than passed through.
+    ///
+    /// The YM is left unpatched so the stereo pair is digital silence and the only
+    /// source is the chip: without that, a mix that dropped the OKI term entirely
+    /// would still produce non-silent audio and this test would pass.
+    ///
+    /// The upper bound is what makes it a mix rather than a passthrough. One voice
+    /// at unity gain reaches at most `2047 * 32 = 65,504` in the 2x domain, which
+    /// `mix` scales to 9,825 — so a mix that forwarded `oki_2x / 2` unweighted, or
+    /// used a denominator of 10, would exceed it.
+    #[test]
+    fn a_playing_oki_voice_is_audible_in_the_mono_samples() {
+        on_a_big_stack(|| {
+            let mut m = oki_machine();
+            m.drain_samples();
+            for _ in 0..64 {
+                m.run_scanline();
+            }
+            let s = m.samples();
+            assert!(!s.is_empty(), "the run produced samples");
+            assert!(
+                s.iter().any(|&v| v != 0),
+                "the OKI alone must be audible: the YM is unpatched here, so a mix \
+                 that dropped the OKI term would leave digital silence"
+            );
+            let peak = s
+                .iter()
+                .map(|&v| i32::from(v).abs())
+                .max()
+                .expect("samples");
+            assert!(
+                peak <= 9825,
+                "one voice at unity gain caps at 3 * 65504 / 20 = 9825, saw {peak}"
+            );
+            assert!(peak > 100, "and it is not a whisper: {peak}");
+        });
+    }
+
+    /// The machine's mono samples are [`mix`] applied to the chip's own stream,
+    /// sample for sample.
+    ///
+    /// **Not a peak bound.** The first draft of this test asserted the peak stayed
+    /// under `7 * 2 * 32767 / 20 = 22,936` and above half of it — and that claim
+    /// cannot fail: this patch peaks at 11,446, so `(l + r) / 2` would reach 16,351
+    /// and pass the bound too. A range wide enough for the real value to sit inside
+    /// is a range the wrong fold also sits inside.
+    ///
+    /// What makes this exact instead: the Z80's program never writes the YM
+    /// ([`sound_spin`] reads 0xF008 and writes sound RAM), so a copy of the chip
+    /// taken mid-run generates precisely the stream the machine is about to fold. The
+    /// OKI is silent here, so the third term is zero and what is left is the YM
+    /// weighting alone. The final assertion is what makes the comparison
+    /// discriminating rather than merely true: on this stream the average differs
+    /// from the weighted fold, so a mix that averaged would fail the line above.
+    #[test]
+    fn the_mono_samples_are_the_mix_of_the_chips_own_stream() {
+        on_a_big_stack(|| {
+            let mut m = sound_machine();
+            ym_patch(&mut m);
+            for _ in 0..100 {
+                m.run_scanline();
+            }
+            let mut detached = m.sound.ym_ref().clone();
+            m.drain_samples();
+            for _ in 0..100 {
+                m.run_scanline();
+            }
+            let got = m.drain_samples();
+            assert!(
+                got.len() > 300,
+                "there are samples to compare: {}",
+                got.len()
+            );
+
+            let mut pairs = vec![(0i16, 0i16); got.len()];
+            detached.generate(&mut pairs);
+            assert!(
+                pairs.iter().any(|&(l, r)| l != 0 || r != 0),
+                "the patch is audible, so this is not silence against silence"
+            );
+            let want: Vec<i16> = pairs.iter().map(|&(l, r)| mix(l, r, 0)).collect();
+            assert_eq!(
+                got, want,
+                "every mono sample is the mix of the pair the chip produced"
+            );
+
+            let averaged: Vec<i16> = pairs
+                .iter()
+                .map(|&(l, r)| ((i32::from(l) + i32::from(r)) / 2) as i16)
+                .collect();
+            assert_ne!(
+                want, averaged,
+                "the two folds differ on this stream, which is what makes the \
+                 comparison above able to fail"
+            );
+        });
+    }
+
+    /// The OKI advances at its own rate, not once per YM tick.
+    ///
+    /// **The observable is the chip's own position in its phrase**, against the
+    /// samples the mix emitted. One OKI step per YM tick — the obvious wrong
+    /// implementation, and the one a reader would write from
+    /// `while sample_acc >= YM_SAMPLE_CLOCKS` alone — makes the ratio 1.0 rather
+    /// than the 3,200,000/23,624,997 the crystals give, which is a voice playing
+    /// seven times too fast.
+    #[test]
+    fn the_oki_advances_at_its_own_rate_not_the_ym_tick_rate() {
+        on_a_big_stack(|| {
+            let mut m = oki_machine();
+            m.drain_samples();
+            for _ in 0..64 {
+                m.run_scanline();
+            }
+            let ticks = m.samples().len() as u64;
+            let steps = u64::from(m.sound.oki_ref().voices()[0].sample());
+            assert!(
+                ticks > 200,
+                "there are YM ticks to compare against: {ticks}"
+            );
+            assert!(steps > 20, "and the chip stepped: {steps}");
+            let (num, den) = oki_per_ym(true);
+            // Within the one step the accumulator may still be holding.
+            let want = ticks * u64::from(num) / u64::from(den);
+            assert!(
+                steps.abs_diff(want) <= 1,
+                "{steps} OKI steps for {ticks} YM ticks, expected {want} at {num}/{den}"
+            );
+        });
+    }
+
+    /// A reset returns the OKI side to power-up: the chip, its rate accumulator,
+    /// and the sample the mix was holding between chip steps.
+    ///
+    /// Asserted as two runs from reset producing byte-identical audio, not by
+    /// reading back the fields the reset just assigned. A reset that left the
+    /// accumulator mid-fraction, or the held sample at its last value, or a voice
+    /// still playing, makes the second run diverge from the first — which is
+    /// `reset_restores_the_sound_schedule_exactly`'s argument applied to the chip
+    /// whose state `reset` did not previously touch at all.
+    #[test]
+    fn a_reset_returns_the_oki_side_to_power_up() {
+        on_a_big_stack(|| {
+            let mut m = oki_machine();
+            for _ in 0..40 {
+                m.run_scanline();
+            }
+            let first = m.drain_samples();
+            assert!(first.iter().any(|&v| v != 0), "there is audio to reproduce");
+            assert_ne!(
+                m.sound.oki_ref().voices()[0].sample(),
+                0,
+                "and the chip is mid-phrase, so a reset has something to undo"
+            );
+
+            m.reset();
+            assert_eq!(
+                m.sound.oki_ref(),
+                &oki::Oki::new(),
+                "the chip is at power-up, voices stopped"
+            );
+            // The phrase is started again exactly as the fixture started it, and the
+            // same 40 lines run: same input, so same output — unless something
+            // survived.
+            start_the_oki_phrase(&mut m);
+            for _ in 0..40 {
+                m.run_scanline();
+            }
+            assert_eq!(
+                m.drain_samples(),
+                first,
+                "a second run from reset must produce the same audio as the first"
             );
         });
     }

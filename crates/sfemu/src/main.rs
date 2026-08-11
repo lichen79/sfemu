@@ -200,10 +200,20 @@ fn run(args: Vec<String>) -> Result<String, Fault> {
         })?
         .to_vec();
 
+    // The ADPCM samples, on the same terms again. An absent one is silence rather
+    // than noise — every phrase header would read as `start == stop == 0`, which the
+    // chip refuses — but it is silence with no explanation, and "no sound effects,
+    // music fine" is the hardest symptom here to attribute to a missing region.
+    let okirom = set
+        .region("oki")
+        .ok_or_else(|| Fault::Failed("internal: the sf2 spec has no `oki` region".to_string()))?
+        .to_vec();
+
     let mut m = machine::Cps1::with_sound(
         prog,
         gfx,
         audiocpu,
+        okirom,
         machine::BoardConfig::sf2(),
         machine::Timing::cps1_10mhz(),
     );

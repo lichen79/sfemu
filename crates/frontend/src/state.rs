@@ -833,7 +833,19 @@ mod tests {
         }
 
         let cfg = BoardConfig::sf2();
-        let mut m = Cps1::with_sound(&rom, gfx, sound_rom(), cfg, Timing::cps1_10mhz());
+        // No sample ROM. **Task 10 must revisit this**: it puts the OKI's voices into
+        // `MachineState`, and a round trip over a chip with nothing playing would be a
+        // round trip over four stopped voices — trivially preserved. Until then a
+        // restore rebuilds the chip at power-up, so a voice playing here would make the
+        // fixture diverge for a reason the codec is not yet meant to fix.
+        let mut m = Cps1::with_sound(
+            &rom,
+            gfx,
+            sound_rom(),
+            Vec::new(),
+            cfg,
+            Timing::cps1_10mhz(),
+        );
         m.reset();
         // The sound board, before the run: the patch and the bank are what the Z80's
         // 5,241 lines of copying then interleave with.
@@ -920,7 +932,7 @@ mod tests {
         line: u32,
         d0: u32,
         d1: u32,
-        samples: Vec<(i16, i16)>,
+        samples: Vec<i16>,
         z80_cycles: u64,
         z80_pc: u16,
         ym_status: u8,
@@ -1169,12 +1181,12 @@ mod tests {
         let sound = m.samples();
         assert!(!sound.is_empty(), "64 lines produce samples");
         assert!(
-            sound.iter().any(|&(l, r)| l != 0 || r != 0),
+            sound.iter().any(|&s| s != 0),
             "and the patch makes sound, or every sample comparison is a comparison \
              of silence against silence"
         );
         assert!(
-            sound.iter().any(|&(l, _)| l != sound[0].0),
+            sound.iter().any(|&s| s != sound[0]),
             "sound that changes, not one held level"
         );
     }
