@@ -7,17 +7,21 @@ CPS-1 ROM set you own and `--play` opens a window:
 cargo run -p sfemu --release -- /path/to/your/sf2.zip --play
 ```
 
-Seven sub-projects are complete: the **68000 core** (A), the **bus and timing
+Eight sub-projects are complete: the **68000 core** (A), the **bus and timing
 framework with a MAME ROM-set loader** (B), the **CPS-1 scanline renderer** (C),
-the **Z80 audio CPU** (D1), the **frontend** — window, frame clock, keyboard, and
-save states (E1) — the **debugger** (E2): `F1` for an in-window overlay, `F4` to
-step one instruction, `F7` for a breakpoint — and the **graphics viewers** (E3):
-`F9` for a tile, tilemap, palette and layer browser, `F10` to cycle it.
+the **Z80 audio CPU** (D1), the **YM2151 FM chip and the sound board's wiring**
+(D2), the **frontend** — window, frame clock, keyboard, and save states (E1) — the
+**debugger** (E2): `F1` for an in-window overlay, `F4` to step one instruction,
+`F7` for a breakpoint — and the **graphics viewers** (E3): `F9` for a tile,
+tilemap, palette and layer browser, `F10` to cycle it.
 
-**There is still no sound.** D1 is the sound board's *processor* and nothing else:
-a Z80 with no chip attached, validated against 1,604,000 vector cases and wired to
-nothing. D2 gives it a YM2151 and D3 is the one that reaches a speaker. The Street
-Fighter 1 driver (F) is not built yet either.
+**There is still no sound**, and the reason is now narrower than it was. The whole
+chain up to the samples exists: the Z80 executes SF2's driver from `audiocpu`,
+reads the 68000's command latch, and programs a YM2151 that is sample-exact against
+ymfm over 1,000 vector cases. Those samples then go into a buffer nothing drains.
+D3 is what reaches a speaker — the OKI MSM6295's ADPCM, the mono mix the cabinet
+actually gets, and resampling to the host's rate. The Street Fighter 1 driver (F)
+is not built yet either.
 
 ## The 68000 core
 
@@ -64,6 +68,41 @@ has a `z80int` set whose survivors would mean genuinely unverified behaviour, an
 why it is run rather than trusted.
 
 [sstz]: https://github.com/SingleStepTests/z80
+
+## The YM2151
+
+There is no public vector suite for an FM chip, so this one is validated against
+[ymfm][ymfm] — the BSD-3 implementation MAME itself uses — by generating 1,000
+cases from it and requiring this core to match **every stereo sample and every
+status-register read, exactly**: 1,000 of 1,000 cases, no tolerance, not a
+correlation. The generator and the vectors are this repository's, and no Capcom
+code is involved in either.
+
+**A suite that passes proves nothing until you know it could have failed.** Four
+premises about the vectors are therefore asserted alongside them: the cases are
+audible (a suite of silence matches a chip that outputs silence), every case decays
+after its key-off, the status trace actually varies, and the runner reports a
+sample deliberately corrupted by the test itself. The 1,000 cases are also checked
+to be 1,000 *different* cases.
+
+The audibility threshold is 95%, not 100%, and the reason is worth stating because a
+tolerance is usually where a test stops being able to fail: **993 of 1,000 cases are
+audible**, and the seven that are not have a total level near the generator's cap
+with a slow decay, which puts the whole case under the DAC's quantisation. That is
+real, correct data. The premise this guards is a measured one — a purely random
+register script produced **0** non-zero samples across 500 cases — so the failure it
+exists to catch is off by two orders of magnitude from the threshold, not by 5%.
+
+**The one measurement that shaped the design.** The chip prepares each operator's
+cached state lazily. Forced eager, it produces bit-for-bit identical output over
+40,000 samples — *unless* CSM is on with timer A running, which is a mode nothing
+else in the suite exercises. So at least 100 CSM cases are required, and
+`scripts/mutate.py` proves the requirement rather than asserting it: the mutant that
+forces eager preparation dies to the suite, dies again to the unit tests, and with
+the CSM cases skipped **survives the suite completely**. That surviving control is
+the evidence that the 100 cases are load-bearing.
+
+[ymfm]: https://github.com/aaronsgiles/ymfm
 
 ## This project ships no ROMs, and never will
 
@@ -311,10 +350,10 @@ they are dropped and counted, because a machine that fell a second behind should
 resync rather than fast-forward through a second of the game. Pausing owes nothing
 — the clock is only read on a running tick.
 
-### Six things only you can check
+### Seven things only you can check
 
 Everything in this repository is tested without a display, which leaves exactly
-six claims no test here can make. Run it against your own ROM set and look:
+seven claims no test here can make. Run it against your own ROM set and look:
 
 1. **Does the window show Street Fighter II?** A test can assert the framebuffer
    changed, that a save state round-trips, and that a pen becomes the right ARGB
@@ -337,6 +376,12 @@ six claims no test here can make. Run it against your own ROM set and look:
    is about 5×4 pixels each. A test can prove every one holds the right colour
    through the same conversion the game's own frame goes through; it cannot prove
    two adjacent near-identical entries look different to you.
+7. **Is the sound panel legible, and do its numbers look like a driver running?**
+   A test reads the panel's own pixels back and proves the Z80's T-states, the two
+   latch bytes, and the chip's register writes are drawn where the layout says. It
+   cannot tell you whether a latch byte changing sixty times a second beside a
+   register count climbing in the thousands reads, to you, as SF2 playing music —
+   which is the only thing that number is for until D3 gives you the audio itself.
 
 If the picture comes up wrong, `F12` gives you a frame to look at and the trace
 counters in the no-`--play` report give you the interrupts and bus activity behind
@@ -377,8 +422,15 @@ crates/video/        CPS-1 graphics: tiles, three layers, sprites, palettes,
 crates/z80/          the sound board's CPU core, on m68k's terms: no
                      dependencies, no unsafe, no clock access, no_std-friendly.
                      Includes a disassembler cross-checked against the core.
+crates/ym2151/       the FM chip, on the same terms: no dependencies, no unsafe,
+                     no clock access, no_std-friendly. Four tables built from
+                     closed forms and checksummed, and a lazily-prepared operator
+                     state the CSM vectors exist to pin.
 crates/machine/      the board: memory map, bus, interrupts, scheduler, inputs,
-                     snapshot and restore. Depends on m68k and video.
+                     the sound board and its rational Z80 clock, snapshot and
+                     restore. Depends on m68k, video, z80 and ym2151 — all four
+                     dependency-free and no_std-shaped, so the display boundary
+                     below still holds.
 crates/romset/       the MAME ROM-set loader: zip or a directory, CRC-checked,
                      interleaved into the regions the board wants.
 crates/frontend/     every frontend decision, with no window: frame pacing, the
@@ -388,10 +440,10 @@ crates/frontend/     every frontend decision, with no window: frame pacing, the
 crates/sfemu/        the binary. The only crate that names a windowing library,
                      and only in one file (a test enforces it).
 crates/testrunner/   dev-only harness for the external vector suite.
-scripts/mutate.py    the mutation harness: 181 mutants over the above in 16 sets,
+scripts/mutate.py    the mutation harness: 210 mutants over the above in 18 sets,
                      each an exact string replacement with a declared
-                     expectation. 162 killed, 19 declared survivors (16 controls
-                     and 3 proven equivalents), 181/181 as expected.
+                     expectation. 189 killed, 21 declared survivors (18 controls
+                     and 3 proven equivalents), 210/210 as expected.
 docs/hardware/       what the vectors proved about the hardware, with evidence.
 docs/superpowers/    design specs and implementation plans.
 testdata/            gitignored; fetched vectors.
@@ -459,7 +511,7 @@ pass is distinguishable from a harness that reports success without running.
 | **B** | Bus/timing framework, MAME ROM-set loader | **complete** — first execution of real board code |
 | **C** | CPS-1 video: tilemaps, sprites, palettes, CPS-A/B registers, scanline renderer | **complete** — the largest piece, and where SF2 becomes visible |
 | **D1** | Z80 audio CPU | **complete** — 1,604/1,604 files, 1,604,000/1,604,000 cases. Still silent: a CPU with no chip attached |
-| D2 | YM2151 FM, and the sound board's wiring | the latch reaches a chip; still silent |
+| **D2** | YM2151 FM, and the sound board's wiring | **complete** — 1,000/1,000 vector cases against ymfm, sample-exact. Still silent: the samples reach no speaker |
 | D3 | OKI MSM6295 ADPCM, mixing, host audio | the one that ends "there is no sound" |
 | **E1** | Frontend: window, frame clock, keyboard, save states | **complete** — `--play` |
 | **E2** | Debugger: single-step, breakpoints, disassembly, register and memory views | **complete** — `F1`, in-window, and it does not perturb the machine |
@@ -476,8 +528,20 @@ it, and then took it.
 is how many vector files the Z80 suite has, against the 68000's 127 — and the
 68000 took 16,462 lines and a spec of its own. A Z80 core, an FM synthesizer, and
 a host audio path are three unrelated subsystems; asking one review pass to gate
-all three is what the original decomposition was written to avoid. **D1 is done**,
-and it was silent by design: D3 is the one that ends "there is no sound."
+all three is what the original decomposition was written to avoid. **D1 and D2 are
+done**, and both were silent by design: D3 is the one that ends "there is no
+sound."
+
+The split paid off in a way worth recording, because it is an argument for the
+decomposition rather than for the emulator. D2's 1,000-case suite includes at least
+100 cases that enable CSM with timer A running — and that requirement exists
+because the YM2151's `prepare()` gate is *invisible* without them: eager and lazy
+preparation agree bit-for-bit over 40,000 samples with CSM off, so a suite lacking
+those cases passes at 1,000/1,000 on a chip that is wrong. The mutation harness
+measures exactly that: forcing the gate eager dies to the suite, and dies again to
+the unit tests, but with the CSM cases skipped it *survives* the suite entirely.
+A review pass covering the Z80, the FM chip, and the audio path at once would not
+have had the attention to spend on one gate in one of them.
 
 WASM and netplay are not stages. They are constraints on A–D: no threads, no
 wall-clock access, no host I/O in the core, a frame-stepped API, and complete
