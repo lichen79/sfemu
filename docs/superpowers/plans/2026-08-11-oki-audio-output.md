@@ -1919,37 +1919,79 @@ git commit -m "test(oki): the AOKV vector-file codec"
 
 The generator is C++ compiled against MAME's unmodified `okiadpcm.cpp`. It needs `okiadpcm.h`, `okiadpcm.cpp`, and a three-line `emu.h` shim (`#pragma once` plus `<cstdint>` and `<cmath>`) — MAME's `okiadpcm.cpp` includes `emu.h`, but needs nothing from it. **`okim6295.cpp` cannot be compiled standalone** (it is a `device_t`), so the *protocol* in the generator is a transcription, and it must be the same transcription that `crates/oki/src/chip.rs` is — that is the suite's weakest link and this plan says so out loud.
 
-`genoki.rs` fetches the three MAME files from `raw.githubusercontent.com` (BSD-3 reference code, not game code — permitted by the Global Constraints), writes the shim, compiles, runs, and then **re-parses its own output rather than trusting the generator's word for it**.
+`genoki.rs` fetches **two** files from `raw.githubusercontent.com` (BSD-3 reference code, not game code — permitted by the Global Constraints), writes the shim itself, compiles, runs, and then **re-parses its own output rather than trusting the generator's word for it**. Two, not three: `emu.h` is written rather than downloaded, and `okim6295.cpp` is never fetched at all because nothing compiles it.
+
+Three corrections this task's implementation forced on the plan, before the code:
+
+1. **The MAME URL is pinned to the `mame0261` tag, not `master`,** and the two fetched files' line counts (76 and 260) and the two lines that *are* the decoder — `s_index_shift` and the `stepval` formula — are checked after every fetch. The suite is 254 MB of expectations derived from that arithmetic; upstream moving it must stop the run, not silently replace every vector.
+2. **The scratch directory is `target/okigen/`, not `testdata/oki/build/`.** `testdata/oki/` is the suite; a compiled binary and a copy of MAME's sources sitting inside it turn any later measurement of the suite's size or contents into a guess. `genym` puts its scratch under `target/` for the same reason.
+3. **`main` returns `Box<dyn std::error::Error>`, not `String`** — the same correction Task 4 made to `okifiles::load`, and for the same reason: `genym.rs` returns the boxed form and a second spelling in one crate is one the next reader has to check.
 
 - [ ] **Step 1: Write `okigen.cpp`**
+
+Three phrase-table entries are reserved in **every** case. The plan originally reserved one; the other two were added because a premise the fixture does not reach is a premise the suite does not test:
+
+- **Phrase 1, the step ladder** — 16 bytes of nibble 7 then 48 of nibble 0, which is 32 sevens then 96 zeros. Measured against MAME's own decoder: step 48 first reached at sample 5 and **held for 27 samples**, step 0 first at sample 79 and held for 49, and the segment is audible (total |signal| over the 128 samples is 253,808, so it is not a silent ramp). Random nibbles drive the step index over 1..48 only — never to 0 — so without this the lower step clamp is untested. The signal pins at 2047 from sample 5 onward, which is also the upper signal clamp held rather than touched.
+- **Phrase 3, the top 64 bytes of the 18-bit space** (`0x3FFC0..0x3FFFF`), opened on voice 1 at sample 0. A core masking addresses with `0x1FFFF` instead of `0x3FFFF` folds these reads onto a different byte and diverges here; nothing else in the fixture reaches this high. It also puts a **second** voice at unity gain over the first 128 samples, which is what drives the chip's own ±65536 clamp — see the floor correction in Step 2.
+- **Phrase 2, refused in every fourth case** — its start and stop are swapped so `start < stop` fails. The case then issues that start *explicitly*, on voice 3, having stopped voice 3 one sample earlier, so the refusal is what leaves the voice silent rather than the already-playing skip. The plan left this to a random event picking phrase 2, which most cases do not do.
+
+And random events are scheduled at samples `2..SAMPLES`, not `0..SAMPLES`: samples 0 and 1 carry the deterministic openers and the refusal, and a random event landing on top of one would undo a premise the validator then checks for.
 
 ```cpp
 // Generates the AOKV OKI vector suite.
 //
-// The ADPCM arithmetic is MAME's okiadpcm.cpp, unmodified. The four-voice
-// protocol is transcribed from okim6295.cpp, which cannot be compiled
-// standalone because it is a device_t. That transcription is this suite's
-// weakest link: it and crates/oki/src/chip.rs are the same reading of the same
-// file, so a misreading would agree with itself. The premise tests in
-// crates/testrunner/tests/okisuite.rs are the check on that.
+// The ADPCM arithmetic is MAME's okiadpcm.cpp, unmodified -- this file is
+// compiled against it, so the decoder here is not a transcription of anything.
+//
+// The four-voice protocol *is* a transcription, from okim6295.cpp, which cannot
+// be compiled standalone because it is a device_t. That transcription is this
+// suite's weakest link: it and crates/oki/src/chip.rs are the same reading of
+// the same file, so a misreading would agree with itself and the suite would
+// pass. The premise tests in crates/testrunner/tests/okisuite.rs are the check
+// on that, and every deliberate fixture choice below is written down so a
+// reader can tell a premise from an accident.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
-#include <algorithm>
 #include "okiadpcm.h"
 
-static const int VOLT[16] = {0x20,0x16,0x10,0x0b,0x08,0x06,0x04,0x03,0x02,0,0,0,0,0,0,0};
+static const int VOLT[16] = {0x20, 0x16, 0x10, 0x0b, 0x08, 0x06, 0x04, 0x03, 0x02, 0, 0, 0, 0, 0, 0, 0};
 static const long CLAMP2X = 65536;
-static const int  VOICES  = 4;
+static const int VOICES = 4;
 static const size_t ROM_BYTES = 0x40000;
-static const int  SAMPLES = 512;
-static const int  CASES   = 1000;
-// Phrase 1 in every case: 16 bytes of nibble 7 then 48 of nibble 0, which drives
-// the step index to 48 and back to 0. `crates/testrunner/tests/okisuite.rs`
-// recomputes both extremes from the recorded nibbles and asserts them.
+static const int SAMPLES = 512;
+static const int CASES = 1000;
+
+// Three phrases are reserved in every case, because each one pins down a
+// premise that random data does not reach.
+//
+// Phrase 1 -- the step ladder. 16 bytes of nibble 7 then 48 of nibble 0, which
+// is 32 sevens then 96 zeros. Measured against MAME's own decoder
+// (target/okigen/ladderprobe.cpp): step 48 is first reached at sample 5 and
+// held for 27 samples, step 0 at sample 79 and held for 49. Both step clamps
+// are *held*, not merely touched, and the segment is audible -- total |signal|
+// over the 128 samples is 253808, so it is not a silent ramp. Random nibbles
+// reach step 1..48 only and never 0, so without this the lower step clamp is
+// untested.
 static const uint32_t LADDER_START = 0x400;
-static const uint32_t LADDER_END   = 0x440;
+static const uint32_t LADDER_END = 0x440;  // exclusive; 64 bytes = 128 nibbles
+
+// Phrase 3 -- the last 64 bytes of the ROM, so the top of the 18-bit address
+// bus is walked in every case. A core that masked addresses with 0x1FFFF
+// instead of 0x3FFFF would fold these reads onto a different byte and diverge
+// here; nothing else in the fixture reaches this high. Started on voice 1 at
+// sample 0 alongside the ladder, which also puts two voices at unity gain over
+// the first 128 samples -- that is what drives the chip's own +-65536 clamp.
+static const uint32_t TOP_START = 0x3FFC0;
+static const uint32_t TOP_STOP = 0x3FFFF;
+
+// Phrase 2 -- a normal phrase, except in every fourth case where its start and
+// stop are swapped so that `start < stop` fails and the phrase is refused. Such
+// a case also issues the refused start explicitly (see below) rather than
+// hoping a random event picks phrase 2.
+static const int REFUSED_PHRASE = 2;
 
 struct Voice {
     oki_adpcm_state adpcm;
@@ -1965,11 +2007,12 @@ struct Oki {
 
     uint8_t rd(uint32_t a) const { return a < rom.size() ? rom[a] : 0; }
     uint32_t rd24(uint32_t a) const {
-        return ((uint32_t)rd(a) << 16 | (uint32_t)rd(a+1) << 8 | rd(a+2)) & 0x3ffff;
+        return ((uint32_t)rd(a) << 16 | (uint32_t)rd(a + 1) << 8 | rd(a + 2)) & 0x3ffff;
     }
     uint8_t status() const {
         uint8_t r = 0xf0;
-        for (int i = 0; i < VOICES; i++) if (v[i].playing) r |= 1u << i;
+        for (int i = 0; i < VOICES; i++)
+            if (v[i].playing) r |= 1u << i;
         return r;
     }
     void write(uint8_t c) {
@@ -1978,13 +2021,16 @@ struct Oki {
             for (int i = 0; i < VOICES; i++, mask >>= 1) {
                 if (!(mask & 1)) continue;
                 Voice &vo = v[i];
-                if (vo.playing) continue;               // "fixes Got-cha and Steel Force"
+                if (vo.playing) continue;  // "fixes Got-cha and Steel Force"
                 uint32_t base = (uint32_t)command * 8;
                 uint32_t start = rd24(base), stop = rd24(base + 3);
                 if (start < stop) {
-                    vo.playing = true; vo.base = start; vo.sample = 0;
+                    vo.playing = true;
+                    vo.base = start;
+                    vo.sample = 0;
                     vo.count = 2 * (stop - start + 1);
-                    vo.adpcm.reset(); vo.volume = VOLT[c & 0x0f];
+                    vo.adpcm.reset();
+                    vo.volume = VOLT[c & 0x0f];
                 }
             }
             command = -1;
@@ -1992,11 +2038,14 @@ struct Oki {
             command = c & 0x7f;
         } else {
             int mask = c >> 3;
-            for (int i = 0; i < VOICES; i++, mask >>= 1) if (mask & 1) v[i].playing = false;
+            for (int i = 0; i < VOICES; i++, mask >>= 1)
+                if (mask & 1) v[i].playing = false;
         }
     }
     long step(uint8_t &voices, uint16_t &nibbles) {
-        long sum = 0; voices = 0; nibbles = 0;
+        long sum = 0;
+        voices = 0;
+        nibbles = 0;
         for (int i = 0; i < VOICES; i++) {
             Voice &vo = v[i];
             if (!vo.playing) continue;
@@ -2013,114 +2062,160 @@ struct Oki {
 
 static uint64_t rng_state;
 static uint32_t rnd() {
-    rng_state ^= rng_state << 13; rng_state ^= rng_state >> 7; rng_state ^= rng_state << 17;
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 7;
+    rng_state ^= rng_state << 17;
     return (uint32_t)(rng_state >> 11);
 }
 
-static void put8 (std::vector<uint8_t> &o, uint8_t v)  { o.push_back(v); }
-static void put16(std::vector<uint8_t> &o, uint16_t v) { o.push_back(v & 0xff); o.push_back(v >> 8); }
+static void put8(std::vector<uint8_t> &o, uint8_t v) { o.push_back(v); }
+static void put16(std::vector<uint8_t> &o, uint16_t v) {
+    o.push_back(v & 0xff);
+    o.push_back(v >> 8);
+}
 static void put32(std::vector<uint8_t> &o, uint32_t v) {
-    for (int i = 0; i < 4; i++) o.push_back((v >> (8*i)) & 0xff);
+    for (int i = 0; i < 4; i++) o.push_back((v >> (8 * i)) & 0xff);
+}
+
+// A phrase-table entry: 3-byte big-endian start then stop, at phrase * 8.
+static void put_phrase(std::vector<uint8_t> &rom, int phrase, uint32_t start, uint32_t stop) {
+    uint32_t a = (uint32_t)phrase * 8;
+    rom[a + 0] = start >> 16;
+    rom[a + 1] = start >> 8;
+    rom[a + 2] = start;
+    rom[a + 3] = stop >> 16;
+    rom[a + 4] = stop >> 8;
+    rom[a + 5] = stop;
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: okigen <out-file>\n"); return 2; }
+    if (argc < 2) {
+        fprintf(stderr, "usage: okigen <out-file>\n");
+        return 2;
+    }
     std::vector<uint8_t> out;
-    put32(out, 0x564b4f41);   // AOKV
+    put32(out, 0x564b4f41);  // AOKV
     put32(out, CASES);
 
     for (int c = 0; c < CASES; c++) {
         rng_state = 0x9e3779b97f4a7c15ull ^ (uint64_t)(c + 1) * 0x100000001b3ull;
-        Oki o; o.rom.assign(ROM_BYTES, 0);
+        Oki o;
+        o.rom.assign(ROM_BYTES, 0);
 
-        // A phrase table of up to 32 entries, then pseudorandom sample data.
-        // Phrase lengths vary so short and long phrases both appear; every
-        // fourth case gets one deliberately invalid entry (start >= stop).
-        //
-        // Phrase 1 is reserved in EVERY case for the step ladder below, so its
-        // table entry is fixed rather than random.
+        // A phrase table of up to 32 entries. Phrases 4..phrases are random, so
+        // short and long phrases both appear; 1, 2 and 3 are the reserved ones
+        // described at the top of this file.
         int phrases = 8 + (int)(rnd() % 25);
-        for (int p = 2; p <= phrases; p++) {
-            uint32_t start = LADDER_END + (rnd() % 0x3A000);
-            uint32_t len   = 1 + (rnd() % 0x300);
-            uint32_t stop  = start + len;
-            if (c % 4 == 3 && p == 2) { uint32_t t = start; start = stop; stop = t; }
-            uint32_t a = (uint32_t)p * 8;
-            o.rom[a+0] = start >> 16; o.rom[a+1] = start >> 8; o.rom[a+2] = start;
-            o.rom[a+3] = stop  >> 16; o.rom[a+4] = stop  >> 8; o.rom[a+5] = stop;
+        for (int p = 4; p <= phrases; p++) {
+            uint32_t start = LADDER_END + (rnd() % 0x39000);
+            uint32_t len = 1 + (rnd() % 0x300);
+            put_phrase(o.rom, p, start, start + len);
         }
-        o.rom[8+0] = LADDER_START >> 16; o.rom[8+1] = LADDER_START >> 8; o.rom[8+2] = LADDER_START;
-        o.rom[8+3] = (LADDER_END-1) >> 16; o.rom[8+4] = (LADDER_END-1) >> 8; o.rom[8+5] = LADDER_END-1;
+        {
+            uint32_t start = LADDER_END + (rnd() % 0x39000);
+            uint32_t stop = start + 1 + (rnd() % 0x300);
+            if (c % 4 == 3) std::swap(start, stop);
+            put_phrase(o.rom, REFUSED_PHRASE, start, stop);
+        }
+        put_phrase(o.rom, 1, LADDER_START, LADDER_END - 1);
+        put_phrase(o.rom, 3, TOP_START, TOP_STOP);
+
+        // Sample data. The fill starts past the ladder so the ladder's own bytes
+        // stay deliberate; the phrase table lives below LADDER_START and is not
+        // touched either.
         for (size_t a = LADDER_END; a < ROM_BYTES; a++) o.rom[a] = (uint8_t)rnd();
-
-        // The step ladder, deliberate rather than random. Measured: random
-        // nibbles drive the step index over 1..48 only -- never to 0 -- so a
-        // random script leaves the lower clamp untested. Nibble 7 shifts the
-        // index by +8 and nibble 0 by -1, so 32 sevens then 96 zeros cross the
-        // whole range. Measured over these 128 samples: step 48 first reached at
-        // sample 5 and held for 27 samples, step 0 first at sample 79 and held
-        // for 49. Both clamps are held, not merely touched, and the segment is
-        // audible (total |signal| 253808, so it is not a silent ramp).
         for (uint32_t a = LADDER_START; a < LADDER_START + 16; a++) o.rom[a] = 0x77;
-        for (uint32_t a = LADDER_START + 16; a < LADDER_END; a++)   o.rom[a] = 0x00;
+        for (uint32_t a = LADDER_START + 16; a < LADDER_END; a++) o.rom[a] = 0x00;
 
-        // The command script. Every case starts at least one voice on sample 0
-        // so no case is silent, then issues starts, stops and volume changes.
-        struct W { uint16_t at; uint8_t byte; };
+        struct W {
+            uint16_t at;
+            uint8_t byte;
+        };
         std::vector<W> writes;
         auto start_voice = [&](uint16_t at, int voice, int phrase, int vol) {
             writes.push_back({at, (uint8_t)(0x80 | phrase)});
+            // Note that for voice 3 this data byte has bit 7 set: a chip that
+            // tested bit 7 before the pending command would read it as a latch.
             writes.push_back({at, (uint8_t)((1 << (voice + 4)) | vol)});
         };
-        // Voice 0 always opens on the ladder phrase at volume index 0 (unity),
-        // so every case walks the step index across its whole range audibly.
+        auto stop_voice = [&](uint16_t at, int voice) {
+            writes.push_back({at, (uint8_t)(1u << (voice + 3))});
+        };
+
+        // Sample 0: the ladder on voice 0 and the top-of-ROM phrase on voice 1,
+        // both at unity gain. No case is silent, every case walks the whole step
+        // range, every case reads the top of the address bus, and two voices at
+        // unity is what reaches the chip's clamp.
         start_voice(0, 0, 1, 0);
-        int events = 3 + (int)(rnd() % 10);
+        start_voice(0, 1, 3, 0);
+        // Every fourth case exercises the refused phrase deliberately: stop
+        // voice 3 first, so the refusal is what leaves it silent rather than the
+        // already-playing skip.
+        if (c % 4 == 3) {
+            stop_voice(1, 3);
+            start_voice(1, 3, REFUSED_PHRASE, 0);
+        }
+        int events = 6 + (int)(rnd() % 12);
         for (int e = 0; e < events; e++) {
-            uint16_t at = (uint16_t)(rnd() % SAMPLES);
+            // Samples 0 and 1 are reserved for the deterministic openers and the
+            // refusal above, so a random event cannot land on top of them and
+            // undo a premise the validator then checks for.
+            uint16_t at = (uint16_t)(2 + rnd() % (SAMPLES - 2));
             uint32_t kind = rnd() % 10;
             int voice = (int)(rnd() % VOICES);
             if (kind < 6) {
-                // volume index 0..15, so the silent indices 9..15 appear too
+                // Volume index 0..15, so the silent indices 9..15 appear too.
                 start_voice(at, voice, 1 + (int)(rnd() % phrases), (int)(rnd() % 16));
             } else if (kind < 8) {
-                // Never voice 0: it is running the ladder, and stopping it early
-                // would truncate the one segment that reaches step 0. Voices 1-3
-                // cover the stop command.
-                writes.push_back({at, (uint8_t)((1 << (1 + (int)(rnd() % 3))) << 3)});
+                // Never voice 0: it runs the ladder, and stopping it early would
+                // truncate the one segment that reaches step 0.
+                stop_voice(at, 1 + (int)(rnd() % 3));
             } else {
-                // all four at once: this is what reaches the chip's clamp
+                // All four at once, at a loud volume index: the other way the
+                // clamp is reached, and the only thing that starts four voices
+                // from one command byte.
                 writes.push_back({at, (uint8_t)(0x80 | (1 + (rnd() % phrases)))});
                 writes.push_back({at, (uint8_t)(0xF0 | (rnd() % 3))});
             }
         }
+        // Stable, so the two bytes of a start stay adjacent and in order.
         std::stable_sort(writes.begin(), writes.end(),
                          [](const W &a, const W &b) { return a.at < b.at; });
 
-        put32(out, (uint32_t)c);                        // seed == index
-        put8 (out, (uint8_t)(c % 2));                   // pin7 alternates
+        put32(out, (uint32_t)c);        // seed == index
+        put8(out, (uint8_t)(c % 2));    // pin7 alternates
         put16(out, (uint16_t)writes.size());
         put16(out, (uint16_t)SAMPLES);
         put32(out, (uint32_t)ROM_BYTES);
-        for (const W &w : writes) { put16(out, w.at); put8(out, w.byte); }
+        for (const W &w : writes) {
+            put16(out, w.at);
+            put8(out, w.byte);
+        }
         out.insert(out.end(), o.rom.begin(), o.rom.end());
 
         size_t wi = 0;
         for (int s = 0; s < SAMPLES; s++) {
             while (wi < writes.size() && writes[wi].at == (uint16_t)s) o.write(writes[wi++].byte);
-            uint8_t voices; uint16_t nibbles;
+            uint8_t voices;
+            uint16_t nibbles;
             long mono = o.step(voices, nibbles);
             put32(out, (uint32_t)(int32_t)mono);
-            put8 (out, o.status());
-            put8 (out, voices);
+            put8(out, o.status());
+            put8(out, voices);
             put16(out, nibbles);
         }
     }
 
     FILE *f = fopen(argv[1], "wb");
-    if (!f) { fprintf(stderr, "cannot write %s\n", argv[1]); return 1; }
-    fwrite(out.data(), 1, out.size(), f);
-    fclose(f);
+    if (!f) {
+        fprintf(stderr, "cannot write %s\n", argv[1]);
+        return 1;
+    }
+    size_t wrote = fwrite(out.data(), 1, out.size(), f);
+    if (wrote != out.size() || fclose(f) != 0) {
+        fprintf(stderr, "short write to %s\n", argv[1]);
+        return 1;
+    }
     fprintf(stderr, "wrote %zu bytes, %d cases\n", out.size(), CASES);
     return 0;
 }
@@ -2128,167 +2223,433 @@ int main(int argc, char **argv) {
 
 - [ ] **Step 2: Write `genoki.rs`**
 
-Model on `crates/testrunner/src/bin/genym.rs`: write to a `.part` file, validate, rename, and delete the `.part` on failure. The validation floors below were measured against a trial run — **if your run reports lower figures, do not lower the floor to match: report it, because a suite that exercises less than this does not test the clamp.**
+Model on `crates/testrunner/src/bin/genym.rs`: write to a `.part` file, validate, rename, and delete the `.part` on failure.
+
+**Two of the plan's original validation checks could not fail, and both are corrected here.**
+
+1. **The refused-phrase count was `if i % 4 == 3 { refused += 1 }`.** That counts *indices*, not refusals: it reports exactly 250 on a generator that stopped emitting refused phrases altogether, which is the one thing it exists to catch. Every premise in the validator now reads the case's own bytes — the phrase-table entry out of the ROM, the command script walked the way the chip's state machine walks it, the nibbles the file recorded — so a generator that stopped producing something cannot satisfy the check that it did.
+2. **The clamp floor of 0.30 was measured on a fixture with one unity-gain voice.** Two open in every case now, so the measured figure is **0.998** and the floor is **0.90**. A floor five times below the measurement is a floor that passes on a fixture which has lost most of its clamping.
+
+Note also that the script walk is a **state machine, not a `windows(2)` pattern match**. Which bytes are data bytes depends on what came before them: `0x80 | phrase` followed by `0xF3` is a start, but that same `0xF3` alone is a latch. Matching pairs positionally miscounts both the refused-phrase count and the silent-volume count — and in a fixture the generator controls it miscounts them *consistently*, which is exactly the kind of agreement that reads as a passing check.
 
 ```rust
-//! Generates the OKI vector suite.
+//! Generates the OKI MSM6295 vector suite.
 //!
-//! Downloads MAME's `okiadpcm.{h,cpp}` (BSD-3 reference code, not game code),
-//! writes a three-line `emu.h` shim, compiles `okigen.cpp` against them, runs
-//! it, and then re-parses the result rather than trusting the generator's word
-//! for its own output.
+//! ```text
+//! cargo run -q -p testrunner --release --bin genoki
+//! ```
 //!
-//! The floors below were measured on a trial run. They are premises about what
-//! the suite exercises, not tolerances: if a later change makes the suite
-//! quieter or stops it reaching the clamp, this fails, and the fix is the
-//! generator, not the floor.
+//! Downloads MAME's `okiadpcm.{h,cpp}` (BSD-3 reference *code*, © Andrew Gardner
+//! and Aaron Giles — not game code), writes the three-line `emu.h` shim that
+//! `okiadpcm.cpp`'s one include needs, compiles
+//! [`okigen.cpp`](../../src/testrunner/okigen.cpp.html) against them, runs it,
+//! and then **re-parses the result rather than trusting the generator's word for
+//! its own output**. `/testdata` is gitignored: this writes ~310 MB there and
+//! none of it is committed. No ROM is involved anywhere in this program.
+//!
+//! # The floors are the point
+//!
+//! A generator that regressed to silence would produce a file the runner
+//! compares sample-for-sample and passes on, because silence equals silence. So
+//! the premises below are checked before the file is accepted, and the counted
+//! ones come from a measured run. **If a later run reports lower figures, do not
+//! lower the floor to match** — a suite that exercises less than this does not
+//! test the clamp, and the fix is the generator.
+//!
+//! # Why several checks read the ROM back
+//!
+//! The tempting way to count refused phrases is `if i % 4 == 3 { refused += 1 }`,
+//! which is what the plan proposed. That counts indices, not refusals: it passes
+//! on a generator that stopped emitting refused phrases altogether. Every premise
+//! here is instead read out of the case's own bytes — the phrase-table entry, the
+//! command script, the recorded nibbles — so a generator that stopped producing
+//! one cannot satisfy the check that it did.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use testrunner::{okifiles, okifmt};
 
-/// At least this fraction of cases must reach the chip's own clamp. Measured:
-/// the four-voice events drive it in most cases.
-const MIN_CLAMPED: f64 = 0.30;
+/// At least this fraction of cases must reach the chip's own `+-65536` bound.
+/// Measured: two voices open at unity gain in every case, so the bound is
+/// reached in all of them; the floor leaves room for the fixture to change
+/// without becoming vacuous.
+const MIN_CLAMPED: f64 = 0.90;
+
 /// At least this fraction of samples across the suite must be non-zero.
 const MIN_AUDIBLE: f64 = 0.80;
-/// At least this many cases must contain a refused phrase (start >= stop).
+
+/// At least this many cases must carry a phrase the chip refuses (`start >=
+/// stop`) **and** a command that tries to play it. Every fourth case is built
+/// that way, so the design figure is 250.
 const MIN_REFUSED_CASES: usize = 200;
 
+/// MAME's sound sources, pinned to a release tag rather than `master`: the
+/// vectors this repository was verified against came from this exact revision,
+/// and `master` moving would silently change them.
 const MAME: &str = "https://raw.githubusercontent.com/mamedev/mame/mame0261/src/devices/sound";
 
-fn main() -> Result<(), String> {
+/// The two fetched files and their measured line counts.
+///
+/// A tripwire, not a checksum — but at a pinned tag the content cannot drift, so
+/// what this really catches is a truncated download or a proxy's error page
+/// landing in the file, which would otherwise fail later as a confusing compile
+/// error. The arithmetic lines checked below are the substance the suite rests
+/// on.
+const FETCH: [(&str, usize); 2] = [("okiadpcm.h", 76), ("okiadpcm.cpp", 260)];
+
+/// The two lines of `okiadpcm.cpp` that *are* the decoder. If either changed,
+/// every vector in the suite changed with it.
+const ARITHMETIC: [&str; 2] = [
+    "const int8_t oki_adpcm_state::s_index_shift[8] = { -1, -1, -1, -1, 2, 4, 6, 8 };",
+    "int stepval = floor(16.0 * pow(11.0 / 10.0, (double)step));",
+];
+
+/// The chip's own output bound, in the 2x domain. `oki::chip::CLAMP_2X`.
+const CLAMP_2X: i32 = 65_536;
+
+/// Where `okigen.cpp` puts the step ladder, and the phrase that plays it.
+const LADDER_PHRASE: usize = 1;
+/// The phrase whose start and stop are swapped in every fourth case.
+const REFUSED_PHRASE: usize = 2;
+/// The phrase covering the top 64 bytes of the 18-bit address space.
+const TOP_PHRASE: usize = 3;
+const LADDER_START: u32 = 0x400;
+const LADDER_STOP: u32 = 0x43F;
+const TOP_START: u32 = 0x3_FFC0;
+const TOP_STOP: u32 = 0x3_FFFF;
+/// How many samples the ladder's leading run of nibble 7 covers.
+const LADDER_SEVENS: usize = 32;
+/// And how many samples the whole ladder covers.
+const LADDER_SAMPLES: usize = 128;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = okifiles::dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let build = dir.join("build");
-    std::fs::create_dir_all(&build).map_err(|e| format!("{}: {e}", build.display()))?;
 
-    for name in ["okiadpcm.h", "okiadpcm.cpp"] {
-        let to = build.join(name);
-        if to.exists() {
-            continue;
-        }
-        let url = format!("{MAME}/{name}");
-        eprintln!("fetching {url}");
-        let out = Command::new("curl")
-            .args(["-fsSL", "-o"])
-            .arg(&to)
-            .arg(&url)
-            .status()
-            .map_err(|e| format!("curl: {e}"))?;
-        if !out.success() {
-            return Err(format!("could not fetch {url}"));
-        }
-    }
-    // MAME's okiadpcm.cpp includes emu.h and needs nothing from it.
-    std::fs::write(build.join("emu.h"), "#pragma once\n#include <cstdint>\n#include <cmath>\n")
-        .map_err(|e| format!("emu.h: {e}"))?;
+    // Scratch under `target/`, not under `testdata/`: `testdata/` is the suite,
+    // and a compiled binary and a copy of MAME's sources sitting in it turn any
+    // later measurement of the suite's size or contents into a guess. `target/`
+    // is already gitignored and is where `genym` puts its scratch too.
+    let build = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/okigen"));
+    std::fs::create_dir_all(&build).map_err(|e| format!("{}: {e}", build.display()))?;
+    fetch(&build)?;
 
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/okigen.cpp");
     let exe = build.join("okigen");
-    eprintln!("compiling {}", src.display());
-    let st = Command::new("c++")
+    println!("compiling {}", src.display());
+    run(Command::new("c++")
         .args(["-std=c++17", "-O2", "-I"])
         .arg(&build)
         .arg(&src)
         .arg(build.join("okiadpcm.cpp"))
         .arg("-o")
-        .arg(&exe)
-        .status()
-        .map_err(|e| format!("c++: {e}"))?;
-    if !st.success() {
-        return Err("the generator did not compile".into());
-    }
+        .arg(&exe))?;
 
     let part = okifiles::path().with_extension("part");
-    let st = Command::new(&exe).arg(&part).status().map_err(|e| format!("{}: {e}", exe.display()))?;
-    if !st.success() {
+    println!("generating {} cases", okifiles::EXPECTED);
+    if let Err(e) = run(Command::new(&exe).arg(&part)) {
         let _ = std::fs::remove_file(&part);
-        return Err("the generator failed".into());
+        return Err(e);
     }
 
-    // Validate before promoting the file.
-    let check = || -> Result<(), String> {
-        let bytes = std::fs::read(&part).map_err(|e| format!("{}: {e}", part.display()))?;
-        let cases = okifmt::parse(&bytes).map_err(|e| format!("{}: {e}", part.display()))?;
-        if cases.len() != okifiles::EXPECTED {
-            return Err(format!("{} cases, expected {}", cases.len(), okifiles::EXPECTED));
+    if let Err(e) = validate(&part) {
+        // A file that failed its own premises must not be left where the runner
+        // would find it and pass on it.
+        let _ = std::fs::remove_file(&part);
+        return Err(format!("the generator's output did not validate: {e}").into());
+    }
+
+    let dest = okifiles::path();
+    std::fs::rename(&part, &dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    let size = std::fs::metadata(&dest)?.len();
+    println!("wrote {} ({size} bytes)", dest.display());
+    Ok(())
+}
+
+/// Runs `cmd`, echoing its stderr, and failing with the command and that stderr.
+fn run(cmd: &mut Command) -> Result<(), Box<dyn std::error::Error>> {
+    let shown = format!("{cmd:?}");
+    let out = cmd.output().map_err(|e| format!("{shown}: {e}"))?;
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !err.trim().is_empty() {
+        eprint!("{err}");
+    }
+    if !out.status.success() {
+        return Err(format!("{shown} failed ({})", out.status).into());
+    }
+    Ok(())
+}
+
+/// Fetches MAME's decoder into `build` and writes the `emu.h` shim.
+///
+/// Re-fetches whenever the cached copy fails its checks rather than trusting
+/// `exists()`: a half-written download would otherwise be reused forever.
+fn fetch(build: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    for (name, lines) in FETCH {
+        let to = build.join(name);
+        if check_source(&to, name, lines).is_err() {
+            let url = format!("{MAME}/{name}");
+            println!("fetching {url}");
+            run(Command::new("curl")
+                .args(["-sfL", "--retry", "3", "-o"])
+                .arg(&to)
+                .arg(&url))?;
         }
-        let mut clamped = 0usize;
-        let mut refused = 0usize;
-        let mut nonzero = 0usize;
-        let mut total = 0usize;
-        for (i, c) in cases.iter().enumerate() {
-            if c.seed as usize != i {
-                return Err(format!("case {i} carries seed {}", c.seed));
+        check_source(&to, name, lines)?;
+    }
+    // MAME's okiadpcm.cpp includes emu.h and needs nothing from it but these two
+    // headers. Written every run, so a stale or truncated shim cannot persist.
+    std::fs::write(
+        build.join("emu.h"),
+        "#pragma once\n#include <cstdint>\n#include <cmath>\n",
+    )
+    .map_err(|e| format!("emu.h: {e}"))?;
+    Ok(())
+}
+
+/// Checks one fetched file's line count, and `okiadpcm.cpp`'s arithmetic.
+fn check_source(at: &Path, name: &str, lines: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let text = std::fs::read_to_string(at).map_err(|e| format!("{}: {e}", at.display()))?;
+    let got = text.lines().count();
+    if got != lines {
+        return Err(format!("{}: {got} lines, expected {lines}", at.display()).into());
+    }
+    if name == "okiadpcm.cpp" {
+        for want in ARITHMETIC {
+            if !text.contains(want) {
+                return Err(format!(
+                    "{}: MAME's decoder no longer contains `{want}`. The suite's \
+                     arithmetic changed; regenerating would silently replace every \
+                     vector this repository was verified against.",
+                    at.display()
+                )
+                .into());
             }
-            if c.samples.len() != okifiles::SAMPLES_PER_CASE {
-                return Err(format!("case {i} has {} samples", c.samples.len()));
+        }
+    }
+    Ok(())
+}
+
+/// Reads back what the generator wrote and checks it against the premises the
+/// suite rests on.
+#[allow(clippy::too_many_lines)]
+fn validate(part: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(part).map_err(|e| format!("{}: {e}", part.display()))?;
+    let cases = okifmt::parse(&bytes).map_err(|e| format!("{}: {e}", part.display()))?;
+    if cases.len() != okifiles::EXPECTED {
+        return Err(format!("{} cases, expected {}", cases.len(), okifiles::EXPECTED).into());
+    }
+    let mut clamped = 0usize;
+    let mut refused = 0usize;
+    let mut nonzero = 0usize;
+    let mut total = 0usize;
+    let mut four_voice_samples = 0usize;
+    let mut silent_volume_starts = 0usize;
+    for (i, c) in cases.iter().enumerate() {
+        let bad = |m: String| -> Box<dyn std::error::Error> { format!("case {i}: {m}").into() };
+        if c.seed as usize != i {
+            return Err(bad(format!("carries seed {}", c.seed)));
+        }
+        if c.samples.len() != okifiles::SAMPLES_PER_CASE {
+            return Err(bad(format!("has {} samples", c.samples.len())));
+        }
+        if c.rom.len() != okifiles::ROM_BYTES {
+            return Err(bad(format!("has a {}-byte rom", c.rom.len())));
+        }
+        if c.writes.is_empty() {
+            return Err(bad("writes nothing".into()));
+        }
+        if !c
+            .writes
+            .windows(2)
+            .all(|w| w[0].at_sample <= w[1].at_sample)
+        {
+            return Err(bad("writes are not in sample order".into()));
+        }
+        if c.pin7 != (i % 2 == 1) {
+            return Err(bad(format!("pin7 is {}", c.pin7)));
+        }
+
+        // The three reserved phrase-table entries, read back out of the ROM.
+        let (ls, lp) = (phrase(&c.rom, LADDER_PHRASE), phrase(&c.rom, TOP_PHRASE));
+        if ls != (LADDER_START, LADDER_STOP) {
+            return Err(bad(format!("ladder phrase is {ls:#X?}")));
+        }
+        if lp != (TOP_START, TOP_STOP) {
+            return Err(bad(format!("top-of-rom phrase is {lp:#X?}")));
+        }
+
+        // The ladder's nibbles, as the file recorded them. This is what makes the
+        // step index cross its whole range: 32 sevens drive it to 48 and hold it,
+        // then 96 zeros drive it to 0 and hold it. Random nibbles reach 1..48
+        // only, so without this the lower step clamp is never exercised.
+        for (n, s) in c.samples.iter().take(LADDER_SAMPLES).enumerate() {
+            let want = u16::from(n < LADDER_SEVENS) * 7;
+            if s.nibbles & 0x0F != want {
+                return Err(bad(format!(
+                    "sample {n}: voice 0 consumed {:#X}, the ladder says {want:#X}",
+                    s.nibbles & 0x0F
+                )));
             }
-            if c.rom.len() != okifiles::ROM_BYTES {
-                return Err(format!("case {i} has a {}-byte rom", c.rom.len()));
+        }
+        // And voice 1's first nibble must be the high nibble of the ROM's very
+        // last 64 bytes — the top of the 18-bit bus, which nothing else reaches.
+        // Checked against the ROM the file carries, so a generator whose address
+        // walk drifted cannot agree with itself here.
+        let want = u16::from(c.rom[TOP_START as usize] >> 4);
+        if (c.samples[0].nibbles >> 4) & 0x0F != want {
+            return Err(bad(format!(
+                "voice 1's first nibble is {:#X}, the top of the rom says {want:#X}",
+                (c.samples[0].nibbles >> 4) & 0x0F
+            )));
+        }
+
+        // A refused phrase counted from the data: the table entry must actually
+        // be invalid *and* the script must actually try to play it.
+        let (rs, rp) = phrase(&c.rom, REFUSED_PHRASE);
+        let (tried, silent_starts) = scan_script(&c.writes, REFUSED_PHRASE as u8);
+        silent_volume_starts += silent_starts;
+        if rs >= rp && tried {
+            refused += 1;
+            // The refusal must be what left the voice silent. Voice 3 is stopped
+            // at sample 1 and asked for this phrase at sample 1, so it must not
+            // be playing at sample 1.
+            if c.samples[1].voices & 0b1000 != 0 {
+                return Err(bad(
+                    "voice 3 played a phrase whose start is not below its stop".into(),
+                ));
             }
-            if c.writes.is_empty() {
-                return Err(format!("case {i} writes nothing"));
+        }
+
+        for (n, s) in c.samples.iter().enumerate() {
+            if s.status != 0xF0 | (s.status & 0x0F) || s.voices & !0x0F != 0 {
+                return Err(bad(format!("sample {n}: status {:#04X}", s.status)));
             }
-            if !c.writes.windows(2).all(|w| w[0].at_sample <= w[1].at_sample) {
-                return Err(format!("case {i}'s writes are not in sample order"));
+            // `voices` is who sounded during the sample and `status` is who is
+            // still playing after it, so the second is a subset of the first.
+            if s.status & 0x0F & !s.voices != 0 {
+                return Err(bad(format!(
+                    "sample {n}: status {:#04X} claims a voice that did not sound ({:#04X})",
+                    s.status, s.voices
+                )));
             }
-            if c.samples.iter().any(|s| s.mono_2x.abs() == 65_536) {
-                clamped += 1;
+            if s.mono_2x.abs() > CLAMP_2X {
+                return Err(bad(format!("sample {n}: {} exceeds the clamp", s.mono_2x)));
             }
-            if i % 4 == 3 {
-                refused += 1;
+            if s.mono_2x != 0 {
+                nonzero += 1;
             }
-            nonzero += c.samples.iter().filter(|s| s.mono_2x != 0).count();
-            total += c.samples.len();
-            // The status byte must agree with the voice mask it was built from.
-            for (n, s) in c.samples.iter().enumerate() {
-                if s.status != 0xF0 | (s.status & 0x0F) || s.voices & !0x0F != 0 {
-                    return Err(format!("case {i} sample {n}: status {:#04X}", s.status));
+            if s.voices == 0x0F {
+                four_voice_samples += 1;
+            }
+        }
+        total += c.samples.len();
+        if c.samples.iter().any(|s| s.mono_2x.abs() == CLAMP_2X) {
+            clamped += 1;
+        }
+    }
+
+    let clamp_frac = clamped as f64 / cases.len() as f64;
+    let audible = nonzero as f64 / total as f64;
+    println!("  cases reaching the +-{CLAMP_2X} bound: {clamped}/{} = {clamp_frac:.3} (floor {MIN_CLAMPED:.2})", cases.len());
+    println!("  samples non-zero: {nonzero}/{total} = {audible:.3} (floor {MIN_AUDIBLE:.2})");
+    println!("  cases carrying a refused phrase and a command for it: {refused} (floor {MIN_REFUSED_CASES})");
+    println!("  samples with all four voices sounding: {four_voice_samples}");
+    println!("  starts at a silent volume index (9..15): {silent_volume_starts}");
+    if clamp_frac < MIN_CLAMPED {
+        return Err(format!(
+            "only {clamp_frac:.3} of cases reach the clamp, floor {MIN_CLAMPED}. The \
+             fixture has lost the two unity-gain voices it opens with — fix the \
+             generator, not the floor."
+        )
+        .into());
+    }
+    if audible < MIN_AUDIBLE {
+        return Err(format!(
+            "only {audible:.3} of samples are non-zero, floor {MIN_AUDIBLE}. A suite \
+             of silence is one the runner passes on for free."
+        )
+        .into());
+    }
+    if refused < MIN_REFUSED_CASES {
+        return Err(format!(
+            "only {refused} cases carry a refused phrase and a command for it, floor \
+             {MIN_REFUSED_CASES}"
+        )
+        .into());
+    }
+    if four_voice_samples == 0 {
+        return Err("no sample had all four voices sounding".into());
+    }
+    if silent_volume_starts == 0 {
+        return Err("no start used a silent volume index (9..15)".into());
+    }
+    Ok(())
+}
+
+/// Walks a command script the way the chip's own state machine does, returning
+/// whether `phrase` was ever asked for and how many starts used a silent volume
+/// index (9..15, whose table entries are exactly zero).
+///
+/// A state machine rather than a `windows(2)` pattern match, because which bytes
+/// are data bytes depends on what came before them: `0x80 | phrase` followed by
+/// `0xF3` is a start, but the same `0xF3` on its own is a latch. Matching pairs
+/// positionally would miscount both figures, and in a fixture the generator
+/// controls it would miscount them *consistently* — which is exactly the kind of
+/// agreement that reads as a passing check.
+fn scan_script(writes: &[okifmt::Write_], phrase: u8) -> (bool, usize) {
+    let mut pending: Option<u8> = None;
+    let mut tried = false;
+    let mut silent = 0;
+    for w in writes {
+        if let Some(latched) = pending.take() {
+            if w.byte >> 4 != 0 {
+                if latched == phrase {
+                    tried = true;
+                }
+                if w.byte & 0x0F >= 9 {
+                    silent += 1;
                 }
             }
+        } else if w.byte & 0x80 != 0 {
+            pending = Some(w.byte & 0x7F);
         }
-        let clamp_frac = clamped as f64 / cases.len() as f64;
-        let audible = nonzero as f64 / total as f64;
-        eprintln!(
-            "clamped in {clamped}/{} cases ({clamp_frac:.3}), {audible:.3} of samples non-zero, \
-             {refused} cases carry a refused phrase",
-            cases.len()
-        );
-        if clamp_frac < MIN_CLAMPED {
-            return Err(format!("only {clamp_frac:.3} of cases reach the clamp, floor {MIN_CLAMPED}"));
-        }
-        if audible < MIN_AUDIBLE {
-            return Err(format!("only {audible:.3} of samples are non-zero, floor {MIN_AUDIBLE}"));
-        }
-        if refused < MIN_REFUSED_CASES {
-            return Err(format!("only {refused} cases carry a refused phrase, floor {MIN_REFUSED_CASES}"));
-        }
-        Ok(())
-    };
-    if let Err(e) = check() {
-        let _ = std::fs::remove_file(&part);
-        return Err(format!("the generator's output did not validate: {e}"));
     }
+    (tried, silent)
+}
 
-    std::fs::rename(&part, okifiles::path())
-        .map_err(|e| format!("{}: {e}", okifiles::path().display()))?;
-    eprintln!("wrote {}", okifiles::path().display());
-    Ok(())
+/// One phrase-table entry: 3-byte big-endian start then stop, at `phrase * 8`.
+fn phrase(rom: &[u8], phrase: usize) -> (u32, u32) {
+    let at =
+        |a: usize| u32::from(rom[a]) << 16 | u32::from(rom[a + 1]) << 8 | u32::from(rom[a + 2]);
+    (at(phrase * 8), at(phrase * 8 + 3))
 }
 ```
 
 - [ ] **Step 3: Generate the suite**
 
-Run: `cargo run --release -p testrunner --bin genoki`
-Expected: it fetches, compiles, runs, validates, and reports the three fractions. The file is ~310 MB (1,000 cases × a 256 KB ROM each) — **check that against the free disk before running**, and if it is too large, the fix is for the generator to emit a smaller ROM window per case, not to drop the validation.
+Run: `cargo run -q --release -p testrunner --bin genoki`
 
-> **If the ROM-per-case size is a problem:** change `ROM_BYTES` in `okigen.cpp` to `0x4000` and confine the phrase table's `start`/`stop` to that window. 1,000 × 16 KB = 16 MB. The chip code is indifferent; only the fixture shrinks. Make the same change to `okifiles::ROM_BYTES`. Note this in the commit message.
+Expected: it fetches, compiles, runs, validates, and reports five figures. Measured on the run this task committed:
 
-- [ ] **Step 4: The full gate, then commit**
+```text
+wrote 266329592 bytes, 1000 cases
+  cases reaching the +-65536 bound: 998/1000 = 0.998 (floor 0.90)
+  samples non-zero: 449798/512000 = 0.879 (floor 0.80)
+  cases carrying a refused phrase and a command for it: 250 (floor 200)
+  samples with all four voices sounding: 158665
+  starts at a silent volume index (9..15): 3026
+```
 
-The suite itself is **not** committed (`/testdata` is gitignored). Only the generator is.
+The file is **254 MB** (266,329,592 bytes — 1,000 cases × 256 KB of ROM each plus 4 KB of samples), not the ~310 MB the plan estimated. **Check that against the free disk before running**; this machine had 57 GiB free against a 362 MB `testdata/`, and `testdata/` is 616 MB afterwards. If it is too large, the fix is for the generator to emit a smaller ROM window per case, not to drop the validation.
+
+> **If the ROM-per-case size is a problem:** change `ROM_BYTES` in `okigen.cpp` to `0x4000` and confine the phrase table's `start`/`stop` to that window. 1,000 × 16 KB = 16 MB. Make the same change to `okifiles::ROM_BYTES`, and **move `TOP_START`/`TOP_STOP` down with it** — they sit at the top of the 18-bit space on purpose, and a window that no longer contains them silently drops the address-mask premise. Note it in the commit message. Be aware this also stops the address walk from wrapping through the real mask boundary, which is why the full size was kept: see `okifiles::ROM_BYTES`.
+
+- [ ] **Step 4: Verify the generator against `crates/oki`, then the full gate, then commit**
+
+The suite is not worth committing a generator for until it is known to agree with the core, and Task 6 is where the runner that checks that gets built. Do not wait for Task 6: write a scratch integration test that plays every case through `oki::Oki::step_2x_traced` and compares `mono_2x`, `nibbles` and `status`, run it, **then break it on purpose** (compare against `c.samples[(s + 1) % len]` and watch it fail), and delete it. On the committed suite all 1,000 cases agree, and the shifted comparison fails — which is what makes the agreement mean something rather than being two implementations of the same mistake.
+
+Then the full gate. The suite itself is **not** committed (`/testdata` is gitignored). Only the generator is.
 
 ```bash
 git add crates/testrunner/src/okigen.cpp crates/testrunner/src/bin/genoki.rs
