@@ -429,8 +429,11 @@ crates/ym2151/       the FM chip, on the same terms: no dependencies, no unsafe,
 crates/machine/      the board: memory map, bus, interrupts, scheduler, inputs,
                      the sound board and its rational Z80 clock, snapshot and
                      restore. Depends on m68k, video, z80 and ym2151 — all four
-                     dependency-free and no_std-shaped, so the display boundary
-                     below still holds.
+                     dependency-free, so the display boundary below still holds.
+                     Three of the four build for a bare-metal target (verified on
+                     thumbv7em-none-eabihf); `video` allocates a framebuffer and
+                     needs `alloc`, which is a different claim and is not made
+                     for it above.
 crates/romset/       the MAME ROM-set loader: zip or a directory, CRC-checked,
                      interleaved into the regions the board wants.
 crates/frontend/     every frontend decision, with no window: frame pacing, the
