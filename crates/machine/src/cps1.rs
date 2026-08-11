@@ -1601,6 +1601,73 @@ mod tests {
         });
     }
 
+    /// Inside one line, the 68000 runs to the end before the Z80 starts.
+    ///
+    /// MAME's interleave order at scanline granularity, and the claim
+    /// `a_latch_written_mid_line_reaches_the_z80_in_the_same_line` depends on but does
+    /// not state: that test observes the *consequence* — the byte the Z80 copied is the
+    /// one the 68000 left at the line's end — which a Z80 running first still satisfies
+    /// on a fixture whose latch happens not to move. This one observes the order itself.
+    ///
+    /// # How it can fail
+    ///
+    /// Step the machine one 68000 instruction at a time and record, after each step,
+    /// how far each CPU has got. While the line is mid-flight the Z80's T-state count
+    /// must not move at all; on the step that ends the line it must jump by a whole
+    /// line's share at once. Swapping the two — draining the Z80's budget before the
+    /// 68000's line rather than after — makes the Z80 advance on the line's *first*
+    /// step, so `moved_early` is non-zero and the last-step jump is gone.
+    ///
+    /// The premises are asserted too: there must be many mid-line steps (a line of
+    /// one instruction could not distinguish the orders at all) and the jump must be a
+    /// full line's worth rather than a few T-states, which is what tells "the Z80 ran
+    /// its whole line here" from "the Z80 is being trickled a little per step".
+    #[test]
+    fn the_sixty_eight_thousand_runs_before_the_z80_in_a_line() {
+        on_a_big_stack(|| {
+            let mut m = latching_machine();
+            // The first line is special: `step_instruction`'s start-of-line block runs
+            // inside it, so start measuring on the second.
+            while m.line == 0 {
+                m.step_instruction();
+            }
+
+            let line = m.line;
+            let mut steps = 0u32;
+            let mut moved_early = 0u32;
+            let mut last_jump = 0u64;
+            while m.line == line {
+                let before = m.z80_cycles();
+                m.step_instruction();
+                let spent = m.z80_cycles() - before;
+                steps += 1;
+                if m.line == line {
+                    // Still inside the line: the Z80 must not have moved.
+                    moved_early += u32::from(spent != 0);
+                } else {
+                    last_jump = spent;
+                }
+            }
+
+            assert_eq!(
+                moved_early, 0,
+                "the Z80 advanced during the 68000's line, on {moved_early} of {steps} \
+                 steps: the two are interleaved instruction by instruction, not line by \
+                 line"
+            );
+            assert!(
+                (207..=252).contains(&last_jump),
+                "the whole line's share ({last_jump} T) is spent on the step that ends \
+                 the line"
+            );
+            assert!(
+                steps > 8,
+                "and the line held many 68000 instructions ({steps}), so a Z80 that ran \
+                 first would have been visible"
+            );
+        });
+    }
+
     /// A reset returns the sound schedule to where a fresh machine starts.
     ///
     /// The [`Cps1::reset`] counterpart of `reset_restores_the_schedule_exactly`, and
