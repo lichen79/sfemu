@@ -15,6 +15,14 @@
 //! `--ppm` writes the last frame out as a file, which is a picture you can look at
 //! without this program having to draw one.
 
+// Nothing calls into `audio` until the loop is wired, one task from now. The allow is
+// scoped to this module and temporary by construction: wiring `run` to take an `Audio`
+// makes every item here reachable, and the line goes when it does. A crate-wide allow
+// would have hidden the next dead item too.
+#[allow(dead_code)]
+mod audio;
+#[cfg(test)]
+mod confine;
 mod display;
 mod loop_;
 

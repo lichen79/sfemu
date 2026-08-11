@@ -17,3 +17,9 @@ frontend = { path = "../frontend" }
 # romset's DEFLATE decoder. Reachable from `display.rs` alone: every decision a
 # frontend makes lives in `crates/frontend`, which has never heard of a window.
 minifb = "0.28"
+
+# The host audio device. Reachable from `audio.rs` alone, enforced by
+# `the_audio_library_is_named_in_one_file` on the same terms as the window: the rate
+# conversion and the buffer policy live in `machine::resample`, where they are tested,
+# because a device's clock and buffer cannot be asserted about.
+cpal = "0.18"
