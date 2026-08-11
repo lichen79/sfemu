@@ -30,3 +30,7 @@
 #![deny(rustdoc::private_intra_doc_links)]
 
 pub mod adpcm;
+pub mod chip;
+
+pub use adpcm::Adpcm;
+pub use chip::{Oki, Voice, VOICES};
