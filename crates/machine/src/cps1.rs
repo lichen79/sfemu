@@ -1558,11 +1558,20 @@ mod tests {
     /// `a_playing_oki_voice_is_audible_in_the_mono_samples` have something to bound.
     /// The phrase is 0x4000 samples long — far more than any test runs — so no voice
     /// ends mid-test and the "it is still playing" premises hold.
+    /// Phrase 2 is the *oscillating* one, at 0x4000, filled `0xF7`: nibble F is the
+    /// largest negative step and 7 the largest positive, both of which drive the step
+    /// index to its ceiling, so the decoder alternates between roughly ±2047 and the
+    /// output changes on **every** chip step. That is what
+    /// `the_oki_output_is_held_between_chip_steps` needs — phrase 1 saturates, and a
+    /// held plateau cannot distinguish holding from stepping.
     fn oki_rom() -> Vec<u8> {
         let mut r = vec![0u8; 0x8000];
         // Phrase 1's header at bytes 8..14: two 24-bit big-endian addresses.
         r[8..14].copy_from_slice(&[0x00, 0x10, 0x00, 0x00, 0x30, 0x00]);
         r[0x1000..0x3001].fill(0x77);
+        // Phrase 2's header at bytes 16..22.
+        r[16..22].copy_from_slice(&[0x00, 0x40, 0x00, 0x00, 0x60, 0x00]);
+        r[0x4000..0x6001].fill(0xF7);
         r
     }
 
@@ -2454,6 +2463,121 @@ mod tests {
             assert!(
                 steps.abs_diff(want) <= 1,
                 "{steps} OKI steps for {ticks} YM ticks, expected {want} at {num}/{den}"
+            );
+        });
+    }
+
+    /// The OKI's output is **held** between chip steps, not replaced by silence.
+    ///
+    /// **Written because the mutation survived every other test in this file.**
+    /// Consuming `oki_last` on each YM tick — so the level appears once and the next
+    /// six or seven samples read zero — left 165 tests green: the audibility test only
+    /// asks for *some* non-zero sample, the ratio test reads the chip's own position,
+    /// and the mix tests call `mix` directly. The symptom is a sample-and-hold DAC
+    /// replaced by an impulse train, which is a voice buried under broadband hash at
+    /// six times its own level — audible, and invisible here.
+    ///
+    /// Phrase 2 rather than phrase 1: its `0xF7` fill makes the decoder alternate
+    /// sign on every step, so consecutive chip outputs differ and a run of equal
+    /// samples can only be the hold. Under the mutation every other sample is zero, so
+    /// the longest run collapses to 1.
+    #[test]
+    fn the_oki_output_is_held_between_chip_steps() {
+        on_a_big_stack(|| {
+            let mut m = oki_machine();
+            // Phrase 2 on voice 1, alongside phrase 1 on voice 0: `0x82` latches the
+            // phrase, `0x20` is voice mask 2 at volume index 0.
+            m.sound.write(0xF002, 0x82);
+            m.sound.write(0xF002, 0x20);
+            m.drain_samples();
+            for _ in 0..64 {
+                m.run_scanline();
+            }
+            let s = m.drain_samples();
+            assert!(s.len() > 200, "samples to inspect: {}", s.len());
+
+            // The longest run of equal consecutive samples. With ~7.4 YM ticks per OKI
+            // step, a held level appears about seven times over.
+            let mut longest = 1usize;
+            let mut run = 1usize;
+            for w in s.windows(2) {
+                run = if w[0] == w[1] { run + 1 } else { 1 };
+                longest = longest.max(run);
+            }
+            assert!(
+                longest >= 4,
+                "the chip's level must persist across the YM ticks between its own \
+                 steps; longest run of equal samples was {longest}"
+            );
+            // And the premise: the level does change, so the run above is a hold
+            // rather than a constant signal.
+            assert!(
+                s.windows(2).filter(|w| w[0] != w[1]).count() > 20,
+                "the phrase oscillates, so there are transitions between the holds"
+            );
+        });
+    }
+
+    /// A pin-7 write swaps the rate's numerator without moving the phase.
+    ///
+    /// **Also written because the mutation survived.** Rebuilding the accumulator with
+    /// `RationalAccumulator::new` on a pin-7 write — dropping the carried remainder
+    /// instead of carrying it — left 165 tests green, because every other test here
+    /// leaves the pin at its power-up value and never writes 0xF006 mid-run.
+    ///
+    /// The observable is the chip's own position in its phrase. Two machines run the
+    /// same span; one is written `0xF006` with the value it already has, 96 times.
+    /// Each write is a no-op — the ratio does not change — so a correct
+    /// implementation never rebuilds the accumulator at all and the two agree
+    /// exactly. An implementation that rebuilt unconditionally, or rebuilt and lost
+    /// the remainder, would drop up to one OKI sample per write and fall behind.
+    #[test]
+    fn a_pin_seven_write_does_not_move_the_okis_phase() {
+        on_a_big_stack(|| {
+            let mut quiet = oki_machine();
+            let mut written = oki_machine();
+            assert!(
+                written.sound.oki_pin7(),
+                "the premise: the board starts high, so writing 0x01 changes nothing"
+            );
+            for _ in 0..96 {
+                for _ in 0..2 {
+                    quiet.run_scanline();
+                    written.run_scanline();
+                }
+                written.sound.write(0xF006, 0x01);
+            }
+            assert_eq!(
+                written.sound.oki_ref().voices()[0].sample(),
+                quiet.sound.oki_ref().voices()[0].sample(),
+                "a pin-7 write that does not change the rate must not cost a sample"
+            );
+            assert_eq!(
+                written.drain_samples(),
+                quiet.drain_samples(),
+                "and the audio is identical"
+            );
+
+            // Then the write that *does* change the rate: the phase is carried, so the
+            // chip keeps stepping without a stall, and the new rate is the slow one.
+            let mut slowed = oki_machine();
+            for _ in 0..64 {
+                slowed.run_scanline();
+            }
+            let at_swap = u64::from(slowed.sound.oki_ref().voices()[0].sample());
+            slowed.sound.write(0xF006, 0x00);
+            slowed.drain_samples();
+            for _ in 0..64 {
+                slowed.run_scanline();
+            }
+            let ticks = slowed.samples().len() as u64;
+            let stepped = u64::from(slowed.sound.oki_ref().voices()[0].sample()) - at_swap;
+            let (num, den) = oki_per_ym(false);
+            let want = ticks * u64::from(num) / u64::from(den);
+            assert!(
+                stepped.abs_diff(want) <= 1,
+                "after the swap the chip runs at the low rate: {stepped} steps for \
+                 {ticks} ticks, expected {want} at {num}/{den}"
             );
         });
     }
