@@ -4,21 +4,29 @@
 //!
 //! ```text
 //! offset  size  field
-//! 0       8     MAGIC          b"SFEMU\0\0\x02"; the last byte is the version
+//! 0       8     MAGIC          b"SFEMU\0\0\x03"; the last byte is the version
 //! 8       4     board          little-endian; BOARD_SF2 = b"SF2\0"
 //! 12      8     payload length little-endian
 //! 20      len   payload
 //! 20+len  4     CRC-32 of the payload, little-endian
 //! ```
 //!
-//! # Version 2 added the sound board
+//! # Version 2 added the sound board, version 3 the ADPCM chip
 //!
-//! Version 1 predates it. A version-1 file has no Z80, no sound RAM, no YM2151, and
-//! no sound schedule, so there is nothing to restore them from and no defensible
-//! default: a machine whose 68000 is mid-frame and whose Z80 is at its reset vector
-//! is not a state the hardware can be in. So a version-1 file is refused with
-//! [`StateError::Version`], which is what that variant is for — it names the version
-//! rather than calling the file damaged.
+//! Version 1 predates the sound board. A version-1 file has no Z80, no sound RAM, no
+//! YM2151, and no sound schedule, so there is nothing to restore them from and no
+//! defensible default: a machine whose 68000 is mid-frame and whose Z80 is at its
+//! reset vector is not a state the hardware can be in. So a version-1 file is refused
+//! with [`StateError::Version`], which is what that variant is for — it names the
+//! version rather than calling the file damaged.
+//!
+//! A version-2 file is refused for a narrower reason, and it is worth stating because
+//! "default the missing block" looks defensible here: version 2 carries `oki_pin7` but
+//! not the four voices, so the chip would restore silent while the Z80 restores
+//! mid-driver. The driver does not re-issue phrases it believes are already playing,
+//! so the music would simply be missing until the next cue — a state that plays wrong
+//! rather than one that fails. That is the failure mode this format's version byte
+//! exists to prevent.
 //!
 //! The payload's field order is the list in [`encode`]'s source, read top to
 //! bottom, and **every reader and writer follows that list**. Booleans are one
@@ -57,13 +65,13 @@ use machine::z80::Z80;
 use machine::{Inputs, MachineState, PlayerInput};
 
 /// The first eight bytes of every save state. The last byte is [`VERSION`].
-pub const MAGIC: [u8; 8] = *b"SFEMU\0\0\x02";
+pub const MAGIC: [u8; 8] = *b"SFEMU\0\0\x03";
 
 /// The format version, and the last byte of [`MAGIC`].
 ///
-/// 2 since the sound board joined the state — see the module docs on why a
-/// version-1 file is refused rather than filled in.
-pub const VERSION: u8 = 2;
+/// 3 since the ADPCM chip joined the state, 2 since the sound board did — see the
+/// module docs on why an older file is refused rather than filled in.
+pub const VERSION: u8 = 3;
 
 /// The board a state belongs to: `b"SF2\0"` big-endian, so it reads as ASCII in a
 /// hex dump.
@@ -90,6 +98,15 @@ const Z80_BYTES: usize = 10          // a f b c d e h l i r
     + 2                              // iff1 iff2
     + 4                              // im ei q p
     + 3; // halted irq nmi
+
+/// One OKI voice's encoded size, a hand count for [`Z80_BYTES`]'s reason.
+const OKI_VOICE_BYTES: usize = 2     // the decoder's signal
+    + 1                              // and its step index
+    + 1                              // playing
+    + 4                              // base
+    + 4                              // sample
+    + 4                              // count
+    + 1; // volume
 
 /// The payload's exact size, written out term by term.
 ///
@@ -126,7 +143,12 @@ const PAYLOAD: usize = 8 * 4      // d[0..8]
     + 4 + 4 + 4                    // the Z80 accumulator: num, den, remainder
     + 8                            // z80_debt
     + 8                            // z80_total
-    + 4; // sample_acc
+    + 4                            // sample_acc
+    // ---- the ADPCM chip, new in version 3 ----
+    + machine::oki::VOICES * OKI_VOICE_BYTES
+    + 1                            // oki_command: 0xFF for none, else the phrase
+    + 4                            // oki_acc_rem
+    + 4; // oki_last
 
 /// Why a state was refused.
 ///
@@ -318,6 +340,24 @@ impl Writer {
             self.bool(b);
         }
     }
+    /// One ADPCM voice, in [`OKI_VOICE_BYTES`] bytes.
+    ///
+    /// Written here rather than in `oki`, unlike the YM2151's: every part of a `Voice`
+    /// is reachable through accessors and `Voice::restore`, so there is nothing the
+    /// codec cannot see and no reason to put a byte layout inside a chip that has no
+    /// other use for one. The decoder's signal is `i16` and goes out as a `u16` two's
+    /// complement — `signal() as u16` and back through `as i16`, which round-trips
+    /// every bit pattern.
+    fn voice(&mut self, v: &machine::oki::Voice) {
+        let a = v.adpcm();
+        self.u16(a.signal() as u16);
+        self.u8(a.step());
+        self.bool(v.playing());
+        self.u32(v.base());
+        self.u32(v.sample());
+        self.u32(v.count());
+        self.u8(v.volume());
+    }
 }
 
 /// Reads bytes in the payload's order.
@@ -419,6 +459,24 @@ impl Reader<'_> {
             kick: [self.bool(), self.bool(), self.bool()],
         }
     }
+    /// One ADPCM voice, in [`Writer::voice`]'s order.
+    ///
+    /// The chip's own `restore` functions clamp what comes out of a file — the signal,
+    /// the step index, the base against the 18-bit bus — and a position past the end of
+    /// its phrase simply stops the voice. So no validation here: a bad byte is a wrong
+    /// sound, not a panic, and refusing a whole state over a step index of 49 would
+    /// have no better answer to offer.
+    fn voice(&mut self) -> machine::oki::Voice {
+        let adpcm = machine::oki::Adpcm::restore(self.u16() as i16, self.u8());
+        machine::oki::Voice::restore(
+            adpcm,
+            self.bool(),
+            self.u32(),
+            self.u32(),
+            self.u32(),
+            self.u8(),
+        )
+    }
 }
 
 /// Encodes a state as a file.
@@ -497,6 +555,21 @@ pub fn encode(s: &MachineState, board: u32) -> Vec<u8> {
     w.i64(s.z80_debt);
     w.u64(s.z80_total);
     w.u32(s.sample_acc);
+
+    // The ADPCM chip. `oki_pin7` above is the rate its accumulator's remainder is
+    // measured against, so the remainder goes out bare — there is no ratio to check
+    // the way `z80_carry`'s is, because this one follows from a bit already in the file.
+    for v in &s.oki_voices {
+        w.voice(v);
+    }
+    // 0xFF for "no command pending". A latched phrase is seven bits — the chip masks
+    // bit 7 off when it latches — so 0xFF cannot collide with a real one. `decode`
+    // reads *any* value with bit 7 set as none, for the reason the module docs give
+    // about booleans: the byte came from a file, the CRC already passed, and refusing a
+    // whole state over an impossible 0x80 would be a rejection with nothing to suggest.
+    w.u8(s.oki_command.unwrap_or(0xFF));
+    w.u32(s.oki_acc_rem);
+    w.u32(s.oki_last as u32);
 
     let payload = w.0;
     let mut out = Vec::with_capacity(HEADER + payload.len() + 4);
@@ -667,6 +740,18 @@ pub fn decode(bytes: &[u8], board: u32) -> Result<MachineState, StateError> {
     let z80_total = r.u64();
     let sample_acc = r.u32();
 
+    // The ADPCM chip, in `encode`'s order.
+    let mut oki_voices = [machine::oki::Voice::default(); machine::oki::VOICES];
+    for v in oki_voices.iter_mut() {
+        *v = r.voice();
+    }
+    let cmd = r.u8();
+    // Bit 7 set means none — see `encode`. The chip's own `restore` would mask the bit
+    // off, turning 0xFF into a latched phrase 0x7F, so the check has to be here.
+    let oki_command = if cmd & 0x80 != 0 { None } else { Some(cmd) };
+    let oki_acc_rem = r.u32();
+    let oki_last = r.u32() as i32;
+
     Ok(MachineState {
         cpu,
         ram: boxed(ram),
@@ -685,6 +770,10 @@ pub fn decode(bytes: &[u8], board: u32) -> Result<MachineState, StateError> {
         sound_ram: boxed_bytes(sound_ram),
         sound_bank,
         oki_pin7,
+        oki_voices,
+        oki_command,
+        oki_acc_rem,
+        oki_last,
         ym,
         ym_addr,
         z80_carry,
@@ -744,6 +833,36 @@ mod tests {
         // machine reading 0x00 here instead.
         rom[0x1_4000] = 0x5A;
         rom
+    }
+
+    /// A sample ROM with **four** phrases, one per voice, each filled differently.
+    ///
+    /// Four rather than two, and at four different volumes, because the four voices go
+    /// out as a run of identical 17-byte structures — exactly the case where writing
+    /// them in the wrong order, or writing voice 0 four times, is invisible. Distinct
+    /// fills give them distinct decoder state as well as distinct positions: `0x77` is
+    /// the largest positive step repeated, so its signal ramps toward full scale; `0xF7`
+    /// alternates sign and drives the step index to its ceiling; `0x35` and `0x9C` are
+    /// mixed magnitudes that settle somewhere between.
+    ///
+    /// The phrases are 0x1000 bytes each — 8,194 nibbles, against the ~2,700 the
+    /// fixture's run consumes — so every voice is still mid-phrase at snapshot time and
+    /// `sample < count` holds. That inequality is load-bearing: `Voice::restore` forces
+    /// `playing` false for a voice at or past its end, so a voice that had run out would
+    /// make its own `playing` bit unobservable in the round trip.
+    fn oki_rom() -> Vec<u8> {
+        let mut r = vec![0u8; 0x8000];
+        // Phrase headers live at `phrase * 8`, as two 24-bit big-endian addresses:
+        // start and *last* byte, so a phrase spans `stop - start + 1`.
+        for (phrase, start) in [0x1000u32, 0x2000, 0x3000, 0x4000].into_iter().enumerate() {
+            let at = (phrase + 1) * 8;
+            let stop = start + 0x0FFF;
+            r[at..at + 3].copy_from_slice(&start.to_be_bytes()[1..]);
+            r[at + 3..at + 6].copy_from_slice(&stop.to_be_bytes()[1..]);
+            let fill = [0x77u8, 0xF7, 0x35, 0x9C][phrase];
+            r[start as usize..=stop as usize].fill(fill);
+        }
+        r
     }
 
     /// Puts the FM chip in a state no default can imitate: mid-note, LFO running,
@@ -833,19 +952,7 @@ mod tests {
         }
 
         let cfg = BoardConfig::sf2();
-        // No sample ROM. **Task 10 must revisit this**: it puts the OKI's voices into
-        // `MachineState`, and a round trip over a chip with nothing playing would be a
-        // round trip over four stopped voices — trivially preserved. Until then a
-        // restore rebuilds the chip at power-up, so a voice playing here would make the
-        // fixture diverge for a reason the codec is not yet meant to fix.
-        let mut m = Cps1::with_sound(
-            &rom,
-            gfx,
-            sound_rom(),
-            Vec::new(),
-            cfg,
-            Timing::cps1_10mhz(),
-        );
+        let mut m = Cps1::with_sound(&rom, gfx, sound_rom(), oki_rom(), cfg, Timing::cps1_10mhz());
         m.reset();
         // The sound board, before the run: the patch and the bank are what the Z80's
         // 5,241 lines of copying then interleave with.
@@ -853,10 +960,25 @@ mod tests {
         m.sound.write(0xF004, 0x01); // bank 1
         m.sound.write(0xF006, 0x01); // OKI pin 7 high
         m.sound.write(0xF000, 0x30); // an address latched with no data byte yet
-                                     // A byte for the Z80's copy loop to find, and a pattern across sound RAM. The
-                                     // loop only ever writes 0xD000, so without the pattern 2,047 of the 2,048
-                                     // bytes would be zero and a codec that wrote the region short would restore an
-                                     // identical machine.
+                                     // All four ADPCM voices, each on its own phrase at its own volume. A start is
+                                     // two bytes: `0x8p` latches phrase `p`, then `mmmm vvvv` gives the voice mask and
+                                     // the volume index. So voice 0 takes phrase 1 at index 0, voice 1 phrase 2 at
+                                     // index 1, voice 2 phrase 3 at index 3, voice 3 phrase 4 at index 4 — volumes
+                                     // 0x20, 0x16, 0x0B and 0x08, no two alike.
+                                     //
+                                     // **Four**, not two: a codec that wrote voice 0's bytes four times, or wrote the
+                                     // four in the wrong order, produces an array that still looks plausible unless
+                                     // every voice differs from every other in every field. Two of them are stopped
+                                     // again after the run, below, so `playing` differs across the array too.
+        for (phrase, second) in [(1u8, 0x10u8), (2, 0x21), (3, 0x43), (4, 0x84)] {
+            m.sound.write(0xF002, 0x80 | phrase);
+            m.sound.write(0xF002, second);
+        }
+
+        // A byte for the Z80's copy loop to find, and a pattern across sound RAM. The
+        // loop only ever writes 0xD000, so without the pattern 2,047 of the 2,048
+        // bytes would be zero and a codec that wrote the region short would restore an
+        // identical machine.
         m.board.sound_latch[0] = 0x5C;
         for i in 0..SOUND_RAM_BYTES as u16 {
             m.sound.write(0xD000 + i, (i as u8) ^ 0xA5);
@@ -876,6 +998,17 @@ mod tests {
         for _ in 0..5_241 {
             m.run_scanline();
         }
+        // Voices 0 and 3 stopped, 1 and 2 still playing. A stop is a single byte whose
+        // mask is shifted by *three*, so `0x48` is voices 0 and 3. They keep the position
+        // and decoder state the run gave them, which is the point: a voice that had
+        // simply never started would have `sample == count == 0`, and `Voice::restore`
+        // forces `playing` false for such a voice — making the `playing` byte itself
+        // unobservable in the round trip. Stopping a positioned voice instead leaves all
+        // four bytes load-bearing.
+        m.sound.write(0xF002, 0x48);
+        // Another phrase latched with no second byte, which is what `oki_command` carries
+        // across the save. Written after the stop so the stop is not read as its mask.
+        m.sound.write(0xF002, 0x83);
         // Every control is set to the *opposite* of the one encoded next to it, and
         // p2 is p1's complement. The payload is a run of one-byte booleans, so two
         // adjacent fields written in the wrong order is invisible unless the two
@@ -1146,6 +1279,53 @@ mod tests {
         );
         assert!(s.oki_pin7, "pin 7 high, so a dropped `false` is visible");
         assert_eq!(s.ym_addr, 0x30, "an address latched with no data byte yet");
+
+        // The ADPCM chip. All four voices carry their own phrase, volume, position and
+        // decoder state, so a codec that wrote voice 0's bytes four times — or wrote the
+        // four in the wrong order — shows up in a field comparison and not only in a
+        // divergence test. Each field is checked pairwise across all four rather than
+        // spot-checked, because "no two alike" is the whole premise.
+        for (i, v) in s.oki_voices.iter().enumerate() {
+            assert_ne!(v.base(), 0, "voice {i} is on a phrase of its own");
+            assert!(v.count() > 0, "voice {i} has a phrase length");
+            assert!(
+                v.sample() > 0 && v.sample() < v.count(),
+                "voice {i} is mid-phrase ({} of {}), so its position is observable and \
+                 `Voice::restore` will not force `playing` false",
+                v.sample(),
+                v.count()
+            );
+            assert_ne!(
+                v.adpcm().signal(),
+                0,
+                "voice {i}'s decoder is mid-signal, so a reset decoder is not a silent \
+                 difference"
+            );
+            for (j, w) in s.oki_voices.iter().enumerate().skip(i + 1) {
+                assert_ne!(v.base(), w.base(), "voices {i} and {j}: different phrases");
+                assert_ne!(v.volume(), w.volume(), "voices {i} and {j}: volumes");
+                assert_ne!(
+                    (v.adpcm().signal(), v.adpcm().step()),
+                    (w.adpcm().signal(), w.adpcm().step()),
+                    "voices {i} and {j}: decoder state"
+                );
+            }
+        }
+        // And `playing` is not four identical bytes: 1 and 2 still sound, 0 and 3 were
+        // stopped after the run and kept their positions.
+        assert_eq!(
+            s.oki_voices.map(|v| v.playing()),
+            [false, true, true, false],
+            "two playing, two stopped mid-phrase"
+        );
+        assert_eq!(
+            s.oki_command,
+            Some(3),
+            "a phrase latched and awaiting its voice mask — the two-byte command the \
+             fixture leaves half-delivered"
+        );
+        assert_ne!(s.oki_acc_rem, 0, "the chip is mid-sample");
+        assert_ne!(s.oki_last, 0, "and its held output is not silence");
         // The copy loop ran: sound RAM's first byte is the latch the fixture set
         // before the run, not the 0xA5 the pattern put there. The latch itself is
         // 0x12 by snapshot time — `a_machine` sets it last, after the run — so this
@@ -1243,6 +1423,63 @@ mod tests {
         assert_eq!(d.z80_debt, s.z80_debt, "the T-state debt");
         assert_eq!(d.z80_total, s.z80_total, "the T-state total");
         assert_eq!(d.sample_acc, s.sample_acc, "the sample accumulator");
+
+        // The ADPCM chip, voice by voice and field by field. Named individually for the
+        // registers' reason: the four voices go out as a run of identical structures, so
+        // `assert_eq!` on the array would report "not equal" without saying which voice
+        // or which of its seven fields moved.
+        for (i, (d, s)) in d.oki_voices.iter().zip(&s.oki_voices).enumerate() {
+            assert_eq!(d.playing(), s.playing(), "voice {i}: playing");
+            assert_eq!(d.base(), s.base(), "voice {i}: base");
+            assert_eq!(d.sample(), s.sample(), "voice {i}: sample");
+            assert_eq!(d.count(), s.count(), "voice {i}: count");
+            assert_eq!(d.volume(), s.volume(), "voice {i}: volume");
+            assert_eq!(
+                d.adpcm().signal(),
+                s.adpcm().signal(),
+                "voice {i}: the decoder's signal"
+            );
+            assert_eq!(
+                d.adpcm().step(),
+                s.adpcm().step(),
+                "voice {i}: and its step index"
+            );
+        }
+        assert_eq!(d.oki_command, s.oki_command, "the half-delivered command");
+        assert_eq!(d.oki_acc_rem, s.oki_acc_rem, "the OKI's carried remainder");
+        assert_eq!(d.oki_last, s.oki_last, "and its held output");
+    }
+
+    /// A `None` command round-trips as `None`, not as phrase 0x7F.
+    ///
+    /// The one case `every_sound_field_survives_the_round_trip` cannot cover, because
+    /// the fixture deliberately has a command pending: `0xFF` is the sentinel, and
+    /// `Oki::restore` masks bit 7 off whatever it is given — so a decoder that passed
+    /// the byte straight through would turn "nothing pending" into "phrase 0x7F
+    /// latched", and the next single byte the driver writes would be read as that
+    /// phrase's voice mask instead of as a command.
+    #[test]
+    fn no_pending_command_round_trips_as_none() {
+        let mut s = a_machine().snapshot();
+        s.oki_command = None;
+        let d = decode(&encode(&s, BOARD_SF2), BOARD_SF2).expect("valid");
+        assert_eq!(d.oki_command, None, "0xFF decodes as no command pending");
+    }
+
+    /// The version byte moved with the payload.
+    ///
+    /// Three constants have to agree or the format is silently self-inconsistent:
+    /// [`VERSION`], the magic's last byte, and the payload size the two of them
+    /// describe. A change to `PAYLOAD` without a version bump produces files that pass
+    /// every check in this module and restore garbage on the previous build — the exact
+    /// failure `a_version_two_file_is_refused` exists to make impossible.
+    #[test]
+    fn the_version_moved_with_the_payload() {
+        assert_eq!(VERSION, 3, "version 3: the ADPCM chip joined the payload");
+        assert_eq!(
+            MAGIC[7], VERSION,
+            "the magic's last byte *is* the version, so a bump has to touch both"
+        );
     }
 
     /// The sound half is load-bearing in the fingerprint.
@@ -1296,6 +1533,28 @@ mod tests {
             err(&bytes, BOARD_SF2),
             StateError::Version { found: 1 },
             "a version-1 state must be told it is a version-1 state"
+        );
+    }
+
+    /// A version-2 file is refused too, and for a narrower reason worth stating.
+    ///
+    /// Version 2 carries `oki_pin7` but not the four voices, so a decoder that filled
+    /// the block in would restore a silent ADPCM chip beside a Z80 that is mid-driver.
+    /// The driver does not re-issue phrases it believes are already playing, so the
+    /// music would be missing until the next cue — a state that plays *wrong* rather
+    /// than one that fails, which is what the version byte exists to prevent.
+    ///
+    /// It is a separate test from `a_version_one_file_is_refused` rather than a second
+    /// assertion inside it: version 2 is the version this build's own users have files
+    /// in, so it is the refusal most likely to be softened by a later change.
+    #[test]
+    fn a_version_two_file_is_refused() {
+        let mut bytes = encode(&a_machine().snapshot(), BOARD_SF2);
+        bytes[7] = 2;
+        assert_eq!(
+            err(&bytes, BOARD_SF2),
+            StateError::Version { found: 2 },
+            "a version-2 state must be refused, not filled in"
         );
     }
 
@@ -1379,7 +1638,7 @@ mod tests {
     /// reader that consumed a byte and discarded it passes the idempotence test above
     /// and fails here.
     ///
-    /// **Every 13th byte of the sound region, not all 4,039.** Each iteration decodes
+    /// **Every 13th byte of the sound region, not all 4,116.** Each iteration decodes
     /// and re-encodes a 262 KB file and re-runs two CRCs over it, so full coverage is
     /// ~35× this test's cost for no new failure mode; 13 is co-prime with every field
     /// width in the region, so the sampled offsets land inside fields of all sizes
@@ -1390,10 +1649,21 @@ mod tests {
     fn a_flipped_bit_in_the_sound_half_changes_the_decoded_state() {
         let good = encode(&a_machine().snapshot(), BOARD_SF2);
         // The sound half is the payload's tail: the video half's size is the version-1
-        // payload, so the region starts where that ended.
-        let sound_bytes = Z80_BYTES + SOUND_RAM_BYTES + 2 + YM_BYTES + 1 + 12 + 20;
+        // payload, so the region starts where that ended. Hand-counted, and it has to
+        // *grow* with the format — a stale count here would silently stop covering the
+        // block a new version added, which is exactly what happened when version 3
+        // appended the OKI and left this at 4,039.
+        let sound_bytes = Z80_BYTES
+            + SOUND_RAM_BYTES
+            + 2
+            + YM_BYTES
+            + 1
+            + 12
+            + 20
+            + machine::oki::VOICES * OKI_VOICE_BYTES
+            + 9;
         let start = HEADER + PAYLOAD - sound_bytes;
-        assert_eq!(sound_bytes, 4_039, "the sound half's size, hand-counted");
+        assert_eq!(sound_bytes, 4_116, "the sound half's size, hand-counted");
 
         let mut checked = 0;
         for at in (start..HEADER + PAYLOAD).step_by(13) {
@@ -1466,25 +1736,33 @@ mod tests {
     /// ymaddr  1                                           =      1
     /// z80acc  4 num + 4 den + 4 remainder                 =     12
     /// z80sch  8 debt + 8 total + 4 sample_acc             =     20
+    /// ---- the ADPCM chip, new in version 3 ----
+    /// voices  4 * 17                                      =     68
+    /// okicmd  1                                           =      1
+    /// okiacc  4 oki_acc_rem + 4 oki_last                  =      8
     ///                                                       ------
-    /// payload                                               268500
+    /// payload                                               268577
     /// header  8 magic + 4 board + 8 length                 =     20
     /// crc                                                  =      4
     ///                                                       ------
-    /// total                                                 268524
+    /// total                                                 268601
     /// ```
     #[test]
     fn the_encoded_length_is_the_documented_size() {
-        assert_eq!(PAYLOAD, 268_500, "the payload, term by term");
+        assert_eq!(PAYLOAD, 268_577, "the payload, term by term");
         let bytes = encode(&a_machine().snapshot(), BOARD_SF2);
-        assert_eq!(bytes.len(), 268_524, "20 header + payload + 4 CRC");
+        assert_eq!(bytes.len(), 268_601, "20 header + payload + 4 CRC");
         assert_eq!(HEADER, 20);
-        // The sound half is 4,039 of those bytes, and the YM2151 is most of it. Named
+        // The sound half is 4,116 of those bytes, and the YM2151 is most of it. Named
         // here so a change to the chip's private layout shows up as a save-state size
         // change rather than only as a mismatch inside `ym2151`.
         assert_eq!(Z80_BYTES, 37, "a hand count, not size_of::<Z80>() = 38");
         assert_eq!(SOUND_RAM_BYTES, 0x800);
         assert_eq!(YM_BYTES, 1_919, "the chip's own documented size");
+        assert_eq!(
+            OKI_VOICE_BYTES, 17,
+            "a hand count too: size_of::<oki::Voice>() is 20, with padding"
+        );
         // And the declared length in the header agrees with what follows it.
         let declared = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
         assert_eq!(declared as usize, PAYLOAD, "the header declares the truth");
@@ -1494,7 +1772,7 @@ mod tests {
     #[test]
     fn the_header_is_laid_out_as_documented() {
         let bytes = encode(&a_machine().snapshot(), BOARD_SF2);
-        assert_eq!(&bytes[0..8], b"SFEMU\0\0\x02", "magic, version in byte 7");
+        assert_eq!(&bytes[0..8], b"SFEMU\0\0\x03", "magic, version in byte 7");
         assert_eq!(MAGIC[7], VERSION, "the version *is* the magic's last byte");
         assert_eq!(
             &bytes[8..12],

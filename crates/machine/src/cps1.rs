@@ -533,6 +533,10 @@ impl Cps1 {
             sound_ram: Box::new(*self.sound.ram()),
             sound_bank: self.sound.bank(),
             oki_pin7: self.sound.oki_pin7(),
+            oki_voices: *self.sound.oki_ref().voices(),
+            oki_command: self.sound.oki_ref().pending_command(),
+            oki_acc_rem: self.oki_acc.remainder(),
+            oki_last: self.oki_last,
             ym: self.sound.ym_ref().clone(),
             ym_addr: self.sound.ym_addr(),
             z80_carry: self.z80_carry,
@@ -566,23 +570,26 @@ impl Cps1 {
         self.carry = s.carry;
         self.video.set_obj_latch(&s.obj);
         self.z80 = s.z80.clone();
-        // The chip is rebuilt rather than restored in place: Task 10 widens
-        // `MachineState` to carry its voices, and until then a load resets it. The
-        // OKI's rate accumulator and held sample are left alone for the same reason —
-        // there is nothing in the state to put back yet, and zeroing them would be a
-        // second wrong answer rather than a safer one.
+        // The chip is rebuilt from the state's own voices, not from `Oki::new()`. Its
+        // sample ROM is not in the state and does not need to be: it is the board's,
+        // and `SoundBoard::restore` leaves it in place.
         self.sound.restore(
             &s.sound_ram,
             s.sound_bank,
             s.oki_pin7,
             &s.ym,
             s.ym_addr,
-            oki::Oki::new(),
+            oki::Oki::restore(s.oki_voices, s.oki_command),
         );
         self.z80_carry = s.z80_carry;
         self.z80_debt = s.z80_debt;
         self.z80_total = s.z80_total;
         self.sample_acc = s.sample_acc;
+        // The rate follows the pin the line above just restored, and the remainder is
+        // carried onto it — `with_remainder`, not `new`, for `z80_carry`'s reason.
+        let (num, den) = oki_per_ym(s.oki_pin7);
+        self.oki_acc = RationalAccumulator::with_remainder(num, den, s.oki_acc_rem);
+        self.oki_last = s.oki_last;
         // `samples` is deliberately untouched: it is output the host drains, not
         // state, so a load must not retract audio already queued for playback.
     }
@@ -1942,6 +1949,201 @@ mod tests {
             assert_eq!(a.sound, b.sound, "and the same board, chip included");
             assert_eq!(a.z80_cycles(), b.z80_cycles());
             assert_eq!(a.z80_carry_remainder(), b.z80_carry_remainder());
+        });
+    }
+
+    /// [`oki_machine`]'s board with **no** phrase started, for the save-state tests.
+    ///
+    /// The restore target has to be a chip at rest: restoring into `oki_machine` — whose
+    /// constructor starts phrase 1 on voice 0 — would let a codec that dropped the voices
+    /// entirely still produce a machine playing that phrase, and the comparison would
+    /// pass for the wrong reason.
+    fn silent_oki_machine() -> Cps1 {
+        let mut m = Cps1::with_sound(
+            &spin(),
+            Vec::new(),
+            sound_spin(),
+            oki_rom(),
+            BoardConfig::sf2(),
+            Timing::cps1_10mhz(),
+        );
+        m.reset();
+        m
+    }
+
+    /// The ADPCM chip's voices survive a save state — decoder, position and all.
+    ///
+    /// A snapshot carrying only "voice 0 is playing phrase 1" restores a voice that
+    /// resumes at nibble 0 with signal 0 and step index 0: a click, and then a phrase at
+    /// the wrong amplitude for the next few dozen samples. That is the mistake this
+    /// test's negative control makes on purpose, so the positive assertion cannot pass
+    /// vacuously.
+    ///
+    /// Divergence over produced samples, not a field comparison: the voices' interiors
+    /// are private, and the whole point is the *future* the restored chip has.
+    ///
+    /// The YM is left unpatched, so the OKI is the only source — a mix in which the FM
+    /// chip dominated would let a wrong ADPCM position hide under it.
+    #[test]
+    fn the_oki_voices_survive_a_save_state() {
+        on_a_big_stack(|| {
+            let mut a = oki_machine();
+            for _ in 0..600 {
+                a.run_scanline();
+            }
+            let state = a.snapshot();
+            let v = &state.oki_voices[0];
+            assert!(v.playing(), "the premise: voice 0 is mid-phrase");
+            assert!(
+                v.sample() > 100 && v.sample() < v.count(),
+                "well inside it ({} of {}), so a position dropped to 0 is a long way \
+                 from where it was",
+                v.sample(),
+                v.count()
+            );
+            assert_ne!(
+                v.adpcm().signal(),
+                0,
+                "with a decoder that has ramped, so a reset decoder is audible"
+            );
+
+            let mut b = silent_oki_machine();
+            b.restore(&state);
+
+            // The control: the same phrase started from scratch, which is what a codec
+            // carrying `playing` and the phrase number but not the position restores.
+            let mut restarted = silent_oki_machine();
+            restarted.restore(&state);
+            restarted.sound.reset_oki();
+            start_the_oki_phrase(&mut restarted);
+
+            a.drain_samples();
+            b.drain_samples();
+            restarted.drain_samples();
+            for _ in 0..200 {
+                a.run_scanline();
+                b.run_scanline();
+                restarted.run_scanline();
+            }
+            assert!(
+                a.samples().iter().any(|&s| s != 0),
+                "the run produced audio, so there was something to lose"
+            );
+            assert_eq!(
+                a.samples(),
+                b.samples(),
+                "a restored chip must produce the same ADPCM stream"
+            );
+            assert_ne!(
+                a.samples(),
+                restarted.samples(),
+                "and the same phrase restarted from its beginning must not, which is \
+                 what makes the assertion above load-bearing"
+            );
+        });
+    }
+
+    /// A half-delivered OKI command is part of the state.
+    ///
+    /// The chip's start command is two bytes and the Z80 writes them as two
+    /// instructions, so a state taken between them has a phrase latched and no voice
+    /// mask yet. A codec that dropped the latch would read the mask byte as a fresh
+    /// command — `0x10` becomes a *stop* of voices 1 and 3 rather than the
+    /// volume-and-voice half of a start — so the phrase never plays at all.
+    ///
+    /// Asserted through the mask byte written *after* the restore, which is the only way
+    /// the latch is observable: it has no effect of its own until its partner arrives.
+    #[test]
+    fn a_half_delivered_oki_command_survives_a_save_state() {
+        on_a_big_stack(|| {
+            let mut a = silent_oki_machine();
+            a.sound.write(0xF002, 0x81); // latch phrase 1 and stop there
+            assert_eq!(
+                a.sound.oki_ref().pending_command(),
+                Some(1),
+                "the premise: a phrase is latched and waiting"
+            );
+
+            let state = a.snapshot();
+            let mut b = silent_oki_machine();
+            b.restore(&state);
+            assert_eq!(
+                b.sound.oki_ref().pending_command(),
+                Some(1),
+                "the latch is state, not scratch"
+            );
+
+            // The second byte, to both. It only starts a voice if the latch came back.
+            a.sound.write(0xF002, 0x10);
+            b.sound.write(0xF002, 0x10);
+            assert!(
+                a.sound.oki_ref().voices()[0].playing(),
+                "the pair completed, so there is a voice to compare"
+            );
+
+            a.drain_samples();
+            b.drain_samples();
+            for _ in 0..200 {
+                a.run_scanline();
+                b.run_scanline();
+            }
+            assert!(
+                a.samples().iter().any(|&s| s != 0),
+                "and it made sound rather than silence"
+            );
+            assert_eq!(a.samples(), b.samples());
+        });
+    }
+
+    /// The OKI accumulator's remainder and held output are part of the state.
+    ///
+    /// [`the_accumulator_remainder_survives_a_save_state`]'s argument one chip along. At
+    /// ~0.135 OKI samples per YM tick the remainder is almost never zero, so dropping it
+    /// puts a restored machine a fraction of an ADPCM sample out — and dropping
+    /// `oki_last` puts one sample of silence into the middle of a phrase, because most
+    /// YM ticks step the chip zero times and reuse the held level.
+    ///
+    /// Both are asserted twice: the restored value, and the audio that follows. The
+    /// first alone would be a test reading back the field it wrote.
+    #[test]
+    fn the_oki_accumulator_and_held_output_survive_a_save_state() {
+        on_a_big_stack(|| {
+            let mut a = oki_machine();
+            for _ in 0..37 {
+                a.run_scanline();
+            }
+            let state = a.snapshot();
+            assert_ne!(
+                state.oki_acc_rem, 0,
+                "the premise: the chip is mid-sample, so a dropped remainder restores \
+                 a zero rather than coincidentally matching"
+            );
+            assert_ne!(
+                state.oki_last, 0,
+                "and its held output is a level, not silence"
+            );
+
+            let mut b = silent_oki_machine();
+            b.restore(&state);
+            let after = b.snapshot();
+            assert_eq!(
+                after.oki_acc_rem, state.oki_acc_rem,
+                "the fraction came back"
+            );
+            assert_eq!(after.oki_last, state.oki_last, "and the held level");
+
+            a.drain_samples();
+            b.drain_samples();
+            for _ in 0..200 {
+                a.run_scanline();
+                b.run_scanline();
+            }
+            assert!(a.samples().iter().any(|&s| s != 0), "there is audio");
+            assert_eq!(
+                a.samples(),
+                b.samples(),
+                "and the two copies stay on the same ADPCM sample"
+            );
         });
     }
 

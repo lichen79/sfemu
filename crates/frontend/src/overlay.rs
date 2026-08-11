@@ -114,9 +114,16 @@ pub const SND_Y: usize = DIS_Y;
 /// is 32 characters, and a panel sized to the longest instruction *SF2's driver
 /// happens to use* would clip on the first ROM that used a wider one.
 const SND_COLS: usize = 38;
-/// The fixed rows above the listing: registers, the interrupt state, the board, and
-/// the trace counters.
-const SND_HEAD_ROWS: usize = 9;
+/// The fixed rows above the listing: registers, the interrupt state, the board, the
+/// ADPCM chip, and the trace counters.
+///
+/// **Eleven is the ceiling here, not a round number.** The box starts at [`SND_Y`] and
+/// its bottom is `SND_Y + SND_ROWS * LINE + 2 * PAD`, which at 11 header rows and
+/// [`SND_DIS_ROWS`] listing rows is 211 — against [`STATUS_Y`]'s 214. A twelfth header
+/// row would put the sound panel through the status line, so a new row has to take one
+/// from the listing. `the_sound_panel_still_fits_below_its_last_row` is that arithmetic
+/// as a test.
+const SND_HEAD_ROWS: usize = 11;
 /// How many Z80 instructions the sound listing shows.
 ///
 /// Fewer than the 68000's eight: the Z80 is a supporting act here, and the rows are
@@ -464,6 +471,61 @@ fn draw_sound(buf: &mut [u32], m: &Cps1) {
         .collect();
     line(buf, &mut row, &format!("KEYON {keys}"), HI);
 
+    // The ADPCM chip. `STAT` is the byte the driver reads back from 0xF002 — bit 3..0 per
+    // voice plus the idle bit — and `V` spells out which voices are sounding the way
+    // `KEYON` does above, because the status byte alone is four bits you have to decode
+    // in your head while a phrase is playing.
+    //
+    // `DIV` is the pin-7 divisor rather than the pin: the pin is one bit already on the
+    // `LATCH` row, and the divisor is the number that tells you the sample rate — 132 or
+    // 165, which at 1 MHz is 7.576 kHz or 6.061 kHz.
+    let oki = m.sound.oki_ref();
+    let playing: String = oki
+        .voices()
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            if v.playing() {
+                char::from(b'0' + i as u8)
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    line(
+        buf,
+        &mut row,
+        &format!(
+            "OKI {:02X} V {playing} DIV {:3} CMD {}",
+            oki.status(),
+            m.sound.oki_divisor(),
+            // The half-delivered start command, which is the state a phrase that never
+            // plays is stuck in: a driver that latched a phrase and then took an
+            // interrupt shows a number here that never clears.
+            match oki.pending_command() {
+                Some(p) => format!("{p:02X}"),
+                None => "--".to_string(),
+            }
+        ),
+        HI,
+    );
+    // The three counters that answer "why does it sound wrong", in the order the audio
+    // path produces them: the chip clamped its own sum, the ring was full, the ring was
+    // empty. `DRP` and `UND` come from the host through `set_audio_stats` and stay 0
+    // until Task 12 wires the device — 0 is the honest reading for a machine with no
+    // audio device, not a placeholder.
+    line(
+        buf,
+        &mut row,
+        &format!(
+            "CLP {:06} DRP {:06} UND {:06}",
+            m.sound_trace().oki_clamps,
+            m.sound_trace().audio_drops,
+            m.sound_trace().audio_underruns
+        ),
+        FG,
+    );
+
     line(
         buf,
         &mut row,
@@ -554,6 +616,10 @@ mod tests {
     use crate::font::{frame, panel_contains, read_text};
     use machine::config::BoardConfig;
     use machine::timing::Timing;
+    // The Z80's bus, for writing the board's ports the way a driver does rather than
+    // reaching into the chips directly: `0xF002` is how a phrase is started, and a test
+    // that called `Oki::write` would bypass the port decode the panel's rows describe.
+    use machine::z80::Bus as _;
 
     /// A machine stopped part-way through a program, with something in every field a
     /// panel reads.
@@ -611,14 +677,30 @@ mod tests {
             &rom,
             Vec::new(),
             audiocpu,
-            // No sample ROM: the panels this fixture drives read the YM's channels
-            // and the trace counters, and the OKI's own rows are Task 10's.
-            Vec::new(),
+            a_sample_rom(),
             BoardConfig::sf2(),
             Timing::cps1_10mhz(),
         );
         m.reset();
         m
+    }
+
+    /// A sample ROM with two phrases, so the panel's OKI rows have voices to show.
+    ///
+    /// A board built with `Vec::new()` refuses every phrase — `start == stop == 0` — so
+    /// its status byte, its voice string, and its clamp count would all read as an idle
+    /// chip whatever the panel did with them. `0x77` is the largest positive step
+    /// repeated, which ramps to near full scale and makes the OKI clamp against its own
+    /// ±65536 output limit once two voices are sounding: that is what gives `CLP`
+    /// something to count.
+    fn a_sample_rom() -> Vec<u8> {
+        let mut r = vec![0u8; 0x8000];
+        // Phrase headers at `phrase * 8`: start and last byte, 24-bit big-endian.
+        r[8..14].copy_from_slice(&[0x00, 0x10, 0x00, 0x00, 0x30, 0x00]);
+        r[16..22].copy_from_slice(&[0x00, 0x40, 0x00, 0x00, 0x60, 0x00]);
+        r[0x1000..0x3001].fill(0x77);
+        r[0x4000..0x6001].fill(0x77);
+        r
     }
 
     /// The register panel shows the registers, read back off the pixels.
@@ -1248,6 +1330,103 @@ mod tests {
         assert!(
             panel_contains(&buf, &format!("FET {:09}", t.audiocpu_fetches), FG),
             "the fetch count is the machine's"
+        );
+    }
+
+    /// The sound panel shows the ADPCM chip: status, voices, divisor, and the counters.
+    ///
+    /// Read back off the pixels for the rest of the panel's reason, and with values
+    /// chosen so each field can fail on its own:
+    ///
+    /// - **Voices 1 and 2, not 0.** The mask nibble is the high one, so a panel reading
+    ///   `command & 0x0F` as the mask would light voice 0 instead. `.12.` also fails for a
+    ///   panel that printed the status byte's bits in the wrong order.
+    /// - **Pin 7 low, divisor 165.** The default is high, 132, so a panel that ignored the
+    ///   pin — or printed the pin instead of the divisor — reads 132 or `1`.
+    /// - **A phrase latched and left.** `CMD 03` is the half-delivered command; a panel
+    ///   with no such row is how a phrase that never plays stays invisible.
+    /// - **`CLP` non-zero.** Two voices at volume index 0 exceed the chip's own ±65536
+    ///   clamp, which is what makes the counter a number rather than a permanent 0.
+    #[test]
+    fn the_sound_panel_shows_the_adpcm_chip() {
+        let mut m = a_sound_machine();
+        m.sound.write(0xF006, 0x00); // pin 7 low: the slower divisor
+                                     // Two voices, both at volume index 0 so their sum clips.
+        m.sound.write(0xF002, 0x81);
+        m.sound.write(0xF002, 0x20); // mask 2 -> voice 1
+        m.sound.write(0xF002, 0x82);
+        m.sound.write(0xF002, 0x40); // mask 4 -> voice 2
+        for _ in 0..64 {
+            m.run_scanline();
+        }
+        // A third phrase latched with no mask byte, last so it stays pending.
+        m.sound.write(0xF002, 0x83);
+
+        let mut buf = frame();
+        draw(
+            &mut buf,
+            &m,
+            Panels {
+                sound: true,
+                ..Panels::none()
+            },
+            0,
+            0,
+            &[],
+        );
+
+        // The status byte the driver itself would read. `0xF6`, not `0x06`: the chip
+        // builds `0xF0` and sets one bit per playing voice, so the high nibble is always
+        // set — the panel shows the byte the guest sees, not a cleaned-up version of it.
+        assert_eq!(
+            m.sound.oki_ref().status(),
+            0xF6,
+            "the premise: the chip reports voices 1 and 2"
+        );
+        assert!(
+            panel_contains(&buf, "OKI F6 V .12. DIV 165 CMD 03", HI),
+            "the chip's status, its voices, its rate, and the pending command"
+        );
+
+        let t = m.sound_trace();
+        assert!(
+            t.oki_clamps > 0,
+            "the premise: two loud voices clipped, so CLP is a real count ({})",
+            t.oki_clamps
+        );
+        assert!(
+            panel_contains(&buf, &format!("CLP {:06}", t.oki_clamps), FG),
+            "the clamp count is the machine's, not a second tally"
+        );
+        // Both host counters are 0 until Task 12 wires a device, and shown anyway: the
+        // panel's job is to say "the ring is fine", which a missing row cannot.
+        assert!(
+            panel_contains(&buf, "DRP 000000 UND 000000", FG),
+            "the ring's counters, zero with no audio device attached"
+        );
+    }
+
+    /// The sound panel still ends above the status line, with no room for a twelfth row.
+    ///
+    /// `every_panel_fits_inside_the_frame` only checks the frame's edge, and the status
+    /// line is not the frame's edge — a sound panel two rows taller would fit the window
+    /// and draw straight through the status line's box, which `fill_rect` would happily
+    /// do. This is the arithmetic in [`SND_HEAD_ROWS`]'s documentation as an assertion,
+    /// including the part that says a new header row has to take one from the listing.
+    #[test]
+    fn the_sound_panel_still_fits_below_its_last_row() {
+        let bottom = SND_Y + SND_ROWS * LINE + 2 * PAD;
+        assert_eq!(bottom, 211, "the sound box ends here");
+        assert!(
+            bottom < STATUS_Y,
+            "the sound panel ends at {bottom}, at or past the status line's {STATUS_Y}"
+        );
+        let with_one_more = bottom + LINE;
+        assert!(
+            with_one_more > STATUS_Y,
+            "and there is no room for a twelfth header row ({with_one_more} against \
+             {STATUS_Y}), so the next row added has to come out of SND_DIS_ROWS — this \
+             is the assertion that says so rather than leaving it to a comment"
         );
     }
 

@@ -15,8 +15,12 @@
 //!
 //! # What is not in here, and why
 //!
-//! - **The ROM and the graphics ROM.** The user supplied them. A save state
-//!   containing them would be a ROM file, which this project does not produce.
+//! - **The ROM, the graphics ROM, and the OKI's sample ROM.** The user supplied
+//!   them. A save state containing them would be a ROM file, which this project does
+//!   not produce — and one carrying 256 KB of Capcom samples would also be a save
+//!   state that could not be shared. The voices carry *positions* into that ROM; a
+//!   state loaded against a different one plays the wrong sound rather than failing,
+//!   which is the same bargain the 68000's PC has always made.
 //! - **The palette and the framebuffer.** Recomputed by the next
 //!   [`Cps1::render`](crate::Cps1::render).
 //! - **The decoder table.** 512 KB, rebuilt in a constructor.
@@ -88,9 +92,39 @@ pub struct MachineState {
     pub sound_ram: Box<[u8; SOUND_RAM_BYTES]>,
     /// The selected sound-ROM bank.
     pub sound_bank: u8,
-    /// OKI pin 7, the MSM6295's rate divider select. D3 will read it; carried now so
-    /// that a state written today is not silently missing it when D3 lands.
+    /// OKI pin 7, the MSM6295's rate divider select.
+    ///
+    /// Also the *rate* [`Self::oki_acc_rem`]'s fraction is measured against, which is
+    /// why that field carries no numerator of its own: the ratio follows from this bit
+    /// and the board's crystals through [`crate::timing::oki_per_ym`].
     pub oki_pin7: bool,
+    /// The ADPCM chip's four voices: each one's decoder, position and volume.
+    ///
+    /// The decoder, not just the position. A voice restored at the right nibble with a
+    /// reset decoder resumes at signal 0 and step index 0, which is a click and then a
+    /// phrase at the wrong amplitude for the next few dozen samples — the same mistake
+    /// [`Self::ym`] documents for the FM chip's envelopes.
+    pub oki_voices: [oki::Voice; oki::VOICES],
+    /// A phrase number latched by a `0x80`-prefixed byte, awaiting its voice mask.
+    ///
+    /// The OKI's start command is two bytes and the Z80 writes them as two
+    /// instructions, so a state taken between them needs this. Without it the mask
+    /// byte is read as a fresh command — `0x10` becomes a *stop* rather than the
+    /// volume-and-voice half of a start — so the phrase never plays at all.
+    pub oki_command: Option<u8>,
+    /// The OKI sample accumulator's carried remainder.
+    ///
+    /// [`Self::sample_acc`]'s argument one chip along: at ~0.135 OKI samples per YM
+    /// tick, dropping this puts a restored machine a fraction of an ADPCM sample out
+    /// and the phrase drifts from there. Only the remainder, for the reason
+    /// [`Self::oki_pin7`] gives.
+    pub oki_acc_rem: u32,
+    /// The chip's last output in the 2x domain, held between its own steps.
+    ///
+    /// Held, so it is state rather than scratch: most YM ticks step the chip zero
+    /// times and the mix reuses this value, the way a sample-and-hold DAC does. A
+    /// restore that zeroed it would put one silent sample into the middle of a phrase.
+    pub oki_last: i32,
     /// The YM2151, whole: register file, envelopes, phases, LFO, noise, and timers.
     ///
     /// Not just the register file. A chip restored with its registers but not its
@@ -152,6 +186,10 @@ impl Clone for MachineState {
             sound_ram: Box::new(*self.sound_ram),
             sound_bank: self.sound_bank,
             oki_pin7: self.oki_pin7,
+            oki_voices: self.oki_voices,
+            oki_command: self.oki_command,
+            oki_acc_rem: self.oki_acc_rem,
+            oki_last: self.oki_last,
             ym: self.ym.clone(),
             ym_addr: self.ym_addr,
             z80_carry: self.z80_carry,
