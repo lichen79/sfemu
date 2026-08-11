@@ -86,6 +86,13 @@ CRATES: dict[str, str | list[str]] = {
     # 1,000-case suite off disk for every mutant -- and it is what the set is for.
     "ymsound": ["ym2151", "testrunner"],
     "ymsched": "machine",
+    # Five crates, and the breadth is the set's subject rather than laziness. The
+    # chip's rules are killed by unit tests in `oki`, the clamp counter and the mix
+    # by `machine`, the vector format and its runner by `testrunner`, the queueing
+    # by `sfemu`, and the sound panel's row count by `frontend`. Scored against any
+    # one of them most of the table would report SURVIVE for never having been
+    # compiled, which is the failure mode `ymsound`'s comment above describes.
+    "oki": ["oki", "machine", "testrunner", "sfemu", "frontend"],
 }
 
 # How long one mutant's test run may take before it is declared killed. The whole
@@ -2017,6 +2024,563 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
                 '            .field("bank", &0u8)',
                 "SURVIVE",
                 "crates/machine/src/sound.rs",
+            ),
+        ],
+    ),
+    # D3 Task 14: the OKI MSM6295 and everything the samples pass through on the way
+    # to a speaker -- the decoder, the command protocol, the vector format and its
+    # runner, the mix, the resampler, the host ring, the frontend's sound panel, and
+    # the save state's version. One set across five crates, for `ymsound`'s reason
+    # stated in `CRATES` above.
+    "oki": (
+        "crates/oki/src/chip.rs",
+        [
+            # --- The ADPCM decoder (`crates/oki/src/adpcm.rs`) ---
+            # One entry of the step table off by one. The table is a literal because
+            # Rust has no `const fn` float `pow`, so the only thing standing between a
+            # typo and 49 wrong step values is the test that rederives it in f64.
+            (
+                "steptable",
+                "88, 97,",
+                "87, 97,",
+                "KILL",
+                "crates/oki/src/adpcm.rs",
+            ),
+            # The largest step-index adjustment reduced from 8 to 7. A lone `F` from
+            # reset lands on step 8, so exactly one nibble sees this.
+            (
+                "stepshift",
+                "const INDEX_SHIFT: [i8; 8] = [-1, -1, -1, -1, 2, 4, 6, 8];",
+                "const INDEX_SHIFT: [i8; 8] = [-1, -1, -1, -1, 2, 4, 6, 7];",
+                "KILL",
+                "crates/oki/src/adpcm.rs",
+            ),
+            # The unconditional 1/8 term dropped, which is what makes nibble 0 not a
+            # no-op. Every even step value then produces 0, 4, 8 rather than 2, 6, 10.
+            (
+                "diffeighth",
+                "    let mut d = sv / 8;",
+                "    let mut d = 0;",
+                "KILL",
+                "crates/oki/src/adpcm.rs",
+            ),
+            # Bit 1 weighted at 1 rather than 1/2. Coarser than `diffeighth` and it
+            # tests the same claim from the other end: the weights are 1, 1/2, 1/4.
+            (
+                "diffsumfirst",
+                "        d += sv / 2;",
+                "        d += sv;",
+                "KILL",
+                "crates/oki/src/adpcm.rs",
+            ),
+            # The lower clamp one short of the two's-complement floor. Asymmetric by
+            # one, which is inaudible and wrong in 1,000 vector cases.
+            (
+                "signalclamp",
+                "pub const SIGNAL_MIN: i16 = -2048;",
+                "pub const SIGNAL_MIN: i16 = -2047;",
+                "KILL",
+                "crates/oki/src/adpcm.rs",
+            ),
+            # The step index floored at 1 instead of 0, so a decoder fed silence never
+            # returns to its smallest step. Killed by the reset test and by the suite.
+            (
+                "stepclamp",
+                "self.step = step.clamp(0, (STEPS - 1) as i32) as u8;",
+                "self.step = step.clamp(1, (STEPS - 1) as i32) as u8;",
+                "KILL",
+                "crates/oki/src/adpcm.rs",
+            ),
+            # --- The chip: nibble order, tracing, and the clamp report ---
+            # The `^ 4` dropped, so the *low* nibble is decoded first. Every sample
+            # pair is then swapped -- audible as a rasp, and exact in the suite.
+            (
+                "nibbleorder",
+                "let shift = ((voice.sample & 1) << 2) ^ 4;",
+                "let shift = (voice.sample & 1) << 2;",
+                "KILL",
+            ),
+            # The traced nibbles packed voice 3 first. The sample is unaffected, so
+            # only the trace's own test and the runner's nibble check can see it.
+            (
+                "nibblepack",
+                "nibbles |= u16::from(nibble) << (4 * i);",
+                "nibbles |= u16::from(nibble) << (4 * (3 - i));",
+                "KILL",
+            ),
+            # A non-playing voice contributing a nibble. `an_idle_chip_traces_no_nibbles`
+            # is the whole guard: the sample is still 0, so nothing else notices.
+            (
+                "nibbleidle",
+                "let mut nibbles = 0u16;",
+                "let mut nibbles = 0x000Fu16;",
+                "KILL",
+            ),
+            # The clamp report hardwired false, so the board's clip counter never moves.
+            (
+                "clampreport",
+                "(clamped, nibbles, clamped != sum)",
+                "(clamped, nibbles, false)",
+                "KILL",
+            ),
+            # The report re-derived from the output instead of from the comparison, which
+            # is the bug the three-value form exists to prevent: a sum landing exactly on
+            # the bound was not clipped, and the output alone cannot say so.
+            (
+                "clamponbound",
+                "clamped != sum",
+                "clamped.abs() == CLAMP_2X",
+                "KILL",
+            ),
+            # The counted form no longer returning the plain form's sample. The vector
+            # suite drives `step_2x_traced`, so only `the_three_step_forms_agree` compares
+            # the counted projection against the checked one.
+            (
+                "tracedrift",
+                "        let (sample, _, clamped) = self.step_all(rom);",
+                "        let (sample, _, clamped) = (0, 0, self.step_all(rom).2);",
+                "KILL",
+            ),
+            # --- The command protocol ---
+            # MAME's "fixes Got-cha and Steel Force" skip removed, so a start command
+            # restarts a voice that is already playing.
+            (
+                "voiceskip",
+                "                if voice.playing {\n                    continue;\n                }",
+                "                if false {\n                    continue;\n                }",
+                "KILL",
+            ),
+            # The stop mask shifted by four rather than three, so a stop hits the wrong
+            # voices -- or none.
+            (
+                "stopshift",
+                "let mask = command >> 3;",
+                "let mask = command >> 4;",
+                "KILL",
+            ),
+            # A degenerate phrase (start == stop) accepted rather than refused, which
+            # MAME logs and skips.
+            (
+                "startstop",
+                "if start < stop {",
+                "if start <= stop {",
+                "KILL",
+            ),
+            # The phrase one sample-pair short, so every voice stops two nibbles early.
+            (
+                "phrasecount",
+                "count: 2 * (stop - start + 1),",
+                "count: 2 * (stop - start),",
+                "KILL",
+            ),
+            # The phrase table's stride halved: every phrase reads another phrase's
+            # pointers. Nothing hand-written pins the stride; this is the suite's.
+            (
+                "phrasestride",
+                "let base = u32::from(phrase) * 8;",
+                "let base = u32::from(phrase) * 4;",
+                "KILL",
+            ),
+            # The chip's own clamp removed. Four loud voices then exceed +-1.0, which
+            # the real chip cannot do.
+            (
+                "chipclamp",
+                "pub const CLAMP_2X: i32 = 65_536;",
+                "pub const CLAMP_2X: i32 = i32::MAX;",
+                "KILL",
+            ),
+            # Volume index 9 no longer silent. The smallest audible wrong volume there
+            # is, and the only thing that sees it is the test that sums the energy.
+            (
+                "volindex9",
+                "0x02, 0, 0,",
+                "0x02, 1, 0,",
+                "KILL",
+            ),
+            # Every voice at half its volume: the mix is quiet rather than wrong-shaped,
+            # so this is the suite's exact-value check.
+            (
+                "volhalf",
+                "sum += i32::from(signal) * i32::from(voice.volume);",
+                "sum += i32::from(signal) * i32::from(voice.volume) / 2;",
+                "KILL",
+            ),
+            # The idle status byte's high nibble wrong by a bit. The Z80 polls this to
+            # find a free voice, so a wrong high nibble is a driver that never starts one.
+            (
+                "statusidle",
+                "pub const STATUS_IDLE: u8 = 0xF0;",
+                "pub const STATUS_IDLE: u8 = 0xE0;",
+                "KILL",
+            ),
+            # --- The board: pin 7, the rate, the mix, the hold, the clip counter ---
+            # The board constructed at the wrong divisor. Pin 7 starts *high* on CPS-1,
+            # and starting it low is a 25% pitch error in every sample the game plays.
+            (
+                "pin7default",
+                "            oki_pin7: true,",
+                "            oki_pin7: false,",
+                "KILL",
+                "crates/machine/src/sound.rs",
+            ),
+            # The pin read from bit 1 rather than bit 0 of the 0xF006 write.
+            (
+                "pin7bit",
+                "0xF006 => self.oki_pin7 = val & 0x01 != 0,",
+                "0xF006 => self.oki_pin7 = val & 0x02 != 0,",
+                "KILL",
+                "crates/machine/src/sound.rs",
+            ),
+            # The fast ratio's numerator off by one. Inaudible per sample and a
+            # divergence that accumulates over a session, which is why the constant is
+            # derived from the two clocks rather than measured.
+            (
+                "okiratio",
+                "pub const OKI_PER_YM_NUM_PIN7_HIGH: u32 = 3_200_000;",
+                "pub const OKI_PER_YM_NUM_PIN7_HIGH: u32 = 3_200_001;",
+                "KILL",
+                "crates/machine/src/timing.rs",
+            ),
+            # The OKI's clocks per scanline off by one, so it no longer divides exactly.
+            (
+                "okiclocks",
+                "pub const OKI_CLOCKS_PER_LINE: u32 = 64;",
+                "pub const OKI_CLOCKS_PER_LINE: u32 = 65;",
+                "KILL",
+                "crates/machine/src/timing.rs",
+            ),
+            # MAME's YM weight reduced from 7 to 6: the FM is quiet against the samples.
+            (
+                "mixym",
+                "let numerator = 7 * (i32::from(ym_l) + i32::from(ym_r)) + 3 * oki_2x;",
+                "let numerator = 6 * (i32::from(ym_l) + i32::from(ym_r)) + 3 * oki_2x;",
+                "KILL",
+                "crates/machine/src/cps1.rs",
+            ),
+            # The OKI weight doubled, the same error the other way round.
+            (
+                "mixoki",
+                "let numerator = 7 * (i32::from(ym_l) + i32::from(ym_r)) + 3 * oki_2x;",
+                "let numerator = 7 * (i32::from(ym_l) + i32::from(ym_r)) + 6 * oki_2x;",
+                "KILL",
+                "crates/machine/src/cps1.rs",
+            ),
+            # The divisor halved, which doubles the mix and takes it past `i16` -- the
+            # saturation test is exactly the claim that the weights sum to the divisor.
+            (
+                "mixdiv",
+                "(numerator / 20) as i16",
+                "(numerator / 10) as i16",
+                "KILL",
+                "crates/machine/src/cps1.rs",
+            ),
+            # The rate accumulator rebuilt from scratch on every YM tick rather than
+            # carrying its remainder. This one **survived** when it was first written,
+            # because every other test leaves pin 7 at its power-up value and never
+            # writes 0xF006 mid-run -- see `a_pin_seven_write_does_not_move_the_okis_phase`,
+            # which exists because of it.
+            (
+                "okiaccswap",
+                "self.oki_acc = RationalAccumulator::with_remainder(num, den, self.oki_acc.remainder());",
+                "self.oki_acc = RationalAccumulator::new(num, den);",
+                "KILL",
+                "crates/machine/src/cps1.rs",
+            ),
+            # The sample-and-hold removed: the chip's level is discarded, so the mix
+            # hears silence between the chip's own steps. The OKI runs at one step per
+            # ~7 YM ticks, so this is 6 zeros in every 7 samples.
+            (
+                "okihold",
+                "                self.oki_last = self.sound.oki_step_2x();",
+                "                let _ = self.sound.oki_step_2x();",
+                "KILL",
+                "crates/machine/src/cps1.rs",
+            ),
+            # The clip counter incremented by zero. Killed only by a test that asserts
+            # the *count*, not `> 0`.
+            (
+                "okiclampcount",
+                "self.trace.oki_clamps = self.trace.oki_clamps.saturating_add(1);",
+                "self.trace.oki_clamps = self.trace.oki_clamps.saturating_add(0);",
+                "KILL",
+                "crates/machine/src/sound.rs",
+            ),
+            # Every sample counted as a clip, which makes the panel's CLP row a sample
+            # counter and useless as a "why does it sound wrong" signal.
+            (
+                "okiclampalways",
+                "        if clamped {",
+                "        if true {",
+                "KILL",
+                "crates/machine/src/sound.rs",
+            ),
+            # --- The vector format and its runner (`testrunner`) ---
+            # The recorded nibbles parsed as zero while still consuming their bytes, so
+            # the format stays self-consistent and every case's nibble check compares
+            # against 0.
+            (
+                "fmtnibbles",
+                "            let nibbles = r.u16()?;",
+                "            let nibbles = 0;\n            let _ = r.u16()?;",
+                "KILL",
+                "crates/testrunner/src/okifmt.rs",
+            ),
+            # The per-sample record two bytes short in the bounds check, so a truncated
+            # file is read past its end rather than reported.
+            (
+                "fmtcasesize",
+                "let need = writes_len * 3 + rom_len + samples_len * 8;",
+                "let need = writes_len * 3 + rom_len + samples_len * 6;",
+                "KILL",
+                "crates/testrunner/src/okifmt.rs",
+            ),
+            # The runner's nibble check deleted. The suite still passes 1,000/1,000 on a
+            # correct core, which is precisely why the corruption test has a Nibbles arm.
+            (
+                "runnernibbles",
+                """        if got_nibbles != want.nibbles {
+            return fail(
+                Field::Nibbles,
+                i64::from(want.nibbles),
+                i64::from(got_nibbles),
+            );
+        }
+        if got_mono != want.mono_2x {
+            return fail(Field::Mono, i64::from(want.mono_2x), i64::from(got_mono));
+        }
+""",
+                """        if got_mono != want.mono_2x {
+            return fail(Field::Mono, i64::from(want.mono_2x), i64::from(got_mono));
+        }
+""",
+                "KILL",
+                "crates/testrunner/src/okirunner.rs",
+            ),
+            # CONTROL, and one whose verdict is the finding rather than the tally: the
+            # two checks swapped, so a divergence in both fields is *reported* as Mono
+            # rather than as Nibbles. No case can fail that did not fail before, and a
+            # corruption test that mutates one field at a time still gets its own field
+            # named. Expect SURVIVE -- a KILL means some test over-specifies which field
+            # a divergence is blamed on, which is a test to fix, not a mutant to drop.
+            (
+                "runnerorder",
+                """        if got_nibbles != want.nibbles {
+            return fail(
+                Field::Nibbles,
+                i64::from(want.nibbles),
+                i64::from(got_nibbles),
+            );
+        }
+        if got_mono != want.mono_2x {
+            return fail(Field::Mono, i64::from(want.mono_2x), i64::from(got_mono));
+        }
+""",
+                """        if got_mono != want.mono_2x {
+            return fail(Field::Mono, i64::from(want.mono_2x), i64::from(got_mono));
+        }
+        if got_nibbles != want.nibbles {
+            return fail(
+                Field::Nibbles,
+                i64::from(want.nibbles),
+                i64::from(got_nibbles),
+            );
+        }
+""",
+                "SURVIVE",
+                "crates/testrunner/src/okirunner.rs",
+            ),
+            # --- The host side: the loop, the resampler, the ring (`sfemu`, `machine`) ---
+            # Every frame's samples queued twice, which is a doubled rate and a ring that
+            # overflows on every tick. A test asserting only "something was queued"
+            # cannot see it.
+            (
+                "queueonce",
+                """            if let Err(e) = audio.queue(&samples) {
+                note(&mut summary, format!("audio: {e}"));
+            }
+""",
+                """            if let Err(e) = audio.queue(&samples) {
+                note(&mut summary, format!("audio: {e}"));
+            }
+            let _ = audio.queue(&samples);
+""",
+                "KILL",
+                "crates/sfemu/src/loop_.rs",
+            ),
+            # The YM's own divider dropped from the ratio, so the resampler thinks the
+            # board runs at 8 MHz and resamples by 167:1.
+            (
+                "resratio",
+                "(SOUND_XTAL, self.host_rate * YM_SAMPLE_CLOCKS)",
+                "(SOUND_XTAL, self.host_rate)",
+                "KILL",
+                "crates/machine/src/resample.rs",
+            ),
+            # The fractional phase reset per input sample rather than carried, so every
+            # frame boundary is a seam.
+            (
+                "resphase",
+                "self.pos -= den;",
+                "self.pos = 0;",
+                "KILL",
+                "crates/machine/src/resample.rs",
+            ),
+            # Sample-and-hold instead of linear interpolation. **Read this verdict
+            # individually**: nearest-below is still monotonic on a ramp and still
+            # constant on a constant, so a SURVIVE here means the resampler's
+            # interpolation is untested and the killer is missing -- not that the mutant
+            # is equivalent.
+            (
+                "resinterp",
+                "out.push(((a * (d - t) + b * t) / d) as i16);",
+                "out.push(a as i16);",
+                "KILL",
+                "crates/machine/src/resample.rs",
+            ),
+            # The ring halved, below the measured depth swing, so the recorded cadences
+            # start dropping.
+            (
+                "ringcap",
+                "pub const RING_MS: u32 = 100;",
+                "pub const RING_MS: u32 = 50;",
+                "KILL",
+                "crates/machine/src/resample.rs",
+            ),
+            # The prefill removed, so the device's first callback runs on a nearly-empty
+            # ring and underruns immediately.
+            (
+                "ringprefill",
+                "pub const PREFILL_MS: u32 = 50;",
+                "pub const PREFILL_MS: u32 = 0;",
+                "KILL",
+                "crates/machine/src/resample.rs",
+            ),
+            # The armed flag never set, so the ring prefills forever and outputs silence
+            # for the whole session.
+            (
+                "ringarm",
+                "            self.armed = true;",
+                "            self.armed = false;",
+                "KILL",
+                "crates/machine/src/resample.rs",
+            ),
+            # The flag made un-sticky: the ring re-prefills whenever it empties, which is
+            # 50 ms of silence after every stutter rather than one held sample. This is
+            # the failure mode the sticky flag exists for, so it needs its own mutant
+            # rather than only the initialiser's.
+            (
+                "ringrearm",
+                """                self.stats.underruns = self.stats.underruns.saturating_add(1);
+            }
+        }
+    }
+""",
+                """                self.stats.underruns = self.stats.underruns.saturating_add(1);
+            }
+        }
+        if self.buf.is_empty() {
+            self.armed = false;
+        }
+    }
+""",
+                "KILL",
+                "crates/machine/src/resample.rs",
+            ),
+            # Overflow dropping the newest sample instead of the oldest: the audio the
+            # player is about to hear is thrown away in favour of audio they should
+            # already have heard.
+            (
+                "ringdropnewest",
+                "                self.buf.pop_front();",
+                "                self.buf.pop_back();",
+                "KILL",
+                "crates/machine/src/resample.rs",
+            ),
+            # The bound removed entirely, so the ring grows and latency rises for as long
+            # as the emulator runs ahead. No click, and unbounded delay.
+            (
+                "ringdropgrow",
+                """            if self.buf.len() >= self.capacity {
+                self.buf.pop_front();
+                self.stats.drops = self.stats.drops.saturating_add(1);
+            }
+""",
+                "",
+                "KILL",
+                "crates/machine/src/resample.rs",
+            ),
+            # An underrun zeroed rather than held, which is a click where the policy says
+            # a DC excursion the device filters out.
+            (
+                "ringholdzero",
+                "*slot = self.last;",
+                "*slot = 0;",
+                "KILL",
+                "crates/machine/src/resample.rs",
+            ),
+            # The paused arm deleted, so a paused emulator accrues an underrun per sample
+            # and the counter stops meaning "your machine cannot keep up".
+            (
+                "ringpaused",
+                """            } else if paused {
+                *slot = 0;
+            } else {
+""",
+                "            } else {\n",
+                "KILL",
+                "crates/machine/src/resample.rs",
+            ),
+            # --- The panel and the save state (`frontend`) ---
+            # The sound panel's header one row short of what it draws.
+            (
+                "sndheadrows",
+                "const SND_HEAD_ROWS: usize = 11;",
+                "const SND_HEAD_ROWS: usize = 10;",
+                "KILL",
+                "crates/frontend/src/overlay.rs",
+            ),
+            # The CLP/DRP/UND row deleted, so the panel cannot answer "why does it sound
+            # wrong" and 11 rows no longer describes what is drawn.
+            (
+                "overlaystats",
+                """    line(
+        buf,
+        &mut row,
+        &format!(
+            "CLP {:06} DRP {:06} UND {:06}",
+            m.sound_trace().oki_clamps,
+            m.sound_trace().audio_drops,
+            m.sound_trace().audio_underruns
+        ),
+        FG,
+    );
+""",
+                "",
+                "KILL",
+                "crates/frontend/src/overlay.rs",
+            ),
+            # The save-state version left behind after the payload grew, so an old state
+            # loads into a struct that no longer matches it.
+            (
+                "stateversion",
+                "pub const VERSION: u8 = 3;",
+                "pub const VERSION: u8 = 2;",
+                "KILL",
+                "crates/frontend/src/state.rs",
+            ),
+            # CONTROL, and the load-bearing one: a doc comment on a private constant,
+            # wrong about the address bus width. Nothing compiles differently and no test
+            # reads the prose, so it must SURVIVE -- a pass where everything dies is more
+            # likely a broken harness than a thorough suite.
+            #
+            # Checked for overlap with every other mutant in this set: no other row edits
+            # this line, and `ADDRESS_MASK` itself is untouched, so a KILL here would mean
+            # the harness is scoring something other than what it applied.
+            (
+                "CONTROL-okidoc",
+                "/// The sample ROM address bus is 18 bits",
+                "/// The sample ROM address bus is 19 bits",
+                "SURVIVE",
             ),
         ],
     ),
