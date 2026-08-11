@@ -65,6 +65,48 @@ pub const Z80_T_DEN: u32 = 3_125;
 /// sample in the wrong place, and nothing else here would notice.
 pub const YM_SAMPLE_CLOCKS: u32 = 64;
 
+/// The MSM6295's crystal on CPS-1: 1 MHz.
+pub const OKI_XTAL: u32 = 1_000_000;
+
+/// OKI input clocks in one scanline.
+///
+/// Unlike the Z80's, this divides exactly: `1_000_000 / 15_625 = 64` with no
+/// remainder. See `the_oki_clock_divides_into_a_scanline_exactly`.
+pub const OKI_CLOCKS_PER_LINE: u32 = 64;
+
+/// The MSM6295 divides its clock by 132 with pin 7 high (`okim6295.cpp`).
+pub const OKI_DIV_PIN7_HIGH: u32 = 132;
+
+/// ...and by 165 with pin 7 low.
+pub const OKI_DIV_PIN7_LOW: u32 = 165;
+
+/// The denominator both pin-7 ratios share.
+///
+/// A shared denominator makes a pin-7 write a numerator swap: the remainder
+/// already carried keeps its units, so the phase does not jump.
+pub const OKI_PER_YM_DEN: u32 = 23_624_997;
+
+/// OKI samples per YM sample with pin 7 high.
+pub const OKI_PER_YM_NUM_PIN7_HIGH: u32 = 3_200_000;
+
+/// OKI samples per YM sample with pin 7 low.
+pub const OKI_PER_YM_NUM_PIN7_LOW: u32 = 2_560_000;
+
+/// The OKI-samples-per-YM-sample ratio for a pin-7 state.
+///
+/// The mix is driven off the YM tick because both rates are **under one sample
+/// per scanline** — 16/33 and 64/165 — so a per-line loop could not place them.
+/// See `there_is_less_than_one_oki_sample_per_scanline`.
+#[must_use]
+pub const fn oki_per_ym(pin7: bool) -> (u32, u32) {
+    let num = if pin7 {
+        OKI_PER_YM_NUM_PIN7_HIGH
+    } else {
+        OKI_PER_YM_NUM_PIN7_LOW
+    };
+    (num, OKI_PER_YM_DEN)
+}
+
 /// Hands out `num / den` units per step without drifting.
 ///
 /// Integer only: the remainder carries between steps, so the total after `den` steps
@@ -540,5 +582,202 @@ mod tests {
             (7, 2),
             "and a carried remainder does not change it"
         );
+    }
+
+    /// The OKI's clock *does* divide into a scanline, exactly -- unlike the
+    /// Z80's. Asserted from the pixel clock and the horizontal total, not from
+    /// a restatement of the constant.
+    #[test]
+    fn the_oki_clock_divides_into_a_scanline_exactly() {
+        let lines_per_second = PIXEL_CLOCK / HTOTAL;
+        assert_eq!(lines_per_second, 15_625, "8 MHz over 512 pixels");
+        assert_eq!(OKI_XTAL % lines_per_second, 0, "no remainder to carry");
+        assert_eq!(OKI_XTAL / lines_per_second, OKI_CLOCKS_PER_LINE);
+    }
+
+    /// The sample-rate ratio, asserted through its derivation.
+    ///
+    /// `assert_eq!(NUM / DEN, NUM / DEN)` passes for every value including
+    /// wrong ones, so instead: cross-multiply the ratio against the two
+    /// independently-derived quantities that define it -- the OKI divisor and
+    /// the Z80's own T-states-per-line ratio. Both sides come to
+    /// 302,399,961,600,000 for each divisor, and the two divisors reaching the
+    /// same total is not a coincidence to be tidied away: the ratios differ by
+    /// exactly 165:132, so the products cannot differ.
+    #[test]
+    fn the_oki_to_ym_ratio_is_what_the_two_clocks_imply() {
+        for (pin7, div) in [(true, OKI_DIV_PIN7_HIGH), (false, OKI_DIV_PIN7_LOW)] {
+            let (num, den) = oki_per_ym(pin7);
+            let lhs = u64::from(num) * u64::from(div) * u64::from(Z80_T_NUM);
+            let rhs = u64::from(den)
+                * u64::from(OKI_CLOCKS_PER_LINE)
+                * u64::from(Z80_T_DEN)
+                * u64::from(YM_SAMPLE_CLOCKS);
+            assert_eq!(
+                lhs, rhs,
+                "pin7 {pin7}: the ratio does not follow from the clocks"
+            );
+            assert_eq!(lhs, 302_399_961_600_000, "pin7 {pin7}");
+        }
+    }
+
+    /// The ratio also follows from the crystals alone, with no board constant
+    /// on the expected side.
+    ///
+    /// The test above cross-multiplies against `OKI_CLOCKS_PER_LINE` and the
+    /// Z80's T-state ratio, both of which are this module's own constants. This
+    /// one goes back to the two crystals and the two divisors: the OKI's sample
+    /// rate is `OKI_XTAL / div` and the YM's is `SOUND_XTAL /
+    /// YM_SAMPLE_CLOCKS`, so `num / den` must equal
+    /// `OKI_XTAL * YM_SAMPLE_CLOCKS / (div * SOUND_XTAL)`. A ratio that was
+    /// internally consistent with a wrong `OKI_CLOCKS_PER_LINE` fails here.
+    #[test]
+    fn the_ratio_follows_from_the_crystals_alone() {
+        for (pin7, div) in [(true, OKI_DIV_PIN7_HIGH), (false, OKI_DIV_PIN7_LOW)] {
+            let (num, den) = oki_per_ym(pin7);
+            assert_eq!(
+                u64::from(num) * u64::from(div) * u64::from(SOUND_XTAL),
+                u64::from(den) * u64::from(OKI_XTAL) * u64::from(YM_SAMPLE_CLOCKS),
+                "pin7 {pin7}"
+            );
+            // And the fraction is in lowest terms, so the accumulator's period
+            // is as short as the arithmetic allows.
+            let gcd = |mut a: u32, mut b: u32| {
+                while b != 0 {
+                    (a, b) = (b, a % b);
+                }
+                a
+            };
+            assert_eq!(gcd(num, den), 1, "pin7 {pin7}: {num}/{den} is reducible");
+        }
+    }
+
+    /// The two ratios share a denominator, which is what makes a pin-7 write a
+    /// numerator swap that keeps the carried remainder's units.
+    #[test]
+    fn both_pin_seven_states_share_a_denominator() {
+        let (hi_num, hi_den) = oki_per_ym(true);
+        let (lo_num, lo_den) = oki_per_ym(false);
+        assert_eq!(hi_den, lo_den);
+        assert_eq!(hi_den, OKI_PER_YM_DEN);
+        // Pin 7 high is the faster rate, by exactly the divisor ratio 165:132.
+        assert_eq!(
+            u64::from(hi_num) * u64::from(OKI_DIV_PIN7_HIGH),
+            u64::from(lo_num) * u64::from(OKI_DIV_PIN7_LOW)
+        );
+        assert!(hi_num > lo_num);
+    }
+
+    /// The display rates, derived rather than restated.
+    #[test]
+    fn the_sample_rates_round_to_the_documented_hertz() {
+        // (OKI_XTAL + div/2) / div: round-half-up in integers.
+        let round = |div: u32| (OKI_XTAL + div / 2) / div;
+        assert_eq!(round(OKI_DIV_PIN7_HIGH), 7576);
+        assert_eq!(round(OKI_DIV_PIN7_LOW), 6061);
+        // And the exact rates are 250000/33 and 200000/33.
+        assert_eq!(OKI_XTAL * 33, 250_000 * OKI_DIV_PIN7_HIGH);
+        assert_eq!(OKI_XTAL * 33, 200_000 * OKI_DIV_PIN7_LOW);
+    }
+
+    /// Fewer than one OKI sample per scanline at either rate. This is the fact
+    /// that rules out mixing per line.
+    ///
+    /// The exact fractions are 16/33 and 64/165 samples per line, asserted
+    /// against the crystal and the line rate rather than against
+    /// `OKI_CLOCKS_PER_LINE`. The form `CPL * 165 == 64 * DIV_LOW` also fails
+    /// when either constant moves, so it is not vacuous -- but its literals 64
+    /// and 165 *are* the two constants, so it reads as a restatement, and it
+    /// cannot distinguish a wrong `OKI_CLOCKS_PER_LINE` from a wrong divisor.
+    /// Going back to `OKI_XTAL` and the line rate leaves the scanline division
+    /// to the test that owns it, above.
+    #[test]
+    fn there_is_less_than_one_oki_sample_per_scanline() {
+        let lines_per_second = PIXEL_CLOCK / HTOTAL;
+        for div in [OKI_DIV_PIN7_HIGH, OKI_DIV_PIN7_LOW] {
+            let rate = OKI_XTAL / div; // truncating, so a floor
+            assert!(
+                rate < lines_per_second,
+                "div {div}: {rate} >= {lines_per_second}"
+            );
+        }
+        // samples/line = OKI_XTAL / (div * lines_per_second), cross-multiplied
+        // against the literal fractions.
+        assert_eq!(
+            u64::from(OKI_XTAL) * 33,
+            16 * u64::from(OKI_DIV_PIN7_HIGH) * u64::from(lines_per_second)
+        );
+        assert_eq!(
+            u64::from(OKI_XTAL) * 165,
+            64 * u64::from(OKI_DIV_PIN7_LOW) * u64::from(lines_per_second)
+        );
+    }
+
+    /// The accumulator at the OKI's ratio emits the count the crystals imply.
+    ///
+    /// # The expectation comes from the clocks, not from the ratio under test
+    ///
+    /// The obvious form of this test is `want = num * STEPS / den` for the same
+    /// `(num, den)` the accumulator was given. That cannot fail: measured, it
+    /// passes for a doubled numerator, a halved one, a numerator off by 1,000,
+    /// and the two pin-7 numerators swapped -- every mutation this test exists
+    /// to catch, because both sides move together.
+    ///
+    /// So `want` is computed from the two crystals and the divisor:
+    /// `STEPS * OKI_XTAL * YM_SAMPLE_CLOCKS / (div * SOUND_XTAL)`. Measured
+    /// against that expectation, the swapped numerators are out by 2,709 and
+    /// the off-by-1,000 numerator by 5.
+    ///
+    /// The tolerance is one sample, for the truncation at each end of a window
+    /// that is not a whole period -- a full period is 23,624,997 steps.
+    #[test]
+    fn the_accumulator_emits_the_ratio_over_its_full_period() {
+        const STEPS: u32 = 100_000;
+        for (pin7, div) in [(true, OKI_DIV_PIN7_HIGH), (false, OKI_DIV_PIN7_LOW)] {
+            let (num, den) = oki_per_ym(pin7);
+            let mut acc = RationalAccumulator::new(num, den);
+            let emitted: u64 = (0..STEPS).map(|_| u64::from(acc.advance())).sum();
+            let want = u64::from(STEPS) * u64::from(OKI_XTAL) * u64::from(YM_SAMPLE_CLOCKS)
+                / (u64::from(div) * u64::from(SOUND_XTAL));
+            assert!(
+                emitted.abs_diff(want) <= 1,
+                "pin7 {pin7}: {emitted} emitted over {STEPS}, the clocks imply {want}"
+            );
+        }
+    }
+
+    /// The fraction is *carried*, not dropped: the remainder after a window is
+    /// the exact one the arithmetic implies.
+    ///
+    /// The count test above tolerates one sample, which is what lets it accept
+    /// an accumulator that truncates the last partial step. This does not: the
+    /// remainder is the accumulated fraction itself, and an implementation that
+    /// zeroed it, saturated it, or carried it in the wrong direction lands on a
+    /// different value even when the emitted count is within tolerance.
+    ///
+    /// The expected remainders -- 23,040,632 and 23,157,505 -- are
+    /// `num * STEPS % den`, measured. Both are close to `den`, so this window
+    /// also happens to end one step short of an emission, which is the state a
+    /// save/restore has to preserve exactly.
+    #[test]
+    fn the_accumulator_carries_the_okis_fraction_rather_than_dropping_it() {
+        const STEPS: u32 = 100_000;
+        for (pin7, want_rem) in [(true, 23_040_632u32), (false, 23_157_505)] {
+            let (num, den) = oki_per_ym(pin7);
+            let mut acc = RationalAccumulator::new(num, den);
+            for _ in 0..STEPS {
+                acc.advance();
+            }
+            assert_eq!(
+                u64::from(want_rem),
+                u64::from(num) * u64::from(STEPS) % u64::from(den),
+                "pin7 {pin7}: the expected remainder is not what the ratio implies"
+            );
+            assert_eq!(acc.remainder(), want_rem, "pin7 {pin7}");
+            assert!(
+                want_rem < den,
+                "a remainder at or above den is a whole unit"
+            );
+        }
     }
 }
