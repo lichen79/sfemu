@@ -15,6 +15,7 @@
 pub mod binfmt;
 pub mod okifiles;
 pub mod okifmt;
+pub mod okirunner;
 pub mod runner;
 pub mod testbus;
 pub mod ymfiles;
