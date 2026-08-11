@@ -188,10 +188,22 @@ fn run(args: Vec<String>) -> Result<String, Fault> {
         .region("gfx")
         .ok_or_else(|| Fault::Failed("internal: the sf2 spec has no `gfx` region".to_string()))?
         .to_vec();
+    // The sound region, on the same terms and for a sharper reason: an absent one is
+    // not silence, it is 0xFF on every fetch, which is `RST 38h` — a Z80 spinning in a
+    // deterministic loop that racks up a *larger* fetch count than a real driver. The
+    // debugger's sound panel would show that loop, and it would look like a working
+    // panel on a broken driver rather than a machine built without a sound ROM.
+    let audiocpu = set
+        .region("audiocpu")
+        .ok_or_else(|| {
+            Fault::Failed("internal: the sf2 spec has no `audiocpu` region".to_string())
+        })?
+        .to_vec();
 
-    let mut m = machine::Cps1::with_gfx(
+    let mut m = machine::Cps1::with_sound(
         prog,
         gfx,
+        audiocpu,
         machine::BoardConfig::sf2(),
         machine::Timing::cps1_10mhz(),
     );

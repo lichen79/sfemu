@@ -316,8 +316,7 @@ impl Cps1 {
             // instruction.
             self.z80_debt += i64::from(self.z80_carry.advance());
             while self.z80_debt > 0 {
-                let t = self.step_sound();
-                self.z80_debt -= i64::from(t);
+                self.step_sound();
             }
             // One sample per scanline, taken after the line has run so the PC is where
             // the program got to rather than where it started.
@@ -355,6 +354,12 @@ impl Cps1 {
     ///   instruction runs instead.
     /// - **Samples are accrued from T-states actually spent**, so the sample rate is
     ///   locked to the Z80 rather than drifting against it.
+    /// - **The debt is charged in here, not by the caller.** It was the caller's until
+    ///   [`Cps1::step_sound_instruction`] became the second caller: a stepping path
+    ///   that spent T-states beside the line's budget instead of against it breaks
+    ///   the identity `a_scanline_advances_the_z80_by_its_share_of_the_line` asserts —
+    ///   granted equals spent plus debt — and the symptom is a sound CPU that runs
+    ///   fast in proportion to how much the user stepped it.
     fn step_sound(&mut self) -> u32 {
         self.sound.set_latch(0, self.board.sound_latch[0]);
         self.sound.set_latch(1, self.board.sound_latch[1]);
@@ -363,6 +368,7 @@ impl Cps1 {
         if t == 0 {
             t = self.z80.step(&mut self.sound);
         }
+        self.z80_debt -= i64::from(t);
         self.z80_total += u64::from(t);
         self.sample_acc += t;
         while self.sample_acc >= YM_SAMPLE_CLOCKS {
@@ -372,6 +378,44 @@ impl Cps1 {
             self.samples.push(one[0]);
         }
         t
+    }
+
+    /// Runs exactly one Z80 instruction, returning the T-states it consumed.
+    ///
+    /// The debugger's stepping primitive for the sound board, and **the same code
+    /// path the scheduler runs** — `step_sound` is that path (a plain code span: it is
+    /// private, so a rustdoc link to it fails this crate's
+    /// `deny(rustdoc::private_intra_doc_links)`), and this is a
+    /// public door onto it rather than a second copy. `step_instruction`'s own note
+    /// says why: "a separate stepping path is a debugger that single-steps a machine
+    /// subtly unlike the one that runs", and `stepping_and_running_produce_the_same_samples`
+    /// is what would catch a copy that drifted.
+    ///
+    /// The T-states are spent against the current line's budget, so stepping the Z80
+    /// leaves less for the scheduler to grant and the two never double-count. That
+    /// means a user who steps the sound CPU through a long routine has borrowed from
+    /// future lines and the Z80 will idle until the debt is repaid — which is the
+    /// honest behaviour: the alternative is a sound CPU that runs faster the more it
+    /// is single-stepped.
+    ///
+    /// A `service`d interrupt costs its own T-states and no instruction runs, so this
+    /// can return without the PC having moved anywhere the user expects — the same
+    /// thing that happens on real hardware, and visible in the panel as the jump to
+    /// the handler.
+    pub fn step_sound_instruction(&mut self) -> u32 {
+        self.step_sound()
+    }
+
+    /// What the sound board has seen.
+    ///
+    /// Not machine state and not part of a save state, and — like [`crate::Trace`] —
+    /// **not cleared by [`Cps1::reset`]**: it is an instrument attached to the
+    /// machine, and a driver that resets mid-run wants to keep what it has already
+    /// observed. See [`crate::sound::SoundTrace`]. It is what `tests/sound_boot.rs`
+    /// reads, and the debugger's sound panel shows two of its counters.
+    #[must_use]
+    pub const fn sound_trace(&self) -> crate::sound::SoundTrace {
+        self.sound.trace()
     }
 
     /// Runs one scanline's worth of CPU, returning the cycles actually consumed.
@@ -1623,9 +1667,15 @@ mod tests {
     ///
     /// The two whole-value comparisons at the end are a stronger net than the samples:
     /// `SoundBoard` derives `PartialEq`, so they cover every register, envelope, phase
-    /// counter and timer. They are legitimate here because the fixture touches neither
-    /// the OKI nor an I/O port, so the two diagnostic counters `restore` deliberately
-    /// leaves alone are zero on both machines.
+    /// counter and timer.
+    ///
+    /// ⚠️ **They need [`crate::sound::SoundBoard::clear_trace`] first**, because the
+    /// derived eq covers the [`crate::sound::SoundTrace`] and `restore` deliberately
+    /// leaves it alone: `a` has been running since its own reset while `b` started
+    /// from a snapshot, so `b`'s fetch count is short by exactly the 600 lines it never
+    /// ran. Measured, when the counters were added: 127,638 fetches against 98,183.
+    /// Zeroing both is the exclusion made visible at the call site — the counters are
+    /// the session, not the machine, and this test is about the machine.
     #[test]
     fn a_save_state_round_trips_the_sound_board() {
         on_a_big_stack(|| {
@@ -1655,6 +1705,17 @@ mod tests {
                 "a restored machine must produce the same audio as the original"
             );
             assert_eq!(a.z80, b.z80, "and the same CPU state");
+            // The counters differ by construction and are not state — see the doc
+            // above. Asserted before zeroing so the premise stays checked: if they
+            // ever *did* agree, the exclusion below would be hiding nothing and this
+            // whole paragraph would be stale.
+            assert_ne!(
+                a.sound_trace(),
+                b.sound_trace(),
+                "the premise: b never ran a's first 600 lines, so its counters are short"
+            );
+            a.sound.clear_trace();
+            b.sound.clear_trace();
             assert_eq!(a.sound, b.sound, "and the same board, chip included");
             assert_eq!(a.z80_cycles(), b.z80_cycles());
             assert_eq!(a.z80_carry_remainder(), b.z80_carry_remainder());
@@ -1837,6 +1898,137 @@ mod tests {
             // Bank 1 is a different window on the ROM, which is what makes the bank
             // more than a stored byte.
             assert_eq!(b.sound.read(0x8000), a.sound.read(0x8000));
+        });
+    }
+
+    /// Single-stepping the Z80 advances exactly one instruction and no more.
+    ///
+    /// Three claims beyond "the PC moved", each of which a plausible stepping path
+    /// gets wrong:
+    ///
+    /// - **The T-states are billed.** A path that ran the instruction without adding
+    ///   its cost to [`Cps1::z80_cycles`] would make the debugger's machine run the
+    ///   sound CPU for free.
+    /// - **They reach the sample accumulator.** One instruction is less than a
+    ///   sample, so the observable is the accumulator rather than a sample; the long
+    ///   version of this claim is
+    ///   `stepping_and_running_produce_the_same_samples`.
+    /// - **They are spent against the line's budget**, so `z80_debt` goes into
+    ///   deficit by exactly what was stepped. A stepping path that spent beside the
+    ///   budget instead of against it breaks the identity
+    ///   `a_scanline_advances_the_z80_by_its_share_of_the_line` asserts — granted
+    ///   equals spent plus debt — and the symptom is a Z80 that runs fast in
+    ///   proportion to how much the user stepped it.
+    #[test]
+    fn stepping_the_sound_cpu_advances_one_instruction() {
+        on_a_big_stack(|| {
+            let mut m = sound_machine();
+            let before = m.z80_cycles();
+            let pc = m.z80.pc;
+            let t = m.step_sound_instruction();
+            assert!(t >= 4, "every Z80 instruction costs at least 4 T: {t}");
+            assert_eq!(u64::from(t), m.z80_cycles() - before, "and it was billed");
+            assert_ne!(m.z80.pc, pc, "and the PC moved");
+            assert!(
+                t < YM_SAMPLE_CLOCKS,
+                "the premise: one instruction is less than a sample's 64 T"
+            );
+            let s = m.snapshot();
+            assert_eq!(s.sample_acc, t, "its T-states went into the accumulator");
+            assert!(m.samples().is_empty(), "which is not yet a whole sample");
+            assert_eq!(
+                s.z80_debt,
+                -i64::from(t),
+                "and they were spent against the line's budget, not beside it"
+            );
+        });
+    }
+
+    /// Single-stepping generates samples on the same schedule as running does.
+    ///
+    /// **This is what makes the debugger's machine the same machine.** A stepping
+    /// path that skipped the sample accumulator would let a user step through the
+    /// sound driver and hear nothing, then wonder which of the two was lying. Run one
+    /// machine by scanline and step another instruction-by-instruction over the same
+    /// T-state span; the samples must match exactly.
+    ///
+    /// [`ym_patch`] on both, and the non-silence assertion, are what make the
+    /// comparison able to fail: [`sound_machine`] alone produces 717 samples of
+    /// digital silence over this span, and two buffers of zeros compare equal for a
+    /// stepping path that generates samples from the wrong clock, from no clock, or
+    /// from a chip it forgot to advance.
+    ///
+    /// The stepping machine never runs its 68000, which is legitimate only because
+    /// [`sound_machine`]'s program never writes the sound latch —
+    /// [`latching_machine`] is the fixture for the interleave, and this one is the
+    /// fixture for the schedule.
+    #[test]
+    fn stepping_and_running_produce_the_same_samples() {
+        on_a_big_stack(|| {
+            let mut running = sound_machine();
+            let mut stepping = sound_machine();
+            ym_patch(&mut running);
+            ym_patch(&mut stepping);
+            for _ in 0..200 {
+                running.run_scanline();
+            }
+            let target = running.z80_cycles();
+            while stepping.z80_cycles() < target {
+                stepping.step_sound_instruction();
+            }
+            // The stepping machine may overshoot by one instruction, so compare the
+            // prefix they both cover rather than the whole buffer.
+            let n = running.samples().len().min(stepping.samples().len());
+            assert!(n > 100, "there are samples to compare: {n}");
+            assert!(
+                running.samples()[..n]
+                    .iter()
+                    .any(|&(l, r)| l != 0 || r != 0),
+                "and they are not silence, so there is something to lose"
+            );
+            assert_eq!(&running.samples()[..n], &stepping.samples()[..n]);
+        });
+    }
+
+    /// The trace counters count, and start at zero.
+    ///
+    /// The counters are the real-ROM test's only instrument, so "it counts at all" is
+    /// worth pinning here where the ROM is this crate's own: a counter wired to the
+    /// wrong address arm reports a driver that never touched the chip.
+    #[test]
+    fn the_sound_trace_counters_start_at_zero_and_count() {
+        on_a_big_stack(|| {
+            let mut m = sound_machine();
+            let t = m.sound_trace();
+            assert_eq!((t.ym_writes, t.latch_reads, t.audiocpu_fetches), (0, 0, 0));
+            m.sound.write(0xF000, 0x20);
+            m.sound.write(0xF001, 0xC7);
+            assert_eq!(
+                m.sound_trace().ym_writes,
+                2,
+                "the address latch and the data byte are both writes to the chip"
+            );
+            let _ = m.sound.read(0xF008);
+            assert_eq!(m.sound_trace().latch_reads, 1);
+            let _ = m.sound.read(0xF00A);
+            assert_eq!(m.sound_trace().latch_reads, 2, "either latch counts");
+            m.run_scanline();
+            assert!(
+                m.sound_trace().audiocpu_fetches > 0,
+                "the Z80 fetched something"
+            );
+            // The two Task 10 counters join the same struct, and they are still the
+            // counters `sound.rs` tests: a `SoundTrace` reading a different field
+            // would report a driver that never touched the OKI.
+            m.sound.write(0xF002, 0x80);
+            m.sound.port_out(0x00, 0x00);
+            let t = m.sound_trace();
+            assert_eq!((t.oki_writes, t.port_accesses), (1, 1));
+            assert_eq!(
+                (t.oki_writes, t.port_accesses),
+                (m.sound.oki_writes(), m.sound.port_accesses()),
+                "and they are the board's own counts, not a second tally"
+            );
         });
     }
 }

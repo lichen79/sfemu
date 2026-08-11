@@ -53,10 +53,51 @@ const BANK_ROM_BASE: usize = 0x1_0000;
 /// `the_banked_window_is_two_banks_ending_at_the_rom_end`.
 const BANKS: u8 = 2;
 
+/// What the sound board saw: five counters, none of them machine state.
+///
+/// [`crate::Trace`]'s counterpart for the Z80's side of the board, and the same
+/// argument for being separate from the machine: it records the session rather than
+/// the machine, so [`SoundBoard::restore`] leaves it alone and no save state carries
+/// it. Putting it in one would make two otherwise-identical machines compare unequal.
+///
+/// It is the whole instrument the real-ROM trace test has — `tests/sound_boot.rs`
+/// asserts these counters rather than an audio hash, because the question there is
+/// whether the driver executes and reaches the chip, not whether it produces one
+/// particular waveform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SoundTrace {
+    /// Writes the guest made to the YM2151, address latches and data bytes alike.
+    pub ym_writes: u32,
+    /// Reads the guest made of either command latch.
+    pub latch_reads: u32,
+    /// Bytes the guest read from the `audiocpu` region, **as answered**.
+    ///
+    /// Opcode fetches plus immediate operands and any table the driver reads from its
+    /// own ROM: `z80::Bus::read` carries no M1 flag, so the board cannot tell them
+    /// apart, and the number's job is to answer "did the Z80 execute from `audiocpu`
+    /// at all". A read the ROM did not answer is **not** counted — see
+    /// this board's [`z80::Bus::read`] — so a machine built with no sound region reports 0
+    /// rather than a large number describing a Z80 spinning on `RST 38h`.
+    pub audiocpu_fetches: u32,
+    /// Writes the guest made to the OKI's address, which is a stub until D3.
+    pub oki_writes: u32,
+    /// I/O port accesses the guest made. This board has no ports, so a non-zero count
+    /// is a finding about the driver rather than a shrug.
+    pub port_accesses: u32,
+}
+
 /// Everything on the sound Z80's bus.
 ///
 /// `Clone` and `PartialEq` for the snapshot work in Task 11. `Debug` is written by
 /// hand: deriving it would print 96 KB of ROM.
+///
+/// ⚠️ **The derived `PartialEq` compares [`SoundBoard::trace`] too**, which is not
+/// machine state. Two boards that ran the same program from different starting
+/// points — a restored save state against the original — hold the same state and
+/// different counters. A divergence test comparing whole boards therefore calls
+/// [`SoundBoard::clear_trace`] on both first, which is visible at the call site;
+/// hand-writing an eq that skipped the counters would hide the exclusion inside `==`
+/// and make a future field silently excluded too.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SoundBoard {
     /// The assembled `audiocpu` region: fixed window, then the banks from 0x10000.
@@ -73,12 +114,8 @@ pub struct SoundBoard {
     bank: u8,
     /// OKI pin 7, which selects the MSM6295's sample rate divider. D3 reads it.
     oki_pin7: bool,
-    /// How many times the guest has written to the OKI. See
-    /// `the_oki_is_a_counted_stub`.
-    oki_writes: u32,
-    /// How many I/O port accesses the guest has made. This board has no ports, so a
-    /// non-zero count is a finding about the driver rather than a shrug.
-    port_accesses: u32,
+    /// What the guest has done, counted. Not machine state — see [`SoundTrace`].
+    trace: SoundTrace,
 }
 
 impl core::fmt::Debug for SoundBoard {
@@ -89,8 +126,7 @@ impl core::fmt::Debug for SoundBoard {
             .field("latches", &self.latches)
             .field("bank", &self.bank)
             .field("oki_pin7", &self.oki_pin7)
-            .field("oki_writes", &self.oki_writes)
-            .field("port_accesses", &self.port_accesses)
+            .field("trace", &self.trace)
             .finish_non_exhaustive()
     }
 }
@@ -107,8 +143,7 @@ impl SoundBoard {
             latches: [0; 2],
             bank: 0,
             oki_pin7: false,
-            oki_writes: 0,
-            port_accesses: 0,
+            trace: SoundTrace::default(),
         }
     }
 
@@ -145,8 +180,8 @@ impl SoundBoard {
         self.ym_addr
     }
 
-    /// Puts the state a snapshot carries back, leaving the ROM and the diagnostic
-    /// counters alone.
+    /// Puts the state a snapshot carries back, leaving the ROM and the [`SoundTrace`]
+    /// alone.
     ///
     /// The counters are deliberately absent: they record the session rather than the
     /// machine, for the same reason [`crate::Trace`] is not restored. Restoring them
@@ -196,13 +231,62 @@ impl SoundBoard {
     /// How many writes the guest has made to the OKI's address.
     #[must_use]
     pub const fn oki_writes(&self) -> u32 {
-        self.oki_writes
+        self.trace.oki_writes
     }
 
     /// How many I/O port accesses the guest has made. Expected to stay 0.
     #[must_use]
     pub const fn port_accesses(&self) -> u32 {
-        self.port_accesses
+        self.trace.port_accesses
+    }
+
+    /// Every counter at once, which is what a debugger and the boot test read.
+    #[must_use]
+    pub const fn trace(&self) -> SoundTrace {
+        self.trace
+    }
+
+    /// Zeroes the counters, leaving the machine alone.
+    ///
+    /// For a divergence test comparing two whole boards: the derived `PartialEq`
+    /// covers the counters, and a restored board's counters are the restoring
+    /// machine's rather than the original's. Calling this on both is how that
+    /// exclusion stays visible at the call site — see [`SoundBoard`]'s own note.
+    pub fn clear_trace(&mut self) {
+        self.trace = SoundTrace::default();
+    }
+
+    /// The byte at `addr` as a debugger sees it — **with no side effects.**
+    ///
+    /// [`crate::board::Board::peek_word`]'s counterpart on this side of the machine,
+    /// and here for a sharper reason than symmetry: reading through [`z80::Bus::read`]
+    /// moves `audiocpu_fetches` and `latch_reads`, which are the two numbers
+    /// `tests/sound_boot.rs` reads to claim the driver ran. A disassembly panel drawn
+    /// once a frame would add 60 × its window to the fetch count, so the panel would
+    /// manufacture the evidence for the assertion — and the number a user reads off
+    /// the panel would be mostly the panel.
+    ///
+    /// `&self` is the enforcement rather than a preference: a `&mut self` version
+    /// could bump a counter and the compiler would not object. It is also what lets
+    /// the overlay hold `&Cps1`, which is that module's stated invariant —
+    /// [`z80::disasm::disasm_bus`] takes `&mut B` and so cannot be used there at all.
+    ///
+    /// This mirrors `read`'s map arm for arm, and
+    /// `peeking_agrees_with_the_bus_and_moves_no_counter` walks all 65,536 addresses
+    /// to hold the two together. Two maps that can disagree is what that test exists
+    /// to prevent; unlike `Board`, the counters mean the map genuinely has to be
+    /// written twice.
+    #[must_use]
+    pub fn peek_byte(&self, addr: u16) -> u8 {
+        match addr {
+            0x0000..=0xBFFF => self.rom_byte(addr).unwrap_or(UNMAPPED),
+            0xD000..=0xD7FF => self.ram[usize::from(addr - RAM_BASE)],
+            0xF000 | 0xF001 => self.ym.read_status(),
+            0xF002 => 0x00,
+            0xF008 => self.latches[0],
+            0xF00A => self.latches[1],
+            _ => UNMAPPED,
+        }
     }
 
     /// The ROM byte behind a program address, or `None` if the ROM is too short.
@@ -219,15 +303,33 @@ impl SoundBoard {
 impl z80::Bus for SoundBoard {
     fn read(&mut self, addr: u16) -> u8 {
         match addr {
-            0x0000..=0xBFFF => self.rom_byte(addr).unwrap_or(UNMAPPED),
+            0x0000..=0xBFFF => match self.rom_byte(addr) {
+                // Counted only when the ROM answered. A machine built with no sound
+                // region reads UNMAPPED here on every fetch, and counting those would
+                // report a Z80 executing from `audiocpu` when there is no `audiocpu`
+                // — which is exactly the claim `tests/sound_boot.rs` makes with the
+                // number. `the_fetch_counter_counts_only_bytes_the_rom_answered` is
+                // what holds the distinction.
+                Some(b) => {
+                    self.trace.audiocpu_fetches = self.trace.audiocpu_fetches.saturating_add(1);
+                    b
+                }
+                None => UNMAPPED,
+            },
             0xD000..=0xD7FF => self.ram[usize::from(addr - RAM_BASE)],
             // Both YM2151 addresses read the status register. The chip has one status
             // port and the board does not decode A0 for reads.
             0xF000 | 0xF001 => self.ym.read_status(),
             // The OKI's status is "not busy" until D3 implements it.
             0xF002 => 0x00,
-            0xF008 => self.latches[0],
-            0xF00A => self.latches[1],
+            0xF008 | 0xF00A => {
+                self.trace.latch_reads = self.trace.latch_reads.saturating_add(1);
+                if addr == 0xF008 {
+                    self.latches[0]
+                } else {
+                    self.latches[1]
+                }
+            }
             _ => UNMAPPED,
         }
     }
@@ -237,9 +339,18 @@ impl z80::Bus for SoundBoard {
             // ROM. A write here is what a driver bug looks like, not a crash.
             0x0000..=0xBFFF => {}
             0xD000..=0xD7FF => self.ram[usize::from(addr - RAM_BASE)] = val,
-            0xF000 => self.ym_addr = val,
-            0xF001 => self.ym.write(self.ym_addr, val),
-            0xF002 => self.oki_writes = self.oki_writes.saturating_add(1),
+            // Both halves of a chip write are counted: the driver's cost is two
+            // instructions per register and the question the count answers is whether
+            // it reached the chip at all. Counting only 0xF001 would report half.
+            0xF000 => {
+                self.trace.ym_writes = self.trace.ym_writes.saturating_add(1);
+                self.ym_addr = val;
+            }
+            0xF001 => {
+                self.trace.ym_writes = self.trace.ym_writes.saturating_add(1);
+                self.ym.write(self.ym_addr, val);
+            }
+            0xF002 => self.trace.oki_writes = self.trace.oki_writes.saturating_add(1),
             0xF004 => self.bank = val & (BANKS - 1),
             0xF006 => self.oki_pin7 = val & 0x01 != 0,
             _ => {}
@@ -247,12 +358,12 @@ impl z80::Bus for SoundBoard {
     }
 
     fn port_in(&mut self, _port: u16) -> u8 {
-        self.port_accesses = self.port_accesses.saturating_add(1);
+        self.trace.port_accesses = self.trace.port_accesses.saturating_add(1);
         UNMAPPED
     }
 
     fn port_out(&mut self, _port: u16, _val: u8) {
-        self.port_accesses = self.port_accesses.saturating_add(1);
+        self.trace.port_accesses = self.trace.port_accesses.saturating_add(1);
     }
 }
 
@@ -485,6 +596,197 @@ mod tests {
         assert_eq!(plain.ram, b.ram);
         assert_eq!(plain.bank(), 0);
         assert_eq!(plain.oki_writes(), 0);
+    }
+
+    /// The fetch counter counts only bytes the ROM actually answered.
+    ///
+    /// **The distinction the number's whole meaning rests on.** `tests/sound_boot.rs`
+    /// reads it to claim "the Z80 executed from `audiocpu`", and a machine built with
+    /// no sound region reads [`UNMAPPED`] on every fetch — which is `RST 38h`, so the
+    /// Z80 spins in a tight loop and racks up a *larger* count than a real driver
+    /// would. A counter that counted those would make the boot test's assertion
+    /// satisfiable by a machine with no sound ROM at all.
+    #[test]
+    fn the_fetch_counter_counts_only_bytes_the_rom_answered() {
+        let mut b = SoundBoard::new(rom());
+        assert_eq!(b.trace().audiocpu_fetches, 0);
+        let _ = b.read(0x0000);
+        let _ = b.read(0x8000);
+        assert_eq!(
+            b.trace().audiocpu_fetches,
+            2,
+            "fixed and banked windows both"
+        );
+        // Reads outside the ROM window are not fetches, however they read.
+        let _ = b.read(0xD000);
+        let _ = b.read(0xF008);
+        let _ = b.read(0xE000);
+        assert_eq!(
+            b.trace().audiocpu_fetches,
+            2,
+            "RAM, a latch, and a gap are not"
+        );
+
+        // And an absent region answers nothing, so nothing is counted.
+        let mut none = SoundBoard::new(Vec::new());
+        for a in 0..=0xBFFFu16 {
+            assert_eq!(none.read(a), UNMAPPED, "at {a:04X}");
+        }
+        assert_eq!(
+            none.trace().audiocpu_fetches,
+            0,
+            "a board with no sound ROM has executed nothing, however much it read"
+        );
+    }
+
+    /// Both halves of a YM2151 write are counted, and a read of the chip is not.
+    ///
+    /// Two per register is what a driver costs — the address latch and the data byte
+    /// are separate instructions — and the count's job is to answer whether the driver
+    /// reached the chip at all, so counting only the data byte would report half. A
+    /// status *read* is not a write: a driver polling the status in a tight loop would
+    /// otherwise look like one programming the chip furiously.
+    #[test]
+    fn both_halves_of_a_chip_write_are_counted_and_a_status_read_is_not() {
+        let mut b = SoundBoard::new(rom());
+        b.write(0xF000, 0x20);
+        b.write(0xF001, 0xC7);
+        assert_eq!(b.trace().ym_writes, 2);
+        b.write(0xF001, 0xC0);
+        assert_eq!(b.trace().ym_writes, 3, "a second data byte, same address");
+        let _ = b.read(0xF000);
+        let _ = b.read(0xF001);
+        assert_eq!(
+            b.trace().ym_writes,
+            3,
+            "and polling the status is not a write"
+        );
+        // The bank and OKI-pin registers live in the same page and are not chip writes.
+        b.write(0xF004, 0x01);
+        b.write(0xF006, 0x01);
+        assert_eq!(b.trace().ym_writes, 3);
+    }
+
+    /// Either command latch counts as a latch read, and a write to one does not.
+    #[test]
+    fn reading_either_latch_is_counted() {
+        let mut b = SoundBoard::new(rom());
+        b.set_latch(0, 0xA5);
+        b.set_latch(1, 0x5A);
+        assert_eq!(b.read(0xF008), 0xA5, "and the byte is still the right one");
+        assert_eq!(b.read(0xF00A), 0x5A);
+        assert_eq!(b.trace().latch_reads, 2);
+        // `set_latch` is the 68000's side of the board, not the guest's.
+        b.set_latch(0, 0x00);
+        // And the Z80 cannot write a latch, so the attempt is not a read either.
+        b.write(0xF008, 0xFF);
+        assert_eq!(b.trace().latch_reads, 2);
+    }
+
+    /// Clearing the trace zeroes every counter and touches nothing else.
+    ///
+    /// A divergence test comparing two whole boards calls this on both, so what it
+    /// must *not* do is disturb the state that test is comparing. Asserted by
+    /// comparing against a board that never had the counters moved: if `clear_trace`
+    /// touched anything else, the two would differ.
+    #[test]
+    fn clearing_the_trace_zeroes_the_counters_and_nothing_else() {
+        let mut worked = SoundBoard::new(rom());
+        let mut untouched = SoundBoard::new(rom());
+        for b in [&mut worked, &mut untouched] {
+            b.write(0xD100, 0xA5);
+            b.write(0xF004, 0x01);
+            b.write(0xF006, 0x01);
+            b.write(0xF000, 0x08);
+            b.write(0xF001, 0x78);
+        }
+        // Only `worked` reads, so only its counters move.
+        for _ in 0..7 {
+            let _ = worked.read(0x0000);
+            let _ = worked.read(0xF008);
+        }
+        worked.write(0xF002, 0x80);
+        worked.port_out(0x00, 0x00);
+        assert_ne!(
+            worked.trace(),
+            untouched.trace(),
+            "the premise: the counters differ"
+        );
+        assert_ne!(worked, untouched, "and the derived eq sees that difference");
+
+        worked.clear_trace();
+        untouched.clear_trace();
+        assert_eq!(
+            worked.trace(),
+            SoundTrace::default(),
+            "every counter zeroed"
+        );
+        assert_eq!(
+            worked, untouched,
+            "and the boards are otherwise identical, so nothing else was touched"
+        );
+    }
+
+    /// A restore leaves the counters where they were.
+    ///
+    /// They record the session rather than the machine, so a save state does not carry
+    /// them and `restore` must not zero them either: a debugger that reset its own
+    /// instrument on every state load would lose the history it was opened to read.
+    #[test]
+    fn a_restore_does_not_touch_the_counters() {
+        let mut b = SoundBoard::new(rom());
+        for _ in 0..5 {
+            let _ = b.read(0x0000);
+        }
+        b.write(0xF002, 0x80);
+        let before = b.trace();
+        assert_eq!((before.audiocpu_fetches, before.oki_writes), (5, 1));
+        let ram = [0x5Au8; RAM_BYTES];
+        b.restore(&ram, 1, true, &Ym2151::new(), 0x08);
+        assert_eq!(b.trace(), before, "the instrument survives the state load");
+        assert_eq!(b.bank(), 1, "and the state really was restored");
+    }
+
+    /// `peek_byte` returns what the bus would, everywhere, and moves no counter.
+    ///
+    /// **The whole 16-bit space, not a sample.** `peek_byte` writes the address map a
+    /// second time — it must, because the point of it is not bumping the counters
+    /// `read` bumps — so nothing structural stops the two drifting. A test spot-checking
+    /// a few addresses would miss exactly the arm someone forgets, and the arm someone
+    /// forgets is where a debugger's disassembly silently shows 0xFF for a byte the
+    /// Z80 reads as something else.
+    ///
+    /// The counter half is the other claim: a panel that peeked its way through a
+    /// disassembly window once a frame would add its own reads to the numbers
+    /// `tests/sound_boot.rs` asserts.
+    #[test]
+    fn peeking_agrees_with_the_bus_and_moves_no_counter() {
+        for bank in [0u8, 1] {
+            let mut b = SoundBoard::new(rom());
+            b.write(0xF004, bank);
+            b.set_latch(0, 0xA5);
+            b.set_latch(1, 0x5A);
+            b.write(0xD000, 0x11);
+            b.write(0xD7FF, 0x22);
+            // Something in the chip's status, so the 0xF000/0xF001 arms are not both
+            // trivially zero.
+            b.write(0xF000, 0x14);
+            b.write(0xF001, 0x0F);
+            b.clear_trace();
+
+            for a in 0..=0xFFFFu16 {
+                // Peek first: if it had side effects, the bus read below would see
+                // them and the two could still agree while both being wrong.
+                let peeked = b.peek_byte(a);
+                assert_eq!(
+                    b.trace(),
+                    SoundTrace::default(),
+                    "peeking {a:04X} moved a counter"
+                );
+                assert_eq!(peeked, b.read(a), "at {a:04X}, bank {bank}");
+                b.clear_trace();
+            }
+        }
     }
 
     /// A short ROM does not panic; it reads 0xFF where the data is missing.

@@ -98,6 +98,33 @@ pub const MEM_ROWS: usize = 12;
 /// Words per row of the dump.
 pub const MEM_WORDS: usize = 4;
 
+/// Where the sound panel's box starts: to the right of the disassembly.
+///
+/// The only free space of this shape. The top band is full — registers, then the
+/// memory dump — and the bottom row is the status line, so the sound panel takes the
+/// column beside the 68000 listing. Written as arithmetic on the disassembly's extent
+/// rather than as `156`, so widening `DIS_COLS` moves this instead of silently
+/// overlapping it.
+pub const SND_X: usize = DIS_X + DIS_COLS * ADVANCE + 2 * PAD + 2;
+/// Ditto: level with the disassembly, below the whole top band.
+pub const SND_Y: usize = DIS_Y;
+/// `>8000 ld a,($f008)` at [`machine::z80::disasm::Text::CAP`] is 38 characters.
+///
+/// The cap, not a measured maximum: the widest text the Z80 disassembler can produce
+/// is 32 characters, and a panel sized to the longest instruction *SF2's driver
+/// happens to use* would clip on the first ROM that used a wider one.
+const SND_COLS: usize = 38;
+/// The fixed rows above the listing: registers, the interrupt state, the board, and
+/// the trace counters.
+const SND_HEAD_ROWS: usize = 9;
+/// How many Z80 instructions the sound listing shows.
+///
+/// Fewer than the 68000's eight: the Z80 is a supporting act here, and the rows are
+/// what buys the header its space without pushing the box into the status line.
+pub const SND_DIS_ROWS: usize = 6;
+/// The whole box.
+const SND_ROWS: usize = SND_HEAD_ROWS + SND_DIS_ROWS;
+
 /// Where the status line's box starts: the bottom of the screen.
 pub const STATUS_X: usize = 2;
 /// Ditto.
@@ -107,7 +134,7 @@ const STATUS_COLS: usize = 44;
 
 /// Which panels are shown.
 ///
-/// Four independent flags rather than a mode enum: the useful combinations are not a
+/// Five independent flags rather than a mode enum: the useful combinations are not a
 /// sequence. Watching the beam position while stepping wants the status line and
 /// nothing else; chasing a bad pointer wants registers and memory without the
 /// disassembly taking half the screen.
@@ -121,6 +148,8 @@ pub struct Panels {
     pub mem: bool,
     /// One line: flags, beam position, and whether the CPU is halted or stopped.
     pub status: bool,
+    /// The sound board: the Z80, its listing, the latches, and the chip's key-on.
+    pub sound: bool,
 }
 
 impl Panels {
@@ -134,26 +163,35 @@ impl Panels {
             disasm: false,
             mem: false,
             status: false,
+            sound: false,
         }
     }
 
-    /// Registers, disassembly, and the status line: what `F1` switches on.
+    /// Registers, disassembly, the sound board, and the status line: what `F1`
+    /// switches on.
     ///
     /// Not the memory dump. It needs an address to be worth its width, and the
     /// address it would default to is a guess; `PageUp`/`PageDown` and `F6` are how
     /// you get it, and having asked for it is what makes it useful.
+    ///
+    /// The sound panel *is* in here, and the memory dump's argument does not apply to
+    /// it: it needs no address, it always describes the machine, and it occupies space
+    /// nothing else uses. There is also no key that shows it on its own, so leaving it
+    /// out would make it unreachable — a panel nobody can display is a panel that
+    /// silently rots.
     pub const fn on() -> Self {
         Self {
             regs: true,
             disasm: true,
             mem: false,
             status: true,
+            sound: true,
         }
     }
 
     /// Whether any panel is shown.
     pub const fn any(self) -> bool {
-        self.regs || self.disasm || self.mem || self.status
+        self.regs || self.disasm || self.mem || self.status || self.sound
     }
 }
 
@@ -192,6 +230,9 @@ pub fn draw(buf: &mut [u32], m: &Cps1, p: Panels, disasm_at: u32, mem_at: u32, b
     }
     if p.mem {
         draw_mem(buf, m, mem_at);
+    }
+    if p.sound {
+        draw_sound(buf, m);
     }
     if p.status {
         draw_status(buf, m);
@@ -298,6 +339,173 @@ fn draw_mem(buf: &mut [u32], m: &Cps1, at: u32) {
     }
 }
 
+/// The sound board: the Z80, its listing, the latches, and the chip.
+///
+/// # The Z80's PC is not the 68000's
+///
+/// There is no [`executing_pc`] here, and that is not an oversight. The 68000's `pc`
+/// is four bytes past the instruction about to run because of the prefetch queue;
+/// `z80::Z80::pc` is the address of the *next fetch*, so it already is the executing
+/// instruction's. Subtracting anything would put the listing's marker in the middle of
+/// whatever ran last.
+///
+/// # The listing always follows the PC
+///
+/// No scroll address. `Focus` has two variants because only two panels scroll, and a
+/// sound listing you could park somewhere would need a third — for a 16-bit space you
+/// can read in one screenful of pages. Following is what you want from a panel you
+/// opened to watch a driver run.
+fn draw_sound(buf: &mut [u32], m: &Cps1) {
+    let (x, y) = box_at(buf, SND_X, SND_Y, SND_COLS, SND_ROWS);
+    let z = &m.z80;
+    let mut row = 0usize;
+    let line = |buf: &mut [u32], row: &mut usize, s: &str, fg: u32| {
+        draw_text(buf, x, y + *row * LINE, s, fg);
+        *row += 1;
+    };
+
+    line(
+        buf,
+        &mut row,
+        &format!(
+            "AF {:04X} BC {:04X} DE {:04X} HL {:04X}",
+            z.af(),
+            z.bc(),
+            z.de(),
+            z.hl()
+        ),
+        FG,
+    );
+    line(
+        buf,
+        &mut row,
+        &format!(
+            "IX {:04X} IY {:04X} SP {:04X} PC {:04X}",
+            z.ix, z.iy, z.sp, z.pc
+        ),
+        HI,
+    );
+    // The alternate set, which `exx` and `ex af,af'` swap in. A driver's interrupt
+    // handler is where they are used, and a panel without them shows a Z80 whose
+    // registers appear to change for no reason.
+    line(
+        buf,
+        &mut row,
+        &format!(
+            "AF'{:04X} BC'{:04X} DE'{:04X} HL'{:04X}",
+            z.af_, z.bc_, z.de_, z.hl_
+        ),
+        FG,
+    );
+    // `HALT` is a real state on this CPU and not a fault: the driver halts waiting for
+    // the YM2151's timer interrupt, so a halted Z80 with `EI` set is normal and one
+    // with `DI` set is hung forever. Both bits are shown for that reason.
+    let run = if z.halted { "HALT" } else { "RUN " };
+    line(
+        buf,
+        &mut row,
+        &format!(
+            "I {:02X} R {:02X} IM{} IFF{}{} {run}",
+            z.i,
+            z.r,
+            z.im,
+            u8::from(z.iff1),
+            u8::from(z.iff2)
+        ),
+        HI,
+    );
+
+    // The 68000's side of the two latches beside the Z80's, because they are different
+    // bytes: the board's are what the 68000 last wrote, and the board copies them into
+    // the sound board's at the start of each Z80 instruction. Showing only one pair
+    // hides a command in flight, which is the moment you opened this panel to see.
+    line(
+        buf,
+        &mut row,
+        &format!(
+            "LATCH {:02X} {:02X} < {:02X} {:02X}  BANK {}  OKI7 {}",
+            m.sound.latch(0),
+            m.sound.latch(1),
+            m.board.sound_latch[0],
+            m.board.sound_latch[1],
+            m.sound.bank(),
+            u8::from(m.sound.oki_pin7()),
+        ),
+        FG,
+    );
+
+    let ym = m.sound.ym_ref();
+    line(
+        buf,
+        &mut row,
+        &format!(
+            "YM REG {:02X} STAT {:02X} IRQ {}",
+            m.sound.ym_addr(),
+            ym.read_status(),
+            if ym.irq() { "Y" } else { "-" }
+        ),
+        FG,
+    );
+    // One character per channel: its own number when any of its four operators is
+    // keyed, a dot when none is. Read off `keyon_live` rather than register 0x08,
+    // which is write-only and holds only the *last* write — a driver keying one
+    // channel at a time would show one voice however many were sounding.
+    let keys: String = ym
+        .channels
+        .iter()
+        .enumerate()
+        .map(|(c, ch)| {
+            if ch.ops.iter().any(|op| op.keyon_live != 0) {
+                char::from(b'0' + c as u8)
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    line(buf, &mut row, &format!("KEYON {keys}"), HI);
+
+    line(
+        buf,
+        &mut row,
+        &format!("TSC {:012} SMP {:06}", m.z80_cycles(), m.samples().len()),
+        FG,
+    );
+    let t = m.sound_trace();
+    line(
+        buf,
+        &mut row,
+        &format!(
+            "FET {:09} YM {:06} LAT {:06}",
+            t.audiocpu_fetches, t.ym_writes, t.latch_reads
+        ),
+        FG,
+    );
+    debug_assert_eq!(
+        row, SND_HEAD_ROWS,
+        "the header is what the box was sized for"
+    );
+
+    // The listing. `peek_byte`, not the bus: reading through `z80::Bus` would add this
+    // panel's own reads to the `FET` count directly above it, so the number would be
+    // mostly the panel. `disasm_bus` is unusable here for the same reason — it takes
+    // `&mut B`, and this module holds `&Cps1`.
+    let mut a = z.pc;
+    for i in 0..SND_DIS_ROWS {
+        let (text, len) = machine::z80::disasm::disasm(|w| m.sound.peek_byte(w), a);
+        let marker = if a == z.pc { '>' } else { ' ' };
+        let fg = if a == z.pc { HI } else { FG };
+        draw_text(
+            buf,
+            x,
+            y + (SND_HEAD_ROWS + i) * LINE,
+            &format!("{marker}{a:04X} {}", text.as_str()),
+            fg,
+        );
+        // `len` is at least 1, so the listing always advances and cannot loop.
+        a = a.wrapping_add(len);
+    }
+}
+
 /// Flags, the beam, and whether the CPU is running at all.
 fn draw_status(buf: &mut [u32], m: &Cps1) {
     let (x, y) = box_at(buf, STATUS_X, STATUS_Y, STATUS_COLS, 1);
@@ -355,7 +563,8 @@ mod tests {
     /// instructions cannot tell a correct `insn.len` from a hardcoded 2, and
     /// `executing_pc` cannot be told from `pc` itself unless the instruction it
     /// points at is longer than one word.
-    fn a_machine() -> Cps1 {
+    /// The 68000 program both fixtures run.
+    fn prog() -> Vec<u8> {
         let mut rom = vec![0u8; 0x2000];
         // SSP 0x00FF8000, PC 0x1000.
         rom[0..8].copy_from_slice(&[0x00, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00]);
@@ -365,6 +574,11 @@ mod tests {
             0x52, 0x40, // addq.w #1,d0    (1 word)
             0x60, 0xFA, // bra.s back      (1 word)
         ]);
+        rom
+    }
+
+    fn a_machine() -> Cps1 {
+        let rom = prog();
         let mut m = Cps1::new(&rom, BoardConfig::sf2(), Timing::cps1_10mhz());
         m.reset();
         m.cpu.d[0] = 0x1234_ABCD;
@@ -376,6 +590,31 @@ mod tests {
         // right number by coincidence and the assertion could not fail. The shadow is
         // stale exactly here, inside a handler, which is when you read it.
         m.cpu.a[7] = 0x00FF_7FF0;
+        m
+    }
+
+    /// A machine with a sound program the Z80 actually executes.
+    ///
+    /// The driver is `machine`'s own `sound_spin` loop — read the command latch, store
+    /// it to sound RAM, jump back — and it is padded to the full 0x18000 so both ROM
+    /// banks decode. A machine built with `Cps1::new` has an *empty* sound region,
+    /// where every fetch reads 0xFF: the Z80 spins on `RST 38h`, `keyon_live` is zero
+    /// for all eight channels, and a listing shows six identical lines. That fixture
+    /// cannot tell a working panel from one that reads the wrong fields, so the panel
+    /// tests use this one.
+    fn a_sound_machine() -> Cps1 {
+        // `ld a,($f008)` / `ld ($d000),a` / `jr -9`, from `machine`'s `sound_spin`.
+        let mut audiocpu = vec![0u8; 0x1_8000];
+        audiocpu[..9].copy_from_slice(&[0x3A, 0x08, 0xF0, 0x32, 0x00, 0xD0, 0x00, 0x18, 0xF7]);
+        let rom = prog();
+        let mut m = Cps1::with_sound(
+            &rom,
+            Vec::new(),
+            audiocpu,
+            BoardConfig::sf2(),
+            Timing::cps1_10mhz(),
+        );
+        m.reset();
         m
     }
 
@@ -724,6 +963,7 @@ mod tests {
             ("disasm", DIS_X, DIS_Y, DIS_COLS, DIS_ROWS),
             ("mem", MEM_X, MEM_Y, MEM_COLS, MEM_ROWS),
             ("status", STATUS_X, STATUS_Y, STATUS_COLS, 1),
+            ("sound", SND_X, SND_Y, SND_COLS, SND_ROWS),
         ] {
             let right = x + cols * ADVANCE + 2 * PAD;
             let bottom = y + rows * LINE + 2 * PAD;
@@ -738,13 +978,14 @@ mod tests {
     /// pixels would hide one behind the other — legible in a test that draws only one
     /// panel, and useless in the window.
     #[test]
-    fn all_four_panels_can_be_shown_at_once_without_overlapping() {
+    fn all_five_panels_can_be_shown_at_once_without_overlapping() {
         let m = a_machine();
         let all = Panels {
             regs: true,
             disasm: true,
             mem: true,
             status: true,
+            sound: true,
         };
         // Each panel drawn alone, and the pixels it changed recorded. Two panels
         // claiming the same pixel is the failure.
@@ -767,6 +1008,10 @@ mod tests {
                 status: true,
                 ..Panels::none()
             },
+            Panels {
+                sound: true,
+                ..Panels::none()
+            },
         ] {
             let mut buf = blank.clone();
             draw(&mut buf, &m, p, 0x1000, 0xFF_0000, &[]);
@@ -784,12 +1029,26 @@ mod tests {
             "{} pixels are claimed by two panels",
             claimed.iter().filter(|&&n| n > 1).count()
         );
-        // And all four together really is all four: the same pixel count.
+        // And all five together really is all five: the same pixel count.
         let mut buf = blank.clone();
         draw(&mut buf, &m, all, 0x1000, 0xFF_0000, &[]);
         let together = (0..buf.len()).filter(|&i| buf[i] != blank[i]).count();
         let separate = claimed.iter().filter(|&&n| n > 0).count();
-        assert_eq!(together, separate, "all four drawn together cover all four");
+        assert_eq!(together, separate, "all five drawn together cover all five");
+        // `all` really is every flag: a field added to `Panels` and left out of the
+        // literal above would make this whole test blind to it. The exhaustive
+        // destructuring is what fails to compile if a sixth panel appears.
+        let Panels {
+            regs,
+            disasm,
+            mem,
+            status,
+            sound,
+        } = all;
+        assert!(
+            regs && disasm && mem && status && sound,
+            "every flag is set, so every panel was compared"
+        );
     }
 
     /// No panels enabled draws nothing at all.
@@ -915,6 +1174,226 @@ mod tests {
         assert!(panel_contains(&buf, "S0", HI), "and user mode");
     }
 
+    /// The sound panel shows the Z80, the board, and the chip.
+    ///
+    /// Read back off the pixels, like the 68000 panel's, for the same reason: comparing
+    /// against the same `format!` the panel used would assert the formatter equals
+    /// itself.
+    #[test]
+    fn the_sound_panel_shows_the_z80_the_latches_and_the_chip() {
+        let mut m = a_sound_machine();
+        // A command in flight: the 68000 has written the board's latches, and the Z80's
+        // copy is a scanline behind until `step_sound` refreshes it.
+        m.board.sound_latch = [0x5C, 0xA3];
+        // A voice sounding, so `KEYON` has something to show. Channel 5, not 0: the
+        // low three bits of 0x08 select the channel, and a panel keying the wrong one
+        // would still light a voice.
+        m.sound.ym().write(0x08, 0x78 | 5);
+        m.run_scanline();
+
+        let mut buf = frame();
+        draw(
+            &mut buf,
+            &m,
+            Panels {
+                sound: true,
+                ..Panels::none()
+            },
+            0,
+            0,
+            &[],
+        );
+
+        // The PC row, at the exact pixels the layout says. SP is 0xFFFF and AF is all
+        // ones after a Z80 reset — real hardware, not a placeholder, and asserted here
+        // because a panel showing 0000 for SP would look like a plausible fresh
+        // machine while actually reading the wrong field. The driver's PC is one of
+        // 0x0000, 0x0003, or 0x0006 depending on where the line's budget ran out.
+        let pcs = read_text(&buf, SND_X + PAD, SND_Y + PAD + LINE, 38, HI);
+        assert!(
+            pcs.starts_with("IX 0000 IY 0000 SP FFFF PC 000"),
+            "the index, stack, and program registers: {pcs:?}"
+        );
+        // The alternate set is shown, and this driver never touches it — no `exx`, no
+        // `ex af,af'` — so it is still the all-ones a Z80 reset leaves. The main `AF`
+        // cannot be asserted here: `ld a,($f008)` has loaded the latch into A, and
+        // whether it has run yet depends on where the scanline's budget ran out.
+        assert_eq!(
+            read_text(&buf, SND_X + PAD, SND_Y + PAD + 2 * LINE, 31, FG),
+            "AF'0000 BC'0000 DE'0000 HL'0000",
+            "the shadow set, which this driver never swaps in — and which a panel \
+             printing the main set twice would show as the main set"
+        );
+        // The latches, both pairs. The Z80's copy is what `step_sound` refreshed, and
+        // the board's is what the 68000 wrote — the same bytes here, because a
+        // scanline ran, and the point is that both are shown.
+        assert!(
+            panel_contains(&buf, "LATCH 5C A3 < 5C A3", FG),
+            "the Z80's latches and the 68000's, side by side"
+        );
+        assert!(panel_contains(&buf, "BANK 0", FG), "and the ROM bank");
+        // The chip. Channel 5 keyed and nothing else: `.....5..`, which is the
+        // assertion a panel reading register 0x08 instead of `keyon_live` fails once
+        // the driver keys a second voice.
+        assert!(
+            panel_contains(&buf, "KEYON .....5..", HI),
+            "one character per channel, and only channel 5 is keyed"
+        );
+        // The trace counters, from the machine rather than from a second tally.
+        let t = m.sound_trace();
+        assert!(t.audiocpu_fetches > 0, "the premise: the Z80 fetched");
+        assert!(
+            panel_contains(&buf, &format!("FET {:09}", t.audiocpu_fetches), FG),
+            "the fetch count is the machine's"
+        );
+    }
+
+    /// The sound listing follows the Z80's PC and marks it, with no prefetch offset.
+    ///
+    /// **The Z80's `pc` is already the executing instruction's**, unlike the 68000's.
+    /// A panel that borrowed [`executing_pc`]'s `- 4` here would point four bytes
+    /// behind, into the middle of whatever ran last — and the driver's three
+    /// instructions are 3, 3, and 2 bytes, so a fixed offset lands mid-instruction and
+    /// disassembles to something that was never executed.
+    #[test]
+    fn the_sound_listing_starts_at_the_z80s_pc_and_marks_it() {
+        let m = a_sound_machine();
+        assert_eq!(m.z80.pc, 0, "the premise: a freshly reset Z80 is at 0x0000");
+        let mut buf = frame();
+        draw(
+            &mut buf,
+            &m,
+            Panels {
+                sound: true,
+                ..Panels::none()
+            },
+            0,
+            0,
+            &[],
+        );
+        let head = SND_Y + PAD + SND_HEAD_ROWS * LINE;
+        assert_eq!(
+            read_text(&buf, SND_X + PAD, head, 20, HI),
+            ">0000 ld a,($f008)  ",
+            "the first line: marked, addressed, and disassembled"
+        );
+        // The second line proves the instruction *length* was used: a listing advancing
+        // by a fixed 1 or 2 would show 0001 or 0002, both mid-instruction.
+        assert!(
+            panel_contains(&buf, "0003 ld ($d000),a", FG),
+            "the next instruction is at 0003, not 0001"
+        );
+        // And exactly one line is marked, counted across both colours — reading only
+        // `HI` cannot fail, because a panel marking every line still draws the others
+        // in `FG`.
+        let markers = (0..SND_DIS_ROWS)
+            .filter(|row| {
+                let y = head + row * LINE;
+                [HI, FG]
+                    .iter()
+                    .any(|&fg| read_text(&buf, SND_X + PAD, y, 1, fg) == ">")
+            })
+            .count();
+        assert_eq!(markers, 1, "exactly one line carries the marker");
+    }
+
+    /// Drawing the sound panel does not move the trace counters it displays.
+    ///
+    /// **The claim that makes the numbers mean anything.** A listing read through
+    /// `z80::Bus` would add six instructions' worth of fetches per frame — 360 a second
+    /// — to the count printed one row above it, so `FET` would be mostly the panel and
+    /// `tests/sound_boot.rs`'s `audiocpu_fetches > 100_000` would be satisfiable by a
+    /// machine that never ran the driver at all.
+    #[test]
+    fn drawing_the_sound_panel_does_not_move_the_counters() {
+        let mut m = a_sound_machine();
+        m.run_scanline();
+        let before = m.sound_trace();
+        assert!(before.audiocpu_fetches > 0, "the premise: there is a count");
+        let mut buf = frame();
+        for _ in 0..8 {
+            draw(
+                &mut buf,
+                &m,
+                Panels {
+                    sound: true,
+                    ..Panels::none()
+                },
+                0,
+                0,
+                &[],
+            );
+        }
+        assert_eq!(
+            m.sound_trace(),
+            before,
+            "eight frames of panel added nothing to the counters"
+        );
+    }
+
+    /// The sound panel renders for a machine in any state.
+    ///
+    /// Not a legibility test — that one is the user's, with a real ROM and `F1`. This is
+    /// the crash test: a panel that indexes a register array or a disassembly window out
+    /// of bounds takes the whole frontend down, and it would do it at whatever moment
+    /// the user pressed the key rather than in CI.
+    ///
+    /// Both fixtures, because they exercise different code: the sound machine runs a
+    /// real driver, and the ROM-less one spins on `RST 38h` with an empty region, where
+    /// every `peek_byte` misses the ROM entirely. 97 instructions between draws is
+    /// deliberately coprime with the driver's 3-instruction loop, so the panel is drawn
+    /// at every point in it rather than always at the same one.
+    #[test]
+    fn the_sound_panel_renders_without_panicking() {
+        for mut m in [a_sound_machine(), a_machine()] {
+            let mut buf = frame();
+            for _ in 0..4 {
+                draw(
+                    &mut buf,
+                    &m,
+                    Panels {
+                        sound: true,
+                        ..Panels::none()
+                    },
+                    0,
+                    0,
+                    &[],
+                );
+                for _ in 0..97 {
+                    m.step_sound_instruction();
+                }
+            }
+        }
+    }
+
+    /// A sound listing that runs off the top of the address space wraps.
+    ///
+    /// A Z80 PC near 0xFFFF is reachable — a driver bug, or `RST 38h` in unmapped
+    /// space walking upward — and the listing's six rows then cross the wrap. Debug
+    /// builds panic on overflow, so this is the difference between a debugger and a
+    /// crash at the moment you most need one.
+    #[test]
+    fn a_sound_listing_at_the_top_of_the_space_wraps() {
+        let mut m = a_sound_machine();
+        m.z80.pc = 0xFFFD;
+        let mut buf = frame();
+        draw(
+            &mut buf,
+            &m,
+            Panels {
+                sound: true,
+                ..Panels::none()
+            },
+            0,
+            0,
+            &[],
+        );
+        assert!(
+            panel_contains(&buf, "FFFD", HI),
+            "the listing starts where the PC is"
+        );
+    }
+
     /// A listing pointed at nothing renders `dc.w`, not a panic and not a blank.
     ///
     /// A debugger is most often opened *because* the PC has gone somewhere it should
@@ -954,6 +1433,7 @@ mod tests {
                 disasm: true,
                 mem: true,
                 status: true,
+                sound: true,
             },
             0xFFFF_FFFE,
             0xFFFF_FFF0,
