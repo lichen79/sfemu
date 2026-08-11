@@ -4,6 +4,7 @@ members = [
     "crates/frontend",
     "crates/m68k",
     "crates/machine",
+    "crates/oki",
     "crates/romset",
     "crates/sfemu",
     "crates/testrunner",

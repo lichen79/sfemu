@@ -1,0 +1,18 @@
+[package]
+name = "oki"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "OKI MSM6295 ADPCM sound chip"
+
+# Zero runtime dependencies, like `m68k`, `z80` and `ym2151`, and it must stay that
+# way: `machine` depends on this crate, and `machine` must not gain std or a
+# decompressor. `serde` is optional and off by default so a save state can
+# serialize the chip without the emulator carrying serde in the WASM path.
+[dependencies]
+serde = { version = "1", optional = true, default-features = false, features = ["derive"] }
+
+[features]
+default = ["std"]
+std = []
+serde = ["dep:serde"]

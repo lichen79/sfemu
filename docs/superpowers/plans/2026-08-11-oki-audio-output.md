@@ -32,10 +32,12 @@
   cargo doc --no-deps --workspace
   cargo run -q --release -p testrunner --bin report    -- --test suite
   cargo run -q --release -p testrunner --bin reportz80 -- --test suite
-  cargo run -q --release -p testrunner --bin reportym  -- --test suite
+  cargo run -q --release -p testrunner --bin reportym
   cargo build -p oki --no-default-features --target thumbv7em-none-eabihf
   ```
   The `--bin` flag is required; `-p testrunner` alone is ambiguous. Expected: 127/127, 1,604/1,604, 1,000/1,000, and the cross-build clean.
+
+  **`reportym` takes no `--test suite`, unlike the other two** — its argv match (`reportym.rs:35`) accepts `[]` for the full suite and `["--case", n]` for one case, and anything else prints `usage: reportym [--case N]` **and exits 0**. Measured on 2026-08-11: `--bin reportym -- --test suite` printed the usage line and nothing else. A gate line that prints usage and succeeds is a gate hole — it looks like it ran the suite and never did. Task 6's `reportoki` deliberately follows `report`/`reportz80`'s `--test suite` form instead, so three of the four match and this one is the exception; when adding it, do not "fix" this line to match its neighbours.
   **From Task 6 on**, one more line — the suite the earlier tasks have no data for yet:
   ```
   cargo run -q --release -p testrunner --bin reportoki -- --test suite
@@ -139,12 +141,19 @@ The root manifest's `members` list is currently exactly:
 
 ```toml
 members = [
-    "crates/frontend", "crates/m68k", "crates/machine", "crates/romset",
-    "crates/sfemu", "crates/testrunner", "crates/video", "crates/ym2151", "crates/z80",
+    "crates/frontend",
+    "crates/m68k",
+    "crates/machine",
+    "crates/romset",
+    "crates/sfemu",
+    "crates/testrunner",
+    "crates/video",
+    "crates/ym2151",
+    "crates/z80",
 ]
 ```
 
-Add `"crates/oki"` in alphabetical position (after `"crates/m68k"`, before `"crates/machine"`).
+Add `"crates/oki"` in alphabetical position — which is **after `"crates/machine"`**, not before it. (`machine` < `oki`: compare `m` then `a` against `o`.) The list is one entry per line in the real file, not the two-per-line form quoted above.
 
 - [ ] **Step 1: Create the manifest**
 
@@ -166,7 +175,13 @@ serde = { version = "1", optional = true, default-features = false, features = [
 [features]
 default = ["std"]
 std = []
+serde = ["dep:serde"]
 ```
+
+The `serde = ["dep:serde"]` line is not optional decoration: without it the
+optional dependency creates an implicit feature of the same name, which works but
+means `--features serde` and the `dep:` form are two spellings of one thing.
+`ym2151/Cargo.toml` declares it explicitly and this crate matches.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -193,10 +208,13 @@ mod tests {
     /// (18 against the correct 19).
     #[test]
     fn the_step_table_is_the_floor_of_a_ten_percent_geometric_series() {
-        for step in 0..STEPS {
+        // Iterating the array rather than `0..STEPS` is clippy's requirement, and
+        // it loses nothing: the table's type is `[i16; STEPS]`, so this visits
+        // every entry, and the test below pins `STEP_TABLE.len() == STEPS`.
+        for (step, &value) in STEP_TABLE.iter().enumerate() {
             let want = (16.0_f64 * (11.0_f64 / 10.0_f64).powi(step as i32)).floor();
             assert_eq!(
-                f64::from(STEP_TABLE[step]),
+                f64::from(value),
                 want,
                 "step {step} disagrees with floor(16 * 1.1^{step})"
             );
@@ -222,7 +240,11 @@ mod tests {
 - [ ] **Step 3: Run it and watch it fail**
 
 Run: `cargo test -p oki`
-Expected: FAIL to compile — `STEP_TABLE` and `STEPS` do not exist.
+Expected: FAIL to compile — `STEP_TABLE` and `STEPS` do not exist. Measured: 11 `E0425` errors and one `unused import: super::*` warning.
+
+Note that `cargo test -p oki` only reaches this crate once `"crates/oki"` is in the root `members` list, so do that edit before this step rather than at commit time.
+
+**`for step in 0..STEPS { … STEP_TABLE[step] … }` does not survive the gate.** Clippy's `needless_range_loop` is denied by `-D warnings`, so the loop above iterates the array. Write it that way from the start; the version in this plan already does.
 
 - [ ] **Step 4: Write the table**
 
@@ -261,18 +283,25 @@ And `crates/oki/src/lib.rs`:
 //! with its command protocol and volume table. Driving them at the right rate
 //! is `machine`'s job.
 
+#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// A public module's docs linking to a private item renders as a dead link and
+// clippy cannot see it -- four such bugs survived thirteen tasks in `m68k` and were
+// each found only by someone running `cargo doc`. Denying it fails the build.
 #![deny(rustdoc::private_intra_doc_links)]
-#![cfg_attr(not(feature = "std"), no_std)]
 
 pub mod adpcm;
 ```
 
+**The `cfg_attr` needs the `not(test)` arm**, which the draft above omitted. `m68k`, `z80` and `ym2151` all spell it `all(not(test), not(feature = "std"))` for the same reason: `cargo test --no-default-features` builds the test harness, which needs `std`, so without the `not(test)` guard that command fails to link on a crate that is otherwise correct. Copy the three-crate form, not the two-term one.
+
+The two-line comment above the `deny` is copied from `ym2151/src/lib.rs:35-37` verbatim. It reads as boilerplate and is not: it records why the lint is denied rather than warned.
+
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test -p oki`
-Expected: PASS, 2 tests.
+Expected: PASS, 2 tests. The workspace total moves 1,239 → **1,241**, in both profiles; 2 ignored, unchanged.
 
 - [ ] **Step 6: Prove the `no_std` posture by building it, not by reading it**
 
