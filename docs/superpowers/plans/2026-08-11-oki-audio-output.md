@@ -3956,6 +3956,44 @@ git add crates/machine
 git commit -m "feat(machine): the exact CPS-1 mono mix, clamped and unsaturated"
 ```
 
+#### Six corrections this task forced on the plan, and one branch removed
+
+**1. The plan's `the_ym_pair_is_weighted_not_averaged` is a claim that cannot fail, and was deleted.** As written it asserts the sample peak lands between 11,468 and 22,936 — but the YM patch this file uses peaks at 11,446, so `(l + r) / 2` reaches 16,351 and passes the same bound. A range wide enough for the real value to sit inside is a range the wrong fold also sits inside. Its replacement, `the_mono_samples_are_the_mix_of_the_chips_own_stream`, compares **every** sample against `mix` applied to a detached clone of the YM — legitimate because `sound_spin` never writes the chip, so the clone stays in lockstep — and then asserts the averaged fold produces a *different* vector on that same stream. The premise bound is `got.len() > 300`; 357 is what 100 scanlines actually produce, and the plan's 400 was a guess.
+
+**2. `oki_rom()` needs a second phrase, and the plan named only one.** A `0x77` fill ramps to near full scale and then *stays* there, which is the right fixture for the amplitude tests but useless for anything about the hold: a constant signal held is indistinguishable from a constant signal resampled. Phrase 2 at 0x4000 is filled `0xF7` — nibble F is the largest negative step and 7 the largest positive, both driving the step index to its ceiling — so the decoder alternates around ±2047 and the output moves on **every** chip step.
+
+**3. `SoundBoard::reset_oki` is a new method the plan did not name.** `Cps1::reset` has to stop the chip's voices, because MAME's machine reset propagates `device_reset` (`okim6295.cpp:143-148`). A `&mut Oki` accessor would do it, and is the wrong door for `oki_ref`'s reason — a debug panel must not be able to start a voice. So `sound.rs` gains one narrow method that stops the voices and drops a half-delivered command, leaving `oki_pin7` and the sample ROM alone.
+
+**4. `drain_samples` returns the buffer rather than dropping it.** The plan had it clearing in place. A host that has to queue the audio needs those samples, and a `drain` that only cleared forced every caller to copy the slice out first. It is `core::mem::take`, so the buffer moves to the caller and the machine allocates a fresh one — about 2 KB a frame, against the 120 KB the frame's pixels already cost.
+
+**5. Two of the five `Vec::new()` sites had to take the real `oki` region in this task, not Task 13.** `crates/sfemu/src/main.rs:203` and `crates/sfemu/tests/sound_boot.rs:67` are listed above as Task 13's, but the compile break is here and a placeholder that silently produces no sound effects is the hardest symptom in this sub-project to attribute. Both now pull `set.region("oki")`. Task 13's steps 4 and 5 lose that work; the README edits remain.
+
+**6. `crates/frontend/src/state.rs`'s fixture still passes `Vec::new()`, and Task 10 must change it.** A round trip over a chip with nothing playing is a round trip over four stopped voices — trivially preserved, and exactly the shape of a test that cannot fail. It is left that way here on purpose, with a comment saying so, because `Cps1::restore` still rebuilds the chip at power-up: a voice playing in the fixture would make it diverge for a reason Task 10 is what fixes.
+
+**The falsification pass, and one branch it deleted.** Eleven mutations of this task's code; three survived the first round, all sharing Task 8's shape — a change nothing observed, in code every other test drove in only one order:
+
+| Mutation | Fails, first round | Fails, after |
+| --- | --- | --- |
+| OKI weighted 6/20 (forgetting the 2x) | 4 | 4 |
+| YM averaged (10/20), OKI weighted | 4 | 4 |
+| divisor 10 not 20 | 4 | 4 |
+| OKI term dropped entirely | 5 | 6 |
+| chip stepped once per YM tick | 1 | 2 |
+| `oki_last` consumed rather than held | **0** | 1 |
+| `reset` does not reset the chip | 1 | 1 |
+| `reset` leaves the accumulator mid-fraction | 1 | 1 |
+| `reset` leaves `oki_last` set | 1 | 1 |
+| `with_sound` ignores `okirom` | 3 | 3 |
+| pin-7 swap drops the carried remainder | **0** | 5 |
+| accumulator rebuilt unconditionally | **0** | equivalent — branch deleted |
+
+The two tests written to close the first two mutants **did not close them**, and the commit that added them said they had. Both were written from a guess about what the mutation changes rather than from a measurement, and this is worth recording because the guesses were plausible:
+
+- The hold test measured the **longest run of equal consecutive samples**, expecting the mutation to break every run to length 1. It does not: the impulse train's *zeros* form runs of their own six or seven long, so the longest run is 14 either way. The discriminating observable is the **zero count** — 14 of 229 held against 199 of 229 as an impulse train — because a held level is only zero when the chip's output is.
+- The pin-7 test wrote `0xF006` with the value the board already held, 96 times, on the theory that a rebuild costs a sample. Every such write is a no-op, so the rebuild is never exercised at all. The pin has to **alternate**: 128 rounds of 2 scanlines each, tallying YM ticks per rate, asserting the chip's phrase position equals `(hi_ticks · hi_num + lo_ticks · lo_num) / den` — 111 steps for 454 fast ticks and 462 slow, against 6 when the remainder is dropped.
+
+The third mutant is not alive; it is **equivalent**, and the code changed rather than the tests. With the remainder below the shared denominator, `with_remainder(num, den, rem)` reconstructs a bit-identical accumulator, so `if self.oki_acc.ratio() != (num, den)` guards a no-op and nothing can observe whether the branch was taken. The guard is gone: the accumulator is rebuilt every tick, two struct copies bought at the price of an untestable branch removed.
+
 ---
 
 ### Task 10: The save state and the overlay
