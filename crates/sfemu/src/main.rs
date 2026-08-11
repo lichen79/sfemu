@@ -15,11 +15,6 @@
 //! `--ppm` writes the last frame out as a file, which is a picture you can look at
 //! without this program having to draw one.
 
-// Nothing calls into `audio` until the loop is wired, one task from now. The allow is
-// scoped to this module and temporary by construction: wiring `run` to take an `Audio`
-// makes every item here reachable, and the line goes when it does. A crate-wide allow
-// would have hidden the next dead item too.
-#[allow(dead_code)]
 mod audio;
 #[cfg(test)]
 mod confine;
@@ -231,8 +226,9 @@ fn run(args: Vec<String>) -> Result<String, Fault> {
         // The window is opened *after* the ROM set loads, so a bad path reports the
         // load error rather than flashing a window onto a machine that never booted.
         let mut win = display::Window::open("sfemu").map_err(Fault::Failed)?;
+        let mut sink = open_audio();
         let opts = loop_opts(&args);
-        let summary = loop_::run(&mut m, &mut win, &opts);
+        let summary = loop_::run(&mut m, &mut win, sink.as_mut(), &opts);
         return Ok(play_report(&summary));
     }
 
@@ -252,6 +248,38 @@ fn run(args: Vec<String>) -> Result<String, Fault> {
         Cpu::of(&m),
         Frame::of(&m.video),
     ))
+}
+
+/// The audio sink, or a silent one and a line on stderr saying why.
+///
+/// A host with no output device, a device that refuses the default configuration, a
+/// machine with no sound card at all: none of these is a reason to refuse to run SF2.
+/// The notice goes to stderr rather than into [`loop_::Summary`] because it happens
+/// before the loop exists, and it is printed rather than swallowed because "no sound"
+/// with no explanation is a bug report nobody can act on.
+///
+/// Returns a `Box<dyn Audio>` and not a generic, which is why [`loop_::run`] takes
+/// `&mut dyn Audio`: the choice between a device and silence is made here, at runtime.
+fn open_audio() -> Box<dyn audio::Audio> {
+    match audio::CpalAudio::open() {
+        Ok(a) => {
+            // Both rates, because the interesting number is the pair: the board's
+            // 55,930.39 Hz is not any device's rate, and printing only the device's
+            // would leave a reader with no reason the samples are being converted at
+            // all. Three decimals because the board's rate is not an integer, which is
+            // the whole reason `machine::resample` exists.
+            eprintln!(
+                "audio: device {} Hz, board {:.3} Hz",
+                a.rate(),
+                f64::from(audio::SAMPLE_RATE_NUM) / f64::from(audio::SAMPLE_RATE_DEN)
+            );
+            Box::new(a)
+        }
+        Err(e) => {
+            eprintln!("notice: no audio ({e}); running silently");
+            Box::new(audio::NullAudio::default())
+        }
+    }
 }
 
 /// The two paths the loop writes to, from the parsed arguments.

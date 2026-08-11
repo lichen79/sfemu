@@ -7,21 +7,25 @@ CPS-1 ROM set you own and `--play` opens a window:
 cargo run -p sfemu --release -- /path/to/your/sf2.zip --play
 ```
 
-Eight sub-projects are complete: the **68000 core** (A), the **bus and timing
+Nine sub-projects are built: the **68000 core** (A), the **bus and timing
 framework with a MAME ROM-set loader** (B), the **CPS-1 scanline renderer** (C),
 the **Z80 audio CPU** (D1), the **YM2151 FM chip and the sound board's wiring**
-(D2), the **frontend** — window, frame clock, keyboard, and save states (E1) — the
+(D2), the **OKI MSM6295 ADPCM chip, the mono mix and host audio** (D3), the
+**frontend** — window, frame clock, keyboard, and save states (E1) — the
 **debugger** (E2): `F1` for an in-window overlay, `F4` to step one instruction,
 `F7` for a breakpoint — and the **graphics viewers** (E3): `F9` for a tile,
 tilemap, palette and layer browser, `F10` to cycle it.
 
-**There is still no sound**, and the reason is now narrower than it was. The whole
-chain up to the samples exists: the Z80 executes SF2's driver from `audiocpu`,
-reads the 68000's command latch, and programs a YM2151 that is sample-exact against
-ymfm over 1,000 vector cases. Those samples then go into a buffer nothing drains.
-D3 is what reaches a speaker — the OKI MSM6295's ADPCM, the mono mix the cabinet
-actually gets, and resampling to the host's rate. The Street Fighter 1 driver (F)
-is not built yet either.
+**There is sound.** The chain runs end to end: the Z80 executes SF2's driver from
+`audiocpu`, reads the 68000's command latch, and programs a YM2151 and an MSM6295
+that are each exact against their reference — ymfm and MAME's own `okiadpcm` — over
+1,000 vector cases apiece. Those two streams are collapsed into the single mono
+output the cabinet's one speaker gets, at MAME's own weights, and handed to the
+host device through a bounded ring. The one link in that chain that is *not* exact
+is the last: no host sample rate is a rational multiple of the board's
+55,930.390625 Hz, so the final conversion interpolates, and what it costs is
+[written down](#the-oki-msm6295-and-the-mix) rather than glossed. The Street
+Fighter 1 driver (F) is not built yet.
 
 ## The 68000 core
 
@@ -104,6 +108,79 @@ the evidence that the 100 cases are load-bearing.
 
 [ymfm]: https://github.com/aaronsgiles/ymfm
 
+## The OKI MSM6295, and the mix
+
+The ADPCM sample player, validated the same way and against the same kind of
+reference: `testrunner` links [MAME][mame]'s own `okiadpcm.cpp` (BSD-3, © Andrew
+Gardner and Aaron Giles, pinned to tag `mame0261` so `master` moving cannot silently
+change the vectors), runs a deterministic command script against a **synthetic**
+sample ROM this repository generates, and requires this core to reproduce every
+sample and every status read exactly: **1,000 of 1,000 cases.** No Capcom data is
+involved — the ROM the vectors play is a ladder of nibbles built for the purpose.
+
+**The step table is the one thing not checked against the reference, deliberately.**
+It is 49 entries of `floor(16 * 1.1^step)`, held as a literal because Rust has no
+`const fn` float `pow` and the exact integer form needs 171 bits. Checking it
+against MAME would only prove the transcription; it is checked instead against an
+independently derived closed form, because the obvious shortcut — the recurrence
+`v += v / 10` — is *not* the same function: it disagrees at **47 of the 49 entries**,
+from step 2 onward, where it gives 18 for a correct 19. A test that compared against
+the shortcut would have been the bug.
+
+**The suite's premises are read out of the cases' own bytes.** The tempting way to
+assert "a quarter of the cases carry a phrase the chip refuses" is `i % 4 == 3`,
+which counts indices rather than refusals and keeps passing after a generator stops
+producing them. So each premise is recomputed from what was recorded: the phrase
+table entry, the command script, the nibble stream. Ten are checked — every case
+audible; the chip's own ±65,536 clamp reached (measured 998 of 1,000, floor 90%) and
+never exceeded; all four voices sounding at once (933 of 1,000); voices that both
+start and stop mid-case; the status byte a *subset* of the voices that sounded; the
+step index driven to both of its clamps, recomputed from the nibbles by MAME's own
+rule rather than read back from this core; the ladder phrase intact; the top of the
+address bus actually read, checked against the ROM the case carries rather than a
+constant; the silent volume indices (9–15, whose table entries are exactly zero)
+used, 3,026 times, so a core reading the table one entry short would not pass; and
+both pin-7 states present.
+
+**Two rates, and neither is a round number.** The MSM6295 divides its 1 MHz crystal
+by 132 with pin 7 high and 165 with pin 7 low — 7,576 Hz and 6,061 Hz — while the FM
+chip runs at 3,579,545/64 = 55,930.390625 Hz. Both OKI rates are *under one sample
+per scanline* (16/33 and 64/165), so the mix is driven off the YM tick rather than
+per line, with the two pin-7 ratios sharing a denominator so that flipping pin 7 is
+a numerator swap and the phase does not jump. A fresh board starts pin 7 **high**,
+because that is the state MAME constructs with and `device_reset()` leaves alone —
+starting low would be a 25% pitch error until the driver's first `0xF006` write.
+
+**The mix is MAME's, at integer weights.** CPS-1 has one speaker
+(`cps1.cpp:3935`), with the two YM channels at 0.35 and the OKI at 0.30 — 7, 7 and
+6 over 20, and the OKI term is 3 rather than 6 because the value it is given is
+already twice the stream value, which is the widest form in which a voice's
+`signal × volume` product stays an exact integer. No saturation, and that is
+measured rather than omitted: the chip clamps its own sum before the mix sees it,
+which bounds the numerator at ±655,360 = 20 × 32,768. The truncating divide deviates
+from MAME's `f32` chain by at most 0.952 LSB — under one, so no rounding term is
+worth the drift it would add.
+
+**What is not exact, stated plainly.** The host conversion. No device rate is a
+rational multiple of 55,930.390625 Hz, so `machine::resample` interpolates linearly:
+at 1.165× downsampling to 48 kHz that attenuates the top of the band and folds
+content above 24 kHz back down. A polyphase FIR would be better and is either a
+dependency or 200 lines of DSP with its own verification burden. Handing the stream
+over *unconverted* would play it **14.2% slow** — a device taking 48,000 samples a
+second out of a 55,930 Hz stream needs 1.165 seconds of music to fill one second, so
+SF2's would come out 2.65 semitones flat, A440 at 378 Hz. The choice is therefore not
+between exact and approximate but between two approximations, and this is the one
+whose error is bounded and written down.
+
+The ring between the two clocks is also measured rather than designed: 100 ms of
+capacity prefilled to 50 ms (the observed depth swing was 29.3–58.7 ms), drop the
+oldest on overflow so latency stays bounded, hold the last sample on underrun
+because a step to silence clicks, count both so "the audio is crackly" is
+diagnosable, and **no clock slewing** — drift measured at +6.3 ppm ± 59.6 ppm, below
+the method's own resolution, so correcting it would be correcting noise.
+
+[mame]: https://github.com/mamedev/mame
+
 ## This project ships no ROMs, and never will
 
 **No Street Fighter ROM, no Capcom code, and no diagnostic binary is contained
@@ -131,12 +208,44 @@ contain no game code — but they are still fetched at runtime rather than vendo
 If a vector file is missing, the harness fails loudly, naming the file and the
 command that fetches it. It does not skip, warn, or silently pass.
 
+**Three tests are the documented exception, and they are `#[ignore]`d for the reason
+the rule itself gives.** "Fail loudly naming the command that fetches it" holds
+because the vector data *is* fetchable and there is a command to name. A ROM set is
+not, and there is no command we may put in a failure message. So `boot.rs`,
+`sound_boot.rs` and `audio_boot.rs` — the three tests that need real Capcom code —
+skip by default and read a path you supply:
+
+```bash
+SFEMU_ROMS=/path/to/your/sf2.zip cargo test -p sfemu --test audio_boot -- --ignored
+```
+
+One variable, one panic message per test, no second escape hatch. `SFEMU_ROMS` is
+**not** how the binary is pointed at a ROM set — that is a positional argument; the
+variable exists only for these three. What they add over the unconditional suites is
+narrow and specific: that SF2's own driver talks to the chips *where this code expects
+it to*. `audio_boot.rs` exists because of one trap in particular — with no sample ROM,
+every phrase-table entry reads `start == stop == 0`, the chip refuses every command,
+and the OKI write counter climbs anyway. A rising counter over a silent chip is
+exactly what a green test must not look like, so that test asserts on the samples that
+left the mix rather than on the count.
+
 ## Getting started
 
 ```bash
-# Fetch the test vectors (~138 MB (132 MiB) over 127 files, into gitignored testdata/).
-# Shells out to curl; no HTTP dependency is taken for a once-per-checkout job.
+# Fetch the 68000 vectors (~138 MB (132 MiB) over 127 files, into gitignored
+# testdata/). Shells out to curl; no HTTP dependency is taken for a
+# once-per-checkout job.
 cargo run -p testrunner --bin fetch --release
+
+# The Z80 vectors. Upstream is 1.37 GB of JSON, so nothing is kept: each file is
+# converted to a binary form and its JSON deleted before the next starts.
+cargo run -p testrunner --bin fetchz80 --release
+
+# The two generated suites. Each fetches its BSD-3 reference implementation
+# (ymfm, and MAME's okiadpcm.cpp pinned to tag mame0261), compiles it, runs it,
+# and re-parses its own output rather than trusting it. No game code anywhere.
+cargo run -p testrunner --bin genym --release
+cargo run -p testrunner --bin genoki --release
 
 # Unit tests, plus one test per suite group. Both profiles: `--release` is
 # where the timing law is measured, and debug is where `debug_assert!` is
@@ -144,14 +253,25 @@ cargo run -p testrunner --bin fetch --release
 cargo test --workspace --release
 cargo test --workspace
 
-# The full-suite report: a per-group table, then the headline figures.
-# Exits nonzero if any group is red.
-cargo run -p testrunner --bin report --release
+# The four suite reports: a per-group or per-case table, then the headline
+# figures. Each exits nonzero if anything is red. Note reportym takes NO
+# argument — `reportym -- --test suite` printed usage and exited 0, which is a
+# gate that silently ran nothing, so reportoki accepts both spellings and
+# rejects anything else with 2.
+cargo run -p testrunner --bin report     --release -- --test suite   # 68000
+cargo run -p testrunner --bin reportz80  --release -- --test suite   # Z80
+cargo run -p testrunner --bin reportym   --release                   # YM2151
+cargo run -p testrunner --bin reportoki  --release -- --test suite   # MSM6295
+
+# The oki crate's two other build shapes, since it claims to be no_std-friendly
+# and a claim that is never compiled is not a claim.
+cargo build -p oki --no-default-features --target thumbv7em-none-eabihf
+cargo build -p oki --features serde
 
 # Throughput. Read the caveat below before quoting a number from it.
 cargo bench -p m68k
 
-# Mutation testing: 158 mutants, each an exact string replacement, each with a
+# Mutation testing: 210 mutants, each an exact string replacement, each with a
 # declared KILL or SURVIVE. Every set carries at least one control that must
 # survive — a pass where everything dies is more likely a broken harness than a
 # thorough suite. Commit first: it edits files in place.
@@ -188,6 +308,13 @@ cargo run -p sfemu --release -- /path/to/your/sf2.zip 600 --ppm frame.ppm
 ```
 
 `--release` is not optional advice here: a debug build does not hold 59.6 Hz.
+
+Audio opens on the default output device and needs no flag. If none can be opened,
+that is a notice on `stderr` and a `[no audio]` tag in the title bar, not a refusal
+to run — no sound is a degradation, and a machine you can watch is better than one
+that would not start. The device's own rate is printed beside the board's at startup,
+because the interesting number is the pair: neither is the other's multiple, which is
+why the samples are converted rather than played as they are.
 
 | Key | Does |
 |---|---|
@@ -350,10 +477,11 @@ they are dropped and counted, because a machine that fell a second behind should
 resync rather than fast-forward through a second of the game. Pausing owes nothing
 — the clock is only read on a running tick.
 
-### Seven things only you can check
+### Eight things only you can check
 
-Everything in this repository is tested without a display, which leaves exactly
-seven claims no test here can make. Run it against your own ROM set and look:
+Everything in this repository is tested without a display and without an audio
+device, which leaves exactly eight claims no test here can make. Run it against
+your own ROM set, and look — and, for the last one, listen:
 
 1. **Does the window show Street Fighter II?** A test can assert the framebuffer
    changed, that a save state round-trips, and that a pen becomes the right ARGB
@@ -380,8 +508,25 @@ seven claims no test here can make. Run it against your own ROM set and look:
    A test reads the panel's own pixels back and proves the Z80's T-states, the two
    latch bytes, and the chip's register writes are drawn where the layout says. It
    cannot tell you whether a latch byte changing sixty times a second beside a
-   register count climbing in the thousands reads, to you, as SF2 playing music —
-   which is the only thing that number is for until D3 gives you the audio itself.
+   register count climbing in the thousands reads, to you, as SF2 playing music.
+8. **Does it actually sound right?** This is the one claim in the project that no
+   amount of testing can approach. The ADPCM decoder is exact against MAME's over
+   1,000 vector cases, the YM2151 is exact against ymfm's over 1,000 more, the mix
+   and the ring are tested against scripted producers and consumers, and the loop's
+   queueing is asserted against a recording fake. All of that establishes that the
+   right numbers were computed and handed over. Whether the result is *Street
+   Fighter II* — right pitch, right tempo, voices where they belong, no clicks — is
+   a judgement only your ears make:
+
+   ```bash
+   cargo run -p sfemu --release -- /path/to/your/sf2.zip --play
+   ```
+
+   If you hear nothing, the title bar says `[no audio]` when no device could be
+   opened, and `F1`'s sound panel gives you `CLP` (the mix clamped), `DRP` (the ring
+   overflowed, so the emulator outran the device) and `UND` (the ring starved, so
+   the device outran the emulator). Silence with all three at zero and the register
+   counts climbing is a mix problem; `UND` climbing is a pacing one.
 
 If the picture comes up wrong, `F12` gives you a frame to look at and the trace
 counters in the no-`--play` report give you the interrupts and bus activity behind
@@ -426,11 +571,16 @@ crates/ym2151/       the FM chip, on the same terms: no dependencies, no unsafe,
                      no clock access, no_std-friendly. Four tables built from
                      closed forms and checksummed, and a lazily-prepared operator
                      state the CSM vectors exist to pin.
+crates/oki/          the MSM6295 ADPCM chip, on the same terms: no dependencies,
+                     no unsafe, no clock access, no_std-friendly. Four voices,
+                     the phrase table, and a 49-step table built from a closed
+                     form and checksummed.
 crates/machine/      the board: memory map, bus, interrupts, scheduler, inputs,
-                     the sound board and its rational Z80 clock, snapshot and
-                     restore. Depends on m68k, video, z80 and ym2151 — all four
+                     the sound board with its rational Z80 clock, the mono mix
+                     and the host resampler, snapshot and restore. Depends on
+                     m68k, video, z80, ym2151 and oki — all five
                      dependency-free, so the display boundary below still holds.
-                     Three of the four build for a bare-metal target (verified on
+                     Four of the five build for a bare-metal target (verified on
                      thumbv7em-none-eabihf); `video` allocates a framebuffer and
                      needs `alloc`, which is a different claim and is not made
                      for it above.
@@ -440,13 +590,15 @@ crates/frontend/     every frontend decision, with no window: frame pacing, the
                      key map, pen-to-ARGB, the save-state file format, the
                      debugger's state, the graphics viewer's state and its four
                      views, and the 4x6 font drawn in this repository.
-crates/sfemu/        the binary. The only crate that names a windowing library,
-                     and only in one file (a test enforces it).
+crates/sfemu/        the binary. The only crate that names a windowing library or
+                     an audio library, each in one file and nowhere else (a test
+                     per boundary enforces it).
 crates/testrunner/   dev-only harness for the external vector suite.
 scripts/mutate.py    the mutation harness: 210 mutants over the above in 18 sets,
                      each an exact string replacement with a declared
                      expectation. 189 killed, 21 declared survivors (18 controls
-                     and 3 proven equivalents), 210/210 as expected.
+                     and 3 proven equivalents), 210/210 as expected. The `oki`
+                     set is D3's remaining work and is not in that count.
 docs/hardware/       what the vectors proved about the hardware, with evidence.
 docs/superpowers/    design specs and implementation plans.
 testdata/            gitignored; fetched vectors.
@@ -459,6 +611,14 @@ glass" is not something a test can read back — so every decision lives in
 decisions at all. `frontend` also reads no clock: the pacer is *given* the elapsed
 nanoseconds, which is what lets a test drive it through a stalled host. The one
 real clock read in the project is behind that boundary.
+
+**Audio has the same line, drawn for the same reason.** A device has a clock we do
+not control and a buffer we cannot read back, so `sfemu/src/audio.rs` is a handle
+and five forwards; the rate conversion and the full-ring policy — the parts with
+edge cases — live in `machine::resample`, where a test drives them. What the loop
+*decides* about audio (queue once per frame, drain the machine's buffer, report a
+held pause every tick, treat a dead device as a notice rather than a stop) is
+asserted against a recording fake, not by listening.
 
 `m68k` knows nothing about Capcom hardware, which is what makes it testable
 against third-party vectors and WASM-safe by construction. All state lives in
@@ -515,7 +675,7 @@ pass is distinguishable from a harness that reports success without running.
 | **C** | CPS-1 video: tilemaps, sprites, palettes, CPS-A/B registers, scanline renderer | **complete** — the largest piece, and where SF2 becomes visible |
 | **D1** | Z80 audio CPU | **complete** — 1,604/1,604 files, 1,604,000/1,604,000 cases. Still silent: a CPU with no chip attached |
 | **D2** | YM2151 FM, and the sound board's wiring | **complete** — 1,000/1,000 vector cases against ymfm, sample-exact. Still silent: the samples reach no speaker |
-| D3 | OKI MSM6295 ADPCM, mixing, host audio | the one that ends "there is no sound" |
+| **D3** | OKI MSM6295 ADPCM, mixing, host audio | **the samples reach a speaker** — 1,000/1,000 ADPCM vector cases against MAME's decoder, mixed and queued to the device. Its mutation set is the one piece outstanding |
 | **E1** | Frontend: window, frame clock, keyboard, save states | **complete** — `--play` |
 | **E2** | Debugger: single-step, breakpoints, disassembly, register and memory views | **complete** — `F1`, in-window, and it does not perturb the machine |
 | **E3** | Graphics viewers: tile browser, tilemap and palette views, layer toggles | **complete** — `F9`, four views, and the mask subtracts only |
@@ -531,9 +691,9 @@ it, and then took it.
 is how many vector files the Z80 suite has, against the 68000's 127 — and the
 68000 took 16,462 lines and a spec of its own. A Z80 core, an FM synthesizer, and
 a host audio path are three unrelated subsystems; asking one review pass to gate
-all three is what the original decomposition was written to avoid. **D1 and D2 are
-done**, and both were silent by design: D3 is the one that ends "there is no
-sound."
+all three is what the original decomposition was written to avoid. D1 and D2 were
+each silent by design — a CPU with no chip attached, then a chip whose samples
+reached no speaker — and **D3 is the one that ended "there is no sound."**
 
 The split paid off in a way worth recording, because it is an argument for the
 decomposition rather than for the emulator. D2's 1,000-case suite includes at least

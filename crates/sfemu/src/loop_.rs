@@ -17,7 +17,13 @@
 //! *when*, in the sense of ordering: read the keys, then act on them, then run, then
 //! present. It holds no arithmetic, which is why every constant it uses comes from
 //! `frontend`.
+//!
+//! Audio arrives through a second such trait, [`crate::audio::Audio`], for the same
+//! reason and with the same division: the rate conversion and the buffer policy are
+//! [`machine::resample`]'s, and what happens here is only *when* a frame's samples are
+//! handed over.
 
+use crate::audio::Audio;
 use frontend::debug::Debugger;
 use frontend::gfx::GfxViewer;
 use frontend::keys::{Actions, Controls, KeySet};
@@ -102,12 +108,19 @@ const BOARD: u32 = frontend::BOARD_SF2;
 ///    the render below, so this tick's frame is the masked one;
 /// 8. run the frames this tick owes, **stopping mid-frame at a breakpoint**, and step
 ///    one instruction if `F4` asked;
-/// 9. render and present — **every** iteration, including a paused one, or the
-///    window goes black the moment you pause. The overlays are drawn *after*
-///    [`pens_to_argb`], because they are ARGB and the pens are not, and the graphics
-///    viewer goes over the debugger rather than under it;
-/// 10. screenshot, then the title.
-pub fn run(m: &mut Cps1, d: &mut impl Display, o: &LoopOpts) -> Summary {
+/// 9. hand the samples those frames produced to the host, and tell it whether the
+///    emulator is paused — after the frames, so the buffer this tick queues is the one
+///    this tick made, and every iteration, so a pause that is held stays reported;
+/// 10. render and present — **every** iteration, including a paused one, or the
+///     window goes black the moment you pause. The overlays are drawn *after*
+///     [`pens_to_argb`], because they are ARGB and the pens are not, and the graphics
+///     viewer goes over the debugger rather than under it;
+/// 11. screenshot, then the title.
+///
+/// `audio` is `&mut dyn` where `d` is `impl`: `main` picks its sink at runtime — a real
+/// device or [`crate::audio::NullAudio`] when one cannot be opened — so it holds a
+/// `Box<dyn Audio>`, and a generic parameter would make that the caller's problem.
+pub fn run(m: &mut Cps1, d: &mut impl Display, audio: &mut dyn Audio, o: &LoopOpts) -> Summary {
     let mut pacer = FramePacer::cps1();
     let mut controls = Controls::new();
     let mut buf: Vec<u32> = Vec::new();
@@ -203,6 +216,37 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, o: &LoopOpts) -> Summary {
             dbg.note_stopped(m);
         }
 
+        // The pause reaches the sink every tick it is in effect, not on its edge: the
+        // device callback reads the flag once per callback, and a pause reported once and
+        // then forgotten would go on counting a deliberately empty ring as underruns.
+        audio.set_paused(paused);
+        // After the frames, so this is the audio this tick produced, and drained rather
+        // than read, so the machine's buffer does not grow for the whole session. Empty
+        // when no frame ran, and an empty queue is not a call: a sink cannot tell "the
+        // emulator is paused" from "the emulator produced silence" if both arrive as an
+        // empty slice.
+        //
+        // A failure is a notice, not a stop — `note`, so four hundred dead-device frames
+        // are one line. A dropped buffer is a click, and ending someone's session over a
+        // click would be the worse failure.
+        let samples = m.drain_samples();
+        if !samples.is_empty() {
+            if let Err(e) = audio.queue(&samples) {
+                note(&mut summary, format!("audio: {e}"));
+            }
+        }
+        // The ring's counters, handed to the machine so `F1`'s sound panel can show
+        // them beside the chip's own clip count. They are the host's, not the board's —
+        // the ring is sized from a sample rate `machine` has no business knowing — which
+        // is why they arrive through a setter rather than being counted there.
+        //
+        // After the queue and before the render, so the panel drawn this tick shows the
+        // drops this tick's push caused rather than last tick's. Every iteration, paused
+        // included: a panel opened while paused would otherwise read zero and look like
+        // a clean run.
+        let stats = audio.stats();
+        m.sound.set_audio_stats(stats.drops, stats.underruns);
+
         // Outside the loop above: a paused iteration renders too. The frame does not
         // change, but the window is redrawn, and a windowing library that is not
         // given a buffer shows an undefined one.
@@ -226,7 +270,7 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, o: &LoopOpts) -> Summary {
         }
 
         summary.dropped = pacer.dropped();
-        let want = title_for(&summary, m, paused);
+        let want = title_for(&summary, m, paused, audio.is_running());
         if want != title {
             d.set_title(&want);
             title = want;
@@ -270,14 +314,20 @@ fn run_frame_to_breakpoint(m: &mut Cps1, dbg: &mut Debugger) -> bool {
 /// the picture stopped and you want to know why; dropped frames, because the host
 /// cannot keep up and that is not the emulator's bug; halted, because a 68000 that
 /// double bus faulted will never execute another instruction and the window would
-/// otherwise just freeze.
-fn title_for(s: &Summary, m: &Cps1, paused: bool) -> String {
+/// otherwise just freeze; and no audio device, because otherwise "I hear nothing" is
+/// unattributable between a device that would not open, a game that is silent, and a
+/// mix that is broken. The `eprintln!` in `main` names the reason and is gone from the
+/// scrollback five minutes later; this stays.
+fn title_for(s: &Summary, m: &Cps1, paused: bool, audio: bool) -> String {
     let mut t = String::from("sfemu");
     if paused {
         t.push_str(" [paused]");
     }
     if m.cpu.halted {
         t.push_str(" [CPU halted]");
+    }
+    if !audio {
+        t.push_str(" [no audio]");
     }
     if s.dropped > 0 {
         t.push_str(&format!(" [{} dropped]", s.dropped));
@@ -330,6 +380,10 @@ fn screenshot(m: &Cps1, o: &LoopOpts, s: &mut Summary) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The tests that predate audio pass a sink that discards: what they assert is the
+    // loop's frame, pause and save behaviour, and a recording fake in all forty of them
+    // would say nothing they check. The audio tests below use `FakeAudio`.
+    use crate::audio::NullAudio;
     use frontend::keys::Key;
     use frontend::FRAME_NS;
     use machine::video::{HEIGHT, WIDTH};
@@ -561,7 +615,7 @@ mod tests {
         let (o, _s, _p) = opts("ordinary");
         let mut m = machine();
         let mut d = Fake::new(Fake::idle(1));
-        let s = run(&mut m, &mut d, &o);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 1);
         assert_eq!(s.dropped, 0);
         assert!(s.notices.is_empty(), "{:?}", s.notices);
@@ -580,7 +634,7 @@ mod tests {
         script.push(Fake::held(&[Key::P]));
         script.extend(Fake::idle(2));
         let mut d = Fake::new(script);
-        let s = run(&mut machine(), &mut d, &o);
+        let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         // Six ticks, three frames. The pause tick and its two successors run none;
         // the resume tick and the two after it run one each — the pacer's reset
         // discards the time spent paused, but this tick's own elapsed is still
@@ -602,7 +656,7 @@ mod tests {
         script.extend(Fake::idle(1));
         script.push(Fake::held(&[Key::Period]));
         let mut d = Fake::new(script);
-        let s = run(&mut machine(), &mut d, &o);
+        let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 2, "one frame per press, not per tick held");
     }
 
@@ -613,7 +667,7 @@ mod tests {
         let mut script = vec![Fake::held(&[Key::P]), Fake::held(&[Key::Period])];
         script.extend(Fake::idle(3));
         let mut d = Fake::new(script);
-        let s = run(&mut machine(), &mut d, &o);
+        let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 1, "the step, and nothing from the three after it");
     }
 
@@ -626,7 +680,7 @@ mod tests {
     fn a_stalled_host_runs_the_cap_and_not_the_debt() {
         let (o, _s, _p) = opts("stall");
         let mut d = Fake::new(vec![(KeySet::new(), 2_000_000_000)]);
-        let s = run(&mut machine(), &mut d, &o);
+        let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 4, "the catch-up cap");
         assert_eq!(s.dropped, 115, "119 owed less the 4 served");
     }
@@ -648,7 +702,7 @@ mod tests {
         // isolates the reset from the frame that follows it.
         script.push((KeySet::from_keys(&[Key::F3]), 0));
         let mut d = Fake::new(script);
-        run(&mut m, &mut d, &o);
+        run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(m.total_cycles, 0, "the cycle count restarts");
         // 0x1004 and not 0x1000: `M68k::reset` refills the prefetch queue, which
         // advances the PC past the two words it read. Compared against a freshly
@@ -673,7 +727,7 @@ mod tests {
         let mut script = Fake::idle(10);
         script[3] = Fake::held(&[Key::Escape]);
         let mut d = Fake::new(script);
-        run(&mut machine(), &mut d, &o);
+        run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         // Three, not four: the quit tick breaks *before* presenting. Nothing about
         // the frame changed on that tick, and drawing into a window that is closing
         // is at best wasted and at worst a use of a surface that has gone away.
@@ -694,7 +748,7 @@ mod tests {
         script.extend(Fake::idle(3));
         let ticks = script.len();
         let mut d = Fake::new(script);
-        run(&mut machine(), &mut d, &o);
+        run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert_eq!(d.presented.len(), ticks, "one present per tick");
         assert!(
             d.presented.iter().all(|&n| n == WIDTH * HEIGHT),
@@ -717,7 +771,7 @@ mod tests {
         let mut m = machine_that_draws();
         // The very first tick pauses, so no frame runs inside the loop at all.
         let mut d = Fake::new(vec![Fake::held(&[Key::P])]);
-        let s = run(&mut m, &mut d, &o);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 0, "the premise: the loop ran no frames");
         let first = d.first.expect("a paused tick still presents");
         assert!(
@@ -745,7 +799,7 @@ mod tests {
             Fake::held(&[]),
             (KeySet::from_keys(&[Key::P]), 1),
         ]);
-        let s = run(&mut machine(), &mut d, &o);
+        let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert_eq!(
             s.frames, 0,
             "the pre-pause remainder must not complete a frame after the resume"
@@ -761,7 +815,7 @@ mod tests {
     fn the_remainder_completes_a_frame_when_nothing_is_paused() {
         let (o, _s, _p) = opts("pace-remainder");
         let mut d = Fake::new(vec![(KeySet::new(), FRAME_NS - 1), (KeySet::new(), 1)]);
-        let s = run(&mut machine(), &mut d, &o);
+        let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 1, "the two ticks are one frame between them");
     }
 
@@ -770,7 +824,7 @@ mod tests {
     fn the_title_reports_dropped_frames() {
         let (o, _s, _p) = opts("title-drop");
         let mut d = Fake::new(vec![(KeySet::new(), 2_000_000_000)]);
-        run(&mut machine(), &mut d, &o);
+        run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert!(
             d.titles.iter().any(|t| t.contains("115 dropped")),
             "a stall must say so: {:?}",
@@ -781,7 +835,7 @@ mod tests {
         // be noise, and a test that only checked the stall case would pass for one.
         let (o, _s, _p) = opts("title-quiet");
         let mut d = Fake::new(Fake::idle(4));
-        run(&mut machine(), &mut d, &o);
+        run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert!(
             !d.titles.iter().any(|t| t.contains("dropped")),
             "a healthy run must not: {:?}",
@@ -796,7 +850,7 @@ mod tests {
         let mut script = vec![Fake::held(&[Key::P])];
         script.extend(Fake::idle(1));
         let mut d = Fake::new(script);
-        run(&mut machine(), &mut d, &o);
+        run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert!(
             d.titles.iter().any(|t| t.contains("paused")),
             "{:?}",
@@ -819,7 +873,7 @@ mod tests {
         let mut script = vec![Fake::held(&[Key::F5])];
         script.extend(Fake::idle(4));
         let mut d = Fake::new(script);
-        let s = run(&mut m, &mut d, &o);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert!(
             s.notices.is_empty(),
             "the save must succeed: {:?}",
@@ -831,11 +885,11 @@ mod tests {
 
         // Run four more, then load and run the same four again.
         let mut d = Fake::new(Fake::idle(4));
-        run(&mut m, &mut d, &o);
+        run(&mut m, &mut d, &mut NullAudio::default(), &o);
         let mut script = vec![Fake::held(&[Key::F8])];
         script.extend(Fake::idle(4));
         let mut d = Fake::new(script);
-        let s = run(&mut m, &mut d, &o);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert!(
             s.notices.is_empty(),
             "the load must succeed: {:?}",
@@ -873,7 +927,7 @@ mod tests {
         ];
         let ticks = script.len();
         let mut d = Fake::new(script);
-        let s = run(&mut machine(), &mut d, &o);
+        let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert_eq!(d.presented.len(), ticks, "the loop ran to the end");
         assert_eq!(s.notices.len(), 1, "one notice, not one per press");
         assert!(
@@ -894,7 +948,7 @@ mod tests {
         script.extend(Fake::idle(2));
         let ticks = script.len();
         let mut d = Fake::new(script);
-        let s = run(&mut m, &mut d, &o);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(d.presented.len(), ticks, "the loop ran to the end");
         assert_eq!(s.notices.len(), 1, "{:?}", s.notices);
         assert!(
@@ -925,7 +979,7 @@ mod tests {
         // the *load* left the machine alone, and a frame run afterwards would move
         // it for a reason that has nothing to do with the load.
         let mut d = Fake::new(vec![(KeySet::from_keys(&[Key::F8]), 0)]);
-        let s = run(&mut m, &mut d, &o);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.notices.len(), 1, "{:?}", s.notices);
         assert_eq!(s.frames, 0, "the load tick owed nothing");
         assert_eq!(
@@ -950,7 +1004,7 @@ mod tests {
     fn a_saved_state_is_tagged_with_this_build_s_board() {
         let (o, _s, _p) = opts("board-tag");
         let mut d = Fake::new(vec![Fake::held(&[Key::F5])]);
-        let s = run(&mut machine(), &mut d, &o);
+        let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert!(s.notices.is_empty(), "{:?}", s.notices);
 
         let bytes = std::fs::read(&o.state_path).expect("F5 must write the file");
@@ -983,7 +1037,7 @@ mod tests {
 
         let before = (m.total_cycles, m.cpu.d[0], m.line);
         let mut d = Fake::new(vec![(KeySet::from_keys(&[Key::F8]), 0)]);
-        let s = run(&mut m, &mut d, &o);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.notices.len(), 1, "{:?}", s.notices);
         assert!(
             s.notices[0].contains("board"),
@@ -1002,7 +1056,7 @@ mod tests {
     fn a_screenshot_is_written_as_a_ppm() {
         let (o, _s, shot) = opts("shot");
         let mut d = Fake::new(vec![Fake::held(&[Key::F12])]);
-        let s = run(&mut machine(), &mut d, &o);
+        let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert!(s.notices.is_empty(), "{:?}", s.notices);
         let bytes = std::fs::read(&shot.0).expect("F12 must write the file");
         assert_eq!(&bytes[..2], b"P6", "a binary PPM");
@@ -1032,7 +1086,7 @@ mod tests {
         m.reset();
 
         let mut d = Fake::new(Fake::idle(3));
-        let s = run(&mut m, &mut d, &o);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert!(m.cpu.halted, "the premise: this program really halts");
         assert_eq!(d.presented.len(), 3, "the loop ran to the end anyway");
         assert_eq!(s.frames, 3, "and kept running frames");
@@ -1056,7 +1110,7 @@ mod tests {
             Fake::held(&[Key::P]),
             Fake::held(&[Key::P, Key::Num5, Key::Down]),
         ]);
-        let s = run(&mut m, &mut d, &o);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         // P is held on both ticks, so there is no second edge and no unpause.
         assert_eq!(s.frames, 0, "the premise: no frame ran");
         assert!(m.board.inputs.coin1, "the coin reached the board anyway");
@@ -1084,7 +1138,7 @@ mod tests {
             Fake::held(&[Key::P, Key::F4]),
         ];
         let mut d = Fake::new(script);
-        let s = run(&mut m, &mut d, &o);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 0, "the premise: no frame ran");
         assert_eq!(m.total_cycles, 20, "16 for the `move`, 4 for the `addq`");
         assert_eq!(
@@ -1122,7 +1176,7 @@ mod tests {
             (KeySet::new(), FRAME_NS),
         ];
         let mut d = Fake::new(script);
-        let s = run(&mut m, &mut d, &o);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
 
         assert_eq!(
             frontend::overlay::executing_pc(&m),
@@ -1164,7 +1218,7 @@ mod tests {
         ];
         script.extend(Fake::idle(3));
         let mut d = Fake::new(script.clone());
-        run(&mut m, &mut d, &o);
+        run(&mut m, &mut d, &mut NullAudio::default(), &o);
         let stopped = m.total_cycles;
         assert!(stopped > 0, "the premise: the machine ran up to the stop");
 
@@ -1172,7 +1226,7 @@ mod tests {
         m.restore(&start);
         script[3] = Fake::held(&[Key::P]);
         let mut d = Fake::new(script);
-        run(&mut m, &mut d, &o);
+        run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert!(
             m.total_cycles > stopped,
             "resuming must run on: {} cycles against {stopped} stopped",
@@ -1226,7 +1280,7 @@ mod tests {
             // And a tick that owes a frame. It must run.
             (KeySet::new(), FRAME_NS),
         ]);
-        run(&mut m, &mut d, &o);
+        run(&mut m, &mut d, &mut NullAudio::default(), &o);
 
         // 32, not 18: the resume ran the `bra` and the `addq` and stopped when it came
         // back round. 18 is exactly the mutant's answer — stepped onto the breakpoint
@@ -1262,7 +1316,7 @@ mod tests {
         // Zero elapsed and one tick, so the machine does not move: the state it is in
         // afterwards is the state the overlay was drawn from.
         let mut d = Fake::new(vec![(KeySet::from_keys(&[Key::F1]), 0)]);
-        let s = run(&mut m, &mut d, &o);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 0, "the premise: the machine did not move");
         let shown = d.first.expect("a tick presents");
 
@@ -1305,7 +1359,7 @@ mod tests {
         let (o, _s, _p) = opts("overlay-off");
         let mut m = machine_that_draws();
         let mut d = Fake::new(vec![(KeySet::new(), 0)]);
-        run(&mut m, &mut d, &o);
+        run(&mut m, &mut d, &mut NullAudio::default(), &o);
         let shown = d.first.expect("a tick presents");
         let mut game: Vec<u32> = Vec::new();
         pens_to_argb(&m.video, &mut game);
@@ -1337,7 +1391,7 @@ mod tests {
             // the frame this tick presents already has both.
             let mut m = machine_that_draws();
             let mut d = Fake::new(vec![Fake::held(&[Key::F1, Key::GfxToggled])]);
-            run(&mut m, &mut d, &o);
+            run(&mut m, &mut d, &mut NullAudio::default(), &o);
             d.first.expect("a tick presents")
         };
         // What must be there is the viewer's background, not the debugger's.
@@ -1351,7 +1405,7 @@ mod tests {
         let e2 = {
             let mut m = machine_that_draws();
             let mut d = Fake::new(vec![Fake::held(&[Key::F1])]);
-            run(&mut m, &mut d, &o);
+            run(&mut m, &mut d, &mut NullAudio::default(), &o);
             d.first.expect("a tick presents")
         };
         assert_eq!(
@@ -1377,7 +1431,7 @@ mod tests {
         let full = {
             let mut m = machine_that_draws();
             let mut d = Fake::new(Fake::idle(12));
-            run(&mut m, &mut d, &o);
+            run(&mut m, &mut d, &mut NullAudio::default(), &o);
             d.last.expect("a tick presents")
         };
 
@@ -1409,7 +1463,7 @@ mod tests {
             Fake::held(&[Key::GfxToggled]),
             Fake::held(&[]),
         ]);
-        run(&mut m, &mut d, &o);
+        run(&mut m, &mut d, &mut NullAudio::default(), &o);
         let masked = d.last.expect("a tick presents");
         assert_ne!(
             m.video.enable,
@@ -1462,7 +1516,7 @@ mod tests {
             Fake::held(&[Key::Enter]),
             Fake::held(&[]),
         ]);
-        let s_on = run(&mut m, &mut d, &o);
+        let s_on = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         let on = (
             m.total_cycles,
             m.cpu.d,
@@ -1487,7 +1541,7 @@ mod tests {
         m.video.enable = machine::video::compose::LayerMask::all();
         let base = (m.board.trace.acks, m.board.trace.vblanks);
         let mut d = Fake::new(Fake::idle(10));
-        let s_off = run(&mut m, &mut d, &o);
+        let s_off = run(&mut m, &mut d, &mut NullAudio::default(), &o);
 
         assert_eq!(s_on.frames, s_off.frames, "the same frames were asked for");
         assert_eq!(s_on.frames, 10, "and there were some");
@@ -1557,7 +1611,7 @@ mod tests {
         // selection, so the two runs differ in the mask and in nothing else.
         let base = (m.board.trace.acks, m.board.trace.vblanks);
         let mut d = Fake::new(script(0));
-        let s_off = run(&mut m, &mut d, &o);
+        let s_off = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         let want = (
             m.total_cycles,
             m.cpu.d,
@@ -1583,7 +1637,7 @@ mod tests {
             m.video.enable = machine::video::compose::LayerMask::all();
             let base = (m.board.trace.acks, m.board.trace.vblanks);
             let mut d = Fake::new(script(bits));
-            let s = run(&mut m, &mut d, &o);
+            let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
             // Row 0 is the sprites, then the three scrolls in order.
             assert_eq!(
                 m.video.enable,
@@ -1635,7 +1689,7 @@ mod tests {
         let mut script = vec![Fake::held(&[Key::F1])];
         script.extend(Fake::idle(3));
         let mut d = Fake::new(script);
-        let s_on = run(&mut m, &mut d, &o);
+        let s_on = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         let on = (
             m.total_cycles,
             m.cpu.d,
@@ -1657,7 +1711,7 @@ mod tests {
         m.restore(&start);
         let base = (m.board.trace.acks, m.board.trace.vblanks);
         let mut d = Fake::new(Fake::idle(4));
-        let s_off = run(&mut m, &mut d, &o);
+        let s_off = run(&mut m, &mut d, &mut NullAudio::default(), &o);
 
         assert_eq!(s_on.frames, s_off.frames, "the same frames were asked for");
         assert_eq!(s_on.frames, 4, "and there were some");
@@ -1699,7 +1753,7 @@ mod tests {
         );
 
         let mut d = Fake::new(Fake::idle(4));
-        let s = run(&mut m, &mut d, &o);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 4, "the premise: four frames ran");
         let stepped = (
             m.total_cycles,
@@ -1745,8 +1799,297 @@ mod tests {
     fn a_display_that_never_opens_runs_nothing() {
         let (o, _s, _p) = opts("closed");
         let mut d = Fake::new(Vec::new());
-        let s = run(&mut machine(), &mut d, &o);
+        let mut a = FakeAudio::default();
+        let s = run(&mut machine(), &mut d, &mut a, &o);
         assert_eq!(s, Summary::default());
         assert!(d.presented.is_empty());
+        assert_eq!(a.calls, 0, "and queued nothing");
+    }
+
+    /// Records what the loop queued, so a test can assert on the audio without a device.
+    ///
+    /// The counterpart of [`Fake`], and for the same reason: a real device's buffer
+    /// cannot be read back, so what the loop *decides* about audio — how often it
+    /// queues, what it does with a failure, whether a pause is reported — could only be
+    /// checked by listening. `calls` is separate from `queued.len()` because "queued the
+    /// samples twice" and "queued twice as many samples" are different bugs.
+    #[derive(Debug)]
+    struct FakeAudio {
+        queued: Vec<i16>,
+        calls: usize,
+        paused: Vec<bool>,
+        /// When set, every [`Audio::queue`] fails with this message.
+        fail: Option<String>,
+        /// What [`Audio::stats`] reports, so a test can check the numbers reach the
+        /// board's sound panel rather than being read and dropped.
+        stats: machine::resample::RingStats,
+        /// What [`Audio::is_running`] reports. A field rather than a constant because
+        /// the title bar branches on it, and a constant would leave one arm of that
+        /// branch unreachable from any test.
+        running: bool,
+    }
+
+    /// `running: true` by default — a sink that works is the ordinary case, and the
+    /// tests that care about a dead one say so.
+    impl Default for FakeAudio {
+        fn default() -> Self {
+            Self {
+                queued: Vec::new(),
+                calls: 0,
+                paused: Vec::new(),
+                fail: None,
+                stats: machine::resample::RingStats::default(),
+                running: true,
+            }
+        }
+    }
+
+    impl Audio for FakeAudio {
+        fn queue(&mut self, samples: &[i16]) -> Result<(), String> {
+            self.calls += 1;
+            if let Some(e) = &self.fail {
+                return Err(e.clone());
+            }
+            self.queued.extend_from_slice(samples);
+            Ok(())
+        }
+        fn queued(&self) -> usize {
+            self.queued.len()
+        }
+        fn stats(&self) -> machine::resample::RingStats {
+            self.stats
+        }
+        fn set_paused(&mut self, paused: bool) {
+            self.paused.push(paused);
+        }
+        fn is_running(&self) -> bool {
+            self.running
+        }
+    }
+
+    /// Every frame's samples are queued, once, and the machine's buffer is drained — so
+    /// a long run does not grow a `Vec` forever.
+    ///
+    /// The sample count is bounded on both sides against the rate, not against a second
+    /// call to the loop: about 937 per frame at 55,930 Hz over 59.63 fps, so three frames
+    /// is 2,800 give or take one frame's fractional remainder. A loop that queued the
+    /// same buffer twice would land at 5,600 and a loop that never drained would grow
+    /// quadratically.
+    #[test]
+    fn each_frame_queues_its_samples_exactly_once() {
+        let (o, _s, _p) = opts("queue-once");
+        let mut m = machine();
+        let mut d = Fake::new(Fake::idle(3));
+        let mut a = FakeAudio::default();
+        let s = run(&mut m, &mut d, &mut a, &o);
+        assert_eq!(s.frames, 3);
+        assert_eq!(
+            a.calls, 3,
+            "one queue call per frame, not per tick or per two"
+        );
+        assert!(
+            (2_700..3_000).contains(&a.queued.len()),
+            "{} samples for 3 frames, expected about 2,811",
+            a.queued.len()
+        );
+        assert!(
+            m.samples().is_empty(),
+            "the machine's buffer must be drained, or it grows for the whole session: \
+             {} left",
+            m.samples().len()
+        );
+        assert!(s.notices.is_empty(), "{:?}", s.notices);
+    }
+
+    /// A paused frame still presents, but queues nothing new — because the machine did
+    /// not run — and the sink is told about the pause so a drained ring is not counted as
+    /// an underrun.
+    #[test]
+    fn a_paused_tick_queues_nothing_and_reports_the_pause() {
+        let (o, _s, _p) = opts("queue-paused");
+        let mut script = vec![Fake::held(&[Key::P])];
+        script.extend(Fake::idle(2));
+        let mut d = Fake::new(script);
+        let mut a = FakeAudio::default();
+        let s = run(&mut machine(), &mut d, &mut a, &o);
+        assert_eq!(s.frames, 0, "the premise: no frame ran");
+        assert!(
+            a.queued.is_empty(),
+            "queued {} samples while paused",
+            a.queued.len()
+        );
+        assert_eq!(
+            a.calls, 0,
+            "and did not call `queue` with an empty slice either"
+        );
+        // The pause reached the sink on every tick it was in effect, not just its edge:
+        // `Ring::pop` reads the flag per callback, so a pause reported once and then
+        // forgotten would resume counting underruns while still paused.
+        assert_eq!(
+            a.paused,
+            vec![true, true, true],
+            "the pause must be reported every tick it holds"
+        );
+        // And presented anyway, or the window goes black the moment you pause.
+        assert_eq!(d.presented.len(), 3);
+    }
+
+    /// Resuming tells the sink the pause is over, and the samples flow again.
+    ///
+    /// Without this, a `set_paused(true)` that was never undone would silence the
+    /// underrun counter for the rest of the session — the counter would read zero
+    /// through a genuinely struggling host, which is the one thing it exists to say.
+    #[test]
+    fn resuming_tells_the_sink_the_pause_is_over() {
+        let (o, _s, _p) = opts("queue-resume");
+        let mut script = vec![Fake::held(&[Key::P])];
+        script.extend(Fake::idle(1));
+        script.push(Fake::held(&[Key::P]));
+        script.extend(Fake::idle(1));
+        let mut d = Fake::new(script);
+        let mut a = FakeAudio::default();
+        let s = run(&mut machine(), &mut d, &mut a, &o);
+        assert_eq!(s.frames, 2, "the resume tick and the one after it");
+        assert_eq!(
+            a.paused,
+            vec![true, true, false, false],
+            "paused for two ticks, then running for two"
+        );
+        assert_eq!(a.calls, 2, "and the frames that ran queued their samples");
+        assert!(!a.queued.is_empty());
+    }
+
+    /// A device that cannot take the samples is a notice, once, and the loop runs on.
+    ///
+    /// The same policy as a failed save, for a sharper reason: a dropped buffer is a
+    /// click, and stopping someone's game over a click would be the worse failure. Once,
+    /// because sixty identical lines a second is how a message gets hidden inside itself.
+    #[test]
+    fn a_failed_queue_is_one_notice_and_does_not_stop_the_loop() {
+        let (o, _s, _p) = opts("queue-fails");
+        let mut d = Fake::new(Fake::idle(4));
+        let mut a = FakeAudio {
+            fail: Some("the device went away".to_string()),
+            ..FakeAudio::default()
+        };
+        let s = run(&mut machine(), &mut d, &mut a, &o);
+        assert_eq!(s.frames, 4, "the loop ran every frame it owed");
+        assert_eq!(a.calls, 4, "and kept trying rather than giving up");
+        assert_eq!(
+            s.notices,
+            vec!["audio: the device went away".to_string()],
+            "one notice for four identical failures"
+        );
+        assert_eq!(d.presented.len(), 4, "and the picture kept going");
+    }
+
+    /// A sink with no device behind it says so in the title, and a working one does not.
+    ///
+    /// Both halves, because the tag is only useful if its absence means something. `main`
+    /// also prints the reason on `stderr`, but that line is gone from the scrollback five
+    /// minutes later, and "I hear nothing" then has three explanations — no device, a
+    /// silent game, a broken mix — with nothing on screen to choose between them.
+    #[test]
+    fn the_title_says_when_there_is_no_audio_device() {
+        let (o, _s, _p) = opts("title-no-audio");
+        let mut d = Fake::new(Fake::idle(2));
+        let mut dead = FakeAudio {
+            running: false,
+            ..FakeAudio::default()
+        };
+        run(&mut machine(), &mut d, &mut dead, &o);
+        assert!(
+            d.titles.iter().any(|t| t.contains("[no audio]")),
+            "a sink that is not running must say so: {:?}",
+            d.titles
+        );
+
+        let (o2, _s2, _p2) = opts("title-has-audio");
+        let mut d2 = Fake::new(Fake::idle(2));
+        let mut live = FakeAudio::default();
+        run(&mut machine(), &mut d2, &mut live, &o2);
+        assert!(
+            !d2.titles.iter().any(|t| t.contains("no audio")),
+            "and a working device must not: {:?}",
+            d2.titles
+        );
+    }
+
+    /// The ring's drop and underrun counts reach the board, where the sound panel reads
+    /// them.
+    ///
+    /// They are the host's numbers, not the board's — the ring is sized from a device
+    /// sample rate `machine` has no business knowing — so they arrive through a setter,
+    /// and a loop that read [`Audio::stats`] and dropped the result would leave the
+    /// panel's `DRP` and `UND` columns reading zero through a session of clicks. The
+    /// second run is the premise: without it, a `set_audio_stats(0, 0)` that ignored the
+    /// sink would pass the first half.
+    #[test]
+    fn the_rings_counters_reach_the_sound_panel() {
+        let (o, _s, _p) = opts("audio-stats");
+        let mut m = machine();
+        let mut d = Fake::new(Fake::idle(2));
+        let mut a = FakeAudio {
+            stats: machine::resample::RingStats {
+                drops: 17,
+                underruns: 4,
+            },
+            ..FakeAudio::default()
+        };
+        run(&mut m, &mut d, &mut a, &o);
+        let t = m.sound.trace();
+        assert_eq!(t.audio_drops, 17, "drops is the first argument");
+        assert_eq!(t.audio_underruns, 4, "and underruns the second");
+
+        let (o2, _s2, _p2) = opts("audio-stats-quiet");
+        let mut m2 = machine();
+        let mut d2 = Fake::new(Fake::idle(2));
+        run(&mut m2, &mut d2, &mut FakeAudio::default(), &o2);
+        assert_eq!(
+            (
+                m2.sound.trace().audio_drops,
+                m2.sound.trace().audio_underruns
+            ),
+            (0, 0),
+            "a healthy sink leaves them at zero"
+        );
+    }
+
+    /// Queuing does not change the machine.
+    ///
+    /// The audio is drained out of the machine, which is a mutation — so unlike the
+    /// viewer's read-only paths this cannot be asserted as "nothing changed". What is
+    /// asserted instead is that draining changes *only* the sample buffer: two runs of
+    /// the same length, one with a sink that fails and one with a sink that succeeds,
+    /// must reach the same machine. A failure path that skipped the drain would leave the
+    /// buffer full and diverge.
+    #[test]
+    fn a_failing_sink_reaches_the_same_machine_as_a_working_one() {
+        let (o, _s, _p) = opts("queue-same-a");
+        let mut working = machine();
+        let mut d = Fake::new(Fake::idle(3));
+        let mut a = FakeAudio::default();
+        run(&mut working, &mut d, &mut a, &o);
+
+        let (o2, _s2, _p2) = opts("queue-same-b");
+        let mut failing = machine();
+        let mut d2 = Fake::new(Fake::idle(3));
+        let mut a2 = FakeAudio {
+            fail: Some("no device".to_string()),
+            ..FakeAudio::default()
+        };
+        run(&mut failing, &mut d2, &mut a2, &o2);
+
+        assert_eq!(working.board.ram, failing.board.ram, "the same memory");
+        assert_eq!(
+            working.total_cycles, failing.total_cycles,
+            "the same cycle count"
+        );
+        assert!(
+            working.samples().is_empty() && failing.samples().is_empty(),
+            "both drained: {} and {}",
+            working.samples().len(),
+            failing.samples().len()
+        );
     }
 }

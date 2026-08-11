@@ -37,27 +37,18 @@ pub trait Audio {
     /// underrun.
     fn set_paused(&mut self, paused: bool);
 
-    /// Whether the device is still alive.
+    /// Whether anything is actually playing.
+    ///
+    /// `false` for [`NullAudio`], which is what the title bar reads to say `[no audio]`:
+    /// a player who hears nothing needs to be told whether the emulator is silent
+    /// because the device could not be opened or because the game is.
     fn is_running(&self) -> bool;
 }
 
-/// An audio sink that discards everything, for `--no-audio` and for tests.
+/// An audio sink that discards everything, for a host with no usable device.
 #[derive(Debug, Default)]
 pub struct NullAudio {
     queued: usize,
-    paused: bool,
-}
-
-impl NullAudio {
-    /// Whether [`Audio::set_paused`] was last called with `true`.
-    ///
-    /// Recorded rather than dropped so a loop test can assert the loop *told* the sink
-    /// about a pause. The `CpalAudio` path stores the same flag for the callback to read;
-    /// a fake that threw it away would let a loop that never called `set_paused` pass.
-    #[must_use]
-    pub const fn paused(&self) -> bool {
-        self.paused
-    }
 }
 
 impl Audio for NullAudio {
@@ -74,11 +65,14 @@ impl Audio for NullAudio {
         // Nothing is playing, so nothing can drop or starve.
         RingStats::default()
     }
-    fn set_paused(&mut self, paused: bool) {
-        self.paused = paused;
+    fn set_paused(&mut self, _paused: bool) {
+        // Nothing to tell: the flag exists so a real device's callback stops counting
+        // underruns against a deliberately empty ring, and this sink has no ring. What
+        // matters — that the *loop* reports the pause — is asserted in `loop_`'s tests
+        // against a fake that records every call.
     }
     fn is_running(&self) -> bool {
-        true
+        false
     }
 }
 
@@ -246,7 +240,6 @@ mod tests {
             3,
             "a test must be able to tell nothing from never"
         );
-        assert!(a.is_running());
         assert_eq!(
             a.stats(),
             RingStats::default(),
@@ -254,20 +247,20 @@ mod tests {
         );
     }
 
-    /// The null sink remembers a pause, so a loop test can assert the loop reported one.
+    /// The null sink says it is not running, and that is what reaches the title bar.
+    ///
+    /// The one method here whose value is a claim rather than a forward. A sink that
+    /// reported `true` would be a window titled as if sound were playing on a machine
+    /// with no audio device — and "I hear nothing" is then unattributable between a
+    /// missing device, a silent game and a broken mix.
     #[test]
-    fn the_null_sink_remembers_a_pause() {
+    fn the_null_sink_says_it_is_not_running() {
         let mut a = NullAudio::default();
-        assert!(!a.paused(), "a fresh sink is not paused");
+        assert!(!a.is_running(), "there is no device behind this sink");
+        // And a pause is accepted rather than panicking: the loop calls it every tick.
         a.set_paused(true);
-        assert!(a.paused(), "the flag the loop set must be readable");
         a.set_paused(false);
-        assert!(!a.paused());
-        assert_eq!(
-            a.stats(),
-            RingStats::default(),
-            "and a pause still starves nothing"
-        );
+        assert_eq!(a.stats(), RingStats::default());
     }
 
     /// The trait is usable through a `dyn` reference, which is how a frontend holds it —

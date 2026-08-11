@@ -511,9 +511,9 @@ fn draw_sound(buf: &mut [u32], m: &Cps1) {
     );
     // The three counters that answer "why does it sound wrong", in the order the audio
     // path produces them: the chip clamped its own sum, the ring was full, the ring was
-    // empty. `DRP` and `UND` come from the host through `set_audio_stats` and stay 0
-    // until Task 12 wires the device — 0 is the honest reading for a machine with no
-    // audio device, not a placeholder.
+    // empty. `DRP` and `UND` come from the host through `set_audio_stats`, which the
+    // frontend loop calls once a tick from the device's ring; they read 0 on a machine
+    // with no audio device, which is the honest reading rather than a placeholder.
     line(
         buf,
         &mut row,

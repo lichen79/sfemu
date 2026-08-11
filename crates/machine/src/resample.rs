@@ -8,7 +8,11 @@
 //!
 //! The board produces `SOUND_XTAL / YM_SAMPLE_CLOCKS` = 55,930.390625 Hz. A host wants
 //! 48,000. Handing the board's stream to a 48 kHz device unconverted plays it **14.2%
-//! fast** — SF2's music the better part of a whole tone sharp.
+//! slow** — 48,000/55,930.390625 = 0.858, so SF2's music comes out **2.65 semitones
+//! flat**, A440 landing at 378 Hz. The direction is worth stating rather than leaving
+//! to the reader: a device consuming 48,000 samples a second out of a 55,930 Hz stream
+//! takes 1.165 seconds of music to fill one second, so the pitch falls. See
+//! `the_resampler_knows_both_rates_are_different`, which pins the ratio.
 //!
 //! The conversion is **linear interpolation**, and the cost is stated rather than
 //! hidden: at 1.165× downsampling it attenuates the top of the band and folds content
@@ -286,7 +290,8 @@ mod tests {
     use super::*;
 
     /// The ratio is the two rates, and it is not 1 — which is the whole reason this
-    /// file exists. At 48 kHz the unconverted path would be 14% sharp.
+    /// file exists. At 48 kHz the unconverted path would be 14.2% slow, 2.65 semitones
+    /// flat; the module docs work the direction out.
     #[test]
     fn the_resampler_knows_both_rates_are_different() {
         let r = Resampler::new(48_000);
