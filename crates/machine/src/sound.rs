@@ -450,9 +450,29 @@ mod tests {
     }
 
     /// Sound RAM is 2 KB at 0xD000 and reads back what was written.
+    ///
+    /// # Why the array's own length is asserted, not just the window
+    ///
+    /// The loops below walk the bus, and the bus arms are written as literal ranges
+    /// (`0xD000..=0xD7FF` in both `read` and `peek_byte`). Widening `RAM_BYTES` alone
+    /// therefore changes nothing any bus access can observe — the extra bytes are
+    /// unreachable — so the loops pass on a 4 KB array holding 2 KB of reachable
+    /// storage. That is not a harmless discrepancy: `RAM_BYTES` is the length
+    /// `MachineState::sound_ram` carries, so it decides how many bytes every save
+    /// state on disk is, and half of them would be permanently zero. The `assert_eq!`
+    /// on the length is what ties the array to the window; the arithmetic below it
+    /// states the relationship rather than restating the constant, so a reader can see
+    /// *why* 0x800 and not merely *that* it is 0x800.
     #[test]
     fn sound_ram_is_two_kilobytes_at_d000() {
+        assert_eq!(
+            RAM_BYTES,
+            usize::from(0xD7FFu16 - 0xD000u16) + 1,
+            "the array is exactly the window the bus decodes: a longer one is storage \
+             no Z80 access can reach, and it is the save state's length too"
+        );
         let mut b = SoundBoard::new(rom());
+        assert_eq!(b.ram().len(), RAM_BYTES, "and the snapshot sees that array");
         for a in 0xD000..0xD800u16 {
             b.write(a, (a & 0xFF) as u8);
         }

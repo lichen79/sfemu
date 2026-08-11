@@ -273,14 +273,24 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
                 "        return GLYPHS[0];",
                 "KILL",
             ),
-            # CONTROL: `LINE`, which nothing in this module uses -- it is `overlay.rs`
-            # that lays lines out, and Task 4 is what will pin it. Changing it here is
-            # observably identical to this module's tests, and saying so is more
-            # honest than pretending the font set covers it.
+            # CONTROL: a pixel added to `~`, the one printable character no panel in
+            # this repository ever draws. `every_glyph_is_distinct` still passes --
+            # verified: the mutated bitmap collides with none of the other 94 -- and
+            # `~` is not one of the sixteen hex digits the literals pin, which is the
+            # boundary the module docs draw deliberately: distinctness for all 95,
+            # exactness only for the characters the panels are made of. So this
+            # survives, and it should.
+            #
+            # It replaces `CONTROL-line-height-unused-until-task-4`, which was honest
+            # when written and stopped being so: `LINE` is now laid out by
+            # `overlay.rs` and `gfxpanels.rs`, and D2 Task 12's sound panel made
+            # `all_five_panels_can_be_shown_at_once_without_overlapping` kill it. A
+            # control that a later task turns into a real mutant has to be replaced,
+            # not re-argued -- see the run's own BAD row for it.
             (
-                "CONTROL-line-height-unused-until-task-4",
-                "pub const LINE: usize = GLYPH_H + 1;",
-                "pub const LINE: usize = GLYPH_H + 2;",
+                "CONTROL-a-pixel-added-to-a-character-no-panel-draws",
+                'g!("....", "....", ".#.#", "#.#.", "....", "...."), // \'~\'',
+                'g!("....", "....", ".#.#", "#.#.", "..#.", "...."), // \'~\'',
                 "SURVIVE",
             ),
         ],
@@ -1980,18 +1990,31 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
                 "KILL",
                 "crates/machine/src/sound.rs",
             ),
-            # CONTROL: `Debug` dropped from `SoundTrace`. Nothing formats it in a
-            # passing run -- the assertion messages that would are on paths only a
-            # failure takes -- so this compiles and changes no behaviour.
+            # CONTROL: `SoundBoard`'s hand-written `Debug` reports a constant bank
+            # instead of the real one. Nothing in this repository formats a
+            # `SoundBoard` -- checked: the only `{:?}` uses in `machine` and `frontend`
+            # are on `gfx` state and on assertion messages for other types -- so the
+            # wrong number is written into a string no passing or failing test reads.
+            #
+            # It replaces `CONTROL-sound-trace-loses-its-copy-derive`, which the run
+            # scored NO-BUILD: dropping `Copy` from `SoundTrace` breaks
+            # `pub const fn trace(&self) -> SoundTrace`, so nothing was measured, and a
+            # mutant that does not compile is worthless however it scores. Dropping
+            # `Debug` instead would not compile either -- the impl below formats
+            # `trace` -- which is why the target moved to the formatter itself.
+            #
+            # This is a genuine gap and named as one: if D3's overlay ever prints a
+            # sound board, this control becomes a real mutant and must be replaced
+            # rather than argued with -- which is exactly what happened to `font`'s.
             #
             # Checked against every other mutant in both sets for the overlap the plan
-            # warns about: nothing else here touches `SoundTrace`'s derives or the
-            # suite's case selection, and the `ymsound` control's second edit is in
-            # `testrunner`, which this set does not score against.
+            # warns about: nothing else here touches this impl (the bank mutants edit
+            # the 0xF004 write arm and the `BANKS` constant), and the `ymsound`
+            # control's second edit is in `testrunner`, which this set does not score.
             (
-                "CONTROL-sound-trace-loses-its-copy-derive",
-                "#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]\npub struct SoundTrace {",
-                "#[derive(Debug, Clone, PartialEq, Eq, Default)]\npub struct SoundTrace {",
+                "CONTROL-the-debug-impl-reports-a-constant-bank",
+                '            .field("bank", &self.bank)',
+                '            .field("bank", &0u8)',
                 "SURVIVE",
                 "crates/machine/src/sound.rs",
             ),
