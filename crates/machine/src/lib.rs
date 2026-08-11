@@ -5,6 +5,12 @@
 //! no clock access — the same constraints sub-project A honoured, for the same
 //! reason: WASM and rollback netplay stay nearly free.
 //!
+//! [`resample`] is the one module outside that path, and says so: it converts the
+//! board's output to a *host's* sample rate, which is by definition not a property
+//! of the simulation. It uses [`std::collections::VecDeque`] and is not reached by
+//! [`cps1::Cps1::run_frame`] — a rollback or a WASM build that never opens an audio
+//! device never calls it.
+//!
 //! # This crate holds no ROM
 //!
 //! [`Board::new`] takes a byte slice. Assembling that slice from a user-supplied
@@ -24,6 +30,7 @@ pub mod board;
 pub mod config;
 pub mod cps1;
 pub mod inputs;
+pub mod resample;
 pub mod snapshot;
 pub mod sound;
 pub mod timing;
