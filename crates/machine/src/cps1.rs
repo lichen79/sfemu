@@ -424,14 +424,18 @@ impl Cps1 {
             // One YM tick advances the OKI by its ratio, which is well under one
             // sample — so most ticks step the chip zero times and `oki_last` carries
             // the level, the way a sample-and-hold DAC does.
+            // A pin-7 write is a numerator swap: the two ratios share a denominator, so
+            // the carried remainder keeps its units and the phase does not jump. See
+            // `timing::OKI_PER_YM_DEN`.
+            //
+            // Rebuilt every tick rather than only when the ratio moved. The guard that
+            // used to sit here could not be tested: with the remainder below the shared
+            // denominator, `with_remainder` reconstructs a bit-identical accumulator, so
+            // taking the branch when the ratio was unchanged is a no-op and no test can
+            // tell the two apart. An untestable branch is worse than the two struct
+            // copies it saved.
             let (num, den) = oki_per_ym(self.sound.oki_pin7());
-            if self.oki_acc.ratio() != (num, den) {
-                // A pin-7 write is a numerator swap: the two ratios share a
-                // denominator, so the carried remainder keeps its units and the phase
-                // does not jump. See `timing::OKI_PER_YM_DEN`.
-                self.oki_acc =
-                    RationalAccumulator::with_remainder(num, den, self.oki_acc.remainder());
-            }
+            self.oki_acc = RationalAccumulator::with_remainder(num, den, self.oki_acc.remainder());
             for _ in 0..self.oki_acc.advance() {
                 self.oki_last = self.sound.oki_step_2x();
             }
@@ -2477,10 +2481,18 @@ mod tests {
     /// replaced by an impulse train, which is a voice buried under broadband hash at
     /// six times its own level — audible, and invisible here.
     ///
-    /// Phrase 2 rather than phrase 1: its `0xF7` fill makes the decoder alternate
-    /// sign on every step, so consecutive chip outputs differ and a run of equal
-    /// samples can only be the hold. Under the mutation every other sample is zero, so
-    /// the longest run collapses to 1.
+    /// **The observable is how many samples are zero**, not the longest run of equal
+    /// ones. A run-length test was the first draft and it does not work: the impulse
+    /// train's *zeros* form runs of their own, six or seven long, so the longest run
+    /// measured 14 with the hold and 14 without it. Counting zeros separates them
+    /// cleanly — 14 of 229 held, 199 of 229 as an impulse train — because a held level
+    /// is only zero when the chip's own output is.
+    ///
+    /// Phrase 2 rather than phrase 1: its `0xF7` fill makes the decoder alternate sign
+    /// on every step, so the chip's output crosses zero rarely and the count above is
+    /// a property of the hold rather than of the signal. The transition count is the
+    /// premise — the level really does move, so a constant signal is not what is being
+    /// measured.
     #[test]
     fn the_oki_output_is_held_between_chip_steps() {
         on_a_big_stack(|| {
@@ -2496,21 +2508,21 @@ mod tests {
             let s = m.drain_samples();
             assert!(s.len() > 200, "samples to inspect: {}", s.len());
 
-            // The longest run of equal consecutive samples. With ~7.4 YM ticks per OKI
-            // step, a held level appears about seven times over.
-            let mut longest = 1usize;
-            let mut run = 1usize;
-            for w in s.windows(2) {
-                run = if w[0] == w[1] { run + 1 } else { 1 };
-                longest = longest.max(run);
-            }
+            let zeros = s.iter().filter(|&&v| v == 0).count();
+            let steps = m.sound.oki_ref().voices()[1].sample() as usize;
             assert!(
-                longest >= 4,
-                "the chip's level must persist across the YM ticks between its own \
-                 steps; longest run of equal samples was {longest}"
+                steps > 20,
+                "the chip stepped, so there are gaps to fill: {steps}"
             );
-            // And the premise: the level does change, so the run above is a hold
-            // rather than a constant signal.
+            assert!(
+                zeros <= s.len() / 4,
+                "the chip's level must persist across the YM ticks between its own \
+                 steps: {zeros} of {} samples are silent, and the chip only stepped \
+                 {steps} times — the rest are the hold",
+                s.len()
+            );
+            // The premise: the level really does move, so what the count above measures
+            // is the hold rather than a constant signal.
             assert!(
                 s.windows(2).filter(|w| w[0] != w[1]).count() > 20,
                 "the phrase oscillates, so there are transitions between the holds"
@@ -2525,59 +2537,57 @@ mod tests {
     /// instead of carrying it — left 165 tests green, because every other test here
     /// leaves the pin at its power-up value and never writes 0xF006 mid-run.
     ///
-    /// The observable is the chip's own position in its phrase. Two machines run the
-    /// same span; one is written `0xF006` with the value it already has, 96 times.
-    /// Each write is a no-op — the ratio does not change — so a correct
-    /// implementation never rebuilds the accumulator at all and the two agree
-    /// exactly. An implementation that rebuilt unconditionally, or rebuilt and lost
-    /// the remainder, would drop up to one OKI sample per write and fall behind.
+    /// **The pin has to actually move.** The first draft ran a second machine and wrote
+    /// `0xF006` with the value the board already held — and that kills nothing: the
+    /// ratio never changes, so the rebuild is a no-op and every implementation of it
+    /// agrees. The mutation survived a no-op write 96 times over.
+    ///
+    /// So this alternates the pin every round and tallies how many YM ticks ran at
+    /// each rate. The chip's own position in its phrase must then equal the ticks
+    /// weighted by the two numerators over the shared denominator — 111 steps for
+    /// 454 fast ticks and 462 slow ones. Dropping the carried remainder on each of
+    /// the 128 swaps loses most of a sample every time and the chip reaches 6.
     #[test]
     fn a_pin_seven_write_does_not_move_the_okis_phase() {
         on_a_big_stack(|| {
-            let mut quiet = oki_machine();
-            let mut written = oki_machine();
+            let mut m = oki_machine();
             assert!(
-                written.sound.oki_pin7(),
-                "the premise: the board starts high, so writing 0x01 changes nothing"
+                m.sound.oki_pin7(),
+                "the premise: the board starts high, so the first round is the fast rate"
             );
-            for _ in 0..96 {
+            let at_start = u64::from(m.sound.oki_ref().voices()[0].sample());
+            let mut hi_ticks = 0u64;
+            let mut lo_ticks = 0u64;
+            for round in 0..128 {
+                let before = m.samples().len();
                 for _ in 0..2 {
-                    quiet.run_scanline();
-                    written.run_scanline();
+                    m.run_scanline();
                 }
-                written.sound.write(0xF006, 0x01);
+                // One mono sample per YM tick — see `samples`.
+                let ticks = (m.samples().len() - before) as u64;
+                if m.sound.oki_pin7() {
+                    hi_ticks += ticks;
+                } else {
+                    lo_ticks += ticks;
+                }
+                // Alternate: high on even rounds, low on odd.
+                m.sound.write(0xF006, u8::from(round % 2 == 1));
             }
-            assert_eq!(
-                written.sound.oki_ref().voices()[0].sample(),
-                quiet.sound.oki_ref().voices()[0].sample(),
-                "a pin-7 write that does not change the rate must not cost a sample"
+            let stepped = u64::from(m.sound.oki_ref().voices()[0].sample()) - at_start;
+            let (hi_num, den) = oki_per_ym(true);
+            let (lo_num, den_lo) = oki_per_ym(false);
+            assert_eq!(den, den_lo, "the two ratios share a denominator");
+            let want =
+                (hi_ticks * u64::from(hi_num) + lo_ticks * u64::from(lo_num)) / u64::from(den);
+            assert!(
+                hi_ticks > 100 && lo_ticks > 100,
+                "both rates got a real share of the run: {hi_ticks} fast, {lo_ticks} slow"
             );
-            assert_eq!(
-                written.drain_samples(),
-                quiet.drain_samples(),
-                "and the audio is identical"
-            );
-
-            // Then the write that *does* change the rate: the phase is carried, so the
-            // chip keeps stepping without a stall, and the new rate is the slow one.
-            let mut slowed = oki_machine();
-            for _ in 0..64 {
-                slowed.run_scanline();
-            }
-            let at_swap = u64::from(slowed.sound.oki_ref().voices()[0].sample());
-            slowed.sound.write(0xF006, 0x00);
-            slowed.drain_samples();
-            for _ in 0..64 {
-                slowed.run_scanline();
-            }
-            let ticks = slowed.samples().len() as u64;
-            let stepped = u64::from(slowed.sound.oki_ref().voices()[0].sample()) - at_swap;
-            let (num, den) = oki_per_ym(false);
-            let want = ticks * u64::from(num) / u64::from(den);
             assert!(
                 stepped.abs_diff(want) <= 1,
-                "after the swap the chip runs at the low rate: {stepped} steps for \
-                 {ticks} ticks, expected {want} at {num}/{den}"
+                "the phase is carried across every pin-7 swap: {stepped} steps for \
+                 {hi_ticks} ticks at {hi_num}/{den} and {lo_ticks} at {lo_num}/{den}, \
+                 expected {want}"
             );
         });
     }
