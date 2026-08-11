@@ -683,25 +683,39 @@ mod tests {
 
     /// A ROM with three phrase-table entries and pseudorandom sample data,
     /// matching the fixture the reference probe used.
+    /// Write a phrase-table entry: a 3-byte big-endian start and stop at
+    /// `phrase * 8`.
+    ///
+    /// A free function taking `&mut [u8]` rather than a closure over `rom`,
+    /// and taking the phrase number rather than the address, because the
+    /// obvious spellings both fail `-D warnings`: `put(1 * 8, ..)` trips
+    /// `identity_op`, and a `&mut` closure cannot coexist with the later
+    /// borrow. The bytes written are identical.
+    fn put_phrase(rom: &mut [u8], phrase: usize, start: u32, stop: u32) {
+        let a = phrase * 8;
+        rom[a] = (start >> 16) as u8;
+        rom[a + 1] = (start >> 8) as u8;
+        rom[a + 2] = start as u8;
+        rom[a + 3] = (stop >> 16) as u8;
+        rom[a + 4] = (stop >> 8) as u8;
+        rom[a + 5] = stop as u8;
+    }
+
     fn rom() -> Vec<u8> {
         let mut rom = vec![0u8; 0x4_0000];
-        let mut put = |a: usize, start: u32, stop: u32| {
-            rom[a] = (start >> 16) as u8;
-            rom[a + 1] = (start >> 8) as u8;
-            rom[a + 2] = start as u8;
-            rom[a + 3] = (stop >> 16) as u8;
-            rom[a + 4] = (stop >> 8) as u8;
-            rom[a + 5] = stop as u8;
-        };
-        put(1 * 8, 0x1000, 0x107F); // 0x80 bytes = 256 nibbles
-        put(2 * 8, 0x2000, 0x203F);
-        put(3 * 8, 0x3000, 0x2FFF); // start >= stop: invalid
+        put_phrase(&mut rom, 1, 0x1000, 0x107F); // 0x80 bytes = 256 nibbles
+        put_phrase(&mut rom, 2, 0x2000, 0x203F);
+        put_phrase(&mut rom, 3, 0x3000, 0x2FFF); // start >= stop: invalid
+        // Iterate the slice, not the index range: `for a in 0x1000..0x4000`
+        // trips clippy's `needless_range_loop`, which `-D warnings` makes
+        // fatal. The xorshift advances once per address either way, so the
+        // bytes are the same.
         let mut s: u64 = 0xdead_beef;
-        for a in 0x1000..0x4000 {
+        for byte in &mut rom[0x1000..0x4000] {
             s ^= s << 13;
             s ^= s >> 7;
             s ^= s << 17;
-            rom[a] = s as u8;
+            *byte = s as u8;
         }
         rom
     }
@@ -825,7 +839,7 @@ mod tests {
         // Four voices on the same saturating ramp: measured to peak at 262016
         // unclamped, so it clips hard.
         let mut clipping = vec![0u8; 0x4000];
-        clipping[8..14].copy_from_slice(&[0x00, 0x10, 0x00, 0x00, 0x10, 0x7F]);
+        put_phrase(&mut clipping, 1, 0x1000, 0x107F);
         clipping[0x1000..0x1080].fill(0x77);
         let mut o = Oki::new();
         for byte in [0x81, 0x10, 0x81, 0x20, 0x81, 0x40, 0x81, 0x80] {
@@ -957,19 +971,14 @@ mod tests {
         // Drive all four voices to saturation on the same ramp and confirm the
         // step output stops at the clamp.
         let mut rom = vec![0u8; 0x4_0000];
-        for (a, s, e) in [(1usize, 0x1000u32, 0x10FFu32)] {
-            rom[a * 8] = (s >> 16) as u8;
-            rom[a * 8 + 1] = (s >> 8) as u8;
-            rom[a * 8 + 2] = s as u8;
-            rom[a * 8 + 3] = (e >> 16) as u8;
-            rom[a * 8 + 4] = (e >> 8) as u8;
-            rom[a * 8 + 5] = e as u8;
-        }
+        put_phrase(&mut rom, 1, 0x1000, 0x10FF);
         rom[0x1000..=0x10FF].fill(0x77); // every nibble a 7: ramp up hard
         let mut o = Oki::new();
         for voice in 0..4u8 {
             o.write(0x81, &rom);
-            o.write((1 << (voice + 4)) | 0x00, &rom);
+            // `vvvv gggg` with volume index 0: the voice bit alone. Written
+            // without a `| 0x00`, which clippy rejects as `identity_op`.
+            o.write(1 << (voice + 4), &rom);
         }
         let mut peak = 0i16;
         for _ in 0..64 {
@@ -1003,6 +1012,15 @@ mod tests {
 
     /// A phrase pointing past the end of a short ROM reads as zero rather
     /// than panicking: the ROM's size is the user's file's business.
+    ///
+    /// **Corrected during Task 3.** An earlier draft of this plan expected 0
+    /// here, "signal pinned at 0". That is wrong, and wrong in a way the
+    /// decoder documents: nibble 0 carries the unconditional `stepval / 8`
+    /// term, so a ROM of zeroes is not silence. The step index pins at 0
+    /// (nibble 0 shifts it by -1), so every sample adds `diff(0, 0) == 2`;
+    /// nine samples in the signal is 18 and the output is `18 * 0x20 == 576`.
+    /// Confirmed by compiling MAME's own `okiadpcm.cpp` and clocking nine
+    /// zero nibbles: `signal=18 step=0`.
     #[test]
     fn a_short_rom_reads_as_zero_rather_than_panicking() {
         let mut rom = vec![0u8; 0x40];
@@ -1016,10 +1034,65 @@ mod tests {
         o.write(0x81, &rom);
         o.write(0x10, &rom);
         assert_eq!(o.status(), 0xF1, "the phrase is well-formed, just unbacked");
-        for _ in 0..8 {
-            o.step(&rom);
+        let mut last = 0;
+        for _ in 0..9 {
+            last = o.step(&rom);
         }
-        assert_eq!(o.step(&rom), 0, "nibble 0 of a zero ROM, signal pinned at 0");
+        assert_eq!(last, 576, "9 * diff(0, 0) * 0x20, not a panic and not silence");
+    }
+
+    /// A restored chip plays on identically -- asserted through the samples it
+    /// produces, not by comparing the fields that were just assigned.
+    ///
+    /// Added during Task 3: `restore` is reached by nothing else in this task,
+    /// and Task 10's save state depends on it round-tripping.
+    #[test]
+    fn a_restored_chip_plays_on_from_where_it_was_saved() {
+        let rom = rom();
+        let mut saved = Oki::new();
+        saved.write(0x81, &rom);
+        saved.write(0x10, &rom);
+        saved.write(0x82, &rom);
+        saved.write(0x40, &rom);
+        for _ in 0..20 {
+            saved.step_2x(&rom);
+        }
+        saved.write(0x83, &rom); // latch a command and leave it pending
+        let mut rebuilt = Oki::restore(*saved.voices(), saved.pending_command());
+        assert_eq!(rebuilt.pending_command(), Some(0x03));
+
+        let from_saved: Vec<i32> = (0..16).map(|_| saved.step_2x(&rom)).collect();
+        let from_rebuilt: Vec<i32> = (0..16).map(|_| rebuilt.step_2x(&rom)).collect();
+        assert_eq!(from_saved, from_rebuilt);
+        assert!(
+            from_saved.iter().any(|&s| s != 0),
+            "the comparison must be of something"
+        );
+    }
+
+    /// What `restore` refuses: a position past the end of its own phrase, a
+    /// base wider than the 18-bit bus, and a command byte with bit 7 still set.
+    ///
+    /// Added during Task 3, for the same reason as the test above.
+    #[test]
+    fn a_restore_repairs_the_fields_a_save_file_could_get_wrong() {
+        let dead = Voice::restore(Adpcm::new(), true, 0x1000, 40, 40, 0x20);
+        assert!(!dead.playing(), "a voice saved past its own phrase is stopped");
+        let live = Voice::restore(Adpcm::new(), true, 0x1000, 39, 40, 0x20);
+        assert!(live.playing());
+        assert_eq!(
+            Voice::restore(Adpcm::new(), true, 0x4_1234, 0, 4, 0x20).base(),
+            0x1234,
+            "the base is masked to the 18-bit bus"
+        );
+
+        let o = Oki::restore([Voice::default(); VOICES], Some(0xFF));
+        assert_eq!(
+            o.pending_command(),
+            Some(0x7F),
+            "bit 7 is not part of the phrase number"
+        );
+        assert_eq!(o.status(), STATUS_IDLE);
     }
 
     #[test]
@@ -1054,7 +1127,7 @@ Create `crates/oki/src/chip.rs`:
 //! exactly representable as an integer, and dividing by two here would lose a
 //! bit that the mix can otherwise keep.
 
-use crate::adpcm::{diff, Adpcm};
+use crate::adpcm::Adpcm;
 
 /// The chip has four independent voices.
 pub const VOICES: usize = 4;
@@ -1352,7 +1425,8 @@ pub use chip::{Oki, Voice, VOICES};
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p oki`
-Expected: PASS, 23 tests.
+Expected: PASS, 29 tests — the 11 from Task 2 plus the 18 above. (An earlier
+draft said 23; it predated the two `restore` tests and miscounted.)
 
 - [ ] **Step 5: The full gate, then commit**
 
