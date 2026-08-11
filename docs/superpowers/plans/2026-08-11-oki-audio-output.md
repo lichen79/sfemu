@@ -1584,21 +1584,41 @@ Expected: FAIL to compile.
 
 Create `crates/testrunner/src/okifmt.rs`, following `ymfmt.rs`'s shape exactly: a `Rd<'a>` cursor whose every read is bounds-checked and returns `Result`, and `Vec::new()` with `push` rather than `with_capacity(n)` — **`n` comes from the file**.
 
+The `with_capacity` rule applies to the *case count*, which nothing bounds. The per-case `writes` and `samples` vectors may use `with_capacity`, and `ymfmt::parse` does: by then the whole body's size has been checked against the bytes remaining, so those two counts cannot ask for more than the file holds.
+
+Every struct derives `Default` as well, as `ymfmt`'s do — Task 6's runner builds a `Sample` field by field when it reports a divergence.
+
 ```rust
 //! The `AOKV` OKI vector-file codec.
 //!
 //! One file holds every case. A case is a synthesised sample ROM, a script of
 //! command-byte writes, and the mono output the reference produced.
 //!
+//! ```text
+//! file:   u32 magic 0x564B_4F41   u32 num_cases
+//! case:   u32 seed, u8 pin7, u16 num_writes, u16 num_samples, u32 rom_len,
+//!         write[num_writes], u8 rom[rom_len], sample[num_samples]
+//! write:  u16 at_sample, u8 byte
+//! sample: i32 mono_2x, u8 status, u8 voices, u16 nibbles
+//! ```
+//!
+//! All little-endian.
+//!
 //! The mono field is `i32`, not `i16`: the chip clamps its own sum to +-65536
-//! (`okim6295.cpp:188`), and that does not fit an `i16`. The D3 spec's record
-//! table says `i16`; it is wrong for the same reason.
+//! (`okim6295.cpp:188`), and that does not fit an `i16` -- it would fold onto
+//! `i16::MIN`, the one value a saturation bug would also produce. The D3 spec's
+//! record table says `i16`; it is wrong for the same reason.
 
-/// `AOKV`, little-endian.
+/// `AOKV` in file order. As a little-endian `u32` that is `0x564B_4F41` --
+/// writing the letters in reading order would give `0x414F_4B56`, a different
+/// file.
 pub const MAGIC: u32 = 0x564B_4F41;
 
 /// One command-byte write, scheduled at a sample index.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Named with a trailing underscore because `Write` is `std::io::Write` and a
+/// bare `Write` here would shadow it for anyone who glob-imports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Write_ {
     /// The sample index this byte is written before.
     pub at_sample: u16,
@@ -1607,13 +1627,13 @@ pub struct Write_ {
 }
 
 /// One expected output sample.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Sample {
-    /// The clamped 2x-domain mono sum.
+    /// The clamped 2x-domain mono sum. `i32` -- see the module docs.
     pub mono_2x: i32,
-    /// The status byte after this sample.
+    /// The status byte after this sample: `0xF0` plus one bit per playing voice.
     pub status: u8,
-    /// The playing-voice mask after this sample.
+    /// The playing-voice mask after this sample, in the low four bits.
     pub voices: u8,
     /// The nibble each playing voice consumed, voice `v` in bits `4v..4v+3`.
     ///
@@ -1623,17 +1643,22 @@ pub struct Sample {
 }
 
 /// One case.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Case {
     /// The generator's seed, equal to the case index.
     pub seed: u32,
     /// The pin-7 state this case was generated at.
+    ///
+    /// Recorded but not consumed by the decoder: pin 7 selects the sample rate,
+    /// and the rate is `machine`'s business. It is here so a case generated at
+    /// one rate cannot be silently re-read as the other. Parsed as
+    /// `byte != 0`, not `byte == 1`.
     pub pin7: bool,
-    /// The command script.
+    /// The command script, in sample order.
     pub writes: Vec<Write_>,
     /// The synthesised sample ROM.
     pub rom: Vec<u8>,
-    /// The expected output.
+    /// The expected output, one entry per generated sample.
     pub samples: Vec<Sample>,
 }
 
@@ -1741,14 +1766,16 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Case>, FormatError> {
         if need > r.left() {
             return Err(FormatError::Truncated { needed: need, had: r.left() });
         }
-        let mut writes = Vec::new();
+        // `with_capacity` is safe here and not above: the body-size check just
+        // proved both counts fit inside the bytes remaining.
+        let mut writes = Vec::with_capacity(writes_len);
         for _ in 0..writes_len {
             let at_sample = r.u16()?;
             let byte = r.u8()?;
             writes.push(Write_ { at_sample, byte });
         }
         let rom = r.take(rom_len)?.to_vec();
-        let mut samples = Vec::new();
+        let mut samples = Vec::with_capacity(samples_len);
         for _ in 0..samples_len {
             let mono_2x = r.i32()?;
             let status = r.u8()?;
@@ -1766,61 +1793,88 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Case>, FormatError> {
 
 Model on `ymfiles.rs` exactly — including the loud failure with the generate command in it.
 
+The file is `vectors.aokv`, not `oki.aokv`: its sibling is `testdata/ym2151/vectors.aymv`, and the directory already says which chip it belongs to.
+
 ```rust
-//! Where the OKI vector suite lives and how many cases it holds.
+//! The OKI MSM6295 vector inventory.
+//!
+//! # Why these are literals
+//!
+//! `EXPECTED` is 1,000 because the generator is asked for 1,000 cases, not
+//! because the file on disk happens to hold that many. Reading the count out of
+//! the data would make a truncated or half-generated file into a smaller
+//! passing suite — the same reasoning as [`crate::ymfiles`] and
+//! [`crate::z80files`].
 
-use crate::okifmt::{self, Case};
-use std::path::PathBuf;
-
-/// How many cases the suite holds.
+/// The number of cases the suite must contain.
 pub const EXPECTED: usize = 1000;
 
-/// How many samples each case records.
+/// Samples per case. 512 at 7,576 Hz is 68 ms — long enough for a phrase to
+/// start, saturate, be interrupted and end.
 pub const SAMPLES_PER_CASE: usize = 512;
 
-/// How large a synthesised sample ROM is. The real chip's address bus is 18
-/// bits, and SF2's `oki` region is exactly this size.
+/// How large a synthesised sample ROM is.
+///
+/// The real chip's address bus is 18 bits (`device_rom_interface<18>`), and
+/// SF2's `oki` region is exactly this size. Kept at the true size rather than a
+/// smaller window so that a case whose address walk runs off the end wraps
+/// through the 18-bit mask, which is what the hardware does — with a short ROM
+/// it would instead fall into the read-past-the-end path, a different branch.
+///
+/// 1,000 cases at 256 KB each is ~256 MB of `testdata/`. That is the cost of
+/// checking the mask at its real boundary.
 pub const ROM_BYTES: usize = 0x4_0000;
 
-/// What to tell someone whose suite is missing.
-pub const FETCH_HINT: &str =
-    "the OKI vector suite is missing; generate it with\n  \
-     cargo run --release -p testrunner --bin genoki";
+/// What to tell the user when the vectors are missing.
+///
+/// Every loud failure quotes this one string, for the reason
+/// [`crate::z80files::FETCH_HINT`] gives: duplicated across the harness, one
+/// copy goes stale and sends a reader to a command that no longer exists.
+pub const FETCH_HINT: &str = "run `cargo run -q -p testrunner --release --bin genoki`";
 
-/// Where the suite lives.
+/// Where the generated vectors live.
+///
+/// `CARGO_MANIFEST_DIR` rather than the working directory, so `cargo test` and
+/// `cargo run` find the same suite from whatever directory they are invoked in.
 #[must_use]
-pub fn dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/oki")
+pub fn dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/oki"))
 }
 
-/// The suite file.
+/// The single vector file's path.
 #[must_use]
-pub fn path() -> PathBuf {
-    dir().join("oki.aokv")
+pub fn path() -> std::path::PathBuf {
+    dir().join("vectors.aokv")
 }
 
-/// Load and parse the suite.
+/// Reads and parses the vector file.
 ///
 /// # Errors
 ///
-/// Fails loudly, naming the file and the command that produces it, if the
-/// suite is absent. There is no environment variable that turns this into a
-/// skip: a suite that silently does not run is a suite that silently does not
-/// catch anything.
-pub fn load() -> Result<Vec<Case>, String> {
+/// If the file is missing, unreadable, does not parse, or does not hold
+/// [`EXPECTED`] cases. Every message names the path and [`FETCH_HINT`]: a bare
+/// `NotFound` from deep inside a test run tells the reader nothing about how to
+/// fix it. There is no environment variable that turns any of this into a skip —
+/// a suite that silently does not run is a suite that silently does not catch
+/// anything.
+pub fn load() -> Result<Vec<crate::okifmt::Case>, Box<dyn std::error::Error>> {
     let p = path();
-    let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}\n{FETCH_HINT}", p.display()))?;
-    let cases = okifmt::parse(&bytes).map_err(|e| format!("{}: {e}\n{FETCH_HINT}", p.display()))?;
+    let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e} — {FETCH_HINT}", p.display()))?;
+    let cases =
+        crate::okifmt::parse(&bytes).map_err(|e| format!("{}: {e} — {FETCH_HINT}", p.display()))?;
     if cases.len() != EXPECTED {
         return Err(format!(
-            "{}: holds {} cases, expected {EXPECTED}\n{FETCH_HINT}",
+            "{}: holds {} cases, expected {EXPECTED} — {FETCH_HINT}",
             p.display(),
             cases.len()
-        ));
+        )
+        .into());
     }
     Ok(cases)
 }
 ```
+
+**The error type is `Box<dyn std::error::Error>`, not `String`.** `ymfiles::load` and `z80files::load` both return the boxed form, and a third spelling in the same crate is one the next reader has to check. Task 6's `reportoki` main is therefore `-> Result<(), Box<dyn std::error::Error>>`; the plan's `-> Result<(), String>` there predates this decision.
 
 - [ ] **Step 5: Wire it up**
 
@@ -1828,8 +1882,22 @@ In `crates/testrunner/src/lib.rs`, add `okifiles` and `okifmt` to the module lis
 
 - [ ] **Step 6: Run the tests, then the full gate, then commit**
 
-Run: `cargo test -p testrunner`
-Expected: PASS, including 5 new `okifmt` tests.
+Run: `cargo test -p testrunner --lib okifmt`
+Expected: PASS, 8 `okifmt` tests — the 5 above plus three the tree forces:
+
+- the magic spelled both as a `u32` and as its four file bytes, as
+  `ymfmt::the_magic_is_aymv_in_file_order` does. A byte-order slip in the
+  constant rejects every file the generator writes, and a test that only
+  compares the constant to itself cannot see it.
+- `pin7` read as any-non-zero rather than `== 1`, so a generator writing
+  `0xFF` is not silently a false case.
+- an absurd `rom_len` (not just an absurd case count), which is what proves
+  the whole-body size check fires *before* `to_vec` on a 4 GB slice. The
+  per-field bounds check cannot distinguish the two orders.
+
+Note `cargo test -p testrunner` alone also runs the three suite integration
+tests, which need the m68k, Z80 and YM suites on disk; `--lib okifmt` is the
+part this task is responsible for.
 
 ```bash
 git add crates/testrunner
@@ -1847,7 +1915,7 @@ git commit -m "test(oki): the AOKV vector-file codec"
 
 **Interfaces:**
 - Consumes: `okifmt`, `okifiles` from Task 4.
-- Produces: `testdata/oki/oki.aokv`, 1,000 cases.
+- Produces: `testdata/oki/vectors.aokv`, 1,000 cases.
 
 The generator is C++ compiled against MAME's unmodified `okiadpcm.cpp`. It needs `okiadpcm.h`, `okiadpcm.cpp`, and a three-line `emu.h` shim (`#pragma once` plus `<cstdint>` and `<cmath>`) — MAME's `okiadpcm.cpp` includes `emu.h`, but needs nothing from it. **`okim6295.cpp` cannot be compiled standalone** (it is a `device_t`), so the *protocol* in the generator is a transcription, and it must be the same transcription that `crates/oki/src/chip.rs` is — that is the suite's weakest link and this plan says so out loud.
 
