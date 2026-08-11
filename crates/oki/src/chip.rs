@@ -340,10 +340,15 @@ mod tests {
         let mut rom = vec![0u8; 0x4_0000];
         put_phrase(&mut rom, 1, 0x1000, 0x107F); // 0x80 bytes = 256 nibbles
         put_phrase(&mut rom, 2, 0x2000, 0x203F);
-        put_phrase(&mut rom, 3, 0x3000, 0x2FFF); // start >= stop: invalid
-                                                 // Iterating the slice rather than the index range is clippy's
-                                                 // requirement under `-D warnings`, and the bytes are identical: the
-                                                 // xorshift advances once per address in the same order.
+        put_phrase(&mut rom, 3, 0x3000, 0x2FFF); // start > stop: invalid
+                                                 // start == stop, the *boundary* of the refusal and a separate case from the
+                                                 // one above. `if start <= stop` — accepting a degenerate phrase — is refused
+                                                 // by phrase 3 either way, so without this entry the comparison's boundary is
+                                                 // untested and the mutation survives; see the test below.
+        put_phrase(&mut rom, 4, 0x1800, 0x1800);
+        // Iterating the slice rather than the index range is clippy's
+        // requirement under `-D warnings`, and the bytes are identical: the
+        // xorshift advances once per address in the same order.
         let mut s: u64 = 0xdead_beef;
         for byte in &mut rom[0x1000..0x4000] {
             s ^= s << 13;
@@ -560,6 +565,13 @@ mod tests {
 
     /// `start >= stop` is refused, and refusing it leaves the chip idle
     /// rather than playing a phrase of absurd length.
+    ///
+    /// **Both sides of the comparison**, because `>` and `>=` are a different rule and
+    /// only one fixture separates them. `start > stop` (phrase 3) is refused by
+    /// `start < stop` and by `start <= stop` alike, so on its own it says nothing about
+    /// which of the two is implemented — the mutation to `<=` survived the first draft
+    /// of this test. Phrase 4 is `start == stop`, which the real chip refuses and `<=`
+    /// would accept as a two-nibble phrase.
     #[test]
     fn a_phrase_whose_start_is_not_below_its_stop_is_refused() {
         let rom = rom();
@@ -567,6 +579,22 @@ mod tests {
         o.write(0x83, &rom); // start 0x3000, stop 0x2FFF
         o.write(0x10, &rom);
         assert_eq!(o.status(), STATUS_IDLE, "nothing started");
+
+        let mut o = Oki::new();
+        o.write(0x84, &rom); // start == stop == 0x1800
+        o.write(0x10, &rom);
+        assert_eq!(
+            o.status(),
+            STATUS_IDLE,
+            "a degenerate phrase is refused too: the comparison is `<`, not `<=`"
+        );
+        // And the premise, so a fixture that lost phrase 4 fails here rather than
+        // passing vacuously: the entry really is start == stop.
+        assert_eq!(
+            (read24(&rom, 4 * 8), read24(&rom, 4 * 8 + 3)),
+            (0x1800, 0x1800),
+            "the fixture's degenerate phrase"
+        );
     }
 
     /// MAME skips a voice that is already playing ("fixes Got-cha and Steel

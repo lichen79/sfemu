@@ -1982,9 +1982,13 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # The chip dropped from the save state: a load restores the driver's idea
             # of the chip and not the chip, so every envelope resumes mid-air.
             (
+                # Rewritten in D3: `SoundBoard::restore` gained a sixth argument (the
+                # OKI's voices), so the call is no longer the one-line form this pattern
+                # was written against and the mutant reported NO-OP. Caught by running
+                # `--all` rather than the set under work, which is what `--all` is for.
                 "ym2151-dropped-from-the-save-state",
-                "        self.sound\n            .restore(&s.sound_ram, s.sound_bank, s.oki_pin7, &s.ym, s.ym_addr);",
-                "        self.sound.restore(\n            &s.sound_ram,\n            s.sound_bank,\n            s.oki_pin7,\n            &ym2151::Ym2151::new(),\n            s.ym_addr,\n        );",
+                "            &s.ym,\n            s.ym_addr,",
+                "            &ym2151::Ym2151::new(),\n            s.ym_addr,",
                 "KILL",
             ),
             # Sound RAM sized 4 KB instead of 2. The map's window is 0xD000-0xD7FF, so
@@ -2356,12 +2360,17 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
                 "KILL",
                 "crates/testrunner/src/okirunner.rs",
             ),
-            # CONTROL, and one whose verdict is the finding rather than the tally: the
-            # two checks swapped, so a divergence in both fields is *reported* as Mono
-            # rather than as Nibbles. No case can fail that did not fail before, and a
-            # corruption test that mutates one field at a time still gets its own field
-            # named. Expect SURVIVE -- a KILL means some test over-specifies which field
-            # a divergence is blamed on, which is a test to fix, not a mutant to drop.
+            # The two checks swapped, so a divergence in both fields is reported as Mono
+            # rather than as Nibbles. **Declared SURVIVE and it KILLed**, and the verdict
+            # is the finding: the plan's reasoning was that nothing behavioural changes,
+            # because no case fails that did not fail before. That reasoning is wrong
+            # here. A wrong nibble decodes to a wrong sample, so in practice *every*
+            # nibble divergence is also a mono divergence, and the order is what decides
+            # which of the two a report names -- an address-walk bug or a decoder bug,
+            # which are different files. `the_nibbles_are_compared_before_the_sample`
+            # asserts that priority deliberately and says why, so it is not a test
+            # over-specifying the report; it is the report's contract. Reclassified to
+            # KILL rather than the test being loosened.
             (
                 "runnerorder",
                 """        if got_nibbles != want.nibbles {
@@ -2386,7 +2395,7 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             );
         }
 """,
-                "SURVIVE",
+                "KILL",
                 "crates/testrunner/src/okirunner.rs",
             ),
             # --- The host side: the loop, the resampler, the ring (`sfemu`, `machine`) ---

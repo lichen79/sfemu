@@ -487,6 +487,14 @@ mod tests {
     }
 
     /// Overflow drops the oldest and counts it, so latency stays bounded.
+    ///
+    /// **Counted, not sampled.** Reading `out[cap - 1] == 2` and `out[0] == 1` cannot
+    /// fail: a ring that drops the *newest* — `pop_back` where this one pops the front —
+    /// evicts the sample it is about to insert, so it also ends holding `cap - 1` ones
+    /// followed by a single 2, and both of those reads agree with it. The mutation
+    /// survived on exactly that. What separates the two policies is *how many* of the
+    /// 100 new samples are still there: all of them if the oldest went, one if the
+    /// newest did.
     #[test]
     fn overflow_drops_the_oldest_and_counts_it() {
         let mut ring = Ring::with_prefill(48_000, 0);
@@ -502,6 +510,17 @@ mod tests {
         ring.pop(&mut out, false);
         assert_eq!(out[cap - 1], 2, "the newest sample was dropped instead");
         assert_eq!(out[0], 1);
+        assert_eq!(
+            out.iter().filter(|&&s| s == 2).count(),
+            100,
+            "all 100 new samples must be in the ring: dropping the newest keeps only \
+             the last of them, which the two reads above cannot distinguish"
+        );
+        assert_eq!(
+            out[cap - 100],
+            2,
+            "and they are contiguous at the end, so the boundary is where it should be"
+        );
     }
 
     /// Underrun holds the last sample rather than emitting zeros, and counts how many
