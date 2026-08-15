@@ -7,7 +7,7 @@ CPS-1 ROM set you own and `--play` opens a window:
 cargo run -p sfemu --release -- /path/to/your/sf2.zip --play
 ```
 
-Nine sub-projects are built: the **68000 core** (A), the **bus and timing
+Nine sub-projects are complete: the **68000 core** (A), the **bus and timing
 framework with a MAME ROM-set loader** (B), the **CPS-1 scanline renderer** (C),
 the **Z80 audio CPU** (D1), the **YM2151 FM chip and the sound board's wiring**
 (D2), the **OKI MSM6295 ADPCM chip, the mono mix and host audio** (D3), the
@@ -674,7 +674,7 @@ pass is distinguishable from a harness that reports success without running.
 | **C** | CPS-1 video: tilemaps, sprites, palettes, CPS-A/B registers, scanline renderer | **complete** — the largest piece, and where SF2 becomes visible |
 | **D1** | Z80 audio CPU | **complete** — 1,604/1,604 files, 1,604,000/1,604,000 cases. Still silent: a CPU with no chip attached |
 | **D2** | YM2151 FM, and the sound board's wiring | **complete** — 1,000/1,000 vector cases against ymfm, sample-exact. Still silent: the samples reach no speaker |
-| **D3** | OKI MSM6295 ADPCM, mixing, host audio | **the samples reach a speaker** — 1,000/1,000 ADPCM vector cases against MAME's decoder, mixed and queued to the device. Its mutation set is the one piece outstanding |
+| **D3** | OKI MSM6295 ADPCM, mixing, host audio | **complete** — the samples reach a speaker: 1,000/1,000 ADPCM vector cases against MAME's decoder, mixed and queued to the device |
 | **E1** | Frontend: window, frame clock, keyboard, save states | **complete** — `--play` |
 | **E2** | Debugger: single-step, breakpoints, disassembly, register and memory views | **complete** — `F1`, in-window, and it does not perturb the machine |
 | **E3** | Graphics viewers: tile browser, tilemap and palette views, layer toggles | **complete** — `F9`, four views, and the mask subtracts only |
