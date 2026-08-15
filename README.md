@@ -271,7 +271,7 @@ cargo build -p oki --features serde
 # Throughput. Read the caveat below before quoting a number from it.
 cargo bench -p m68k
 
-# Mutation testing: 210 mutants, each an exact string replacement, each with a
+# Mutation testing: 262 mutants, each an exact string replacement, each with a
 # declared KILL or SURVIVE. Every set carries at least one control that must
 # survive — a pass where everything dies is more likely a broken harness than a
 # thorough suite. Commit first: it edits files in place.
@@ -594,11 +594,10 @@ crates/sfemu/        the binary. The only crate that names a windowing library o
                      an audio library, each in one file and nowhere else (a test
                      per boundary enforces it).
 crates/testrunner/   dev-only harness for the external vector suite.
-scripts/mutate.py    the mutation harness: 210 mutants over the above in 18 sets,
+scripts/mutate.py    the mutation harness: 262 mutants over the above in 19 sets,
                      each an exact string replacement with a declared
-                     expectation. 189 killed, 21 declared survivors (18 controls
-                     and 3 proven equivalents), 210/210 as expected. The `oki`
-                     set is D3's remaining work and is not in that count.
+                     expectation. 240 killed, 22 declared survivors (19 controls
+                     and 3 proven equivalents), 262/262 as expected.
 docs/hardware/       what the vectors proved about the hardware, with evidence.
 docs/superpowers/    design specs and implementation plans.
 testdata/            gitignored; fetched vectors.
