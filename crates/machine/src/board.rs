@@ -1217,8 +1217,12 @@ mod tests {
     ///
     /// With no `cpsb_addr` and no `in2_addr`, both of those addresses are plain
     /// registers. Without this case a hardcoded `0x32` and `0x36` would pass every
-    /// `sf2()` test above — and sub-project F's SF1 board has a different CPS-B
-    /// row, so this is the test that will catch that.
+    /// `sf2()` test above.
+    ///
+    /// Not SF1: that board has no CPS-B at all — no register file, plain palette
+    /// RAM at 0xB00000 and plain I/O at 0xC00000 — so it needs no [`BoardConfig`]
+    /// and will not exercise this. What will is a second CPS-1 title, every one of
+    /// which has its own row in `cps1_v.cpp`'s table with its own address pair.
     #[test]
     fn with_a_plain_config_the_wired_addresses_are_ordinary_registers() {
         let mut b = Board::new(&[], BoardConfig::plain());
