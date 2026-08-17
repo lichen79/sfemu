@@ -308,32 +308,45 @@ refresh is *derived* from the pixel clock (`8,000,000 / (512 × 262)` ≈
 59.637 Hz), so its 10 MHz CPU divides its 15,625 Hz line rate exactly.
 SF1's refresh is *asserted* as a round 60, so nothing divides.
 
-`Timing`'s four `u32` fields (`timing.rs:192-203`) cannot express 3125/6.
-Rather than round `cycles_per_line` to 520 or 521 — a 0.16% error, which is
-precisely the silent-drift failure `timing.rs`'s module doctrine describes:
-"A frame that is 639 cycles per line instead of 640 runs 0.16% slow: music
-drifts against animation over a match, and nothing ever looks broken enough to
-investigate" — `Timing` gains a **fifth field**: a `RationalAccumulator` for the
-68000's cycles per line, and `cycles_per_line` becomes the accumulator's
-`advance()` rather than a constant. CPS-1's constructor builds a
-`RationalAccumulator::new(640, 1)`, which advances by exactly 640 every line and
-is arithmetically identical to today's constant, so the CPS-1 path is unchanged
-in behaviour while gaining one shared code path with SF1.
+`Timing`'s `cycles_per_line: u32` (`timing.rs:196`) cannot express 3125/6, and
+rounding it to 520 or 521 is a 0.16% error — precisely the silent-drift failure
+`timing.rs`'s own module doctrine describes: "A frame that is 639 cycles per
+line instead of 640 runs 0.16% slow: music drifts against animation over a
+match, and nothing ever looks broken enough to investigate."
 
-`Timing::sf1_8mhz()` is then `cpu_hz: 8_000_000`, cycles per line
-`RationalAccumulator::new(8_000_000, 15_360)` (= 3125/6 after reduction),
-`lines_per_frame: 256`, `vblank_line: 240`. The test asserts the reduced
-fraction as literals *and* that 256 advances sum to 133,333 with remainder 1/3
-carried — the sum being the assertion that catches a wrong reduction, because a
-per-line assertion cannot.
+So `cycles_per_line: u32` becomes **`line_cycles: (u32, u32)`**, a reduced
+ratio. `Timing` stays what it is — `Copy`, `Eq`, `const fn`-constructible, pure
+configuration — because the *ratio* is the board's, fixed by its crystals. The
+mutable remainder does **not** go here: it goes in the machine, beside `carry`
+and `z80_carry`, which is where every other fractional clock in this workspace
+already lives. Putting a moving remainder inside a `Copy` config struct would
+make two copies of the same `Timing` disagree about the future, and
+`RationalAccumulator::ratio`'s doc already draws this line: "A save state
+carries the remainder, not the ratio — the ratio is the board's, fixed by its
+crystals."
 
-Making `cycles_per_line` fractional touches `Cps1`'s scheduler: `carry`
-(`cps1.rs`, the private `i64`) is granted `cycles_per_line` at each line start,
-and that grant becomes `advance()`. The remainder is state — it must join the
-save state, exactly as `z80_carry`'s already does, and
-`RationalAccumulator::with_remainder` exists for this. A restored machine that
-zeroed it would be up to five cycles out per line and permanently out of step,
-which is the same argument `with_remainder`'s own doc makes.
+- `cps1_10mhz()`: `line_cycles: (640, 1)`. Every existing test keeps its
+  literals; `cps1_frame_geometry_is_384x224_at_59_63_hz`'s zero-remainder
+  assertion becomes an assertion that the denominator is 1, which is the same
+  claim stated in the new vocabulary.
+- `sf1_8mhz()`: `cpu_hz: 8_000_000`, `line_cycles: (3125, 6)`,
+  `lines_per_frame: 256`, `vblank_line: 240`. The test asserts `(3125, 6)` as
+  literals **and** that it reduces `8_000_000 / 15_360`, with 15,360 itself
+  asserted as `60 * 256` — three independent statements of the same number, so
+  no one of them can pass by matching itself.
+- `cycles_per_frame()` becomes `num * lines / den`, exact for CPS-1 (167,680)
+  and floored for SF1 (133,333 from 400000/3). Its doc says which, and a test
+  pins both values as literals. Its one caller is an inequality in a `loop_.rs`
+  test, which a floor does not weaken.
+
+`Cps1`'s scheduler changes in one line: `self.carry +=
+i64::from(self.timing.cycles_per_line)` (`cps1.rs:300`) becomes
+`i64::from(self.line_cycles.advance())`, where `line_cycles` is a new
+`RationalAccumulator` field built from `timing.line_cycles`. For CPS-1 that
+advances by exactly 640 every line, so behaviour is unchanged. The remainder
+joins the save state exactly as `z80_carry`'s does, via `with_remainder` — a
+restored SF1 machine that zeroed it would be up to five cycles out per line and
+permanently out of step, which is the argument `with_remainder`'s own doc makes.
 
 `vblank_line = 240` is `VBSTART`: the first line past the visible area, which is
 where MAME's `set_vblank_int` fires. Because SF1's vblank *period* is zero, the
@@ -1221,13 +1234,15 @@ Every existing dependency-edge comment stays true:
    the byte order asserted directly — a CRC check catches a swapped *file* but
    not a swapped *byte*, which is the error `spec.rs`'s `Word16Byte` doc warns
    byte-swaps every instruction word.
-2. `Timing`'s `cycles_per_line` is a `RationalAccumulator`, `cps1_10mhz()`
-   builds it as `640/1` with its existing behaviour and test count unchanged,
-   and `Timing::sf1_8mhz()` is 8 MHz / `8_000_000:15_360` / 256 / 240. Tests
-   assert the reduced fraction `3125/6` as literals, assert 256 advances sum to
-   133,333 cycles with remainder 1/3 carried, and assert the Z80 fraction is
-   `715_909/3_072` — not CPS-1's `715_909/3_125`. The 68000 remainder is in the
-   save state and a restore round-trip proves it survives.
+2. `Timing::cycles_per_line: u32` is `line_cycles: (u32, u32)`; `cps1_10mhz()`
+   is `(640, 1)` with every existing test and count unchanged; `sf1_8mhz()` is
+   8 MHz / `(3125, 6)` / 256 / 240, with `(3125, 6)`, `8_000_000 / 15_360` and
+   `60 * 256` each asserted separately. `Cps1` grants
+   `line_cycles.advance()` instead of a constant, the remainder is a save-state
+   field, and a restore round-trip proves it survives. The Z80 fraction is
+   `715_909/3_072` — asserted as *not* CPS-1's `715_909/3_125`, since the shared
+   numerator makes copying the wrong constant the likely error. The ADPCM
+   interrupt fraction is `25/48`.
 3. The SF1 68000 board answers all three maps' shared addresses plus `sfus`'s
    two `nopr()` windows, with `0xFFFF` from the nop windows and a counted
    `UNMAPPED` only for genuinely undecoded addresses. Every read and write path
@@ -1324,12 +1339,16 @@ Each of these names what is *not* eliminated by the work above.
   mitigation is that the three fractions are derived from two named constants
   (the frame rate and the line count) in one place, so correcting the rate is a
   one-line change rather than three transcriptions.
-- **`Timing` gaining a fractional `cycles_per_line` touches CPS-1's scheduler.**
-  The 640/1 accumulator is arithmetically identical to today's constant, but it
-  replaces a field read with an `advance()` in `Cps1::step_instruction`'s hot
-  path, and it puts a new remainder into CPS-1's save state that is always zero.
-  A zero-remainder field that nothing exercises is a field no test protects; the
-  guard is that SF1's non-zero remainder runs through the same code.
+- **Making `cycles_per_line` a ratio touches CPS-1's scheduler.** `(640, 1)` is
+  arithmetically identical to today's constant, but it replaces a field read
+  with an `advance()` in `Cps1::step_instruction`'s hot path and puts a new
+  remainder into CPS-1's save state that is always zero. A zero-valued field
+  nothing exercises is a field no test protects; the guard is that SF1's
+  non-zero remainder runs through the same code. It also changes a public
+  field's type, so `machine/tests/programs.rs:328` and three `cps1.rs` test
+  fixtures that construct `Timing` literally must all be updated — a mechanical
+  change, but one that will not compile until it is complete, which is the
+  cheapest kind of breakage.
 - **`set_periodic_int(..., from_hz(8000))` carries MAME's own `// ?`.** The
   real ADPCM rate is set by hardware sfemu is not modelling. If music and
   sound effects drift against each other, this constant is the first suspect,
