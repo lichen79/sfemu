@@ -1,4 +1,9 @@
-//! CPS-1 video: tiles, sprites, and the palette, rendered to a buffer.
+//! Arcade video: tiles, sprites, and the palette, rendered to a buffer.
+//!
+//! Two boards. The modules at this level are **CPS-1's** — [`compose`],
+//! [`layers`], [`palette`], [`regs`], [`sprites`], [`tiles`], [`bank`] — and
+//! [`sf1`] is Street Fighter 1's, which shares this crate's geometry and
+//! almost none of its code. See [`sf1`] for why.
 //!
 //! Zero dependencies. This crate knows nothing about the 68000, the bus, or a
 //! ROM set: the entry point takes borrowed slices, so a test can construct a
@@ -68,6 +73,7 @@ pub mod compose;
 pub mod layers;
 pub mod palette;
 pub mod regs;
+pub mod sf1;
 pub mod sprites;
 pub mod tiles;
 
