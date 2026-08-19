@@ -1871,10 +1871,11 @@ mod tests {
     /// a long run does not grow a `Vec` forever.
     ///
     /// The sample count is bounded on both sides against the rate, not against a second
-    /// call to the loop: about 937 per frame at 55,930 Hz over 59.63 fps, so three frames
-    /// is 2,800 give or take one frame's fractional remainder. A loop that queued the
-    /// same buffer twice would land at 5,600 and a loop that never drained would grow
-    /// quadratically.
+    /// call to the loop: about 937 *frames* per frame at 55,930 Hz over 59.63 fps, so
+    /// three frames is 2,800 give or take one frame's fractional remainder. A loop that
+    /// queued the same buffer twice would land at 5,600 and a loop that never drained
+    /// would grow quadratically. The buffer is interleaved stereo, so the queued length
+    /// is that count times [`machine::resample::CHANNELS`].
     #[test]
     fn each_frame_queues_its_samples_exactly_once() {
         let (o, _s, _p) = opts("queue-once");
@@ -1887,10 +1888,16 @@ mod tests {
             a.calls, 3,
             "one queue call per frame, not per tick or per two"
         );
-        assert!(
-            (2_700..3_000).contains(&a.queued.len()),
-            "{} samples for 3 frames, expected about 2,811",
+        let frames = a.queued.len() / machine::resample::CHANNELS;
+        assert_eq!(
+            a.queued.len() % machine::resample::CHANNELS,
+            0,
+            "whole frames only: {} samples",
             a.queued.len()
+        );
+        assert!(
+            (2_700..3_000).contains(&frames),
+            "{frames} frames for 3 frames, expected about 2,811"
         );
         assert!(
             m.samples().is_empty(),

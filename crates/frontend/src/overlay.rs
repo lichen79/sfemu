@@ -529,7 +529,11 @@ fn draw_sound(buf: &mut [u32], m: &Cps1) {
     line(
         buf,
         &mut row,
-        &format!("TSC {:012} SMP {:06}", m.z80_cycles(), m.samples().len()),
+        &format!(
+            "TSC {:012} SMP {:06}",
+            m.z80_cycles(),
+            m.samples().len() / machine::resample::CHANNELS
+        ),
         FG,
     );
     let t = m.sound_trace();

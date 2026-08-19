@@ -1088,10 +1088,11 @@ mod tests {
             line: m.line,
             d0: m.cpu.d[0],
             d1: m.cpu.d[1],
-            // Every 71st sample: a stride co-prime with the 128-sample timer periods
-            // and with a frame's sample count, so the kept samples are not one phase of
-            // a repeating envelope. The whole run is ~44,000 samples and comparing all
-            // of them makes the failure message unreadable.
+            // Every 71st sample of the interleaved stream: a stride co-prime with the
+            // 128-sample timer periods, with a frame's sample count, and — being odd —
+            // with the channel count, so the kept samples alternate L and R and cover
+            // both. The whole run is ~88,000 samples and comparing all of them makes
+            // the failure message unreadable.
             samples: m.samples().iter().copied().step_by(71).collect(),
             z80_cycles: m.z80_cycles() - c0,
             z80_pc: m.z80.pc,

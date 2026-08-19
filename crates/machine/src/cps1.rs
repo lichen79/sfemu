@@ -215,9 +215,13 @@ impl Cps1 {
         self.z80_carry.remainder()
     }
 
-    /// The mono samples produced since the last [`Cps1::drain_samples`].
+    /// The interleaved stereo samples produced since the last [`Cps1::drain_samples`].
     ///
-    /// One per YM2151 tick, at 55,930 Hz. Mono because the board is: see [`mix`].
+    /// One **frame** per YM2151 tick, at 55,930 Hz, [`crate::resample::CHANNELS`]
+    /// samples each — so the slice is twice as long as the frame count. The board is
+    /// mono (see [`mix`]) and the two slots in a frame always hold the same value; the
+    /// duplication buys one code path through the resampler rather than a mono one
+    /// beside a stereo one.
     #[must_use]
     pub fn samples(&self) -> &[i16] {
         &self.samples
@@ -452,7 +456,12 @@ impl Cps1 {
             for _ in 0..self.oki_acc.advance() {
                 self.oki_last = self.sound.oki_step_2x();
             }
-            self.samples.push(mix(one[0].0, one[0].1, self.oki_last));
+            // CPS-1 is mono (see `mix`), and the path is interleaved stereo, so the
+            // one value goes into both slots. Two `i16` per sample against one code
+            // path through the resampler — `resample::CHANNELS` states the trade.
+            let mono = mix(one[0].0, one[0].1, self.oki_last);
+            self.samples.push(mono);
+            self.samples.push(mono);
         }
         t
     }
@@ -1765,7 +1774,7 @@ mod tests {
             for _ in 0..64 {
                 m.drain_samples();
                 m.run_frame();
-                let n = m.samples().len();
+                let n = m.samples().len() / crate::resample::CHANNELS;
                 assert!(
                     (930..=945).contains(&n),
                     "one frame's samples, not a burst or a gap: {n}"
@@ -2637,21 +2646,31 @@ mod tests {
                 got.len()
             );
 
-            let mut pairs = vec![(0i16, 0i16); got.len()];
+            let mut pairs = vec![(0i16, 0i16); got.len() / crate::resample::CHANNELS];
             detached.generate(&mut pairs);
             assert!(
                 pairs.iter().any(|&(l, r)| l != 0 || r != 0),
                 "the patch is audible, so this is not silence against silence"
             );
-            let want: Vec<i16> = pairs.iter().map(|&(l, r)| mix(l, r, 0)).collect();
+            // The board is mono, so the one mixed value fills both slots of the frame.
+            let want: Vec<i16> = pairs
+                .iter()
+                .flat_map(|&(l, r)| {
+                    let v = mix(l, r, 0);
+                    [v; crate::resample::CHANNELS]
+                })
+                .collect();
             assert_eq!(
                 got, want,
-                "every mono sample is the mix of the pair the chip produced"
+                "every frame is the mix of the pair the chip produced, in both slots"
             );
 
             let averaged: Vec<i16> = pairs
                 .iter()
-                .map(|&(l, r)| ((i32::from(l) + i32::from(r)) / 2) as i16)
+                .flat_map(|&(l, r)| {
+                    let v = ((i32::from(l) + i32::from(r)) / 2) as i16;
+                    [v; crate::resample::CHANNELS]
+                })
                 .collect();
             assert_ne!(
                 want, averaged,
@@ -2677,7 +2696,7 @@ mod tests {
             for _ in 0..64 {
                 m.run_scanline();
             }
-            let ticks = m.samples().len() as u64;
+            let ticks = (m.samples().len() / crate::resample::CHANNELS) as u64;
             let steps = u64::from(m.sound.oki_ref().voices()[0].sample());
             assert!(
                 ticks > 200,
@@ -2786,8 +2805,8 @@ mod tests {
                 for _ in 0..2 {
                     m.run_scanline();
                 }
-                // One mono sample per YM tick — see `samples`.
-                let ticks = (m.samples().len() - before) as u64;
+                // One frame per YM tick — see `samples`.
+                let ticks = ((m.samples().len() - before) / crate::resample::CHANNELS) as u64;
                 if m.sound.oki_pin7() {
                     hi_ticks += ticks;
                 } else {

@@ -18,7 +18,10 @@ pub const SAMPLE_RATE_DEN: u32 = machine::timing::YM_SAMPLE_CLOCKS;
 
 /// Somewhere to send finished samples.
 pub trait Audio {
-    /// Convert and queue mono samples produced at the emulator's rate.
+    /// Convert and queue interleaved stereo samples produced at the emulator's rate.
+    ///
+    /// Two channels, L,R, always — [`machine::resample::CHANNELS`]. A mono board
+    /// writes its one value into both slots rather than there being a mono path.
     ///
     /// # Errors
     ///
@@ -132,26 +135,39 @@ impl CpalAudio {
         let feed = Arc::clone(&ring);
         let feed_paused = Arc::clone(&paused);
         let ch = usize::from(channels);
-        // Scratch for one callback's worth of mono samples, allocated once here rather
-        // than on the audio thread.
-        let mut mono: Vec<i16> = Vec::new();
+        // Scratch for one callback's worth of interleaved stereo, allocated once here
+        // rather than on the audio thread.
+        let mut stereo: Vec<i16> = Vec::new();
         let stream = device
             .build_output_stream(
                 // By value in 0.18.
                 config,
                 move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let frames = out.len() / ch;
-                    mono.resize(frames, 0);
+                    stereo.resize(frames * machine::resample::CHANNELS, 0);
                     {
                         // A poisoned lock still holds usable samples: a panic elsewhere
                         // must not also silence the audio.
                         let mut r = feed.lock().unwrap_or_else(|e| e.into_inner());
-                        r.pop(&mut mono, feed_paused.load(Ordering::Relaxed));
+                        r.pop(&mut stereo, feed_paused.load(Ordering::Relaxed));
                     }
-                    for (frame, &s) in out.chunks_mut(ch).zip(mono.iter()) {
-                        let v = f32::from(s) / 32768.0;
-                        for slot in frame.iter_mut() {
-                            *slot = v;
+                    // A trailing partial device frame is zeroed rather than left
+                    // alone: cpal hands over the previous callback's memory, so
+                    // skipping it replays a fragment of old audio as a tick.
+                    let (body, tail) = out.split_at_mut(frames * ch);
+                    tail.fill(0.0);
+                    // The device's channel count is the device's, and it is not
+                    // necessarily two: a mono device takes the left channel, and a
+                    // 5.1 device gets L,R and then the pair repeated. Repeating rather
+                    // than zeroing the rest, because a player on a surround device
+                    // hearing only the front pair would report "no sound" from the
+                    // speakers they are facing.
+                    for (frame, src) in body
+                        .chunks_mut(ch)
+                        .zip(stereo.chunks_exact(machine::resample::CHANNELS))
+                    {
+                        for (i, slot) in frame.iter_mut().enumerate() {
+                            *slot = f32::from(src[i % machine::resample::CHANNELS]) / 32768.0;
                         }
                     }
                 },
