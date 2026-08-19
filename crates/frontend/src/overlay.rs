@@ -22,16 +22,15 @@
 //! # Nothing here is writable
 //!
 //! No register edit, no memory poke. Every read goes through
-//! [`machine::cps1::Cps1::peek_word`], which takes `&self`, and `draw` takes `&Cps1`.
+//! [`machine::cps1::Cps1::peek_word`], which takes `&self`, and `draw` takes a
+//! `&Machine`.
 //! A debugger that could write would need to answer what a half-modified machine
 //! means for a save state and for the 127/127 vector suite, and the answer is not
 //! worth having.
 
 use crate::font::{draw_text, fill_rect, ADVANCE, LINE};
 use machine::video::{HEIGHT, WIDTH};
-// `Cps1` stays: `draw_sound` still takes one, because the sound panel is the one
-// panel that forks per board and Task 18 is where it forks.
-use machine::{Cps1, CpuView};
+use machine::{CpuView, Machine};
 
 /// Panel background: dark, and opaque rather than blended.
 ///
@@ -41,16 +40,21 @@ use machine::{Cps1, CpuView};
 const BG: u32 = 0x0000_0020;
 
 /// Ordinary text.
-const FG: u32 = 0x00D0_D0D0;
+///
+/// `pub(crate)` for `sndpanel.rs`, which draws the one panel that forks per board.
+/// Shared rather than copied: `gfxpanels.rs` holds its own `FG`, `HI` and `PAD`, and
+/// its `PAD` is 2 where this one is 1 — a third copy would be the one that silently
+/// misaligns.
+pub(crate) const FG: u32 = 0x00D0_D0D0;
 
 /// The executing instruction's line, and anything else the eye should go to first.
-const HI: u32 = 0x0060_FF60;
+pub(crate) const HI: u32 = 0x0060_FF60;
 
 /// A breakpoint marker.
 const BP: u32 = 0x00FF_6060;
 
 /// One pixel of padding inside a panel's box, so no glyph touches its edge.
-const PAD: usize = 1;
+pub(crate) const PAD: usize = 1;
 
 /// Where the register panel's box starts.
 pub const REGS_X: usize = 2;
@@ -109,30 +113,12 @@ pub const MEM_WORDS: usize = 4;
 /// overlapping it.
 pub const SND_X: usize = DIS_X + DIS_COLS * ADVANCE + 2 * PAD + 2;
 /// Ditto: level with the disassembly, below the whole top band.
+///
+/// ⚠️ The sound panel's *widths* and *row counts* are not here: they are per-board and
+/// live in [`crate::sndpanel`], which is where the panel itself does. Only the box's
+/// origin is a layout decision this module owns, because it is the one the other four
+/// panels' extents constrain.
 pub const SND_Y: usize = DIS_Y;
-/// `>8000 ld a,($f008)` at [`machine::z80::disasm::Text::CAP`] is 38 characters.
-///
-/// The cap, not a measured maximum: the widest text the Z80 disassembler can produce
-/// is 32 characters, and a panel sized to the longest instruction *SF2's driver
-/// happens to use* would clip on the first ROM that used a wider one.
-const SND_COLS: usize = 38;
-/// The fixed rows above the listing: registers, the interrupt state, the board, the
-/// ADPCM chip, and the trace counters.
-///
-/// **Eleven is the ceiling here, not a round number.** The box starts at [`SND_Y`] and
-/// its bottom is `SND_Y + SND_ROWS * LINE + 2 * PAD`, which at 11 header rows and
-/// [`SND_DIS_ROWS`] listing rows is 211 — against [`STATUS_Y`]'s 214. A twelfth header
-/// row would put the sound panel through the status line, so a new row has to take one
-/// from the listing. `the_sound_panel_still_fits_below_its_last_row` is that arithmetic
-/// as a test.
-const SND_HEAD_ROWS: usize = 11;
-/// How many Z80 instructions the sound listing shows.
-///
-/// Fewer than the 68000's eight: the Z80 is a supporting act here, and the rows are
-/// what buys the header its space without pushing the box into the status line.
-pub const SND_DIS_ROWS: usize = 6;
-/// The whole box.
-const SND_ROWS: usize = SND_HEAD_ROWS + SND_DIS_ROWS;
 
 /// Where the status line's box starts: the bottom of the screen.
 pub const STATUS_X: usize = 2;
@@ -235,24 +221,23 @@ pub fn executing_pc(v: &CpuView<'_>) -> u32 {
 /// want registers. See `draw_mem`'s own note (private) for why it must be the
 /// *side-effect-free* peek and not the CPU's read path.
 ///
-/// ⚠️ `m: &Cps1` is still here for one reason: `draw_sound` has not been forked yet.
-/// Task 18 replaces that parameter and this note together. Every other panel below
-/// reads `v`.
+/// ⚠️ `m: &Machine` is here for one panel: the sound panel is the one that forks per
+/// board, and it dispatches on the variant itself. Every other panel below reads `v`.
 ///
 /// # Panics
 ///
 /// If `buf` is not a `WIDTH × HEIGHT` frame, as [`draw_text`].
-// Eight parameters: the frame, the CPU view, the memory peek, the board (for the sound
-// panel, which is the one panel that forks per board and is not migrated here), the
-// panel flags, two scroll addresses and the breakpoint list. Every one is independent
-// — bundling them into a struct would move the same eight names one level down and
-// hand the caller a literal to fill in, which is not fewer decisions.
+// Eight parameters: the frame, the CPU view, the memory peek, the machine (for the
+// sound panel, which is the one panel that forks per board), the panel flags, two
+// scroll addresses and the breakpoint list. Every one is independent — bundling them
+// into a struct would move the same eight names one level down and hand the caller a
+// literal to fill in, which is not fewer decisions.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
     buf: &mut [u32],
     v: &CpuView<'_>,
     peek: &dyn Fn(u32) -> Option<u16>,
-    m: &Cps1,
+    m: &Machine,
     p: Panels,
     disasm_at: u32,
     mem_at: u32,
@@ -269,7 +254,7 @@ pub fn draw(
         draw_mem(buf, peek, mem_at);
     }
     if p.sound {
-        draw_sound(buf, m);
+        crate::sndpanel::draw(buf, m);
     }
     if p.status {
         draw_status(buf, v);
@@ -277,7 +262,16 @@ pub fn draw(
 }
 
 /// A panel's background, and the `(x, y)` of its first line of text.
-fn box_at(buf: &mut [u32], x: usize, y: usize, cols: usize, rows: usize) -> (usize, usize) {
+///
+/// `pub(crate)` for [`crate::sndpanel`], which draws its two boxes with this rather
+/// than a copy: the chrome is what must not drift between panel modules.
+pub(crate) fn box_at(
+    buf: &mut [u32],
+    x: usize,
+    y: usize,
+    cols: usize,
+    rows: usize,
+) -> (usize, usize) {
     fill_rect(
         buf,
         x,
@@ -382,232 +376,6 @@ fn draw_mem(buf: &mut [u32], peek: &dyn Fn(u32) -> Option<u16>, at: u32) {
     }
 }
 
-/// The sound board: the Z80, its listing, the latches, and the chip.
-///
-/// # The Z80's PC is not the 68000's
-///
-/// There is no [`executing_pc`] here, and that is not an oversight. The 68000's `pc`
-/// is four bytes past the instruction about to run because of the prefetch queue;
-/// `z80::Z80::pc` is the address of the *next fetch*, so it already is the executing
-/// instruction's. Subtracting anything would put the listing's marker in the middle of
-/// whatever ran last.
-///
-/// # The listing always follows the PC
-///
-/// No scroll address. `Focus` has two variants because only two panels scroll, and a
-/// sound listing you could park somewhere would need a third — for a 16-bit space you
-/// can read in one screenful of pages. Following is what you want from a panel you
-/// opened to watch a driver run.
-fn draw_sound(buf: &mut [u32], m: &Cps1) {
-    let (x, y) = box_at(buf, SND_X, SND_Y, SND_COLS, SND_ROWS);
-    let z = &m.z80;
-    let mut row = 0usize;
-    let line = |buf: &mut [u32], row: &mut usize, s: &str, fg: u32| {
-        draw_text(buf, x, y + *row * LINE, s, fg);
-        *row += 1;
-    };
-
-    line(
-        buf,
-        &mut row,
-        &format!(
-            "AF {:04X} BC {:04X} DE {:04X} HL {:04X}",
-            z.af(),
-            z.bc(),
-            z.de(),
-            z.hl()
-        ),
-        FG,
-    );
-    line(
-        buf,
-        &mut row,
-        &format!(
-            "IX {:04X} IY {:04X} SP {:04X} PC {:04X}",
-            z.ix, z.iy, z.sp, z.pc
-        ),
-        HI,
-    );
-    // The alternate set, which `exx` and `ex af,af'` swap in. A driver's interrupt
-    // handler is where they are used, and a panel without them shows a Z80 whose
-    // registers appear to change for no reason.
-    line(
-        buf,
-        &mut row,
-        &format!(
-            "AF'{:04X} BC'{:04X} DE'{:04X} HL'{:04X}",
-            z.af_, z.bc_, z.de_, z.hl_
-        ),
-        FG,
-    );
-    // `HALT` is a real state on this CPU and not a fault: the driver halts waiting for
-    // the YM2151's timer interrupt, so a halted Z80 with `EI` set is normal and one
-    // with `DI` set is hung forever. Both bits are shown for that reason.
-    let run = if z.halted { "HALT" } else { "RUN " };
-    line(
-        buf,
-        &mut row,
-        &format!(
-            "I {:02X} R {:02X} IM{} IFF{}{} {run}",
-            z.i,
-            z.r,
-            z.im,
-            u8::from(z.iff1),
-            u8::from(z.iff2)
-        ),
-        HI,
-    );
-
-    // The 68000's side of the two latches beside the Z80's, because they are different
-    // bytes: the board's are what the 68000 last wrote, and the board copies them into
-    // the sound board's at the start of each Z80 instruction. Showing only one pair
-    // hides a command in flight, which is the moment you opened this panel to see.
-    line(
-        buf,
-        &mut row,
-        &format!(
-            "LATCH {:02X} {:02X} < {:02X} {:02X}  BANK {}  OKI7 {}",
-            m.sound.latch(0),
-            m.sound.latch(1),
-            m.board.sound_latch[0],
-            m.board.sound_latch[1],
-            m.sound.bank(),
-            u8::from(m.sound.oki_pin7()),
-        ),
-        FG,
-    );
-
-    let ym = m.sound.ym_ref();
-    line(
-        buf,
-        &mut row,
-        &format!(
-            "YM REG {:02X} STAT {:02X} IRQ {}",
-            m.sound.ym_addr(),
-            ym.read_status(),
-            if ym.irq() { "Y" } else { "-" }
-        ),
-        FG,
-    );
-    // One character per channel: its own number when any of its four operators is
-    // keyed, a dot when none is. Read off `keyon_live` rather than register 0x08,
-    // which is write-only and holds only the *last* write — a driver keying one
-    // channel at a time would show one voice however many were sounding.
-    let keys: String = ym
-        .channels
-        .iter()
-        .enumerate()
-        .map(|(c, ch)| {
-            if ch.ops.iter().any(|op| op.keyon_live != 0) {
-                char::from(b'0' + c as u8)
-            } else {
-                '.'
-            }
-        })
-        .collect();
-    line(buf, &mut row, &format!("KEYON {keys}"), HI);
-
-    // The ADPCM chip. `STAT` is the byte the driver reads back from 0xF002 — bit 3..0 per
-    // voice plus the idle bit — and `V` spells out which voices are sounding the way
-    // `KEYON` does above, because the status byte alone is four bits you have to decode
-    // in your head while a phrase is playing.
-    //
-    // `DIV` is the pin-7 divisor rather than the pin: the pin is one bit already on the
-    // `LATCH` row, and the divisor is the number that tells you the sample rate — 132 or
-    // 165, which at 1 MHz is 7.576 kHz or 6.061 kHz.
-    let oki = m.sound.oki_ref();
-    let playing: String = oki
-        .voices()
-        .iter()
-        .enumerate()
-        .map(|(i, v)| {
-            if v.playing() {
-                char::from(b'0' + i as u8)
-            } else {
-                '.'
-            }
-        })
-        .collect();
-    line(
-        buf,
-        &mut row,
-        &format!(
-            "OKI {:02X} V {playing} DIV {:3} CMD {}",
-            oki.status(),
-            m.sound.oki_divisor(),
-            // The half-delivered start command, which is the state a phrase that never
-            // plays is stuck in: a driver that latched a phrase and then took an
-            // interrupt shows a number here that never clears.
-            match oki.pending_command() {
-                Some(p) => format!("{p:02X}"),
-                None => "--".to_string(),
-            }
-        ),
-        HI,
-    );
-    // The three counters that answer "why does it sound wrong", in the order the audio
-    // path produces them: the chip clamped its own sum, the ring was full, the ring was
-    // empty. `DRP` and `UND` come from the host through `set_audio_stats`, which the
-    // frontend loop calls once a tick from the device's ring; they read 0 on a machine
-    // with no audio device, which is the honest reading rather than a placeholder.
-    line(
-        buf,
-        &mut row,
-        &format!(
-            "CLP {:06} DRP {:06} UND {:06}",
-            m.sound_trace().oki_clamps,
-            m.sound_trace().audio_drops,
-            m.sound_trace().audio_underruns
-        ),
-        FG,
-    );
-
-    line(
-        buf,
-        &mut row,
-        &format!(
-            "TSC {:012} SMP {:06}",
-            m.z80_cycles(),
-            m.samples().len() / machine::resample::CHANNELS
-        ),
-        FG,
-    );
-    let t = m.sound_trace();
-    line(
-        buf,
-        &mut row,
-        &format!(
-            "FET {:09} YM {:06} LAT {:06}",
-            t.audiocpu_fetches, t.ym_writes, t.latch_reads
-        ),
-        FG,
-    );
-    debug_assert_eq!(
-        row, SND_HEAD_ROWS,
-        "the header is what the box was sized for"
-    );
-
-    // The listing. `peek_byte`, not the bus: reading through `z80::Bus` would add this
-    // panel's own reads to the `FET` count directly above it, so the number would be
-    // mostly the panel. `disasm_bus` is unusable here for the same reason — it takes
-    // `&mut B`, and this module holds `&Cps1`.
-    let mut a = z.pc;
-    for i in 0..SND_DIS_ROWS {
-        let (text, len) = machine::z80::disasm::disasm(|w| m.sound.peek_byte(w), a);
-        let marker = if a == z.pc { '>' } else { ' ' };
-        let fg = if a == z.pc { HI } else { FG };
-        draw_text(
-            buf,
-            x,
-            y + (SND_HEAD_ROWS + i) * LINE,
-            &format!("{marker}{a:04X} {}", text.as_str()),
-            fg,
-        );
-        // `len` is at least 1, so the listing always advances and cannot loop.
-        a = a.wrapping_add(len);
-    }
-}
-
 /// Flags, the beam, and whether the CPU is running at all.
 fn draw_status(buf: &mut [u32], v: &CpuView<'_>) {
     let (x, y) = box_at(buf, STATUS_X, STATUS_Y, STATUS_COLS, 1);
@@ -653,12 +421,13 @@ fn draw_status(buf: &mut [u32], v: &CpuView<'_>) {
 mod tests {
     use super::*;
     use crate::font::{frame, panel_contains, read_text};
+    // The sound machine moved out with the panel it was written for, and this module's
+    // `the_sound_panel_renders_without_panicking` still draws that panel through
+    // `draw`. Shared rather than copied: a second copy here would go on claiming to
+    // run a driver after the real one's opcodes changed.
+    use crate::sndpanel::a_sound_machine;
     use machine::config::BoardConfig;
     use machine::timing::Timing;
-    // The Z80's bus, for writing the board's ports the way a driver does rather than
-    // reaching into the chips directly: `0xF002` is how a phrase is started, and a test
-    // that called `Oki::write` would bypass the port decode the panel's rows describe.
-    use machine::z80::Bus as _;
 
     /// A machine stopped part-way through a program, with something in every field a
     /// panel reads.
@@ -686,14 +455,18 @@ mod tests {
     ///
     /// ⚠️ This duplicates [`machine::Machine::cpu_view`]'s five field assignments, and
     /// that is deliberate and bounded. The tests here need the board *as well as* the
-    /// view — `draw` still takes a `&Cps1` for the sound panel — and
-    /// `Machine::Cps1(Box::new(m))` moves the board out of reach. `CpuView`'s fields
-    /// are `pub` because a panel reads them directly, so a test can build one.
+    /// view — they mutate it and read its trace back — and `CpuView`'s fields are `pub`
+    /// because a panel reads them directly, so a test can build one.
     ///
     /// It must not be copied into non-test code: two producers of this view is two
     /// places for `vblank_pending` to disagree. If a field is added to `CpuView` this
     /// helper stops compiling, which is the right failure.
-    fn view(m: &Cps1) -> CpuView<'_> {
+    ///
+    /// ⚠️ `machine::Cps1` spelled out, here and in the three helpers below, rather than
+    /// imported: `use machine::Cps1;` being gone from this file is the measure that
+    /// Task 18 landed, and an import in the test module would put it back. Task 21
+    /// deletes this twin outright.
+    fn view(m: &machine::Cps1) -> CpuView<'_> {
         CpuView {
             cpu: &m.cpu,
             trace: &m.board.trace,
@@ -703,9 +476,38 @@ mod tests {
         }
     }
 
-    fn a_machine() -> Cps1 {
+    /// The board inside a [`Machine`], and the machine around a board.
+    ///
+    /// `draw`'s fourth argument is a `&Machine` now, because the sound panel forks per
+    /// board — but these tests still need the `Cps1`: they set `cpu.stopped`, they poke
+    /// `board.ram`, and they read `board.trace` back afterwards to assert the panel
+    /// disturbed nothing. Both at once is what these two give, and reading the board
+    /// *out of the machine that was drawn* is the point: a decoy `Machine` beside the
+    /// board would let `drawing_the_memory_panel_does_not_disturb_the_machine` assert
+    /// about a machine no panel ever saw.
+    fn wrap(m: machine::Cps1) -> Machine {
+        Machine::Cps1(Box::new(m))
+    }
+
+    /// See [`wrap`]. The `unreachable!` is honest: every caller wrapped a `Cps1`.
+    fn as_cps1(m: &Machine) -> &machine::Cps1 {
+        match m {
+            Machine::Cps1(c) => c,
+            Machine::Sf1(_) => unreachable!("wrapped from a_machine"),
+        }
+    }
+
+    /// See [`wrap`], for the tests that change the CPU between two draws.
+    fn as_cps1_mut(m: &mut Machine) -> &mut machine::Cps1 {
+        match m {
+            Machine::Cps1(c) => c,
+            Machine::Sf1(_) => unreachable!("wrapped from a_machine"),
+        }
+    }
+
+    fn a_machine() -> machine::Cps1 {
         let rom = prog();
-        let mut m = Cps1::new(&rom, BoardConfig::sf2(), Timing::cps1_10mhz());
+        let mut m = machine::Cps1::new(&rom, BoardConfig::sf2(), Timing::cps1_10mhz());
         m.reset();
         m.cpu.d[0] = 0x1234_ABCD;
         m.cpu.d[7] = 0x0000_0001;
@@ -719,50 +521,6 @@ mod tests {
         m
     }
 
-    /// A machine with a sound program the Z80 actually executes.
-    ///
-    /// The driver is `machine`'s own `sound_spin` loop — read the command latch, store
-    /// it to sound RAM, jump back — and it is padded to the full 0x18000 so both ROM
-    /// banks decode. A machine built with `Cps1::new` has an *empty* sound region,
-    /// where every fetch reads 0xFF: the Z80 spins on `RST 38h`, `keyon_live` is zero
-    /// for all eight channels, and a listing shows six identical lines. That fixture
-    /// cannot tell a working panel from one that reads the wrong fields, so the panel
-    /// tests use this one.
-    fn a_sound_machine() -> Cps1 {
-        // `ld a,($f008)` / `ld ($d000),a` / `jr -9`, from `machine`'s `sound_spin`.
-        let mut audiocpu = vec![0u8; 0x1_8000];
-        audiocpu[..9].copy_from_slice(&[0x3A, 0x08, 0xF0, 0x32, 0x00, 0xD0, 0x00, 0x18, 0xF7]);
-        let rom = prog();
-        let mut m = Cps1::with_sound(
-            &rom,
-            Vec::new(),
-            audiocpu,
-            a_sample_rom(),
-            BoardConfig::sf2(),
-            Timing::cps1_10mhz(),
-        );
-        m.reset();
-        m
-    }
-
-    /// A sample ROM with two phrases, so the panel's OKI rows have voices to show.
-    ///
-    /// A board built with `Vec::new()` refuses every phrase — `start == stop == 0` — so
-    /// its status byte, its voice string, and its clamp count would all read as an idle
-    /// chip whatever the panel did with them. `0x77` is the largest positive step
-    /// repeated, which ramps to near full scale and makes the OKI clamp against its own
-    /// ±65536 output limit once two voices are sounding: that is what gives `CLP`
-    /// something to count.
-    fn a_sample_rom() -> Vec<u8> {
-        let mut r = vec![0u8; 0x8000];
-        // Phrase headers at `phrase * 8`: start and last byte, 24-bit big-endian.
-        r[8..14].copy_from_slice(&[0x00, 0x10, 0x00, 0x00, 0x30, 0x00]);
-        r[16..22].copy_from_slice(&[0x00, 0x40, 0x00, 0x00, 0x60, 0x00]);
-        r[0x1000..0x3001].fill(0x77);
-        r[0x4000..0x6001].fill(0x77);
-        r
-    }
-
     /// The register panel shows the registers, read back off the pixels.
     ///
     /// Not compared against the same `format!` the renderer used — that would assert
@@ -770,7 +528,8 @@ mod tests {
     /// buffer, so this proves the formatting, the layout, and the glyphs together.
     #[test]
     fn the_register_panel_shows_the_registers() {
-        let m = a_machine();
+        let mach = wrap(a_machine());
+        let m = as_cps1(&mach);
         // A7 is taken from the fixture, not set here, because the fixture deliberately
         // leaves `a[7]` and `ssp` *different*. Setting it to `ssp`'s value would put
         // the coincidence back and this test's A7 assertion could no longer fail.
@@ -781,9 +540,9 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(&m),
+            &view(m),
             &|a| m.peek_word(a),
-            &m,
+            &mach,
             Panels {
                 regs: true,
                 ..Panels::none()
@@ -818,7 +577,8 @@ mod tests {
     /// showing 001004 for an instruction at 001000 looks entirely plausible.
     #[test]
     fn the_register_panel_shows_the_executing_pc_not_the_prefetched_one() {
-        let m = a_machine();
+        let mach = wrap(a_machine());
+        let m = as_cps1(&mach);
         assert_eq!(
             m.cpu.pc, 0x1004,
             "the premise: PC is prefetched past 0x1000"
@@ -826,9 +586,9 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(&m),
+            &view(m),
             &|a| m.peek_word(a),
-            &m,
+            &mach,
             Panels {
                 regs: true,
                 ..Panels::none()
@@ -847,15 +607,16 @@ mod tests {
     /// The disassembly panel disassembles from the follow address and marks the PC.
     #[test]
     fn the_disassembly_panel_marks_the_executing_instruction() {
-        let m = a_machine();
-        let at = executing_pc(&view(&m));
+        let mach = wrap(a_machine());
+        let m = as_cps1(&mach);
+        let at = executing_pc(&view(m));
         assert_eq!(at, m.cpu.pc - 4, "the premise of this whole panel");
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(&m),
+            &view(m),
             &|a| m.peek_word(a),
-            &m,
+            &mach,
             Panels {
                 disasm: true,
                 ..Panels::none()
@@ -888,14 +649,15 @@ mod tests {
     /// you nothing about where the machine is.
     #[test]
     fn only_the_executing_line_is_marked() {
-        let m = a_machine();
-        let at = executing_pc(&view(&m));
+        let mach = wrap(a_machine());
+        let m = as_cps1(&mach);
+        let at = executing_pc(&view(m));
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(&m),
+            &view(m),
             &|a| m.peek_word(a),
-            &m,
+            &mach,
             Panels {
                 disasm: true,
                 ..Panels::none()
@@ -932,15 +694,17 @@ mod tests {
     /// The memory panel shows what `peek_word` returns, and `--` for what it does not.
     #[test]
     fn the_memory_panel_shows_words_and_gaps() {
-        let mut m = a_machine();
-        m.board.ram[0] = 0xBEEF;
-        m.board.ram[1] = 0xCAFE;
+        let mut mach = wrap(a_machine());
+        let b = as_cps1_mut(&mut mach);
+        b.board.ram[0] = 0xBEEF;
+        b.board.ram[1] = 0xCAFE;
+        let m = as_cps1(&mach);
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(&m),
+            &view(m),
             &|a| m.peek_word(a),
-            &m,
+            &mach,
             Panels {
                 mem: true,
                 ..Panels::none()
@@ -958,9 +722,9 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(&m),
+            &view(m),
             &|a| m.peek_word(a),
-            &m,
+            &mach,
             Panels {
                 mem: true,
                 ..Panels::none()
@@ -987,13 +751,14 @@ mod tests {
     /// 0xFFFF. A panel rendering both as `--` loses the fact that a chip answered.
     #[test]
     fn a_decoded_all_ones_is_not_shown_as_a_gap() {
-        let m = a_machine();
+        let mach = wrap(a_machine());
+        let m = as_cps1(&mach);
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(&m),
+            &view(m),
             &|a| m.peek_word(a),
-            &m,
+            &mach,
             Panels {
                 mem: true,
                 ..Panels::none()
@@ -1016,8 +781,9 @@ mod tests {
     /// unmapped-read counter the status panel could show.
     #[test]
     fn drawing_the_memory_panel_does_not_disturb_the_machine() {
-        let mut m = a_machine();
-        m.board.assert_vblank();
+        let mut mach = wrap(a_machine());
+        as_cps1_mut(&mut mach).board.assert_vblank();
+        let m = as_cps1(&mach);
         assert!(
             m.board.vblank_pending(),
             "the premise: an interrupt is outstanding"
@@ -1029,9 +795,9 @@ mod tests {
         for at in [0x60, 0x40_0000] {
             draw(
                 &mut buf,
-                &view(&m),
+                &view(m),
                 &|a| m.peek_word(a),
-                &m,
+                &mach,
                 Panels {
                     mem: true,
                     disasm: true,
@@ -1061,14 +827,15 @@ mod tests {
     /// like a video bug.
     #[test]
     fn a_panel_leaves_the_rest_of_the_frame_alone() {
-        let m = a_machine();
+        let mach = wrap(a_machine());
+        let m = as_cps1(&mach);
         let before = vec![0x00AB_CDEF_u32; WIDTH * HEIGHT];
         let mut after = before.clone();
         draw(
             &mut after,
-            &view(&m),
+            &view(m),
             &|a| m.peek_word(a),
-            &m,
+            &mach,
             Panels {
                 regs: true,
                 ..Panels::none()
@@ -1126,7 +893,17 @@ mod tests {
             ("disasm", DIS_X, DIS_Y, DIS_COLS, DIS_ROWS),
             ("mem", MEM_X, MEM_Y, MEM_COLS, MEM_ROWS),
             ("status", STATUS_X, STATUS_Y, STATUS_COLS, 1),
-            ("sound", SND_X, SND_Y, SND_COLS, SND_ROWS),
+            // The sound box's width and height are per-board and live in `sndpanel`;
+            // only its origin is this module's. `SND_ROWS` is shared by both boards,
+            // and SF1's wider box has its own extent assertion over there, where the
+            // width it depends on is defined.
+            (
+                "sound",
+                SND_X,
+                SND_Y,
+                crate::sndpanel::CPS1_COLS,
+                crate::sndpanel::SND_ROWS,
+            ),
         ] {
             let right = x + cols * ADVANCE + 2 * PAD;
             let bottom = y + rows * LINE + 2 * PAD;
@@ -1142,7 +919,8 @@ mod tests {
     /// panel, and useless in the window.
     #[test]
     fn all_five_panels_can_be_shown_at_once_without_overlapping() {
-        let m = a_machine();
+        let mach = wrap(a_machine());
+        let m = as_cps1(&mach);
         let all = Panels {
             regs: true,
             disasm: true,
@@ -1179,9 +957,9 @@ mod tests {
             let mut buf = blank.clone();
             draw(
                 &mut buf,
-                &view(&m),
+                &view(m),
                 &|a| m.peek_word(a),
-                &m,
+                &mach,
                 p,
                 0x1000,
                 0xFF_0000,
@@ -1205,9 +983,9 @@ mod tests {
         let mut buf = blank.clone();
         draw(
             &mut buf,
-            &view(&m),
+            &view(m),
             &|a| m.peek_word(a),
-            &m,
+            &mach,
             all,
             0x1000,
             0xFF_0000,
@@ -1238,14 +1016,15 @@ mod tests {
     /// background would black out the game when disabled.
     #[test]
     fn nothing_enabled_draws_nothing() {
-        let m = a_machine();
+        let mach = wrap(a_machine());
+        let m = as_cps1(&mach);
         let before = vec![0x00AB_CDEF_u32; WIDTH * HEIGHT];
         let mut after = before.clone();
         draw(
             &mut after,
-            &view(&m),
+            &view(m),
             &|a| m.peek_word(a),
-            &m,
+            &mach,
             Panels::none(),
             0,
             0,
@@ -1259,17 +1038,18 @@ mod tests {
     /// A breakpoint is marked in the disassembly, in its own colour.
     #[test]
     fn a_breakpoint_is_marked() {
-        let m = a_machine();
-        let at = executing_pc(&view(&m));
+        let mach = wrap(a_machine());
+        let m = as_cps1(&mach);
+        let at = executing_pc(&view(m));
         // On the *second* line, not the current one: a marker only ever drawn on the
         // executing line would be indistinguishable from the `>` marker.
         let brk = at + 4;
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(&m),
+            &view(m),
             &|a| m.peek_word(a),
-            &m,
+            &mach,
             Panels {
                 disasm: true,
                 ..Panels::none()
@@ -1298,326 +1078,52 @@ mod tests {
     /// is waiting for an interrupt and will.
     #[test]
     fn a_halted_cpu_is_shown_as_halted_and_a_stopped_one_as_stopped() {
-        let mut m = a_machine();
+        let mut mach = wrap(a_machine());
         let p = Panels {
             status: true,
             ..Panels::none()
         };
         let mut buf = frame();
-        draw(&mut buf, &view(&m), &|a| m.peek_word(a), &m, p, 0, 0, &[]);
+        {
+            let m = as_cps1(&mach);
+            draw(&mut buf, &view(m), &|a| m.peek_word(a), &mach, p, 0, 0, &[]);
+        }
         assert!(panel_contains(&buf, "RUN", HI), "a running CPU says so");
 
-        m.cpu.stopped = true;
+        as_cps1_mut(&mut mach).cpu.stopped = true;
         let mut buf = frame();
-        draw(&mut buf, &view(&m), &|a| m.peek_word(a), &m, p, 0, 0, &[]);
+        {
+            let m = as_cps1(&mach);
+            draw(&mut buf, &view(m), &|a| m.peek_word(a), &mach, p, 0, 0, &[]);
+        }
         assert!(panel_contains(&buf, "STOP", HI), "stopped");
         assert!(!panel_contains(&buf, "HALT", HI), "and not halted");
 
-        m.cpu.halted = true;
+        as_cps1_mut(&mut mach).cpu.halted = true;
         let mut buf = frame();
-        draw(&mut buf, &view(&m), &|a| m.peek_word(a), &m, p, 0, 0, &[]);
+        {
+            let m = as_cps1(&mach);
+            draw(&mut buf, &view(m), &|a| m.peek_word(a), &mach, p, 0, 0, &[]);
+        }
         assert!(panel_contains(&buf, "HALT", HI), "a dead CPU is not paused");
     }
 
     /// The status line shows the flags that are set and dashes for the rest.
     #[test]
     fn the_status_line_shows_the_flags_and_the_beam() {
-        let mut m = a_machine();
+        let mut mach = wrap(a_machine());
         // Z and C set, X/N/V clear, supervisor, IPL mask 7.
-        m.cpu.set_sr(0x2705);
+        as_cps1_mut(&mut mach).cpu.set_sr(0x2705);
         let mut buf = frame();
-        draw(
-            &mut buf,
-            &view(&m),
-            &|a| m.peek_word(a),
-            &m,
-            Panels {
-                status: true,
-                ..Panels::none()
-            },
-            0,
-            0,
-            &[],
-        );
-        assert_eq!(
-            read_text(&buf, STATUS_X + PAD, STATUS_Y + PAD, 24, HI),
-            "RUN  --Z-C IPL7     LINE",
-            "run state, flags, mask, and no interrupt outstanding"
-        );
-        assert!(panel_contains(&buf, "S1", HI), "supervisor");
-
-        m.cpu.set_sr(0x0018);
-        m.board.assert_vblank();
-        let mut buf = frame();
-        draw(
-            &mut buf,
-            &view(&m),
-            &|a| m.peek_word(a),
-            &m,
-            Panels {
-                status: true,
-                ..Panels::none()
-            },
-            0,
-            0,
-            &[],
-        );
-        assert_eq!(
-            read_text(&buf, STATUS_X + PAD, STATUS_Y + PAD, 19, HI),
-            "RUN  XN--- IPL0 IRQ",
-            "the other flags, and an outstanding interrupt"
-        );
-        assert!(panel_contains(&buf, "S0", HI), "and user mode");
-    }
-
-    /// The sound panel shows the Z80, the board, and the chip.
-    ///
-    /// Read back off the pixels, like the 68000 panel's, for the same reason: comparing
-    /// against the same `format!` the panel used would assert the formatter equals
-    /// itself.
-    #[test]
-    fn the_sound_panel_shows_the_z80_the_latches_and_the_chip() {
-        let mut m = a_sound_machine();
-        // A command in flight: the 68000 has written the board's latches, and the Z80's
-        // copy is a scanline behind until `step_sound` refreshes it.
-        m.board.sound_latch = [0x5C, 0xA3];
-        // A voice sounding, so `KEYON` has something to show. Channel 5, not 0: the
-        // low three bits of 0x08 select the channel, and a panel keying the wrong one
-        // would still light a voice.
-        m.sound.ym().write(0x08, 0x78 | 5);
-        m.run_scanline();
-
-        let mut buf = frame();
-        draw(
-            &mut buf,
-            &view(&m),
-            &|a| m.peek_word(a),
-            &m,
-            Panels {
-                sound: true,
-                ..Panels::none()
-            },
-            0,
-            0,
-            &[],
-        );
-
-        // The PC row, at the exact pixels the layout says. SP is 0xFFFF and AF is all
-        // ones after a Z80 reset — real hardware, not a placeholder, and asserted here
-        // because a panel showing 0000 for SP would look like a plausible fresh
-        // machine while actually reading the wrong field. The driver's PC is one of
-        // 0x0000, 0x0003, or 0x0006 depending on where the line's budget ran out.
-        let pcs = read_text(&buf, SND_X + PAD, SND_Y + PAD + LINE, 38, HI);
-        assert!(
-            pcs.starts_with("IX 0000 IY 0000 SP FFFF PC 000"),
-            "the index, stack, and program registers: {pcs:?}"
-        );
-        // The alternate set is shown, and this driver never touches it — no `exx`, no
-        // `ex af,af'` — so it is still the all-ones a Z80 reset leaves. The main `AF`
-        // cannot be asserted here: `ld a,($f008)` has loaded the latch into A, and
-        // whether it has run yet depends on where the scanline's budget ran out.
-        assert_eq!(
-            read_text(&buf, SND_X + PAD, SND_Y + PAD + 2 * LINE, 31, FG),
-            "AF'0000 BC'0000 DE'0000 HL'0000",
-            "the shadow set, which this driver never swaps in — and which a panel \
-             printing the main set twice would show as the main set"
-        );
-        // The latches, both pairs. The Z80's copy is what `step_sound` refreshed, and
-        // the board's is what the 68000 wrote — the same bytes here, because a
-        // scanline ran, and the point is that both are shown.
-        assert!(
-            panel_contains(&buf, "LATCH 5C A3 < 5C A3", FG),
-            "the Z80's latches and the 68000's, side by side"
-        );
-        assert!(panel_contains(&buf, "BANK 0", FG), "and the ROM bank");
-        // The chip. Channel 5 keyed and nothing else: `.....5..`, which is the
-        // assertion a panel reading register 0x08 instead of `keyon_live` fails once
-        // the driver keys a second voice.
-        assert!(
-            panel_contains(&buf, "KEYON .....5..", HI),
-            "one character per channel, and only channel 5 is keyed"
-        );
-        // The trace counters, from the machine rather than from a second tally.
-        let t = m.sound_trace();
-        assert!(t.audiocpu_fetches > 0, "the premise: the Z80 fetched");
-        assert!(
-            panel_contains(&buf, &format!("FET {:09}", t.audiocpu_fetches), FG),
-            "the fetch count is the machine's"
-        );
-    }
-
-    /// The sound panel shows the ADPCM chip: status, voices, divisor, and the counters.
-    ///
-    /// Read back off the pixels for the rest of the panel's reason, and with values
-    /// chosen so each field can fail on its own:
-    ///
-    /// - **Voices 1 and 2, not 0.** The mask nibble is the high one, so a panel reading
-    ///   `command & 0x0F` as the mask would light voice 0 instead. `.12.` also fails for a
-    ///   panel that printed the status byte's bits in the wrong order.
-    /// - **Pin 7 low, divisor 165.** The default is high, 132, so a panel that ignored the
-    ///   pin — or printed the pin instead of the divisor — reads 132 or `1`.
-    /// - **A phrase latched and left.** `CMD 03` is the half-delivered command; a panel
-    ///   with no such row is how a phrase that never plays stays invisible.
-    /// - **`CLP` non-zero.** Two voices at volume index 0 exceed the chip's own ±65536
-    ///   clamp, which is what makes the counter a number rather than a permanent 0.
-    #[test]
-    fn the_sound_panel_shows_the_adpcm_chip() {
-        let mut m = a_sound_machine();
-        m.sound.write(0xF006, 0x00); // pin 7 low: the slower divisor
-                                     // Two voices, both at volume index 0 so their sum clips.
-        m.sound.write(0xF002, 0x81);
-        m.sound.write(0xF002, 0x20); // mask 2 -> voice 1
-        m.sound.write(0xF002, 0x82);
-        m.sound.write(0xF002, 0x40); // mask 4 -> voice 2
-        for _ in 0..64 {
-            m.run_scanline();
-        }
-        // A third phrase latched with no mask byte, last so it stays pending.
-        m.sound.write(0xF002, 0x83);
-
-        let mut buf = frame();
-        draw(
-            &mut buf,
-            &view(&m),
-            &|a| m.peek_word(a),
-            &m,
-            Panels {
-                sound: true,
-                ..Panels::none()
-            },
-            0,
-            0,
-            &[],
-        );
-
-        // The status byte the driver itself would read. `0xF6`, not `0x06`: the chip
-        // builds `0xF0` and sets one bit per playing voice, so the high nibble is always
-        // set — the panel shows the byte the guest sees, not a cleaned-up version of it.
-        assert_eq!(
-            m.sound.oki_ref().status(),
-            0xF6,
-            "the premise: the chip reports voices 1 and 2"
-        );
-        assert!(
-            panel_contains(&buf, "OKI F6 V .12. DIV 165 CMD 03", HI),
-            "the chip's status, its voices, its rate, and the pending command"
-        );
-
-        let t = m.sound_trace();
-        assert!(
-            t.oki_clamps > 0,
-            "the premise: two loud voices clipped, so CLP is a real count ({})",
-            t.oki_clamps
-        );
-        assert!(
-            panel_contains(&buf, &format!("CLP {:06}", t.oki_clamps), FG),
-            "the clamp count is the machine's, not a second tally"
-        );
-        // Both host counters are 0 until Task 12 wires a device, and shown anyway: the
-        // panel's job is to say "the ring is fine", which a missing row cannot.
-        assert!(
-            panel_contains(&buf, "DRP 000000 UND 000000", FG),
-            "the ring's counters, zero with no audio device attached"
-        );
-    }
-
-    /// The sound panel still ends above the status line, with no room for a twelfth row.
-    ///
-    /// `every_panel_fits_inside_the_frame` only checks the frame's edge, and the status
-    /// line is not the frame's edge — a sound panel two rows taller would fit the window
-    /// and draw straight through the status line's box, which `fill_rect` would happily
-    /// do. This is the arithmetic in [`SND_HEAD_ROWS`]'s documentation as an assertion,
-    /// including the part that says a new header row has to take one from the listing.
-    #[test]
-    fn the_sound_panel_still_fits_below_its_last_row() {
-        let bottom = SND_Y + SND_ROWS * LINE + 2 * PAD;
-        assert_eq!(bottom, 211, "the sound box ends here");
-        assert!(
-            bottom < STATUS_Y,
-            "the sound panel ends at {bottom}, at or past the status line's {STATUS_Y}"
-        );
-        let with_one_more = bottom + LINE;
-        assert!(
-            with_one_more > STATUS_Y,
-            "and there is no room for a twelfth header row ({with_one_more} against \
-             {STATUS_Y}), so the next row added has to come out of SND_DIS_ROWS — this \
-             is the assertion that says so rather than leaving it to a comment"
-        );
-    }
-
-    /// The sound listing follows the Z80's PC and marks it, with no prefetch offset.
-    ///
-    /// **The Z80's `pc` is already the executing instruction's**, unlike the 68000's.
-    /// A panel that borrowed [`executing_pc`]'s `- 4` here would point four bytes
-    /// behind, into the middle of whatever ran last — and the driver's three
-    /// instructions are 3, 3, and 2 bytes, so a fixed offset lands mid-instruction and
-    /// disassembles to something that was never executed.
-    #[test]
-    fn the_sound_listing_starts_at_the_z80s_pc_and_marks_it() {
-        let m = a_sound_machine();
-        assert_eq!(m.z80.pc, 0, "the premise: a freshly reset Z80 is at 0x0000");
-        let mut buf = frame();
-        draw(
-            &mut buf,
-            &view(&m),
-            &|a| m.peek_word(a),
-            &m,
-            Panels {
-                sound: true,
-                ..Panels::none()
-            },
-            0,
-            0,
-            &[],
-        );
-        let head = SND_Y + PAD + SND_HEAD_ROWS * LINE;
-        assert_eq!(
-            read_text(&buf, SND_X + PAD, head, 20, HI),
-            ">0000 ld a,($f008)  ",
-            "the first line: marked, addressed, and disassembled"
-        );
-        // The second line proves the instruction *length* was used: a listing advancing
-        // by a fixed 1 or 2 would show 0001 or 0002, both mid-instruction.
-        assert!(
-            panel_contains(&buf, "0003 ld ($d000),a", FG),
-            "the next instruction is at 0003, not 0001"
-        );
-        // And exactly one line is marked, counted across both colours — reading only
-        // `HI` cannot fail, because a panel marking every line still draws the others
-        // in `FG`.
-        let markers = (0..SND_DIS_ROWS)
-            .filter(|row| {
-                let y = head + row * LINE;
-                [HI, FG]
-                    .iter()
-                    .any(|&fg| read_text(&buf, SND_X + PAD, y, 1, fg) == ">")
-            })
-            .count();
-        assert_eq!(markers, 1, "exactly one line carries the marker");
-    }
-
-    /// Drawing the sound panel does not move the trace counters it displays.
-    ///
-    /// **The claim that makes the numbers mean anything.** A listing read through
-    /// `z80::Bus` would add six instructions' worth of fetches per frame — 360 a second
-    /// — to the count printed one row above it, so `FET` would be mostly the panel and
-    /// `tests/sound_boot.rs`'s `audiocpu_fetches > 100_000` would be satisfiable by a
-    /// machine that never ran the driver at all.
-    #[test]
-    fn drawing_the_sound_panel_does_not_move_the_counters() {
-        let mut m = a_sound_machine();
-        m.run_scanline();
-        let before = m.sound_trace();
-        assert!(before.audiocpu_fetches > 0, "the premise: there is a count");
-        let mut buf = frame();
-        for _ in 0..8 {
+        {
+            let m = as_cps1(&mach);
             draw(
                 &mut buf,
-                &view(&m),
+                &view(m),
                 &|a| m.peek_word(a),
-                &m,
+                &mach,
                 Panels {
-                    sound: true,
+                    status: true,
                     ..Panels::none()
                 },
                 0,
@@ -1626,10 +1132,38 @@ mod tests {
             );
         }
         assert_eq!(
-            m.sound_trace(),
-            before,
-            "eight frames of panel added nothing to the counters"
+            read_text(&buf, STATUS_X + PAD, STATUS_Y + PAD, 24, HI),
+            "RUN  --Z-C IPL7     LINE",
+            "run state, flags, mask, and no interrupt outstanding"
         );
+        assert!(panel_contains(&buf, "S1", HI), "supervisor");
+
+        let b = as_cps1_mut(&mut mach);
+        b.cpu.set_sr(0x0018);
+        b.board.assert_vblank();
+        let mut buf = frame();
+        {
+            let m = as_cps1(&mach);
+            draw(
+                &mut buf,
+                &view(m),
+                &|a| m.peek_word(a),
+                &mach,
+                Panels {
+                    status: true,
+                    ..Panels::none()
+                },
+                0,
+                0,
+                &[],
+            );
+        }
+        assert_eq!(
+            read_text(&buf, STATUS_X + PAD, STATUS_Y + PAD, 19, HI),
+            "RUN  XN--- IPL0 IRQ",
+            "the other flags, and an outstanding interrupt"
+        );
+        assert!(panel_contains(&buf, "S0", HI), "and user mode");
     }
 
     /// The sound panel renders for a machine in any state.
@@ -1646,57 +1180,31 @@ mod tests {
     /// at every point in it rather than always at the same one.
     #[test]
     fn the_sound_panel_renders_without_panicking() {
-        for mut m in [a_sound_machine(), a_machine()] {
+        for board in [a_sound_machine(), a_machine()] {
+            let mut mach = wrap(board);
             let mut buf = frame();
             for _ in 0..4 {
-                draw(
-                    &mut buf,
-                    &view(&m),
-                    &|a| m.peek_word(a),
-                    &m,
-                    Panels {
-                        sound: true,
-                        ..Panels::none()
-                    },
-                    0,
-                    0,
-                    &[],
-                );
+                {
+                    let m = as_cps1(&mach);
+                    draw(
+                        &mut buf,
+                        &view(m),
+                        &|a| m.peek_word(a),
+                        &mach,
+                        Panels {
+                            sound: true,
+                            ..Panels::none()
+                        },
+                        0,
+                        0,
+                        &[],
+                    );
+                }
                 for _ in 0..97 {
-                    m.step_sound_instruction();
+                    as_cps1_mut(&mut mach).step_sound_instruction();
                 }
             }
         }
-    }
-
-    /// A sound listing that runs off the top of the address space wraps.
-    ///
-    /// A Z80 PC near 0xFFFF is reachable — a driver bug, or `RST 38h` in unmapped
-    /// space walking upward — and the listing's six rows then cross the wrap. Debug
-    /// builds panic on overflow, so this is the difference between a debugger and a
-    /// crash at the moment you most need one.
-    #[test]
-    fn a_sound_listing_at_the_top_of_the_space_wraps() {
-        let mut m = a_sound_machine();
-        m.z80.pc = 0xFFFD;
-        let mut buf = frame();
-        draw(
-            &mut buf,
-            &view(&m),
-            &|a| m.peek_word(a),
-            &m,
-            Panels {
-                sound: true,
-                ..Panels::none()
-            },
-            0,
-            0,
-            &[],
-        );
-        assert!(
-            panel_contains(&buf, "FFFD", HI),
-            "the listing starts where the PC is"
-        );
     }
 
     /// A listing pointed at nothing renders `dc.w`, not a panic and not a blank.
@@ -1706,13 +1214,14 @@ mod tests {
     /// an edge one.
     #[test]
     fn a_listing_over_undecoded_space_says_so() {
-        let m = a_machine();
+        let mach = wrap(a_machine());
+        let m = as_cps1(&mach);
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(&m),
+            &view(m),
             &|a| m.peek_word(a),
-            &m,
+            &mach,
             Panels {
                 disasm: true,
                 ..Panels::none()
@@ -1730,13 +1239,14 @@ mod tests {
     /// the right answer — the 68000's own address arithmetic wraps.
     #[test]
     fn addresses_at_the_end_of_the_space_wrap_rather_than_panic() {
-        let m = a_machine();
+        let mach = wrap(a_machine());
+        let m = as_cps1(&mach);
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(&m),
+            &view(m),
             &|a| m.peek_word(a),
-            &m,
+            &mach,
             Panels {
                 regs: true,
                 disasm: true,
@@ -1759,7 +1269,7 @@ mod tests {
     /// to `CpuView` must not lose the subtraction.
     #[test]
     fn the_executing_pc_is_four_behind_the_views_pc() {
-        let mut m = machine::Machine::Cps1(Box::new(a_machine()));
+        let mut m = wrap(a_machine());
         m.step_instruction();
         let v = m.cpu_view();
         assert_eq!(
@@ -1780,10 +1290,11 @@ mod tests {
     #[test]
     fn the_memory_panel_reads_only_through_the_closure() {
         use core::cell::Cell;
-        // The board itself, not a `Machine`: `draw` still takes a `&Cps1` for the
-        // sound panel, and `Machine` deliberately has no accessor to reach inside one.
-        let m = a_machine();
-        let v = view(&m);
+        // Both, because `draw` wants the `Machine` and `view` wants the board inside
+        // it: `Machine` deliberately has no accessor that reaches inside a variant.
+        let mach = wrap(a_machine());
+        let m = as_cps1(&mach);
+        let v = view(m);
         let calls = Cell::new(0usize);
         let peek = |_addr: u32| -> Option<u16> {
             calls.set(calls.get() + 1);
@@ -1794,7 +1305,7 @@ mod tests {
             &mut buf,
             &v,
             &peek,
-            &m,
+            &mach,
             Panels {
                 mem: true,
                 ..Panels::none()
@@ -1822,14 +1333,14 @@ mod tests {
     /// has to reach the same `--` branch a board's `peek_word` did.
     #[test]
     fn a_none_from_the_closure_still_prints_dashes() {
-        let m = a_machine();
-        let v = view(&m);
+        let mach = wrap(a_machine());
+        let v = view(as_cps1(&mach));
         let mut all_none = frame();
         draw(
             &mut all_none,
             &v,
             &|_| None,
-            &m,
+            &mach,
             Panels {
                 mem: true,
                 ..Panels::none()
@@ -1843,7 +1354,7 @@ mod tests {
             &mut all_ffff,
             &v,
             &|_| Some(0xFFFF),
-            &m,
+            &mach,
             Panels {
                 mem: true,
                 ..Panels::none()

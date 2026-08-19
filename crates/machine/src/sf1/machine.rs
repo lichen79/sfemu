@@ -377,6 +377,41 @@ impl Sf1 {
         self.mix_clips
     }
 
+    /// Sets every instrument counter to its maximum, for a frontend test.
+    ///
+    /// ⚠️ **Public and not `#[cfg(test)]` on purpose.** `frontend` is a different
+    /// crate, so a `#[cfg(test)]` helper here would be invisible to it — the same wall
+    /// that puts `sf1::test_video()` out of reach. The alternative is for the panel's
+    /// test to set fifteen private fields, which means making them public, which is a
+    /// worse trade: this is one door with a name that says what it is for.
+    ///
+    /// The sound panel formats every counter to a fixed width, so no row's length
+    /// depends on its value — but that is a property, and a property needs a test.
+    /// `frontend`'s `no_sf1_row_overflows_its_box_with_every_counter_saturated`
+    /// renders the panel with every counter at its maximum, and this is how it gets
+    /// there. The draft that used `{:06}` — a minimum width, not a maximum — had six
+    /// rows that fit at zero and overflowed here.
+    ///
+    /// ⚠️ `1 << 40` for the cycle counters, not `u64::MAX`: the panel prints them
+    /// `{:013}`, and `u64::MAX` is 20 digits, so saturating to it would size the box
+    /// for a case the hardware cannot reach. `1 << 40` T-states is 13 digits and 85
+    /// hours of emulated Z80 time at 3.579545 MHz.
+    ///
+    /// ⚠️ Do not call this outside a test. The name is what says so at the call site.
+    pub fn saturate_counters_for_test(&mut self) {
+        // ⚠️ The **field** names, which are not the accessor names: `fm_irqs` behind
+        // `fm_irqs_raised()`, `fm_total` behind `z80_cycles()`.
+        self.fm_irqs = u32::MAX;
+        self.adpcm_irqs = u32::MAX;
+        self.fm_nmis = u32::MAX;
+        self.adpcm_nmis = u32::MAX;
+        self.mix_clips = u32::MAX;
+        self.fm_total = 1 << 40;
+        self.adpcm_total = 1 << 40;
+        self.fm.saturate_trace_for_test();
+        self.adpcm.saturate_trace_for_test();
+    }
+
     /// Put the whole schedule back, remainders included.
     ///
     /// Twelve arguments because the schedule has twelve independent numbers, and a

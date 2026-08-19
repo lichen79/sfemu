@@ -28,15 +28,15 @@ use frontend::debug::Debugger;
 use frontend::gfx::GfxViewer;
 use frontend::keys::{Actions, Controls, KeySet};
 use frontend::{pens_to_argb, FramePacer};
-use machine::Cps1;
+use machine::{Cps1, Machine};
 use std::path::PathBuf;
 
 /// A [`machine::CpuView`] over the board this loop is running.
 ///
-/// ⚠️ Temporary, and Task 18 deletes it: once `run` takes a `&mut Machine`, the view
-/// comes from `machine::Machine::cpu_view` and this duplication goes away. It exists for
-/// one task so that the panel migration and the loop's board-generic conversion are two
-/// separately reviewable changes.
+/// ⚠️ Temporary, and Task 21 deletes it: `machine::Machine::cpu_view` already produces
+/// this view, and the only reason this twin survives Task 18 is that its callers hold
+/// the `Cps1` the loop's eight unconverted helpers need anyway — see [`cps1_ref`].
+/// Converting it here would have meant touching those helpers, which is Task 21's.
 fn view(m: &Cps1) -> machine::CpuView<'_> {
     machine::CpuView {
         cpu: &m.cpu,
@@ -100,6 +100,38 @@ pub struct Summary {
     pub notices: Vec<String>,
 }
 
+/// The CPS-1 machine inside a [`Machine`], mutably.
+///
+/// ⚠️ **Temporary, and Task 21 deletes it.** Task 18 converted `run`'s signature so the
+/// panels can dispatch on the board, but the loop's eight other helpers — and the
+/// graphics viewer behind three of them — still take `&Cps1`. Task 20 forks the viewer
+/// and Task 21 converts the loop; splitting it here would put a rename and the graphics
+/// fork behind one review, which is the mistake Task 17 was split to avoid.
+///
+/// The `unreachable!` is honest rather than defensive: `main.rs` constructs only a
+/// `Machine::Cps1` until Task 21 adds the SF1 arm, and a silent `return` here would be
+/// a window that opens on nothing.
+///
+/// ⚠️ **Call this per use; never bind the result once.** `step(cps1(m))` on one line and
+/// `panel(m)` on the next both compile, because each reborrow ends with its statement. A
+/// single `let c = cps1(m);` held across the body holds `*m` mutably and the `&Machine`
+/// the panel needs is then rejected — `E0502`. The per-use form is not a style
+/// preference; it is what makes this shape work at all.
+fn cps1(m: &mut Machine) -> &mut Cps1 {
+    match m {
+        Machine::Cps1(c) => c,
+        Machine::Sf1(_) => unreachable!("main builds only Cps1 until Task 21"),
+    }
+}
+
+/// The same, shared. See [`cps1`]; Task 21 deletes both.
+fn cps1_ref(m: &Machine) -> &Cps1 {
+    match m {
+        Machine::Cps1(c) => c,
+        Machine::Sf1(_) => unreachable!("main builds only Cps1 until Task 21"),
+    }
+}
+
 /// The board this build's states belong to.
 ///
 /// Only SF2 exists so far. When the SF1 driver lands, this becomes a field on
@@ -136,7 +168,7 @@ const BOARD: u32 = frontend::BOARD_SF2;
 /// `audio` is `&mut dyn` where `d` is `impl`: `main` picks its sink at runtime — a real
 /// device or [`crate::audio::NullAudio`] when one cannot be opened — so it holds a
 /// `Box<dyn Audio>`, and a generic parameter would make that the caller's problem.
-pub fn run(m: &mut Cps1, d: &mut impl Display, audio: &mut dyn Audio, o: &LoopOpts) -> Summary {
+pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &LoopOpts) -> Summary {
     let mut pacer = FramePacer::cps1();
     let mut controls = Controls::new();
     let mut buf: Vec<u32> = Vec::new();
@@ -153,7 +185,7 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, audio: &mut dyn Audio, o: &LoopOp
             break;
         }
 
-        m.board.inputs = a.inputs;
+        cps1(m).board.inputs = a.inputs;
 
         if a.reset {
             m.reset();
@@ -175,22 +207,22 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, audio: &mut dyn Audio, o: &LoopOp
         }
 
         if a.save {
-            save(m, o, &mut summary);
+            save(cps1_ref(m), o, &mut summary);
         }
         if a.load {
-            load(m, o, &mut summary);
+            load(cps1(m), o, &mut summary);
         }
 
         // Before the frames: a breakpoint set on this tick must be honoured by this
         // tick's frames, not by the next tick's. `dbg` reads the machine and never
         // writes it — see `frontend::debug`.
-        dbg.update(&a, &view(m));
+        dbg.update(&a, &view(cps1_ref(m)));
 
-        gfx.update(&a, m);
+        gfx.update(&a, cps1_ref(m));
         // The mask is a view setting the loop applies, not something `frontend`
         // reaches into the machine to set: every `frontend` entry point takes
         // `&Cps1`. Before `render`, so this tick's frame is the masked one.
-        m.video.enable = gfx.mask();
+        cps1(m).video.enable = gfx.mask();
 
         // A step is one frame regardless of the clock, which is what makes it a
         // step. Checked before `paused` because stepping only means anything while
@@ -207,7 +239,7 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, audio: &mut dyn Audio, o: &LoopOp
         // otherwise would make the frame count disagree with `total_cycles`.
         let mut ran = 0u32;
         for _ in 0..frames {
-            if run_frame_to_breakpoint(m, &mut dbg) {
+            if run_frame_to_breakpoint(cps1(m), &mut dbg) {
                 // A breakpoint stopped this frame part-way through. Pause, so the next
                 // tick does not immediately run on past it, and abandon the frames this
                 // tick still owed: they are host time the user is no longer watching.
@@ -229,7 +261,7 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, audio: &mut dyn Audio, o: &LoopOp
             // The step moved the machine, so the breakpoint at the instruction just
             // *arrived* at must not fire on the next tick as if it were fresh — you
             // asked to be here.
-            dbg.note_stopped(&view(m));
+            dbg.note_stopped(&view(cps1_ref(m)));
         }
 
         // The pause reaches the sink every tick it is in effect, not on its edge: the
@@ -261,32 +293,32 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, audio: &mut dyn Audio, o: &LoopOp
         // included: a panel opened while paused would otherwise read zero and look like
         // a clean run.
         let stats = audio.stats();
-        m.sound.set_audio_stats(stats.drops, stats.underruns);
+        cps1(m).sound.set_audio_stats(stats.drops, stats.underruns);
 
         // Outside the loop above: a paused iteration renders too. The frame does not
         // change, but the window is redrawn, and a windowing library that is not
         // given a buffer shows an undefined one.
         m.render();
-        pens_to_argb(&m.video, &mut buf);
+        pens_to_argb(&cps1_ref(m).video, &mut buf);
         // After the conversion, never before: the overlay's pixels are already
         // `0x00RRGGBB`, while `m.video`'s are CPS-1 pens. Drawn into the pen buffer
         // they would be run through the palette and come out as whatever colours
         // those indices happen to name.
-        dbg.draw(&mut buf, &view(m), &|a| m.peek_word(a), m);
+        dbg.draw(&mut buf, &view(cps1_ref(m)), &|a| m.peek_word(a), m);
         // Over the debugger, not under it: both are opaque, and this one is the
         // whole screen while E2's are corners of it.
-        gfx.draw(&mut buf, m);
+        gfx.draw(&mut buf, cps1_ref(m));
         if let Err(e) = d.present(&buf) {
             note(&mut summary, format!("cannot present a frame: {e}"));
             break;
         }
 
         if a.screenshot {
-            screenshot(m, o, &mut summary);
+            screenshot(cps1_ref(m), o, &mut summary);
         }
 
         summary.dropped = pacer.dropped();
-        let want = title_for(&summary, m, paused, audio.is_running());
+        let want = title_for(&summary, cps1_ref(m), paused, audio.is_running());
         if want != title {
             d.set_title(&want);
             title = want;
@@ -493,7 +525,7 @@ mod tests {
     /// 1100  5241             addq.w #1,d1
     /// 1102  4E73             rte
     /// ```
-    fn machine() -> Cps1 {
+    fn machine() -> Machine {
         let mut rom = vec![0u8; 0x2000];
         rom[0..8].copy_from_slice(&[0x00, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00]);
         rom[0x68..0x6C].copy_from_slice(&[0x00, 0x00, 0x11, 0x00]);
@@ -503,7 +535,7 @@ mod tests {
         rom[0x1100..0x1104].copy_from_slice(&[0x52, 0x41, 0x4E, 0x73]);
         let mut m = Cps1::new(&rom, BoardConfig::sf2(), Timing::cps1_10mhz());
         m.reset();
-        m
+        wrap(m)
     }
 
     /// A machine whose rendered frame is not one flat colour.
@@ -516,7 +548,7 @@ mod tests {
     ///
     /// The program is the plain fixture's, unchanged: what is under test is the
     /// loop's ordering, not the guest.
-    fn machine_that_draws() -> Cps1 {
+    fn machine_that_draws() -> Machine {
         let mut rom = vec![0u8; 0x2000];
         rom[0..8].copy_from_slice(&[0x00, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00]);
         rom[0x68..0x6C].copy_from_slice(&[0x00, 0x00, 0x11, 0x00]);
@@ -550,7 +582,7 @@ mod tests {
         // renderer has anything to draw. Run it here rather than in the loop: the
         // test's point is a *paused* tick, which runs no frames at all.
         m.run_frame();
-        m
+        wrap(m)
     }
 
     /// The address the breakpoint tests stop at: the top of the fixture's loop.
@@ -575,7 +607,7 @@ mod tests {
     /// 1006  51C9 FFFE   dbra d1,$1006
     /// 100A  60F4        bra $1000
     /// ```
-    fn machine_with_a_long_loop() -> Cps1 {
+    fn machine_with_a_long_loop() -> Machine {
         let mut rom = vec![0u8; 0x2000];
         rom[0..8].copy_from_slice(&[0x00, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00]);
         // Both displacements are from the word *after* the opcode: the `dbra` at 0x1006
@@ -589,7 +621,17 @@ mod tests {
         ]);
         let mut m = Cps1::new(&rom, BoardConfig::sf2(), Timing::cps1_10mhz());
         m.reset();
-        m
+        wrap(m)
+    }
+
+    /// A board inside a [`Machine`], which is what `run` takes.
+    ///
+    /// The fixtures build a `Cps1` because that is what has a ROM, a `gfxram` and a
+    /// `cps_a` to set up; `run` takes a `Machine`. The tests then read the board back out
+    /// with [`cps1`] and [`cps1_ref`] — the loop's own two helpers, so a test reaches its
+    /// board exactly the way the code under test does.
+    fn wrap(m: Cps1) -> Machine {
+        Machine::Cps1(Box::new(m))
     }
 
     /// A unique temp path, removed when the guard drops.
@@ -710,7 +752,7 @@ mod tests {
         // built afterwards: a `Cps1` is 525 KB on the stack, and two live in one test
         // thread overflows it. Which also makes the check stronger — the comparison
         // is against this machine's own power-on state.
-        let fresh = (m.cpu.pc, m.cpu.prefetch);
+        let fresh = (cps1_ref(&m).cpu.pc, cps1_ref(&m).cpu.prefetch);
         let mut script = Fake::idle(3);
         // Zero elapsed on the F3 tick: the reset happens before the frame count is
         // decided, so a tick that owed a frame would run one *after* resetting and
@@ -719,19 +761,27 @@ mod tests {
         script.push((KeySet::from_keys(&[Key::F3]), 0));
         let mut d = Fake::new(script);
         run(&mut m, &mut d, &mut NullAudio::default(), &o);
-        assert_eq!(m.total_cycles, 0, "the cycle count restarts");
+        assert_eq!(cps1_ref(&m).total_cycles, 0, "the cycle count restarts");
         // 0x1004 and not 0x1000: `M68k::reset` refills the prefetch queue, which
         // advances the PC past the two words it read. Compared against a freshly
         // reset machine rather than against a literal, so this states "F3 is a power
         // cycle" rather than restating the core's prefetch convention — which is
         // `m68k`'s to change.
-        assert_eq!(m.cpu.pc, fresh.0, "the PC is where power-on leaves it");
-        assert_eq!(m.cpu.prefetch, fresh.1, "and so is the queue");
-        assert_eq!(m.line, 0, "and the beam is at the top of a frame");
+        assert_eq!(
+            cps1_ref(&m).cpu.pc,
+            fresh.0,
+            "the PC is where power-on leaves it"
+        );
+        assert_eq!(cps1_ref(&m).cpu.prefetch, fresh.1, "and so is the queue");
+        assert_eq!(
+            cps1_ref(&m).line,
+            0,
+            "and the beam is at the top of a frame"
+        );
         // Not the trace: `reset` deliberately does not clear it, because the trace
         // records the session and a reset is part of the session.
         assert!(
-            m.board.trace.vblanks > 0,
+            cps1_ref(&m).board.trace.vblanks > 0,
             "the trace keeps the whole session"
         );
     }
@@ -896,7 +946,12 @@ mod tests {
             s.notices
         );
         assert!(o.state_path.exists(), "and leave a file behind");
-        let after = (m.total_cycles, m.cpu.d[0], m.cpu.d[1], m.line);
+        let after = (
+            cps1_ref(&m).total_cycles,
+            cps1_ref(&m).cpu.d[0],
+            cps1_ref(&m).cpu.d[1],
+            cps1_ref(&m).line,
+        );
         assert_ne!(after.0, 0, "the premise: the machine moved");
 
         // Run four more, then load and run the same four again.
@@ -912,7 +967,12 @@ mod tests {
             s.notices
         );
         assert_eq!(
-            (m.total_cycles, m.cpu.d[0], m.cpu.d[1], m.line),
+            (
+                cps1_ref(&m).total_cycles,
+                cps1_ref(&m).cpu.d[0],
+                cps1_ref(&m).cpu.d[1],
+                cps1_ref(&m).line
+            ),
             after,
             "a loaded machine must run the same four frames"
         );
@@ -986,11 +1046,15 @@ mod tests {
         // to being applied.
         let mut m = machine();
         m.run_frame();
-        let mut bytes = frontend::encode(&m.snapshot(), BOARD);
+        let mut bytes = frontend::encode(&cps1_ref(&m).snapshot(), BOARD);
         bytes[100_000] ^= 0x01;
         std::fs::write(&o.state_path, &bytes).expect("temp dir is writable");
 
-        let before = (m.total_cycles, m.cpu.d[0], m.line);
+        let before = (
+            cps1_ref(&m).total_cycles,
+            cps1_ref(&m).cpu.d[0],
+            cps1_ref(&m).line,
+        );
         // Zero elapsed, so the tick owes no frame: what this test asserts is that
         // the *load* left the machine alone, and a frame run afterwards would move
         // it for a reason that has nothing to do with the load.
@@ -999,7 +1063,11 @@ mod tests {
         assert_eq!(s.notices.len(), 1, "{:?}", s.notices);
         assert_eq!(s.frames, 0, "the load tick owed nothing");
         assert_eq!(
-            (m.total_cycles, m.cpu.d[0], m.line),
+            (
+                cps1_ref(&m).total_cycles,
+                cps1_ref(&m).cpu.d[0],
+                cps1_ref(&m).line
+            ),
             before,
             "a refused load must not partially apply"
         );
@@ -1045,13 +1113,17 @@ mod tests {
         let (o, _s, _p) = opts("board-refuse");
         let mut m = machine();
         m.run_frame();
-        let mut bytes = frontend::encode(&m.snapshot(), BOARD);
+        let mut bytes = frontend::encode(&cps1_ref(&m).snapshot(), BOARD);
         // `SF1\0` — a board that does not exist yet, which is exactly the file this
         // check exists to reject once it does.
         bytes[8..12].copy_from_slice(&0x5346_3100_u32.to_le_bytes());
         std::fs::write(&o.state_path, &bytes).expect("temp dir is writable");
 
-        let before = (m.total_cycles, m.cpu.d[0], m.line);
+        let before = (
+            cps1_ref(&m).total_cycles,
+            cps1_ref(&m).cpu.d[0],
+            cps1_ref(&m).line,
+        );
         let mut d = Fake::new(vec![(KeySet::from_keys(&[Key::F8]), 0)]);
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.notices.len(), 1, "{:?}", s.notices);
@@ -1061,7 +1133,11 @@ mod tests {
             s.notices[0]
         );
         assert_eq!(
-            (m.total_cycles, m.cpu.d[0], m.line),
+            (
+                cps1_ref(&m).total_cycles,
+                cps1_ref(&m).cpu.d[0],
+                cps1_ref(&m).line
+            ),
             before,
             "and the running machine is untouched"
         );
@@ -1100,10 +1176,14 @@ mod tests {
         rom[0x1000..0x1006].copy_from_slice(&[0x46, 0xFC, 0x20, 0x00, 0x60, 0xFE]);
         let mut m = Cps1::new(&rom, BoardConfig::sf2(), Timing::cps1_10mhz());
         m.reset();
+        let mut m = wrap(m);
 
         let mut d = Fake::new(Fake::idle(3));
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
-        assert!(m.cpu.halted, "the premise: this program really halts");
+        assert!(
+            cps1_ref(&m).cpu.halted,
+            "the premise: this program really halts"
+        );
         assert_eq!(d.presented.len(), 3, "the loop ran to the end anyway");
         assert_eq!(s.frames, 3, "and kept running frames");
         assert!(
@@ -1129,8 +1209,15 @@ mod tests {
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         // P is held on both ticks, so there is no second edge and no unpause.
         assert_eq!(s.frames, 0, "the premise: no frame ran");
-        assert!(m.board.inputs.coin1, "the coin reached the board anyway");
-        assert_ne!(m.board.inputs.in1(), 0xFFFF, "and so did the stick");
+        assert!(
+            cps1_ref(&m).board.inputs.coin1,
+            "the coin reached the board anyway"
+        );
+        assert_ne!(
+            cps1_ref(&m).board.inputs.in1(),
+            0xFFFF,
+            "and so did the stick"
+        );
     }
 
     /// `F4` steps one instruction per press, and no frames.
@@ -1156,9 +1243,13 @@ mod tests {
         let mut d = Fake::new(script);
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 0, "the premise: no frame ran");
-        assert_eq!(m.total_cycles, 20, "16 for the `move`, 4 for the `addq`");
         assert_eq!(
-            frontend::overlay::executing_pc(&view(&m)),
+            cps1_ref(&m).total_cycles,
+            20,
+            "16 for the `move`, 4 for the `addq`"
+        );
+        assert_eq!(
+            frontend::overlay::executing_pc(&view(cps1_ref(&m))),
             0x1006,
             "and it is sitting at the third instruction"
         );
@@ -1179,7 +1270,7 @@ mod tests {
         let (o, _s, _p) = opts("bp-midframe");
         let mut m = machine_with_a_long_loop();
         assert_eq!(
-            frontend::overlay::executing_pc(&view(&m)),
+            frontend::overlay::executing_pc(&view(cps1_ref(&m))),
             TARGET,
             "the premise: reset leaves the machine on the instruction F7 will mark"
         );
@@ -1195,15 +1286,19 @@ mod tests {
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
 
         assert_eq!(
-            frontend::overlay::executing_pc(&view(&m)),
+            frontend::overlay::executing_pc(&view(cps1_ref(&m))),
             TARGET,
             "it stopped at the breakpoint"
         );
-        assert_ne!(m.line, 0, "mid-frame: the beam is not at a frame boundary");
+        assert_ne!(
+            cps1_ref(&m).line,
+            0,
+            "mid-frame: the beam is not at a frame boundary"
+        );
         assert!(
-            m.total_cycles < u64::from(m.timing.cycles_per_frame()),
+            cps1_ref(&m).total_cycles < u64::from(cps1_ref(&m).timing.cycles_per_frame()),
             "and well short of a whole frame: {} cycles",
-            m.total_cycles
+            cps1_ref(&m).total_cycles
         );
         assert_eq!(s.frames, 0, "a frame cut in half is not a frame that ran");
         assert!(
@@ -1225,7 +1320,7 @@ mod tests {
         let mut m = machine_with_a_long_loop();
         // One machine, snapshotted and put back, rather than two: a `Cps1` is 525 KB on
         // the stack and two live in one test thread overflows it.
-        let start = m.snapshot();
+        let start = cps1_ref(&m).snapshot();
 
         // Stop, then sit there for two more ticks.
         let mut script = vec![
@@ -1235,18 +1330,18 @@ mod tests {
         script.extend(Fake::idle(3));
         let mut d = Fake::new(script.clone());
         run(&mut m, &mut d, &mut NullAudio::default(), &o);
-        let stopped = m.total_cycles;
+        let stopped = cps1_ref(&m).total_cycles;
         assert!(stopped > 0, "the premise: the machine ran up to the stop");
 
         // The same, but the third of those ticks presses `P`.
-        m.restore(&start);
+        cps1(&mut m).restore(&start);
         script[3] = Fake::held(&[Key::P]);
         let mut d = Fake::new(script);
         run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert!(
-            m.total_cycles > stopped,
+            cps1_ref(&m).total_cycles > stopped,
             "resuming must run on: {} cycles against {stopped} stopped",
-            m.total_cycles
+            cps1_ref(&m).total_cycles
         );
     }
 
@@ -1281,6 +1376,7 @@ mod tests {
         rom[0x1000..0x1004].copy_from_slice(&[0x52, 0x40, 0x60, 0xFC]);
         let mut m = Cps1::new(&rom, BoardConfig::sf2(), Timing::cps1_10mhz());
         m.reset();
+        let mut m = wrap(m);
 
         // Zero elapsed on every set-up tick, so the only thing that moves the machine
         // before the last one is `F4`. Three steps: 4 + 10 + 4 = 18 cycles, arriving
@@ -1302,11 +1398,12 @@ mod tests {
         // back round. 18 is exactly the mutant's answer — stepped onto the breakpoint
         // and stuck there.
         assert_eq!(
-            m.total_cycles, 32,
+            cps1_ref(&m).total_cycles,
+            32,
             "the resume must leave the instruction it was stepped onto"
         );
         assert_eq!(
-            frontend::overlay::executing_pc(&view(&m)),
+            frontend::overlay::executing_pc(&view(cps1_ref(&m))),
             0x1002,
             "and stop at the breakpoint again on the way round, not run the frame out"
         );
@@ -1337,7 +1434,7 @@ mod tests {
         let shown = d.first.expect("a tick presents");
 
         let mut game: Vec<u32> = Vec::new();
-        pens_to_argb(&m.video, &mut game);
+        pens_to_argb(&cps1_ref(&m).video, &mut game);
         assert_ne!(
             shown, game,
             "the premise: the overlay changed the presented frame"
@@ -1346,11 +1443,11 @@ mod tests {
         let mut expected = game.clone();
         frontend::overlay::draw(
             &mut expected,
-            &view(&m),
+            &view(cps1_ref(&m)),
             &|a| m.peek_word(a),
             &m,
             frontend::overlay::Panels::on(),
-            frontend::overlay::executing_pc(&view(&m)),
+            frontend::overlay::executing_pc(&view(cps1_ref(&m))),
             0,
             &[],
         );
@@ -1380,7 +1477,7 @@ mod tests {
         run(&mut m, &mut d, &mut NullAudio::default(), &o);
         let shown = d.first.expect("a tick presents");
         let mut game: Vec<u32> = Vec::new();
-        pens_to_argb(&m.video, &mut game);
+        pens_to_argb(&cps1_ref(&m).video, &mut game);
         assert_eq!(shown, game, "not a pixel of the game is disturbed");
     }
 
@@ -1484,7 +1581,7 @@ mod tests {
         run(&mut m, &mut d, &mut NullAudio::default(), &o);
         let masked = d.last.expect("a tick presents");
         assert_ne!(
-            m.video.enable,
+            cps1_ref(&m).video.enable,
             machine::video::compose::LayerMask::all(),
             "the presses reached the layers view and subtracted a row"
         );
@@ -1512,7 +1609,7 @@ mod tests {
         let mut m = machine();
         // One machine, restored between the two runs — 525 KB on the stack means two
         // do not fit in a test thread.
-        let start = m.snapshot();
+        let start = cps1_ref(&m).snapshot();
 
         // Every view, and a subtracted layer. Ten ticks, so the comparison run's ten
         // idle ticks ask for the same frames — the fake advances one frame per tick
@@ -1521,7 +1618,10 @@ mod tests {
         // A released tick after each press: these keys are all edge-triggered, so
         // consecutive held ticks are one press and the script would stop short of the
         // layers view.
-        let base = (m.board.trace.acks, m.board.trace.vblanks);
+        let base = (
+            cps1_ref(&m).board.trace.acks,
+            cps1_ref(&m).board.trace.vblanks,
+        );
         let mut d = Fake::new(vec![
             Fake::held(&[Key::GfxToggled]),
             Fake::held(&[]),
@@ -1535,48 +1635,57 @@ mod tests {
             Fake::held(&[]),
         ]);
         let s_on = run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        let b = cps1_ref(&m);
         let on = (
-            m.total_cycles,
-            m.cpu.d,
-            m.cpu.a,
-            m.cpu.pc,
-            m.line,
-            m.board.trace.acks - base.0,
-            m.board.trace.vblanks - base.1,
+            b.total_cycles,
+            b.cpu.d,
+            b.cpu.a,
+            b.cpu.pc,
+            b.line,
+            b.board.trace.acks - base.0,
+            b.board.trace.vblanks - base.1,
         );
-        let ram_on = m.board.ram.clone();
+        let ram_on = cps1_ref(&m).board.ram.clone();
         assert_ne!(on.0, 0, "the premise: the machine ran");
         assert_ne!(
-            m.video.enable,
+            cps1_ref(&m).video.enable,
             machine::video::compose::LayerMask::all(),
             "the premise: a layer really was subtracted"
         );
 
-        m.restore(&start);
+        cps1(&mut m).restore(&start);
         // `restore` leaves `enable` alone — it is not machine state — so the
         // comparison run must clear it by hand. That this is necessary is itself the
         // point of `machine`'s own `the_layer_mask_is_not_machine_state`.
-        m.video.enable = machine::video::compose::LayerMask::all();
-        let base = (m.board.trace.acks, m.board.trace.vblanks);
+        cps1(&mut m).video.enable = machine::video::compose::LayerMask::all();
+        let base = (
+            cps1_ref(&m).board.trace.acks,
+            cps1_ref(&m).board.trace.vblanks,
+        );
         let mut d = Fake::new(Fake::idle(10));
         let s_off = run(&mut m, &mut d, &mut NullAudio::default(), &o);
 
         assert_eq!(s_on.frames, s_off.frames, "the same frames were asked for");
         assert_eq!(s_on.frames, 10, "and there were some");
+        let b = cps1_ref(&m);
         assert_eq!(
             on,
             (
-                m.total_cycles,
-                m.cpu.d,
-                m.cpu.a,
-                m.cpu.pc,
-                m.line,
-                m.board.trace.acks - base.0,
-                m.board.trace.vblanks - base.1,
+                b.total_cycles,
+                b.cpu.d,
+                b.cpu.a,
+                b.cpu.pc,
+                b.line,
+                b.board.trace.acks - base.0,
+                b.board.trace.vblanks - base.1,
             ),
             "the viewer must not move the machine"
         );
-        assert_eq!(ram_on, m.board.ram, "nor write a word of its memory");
+        assert_eq!(
+            ram_on,
+            cps1_ref(&m).board.ram,
+            "nor write a word of its memory"
+        );
     }
 
     /// And the same claim for **all sixteen** mask combinations, not just one.
@@ -1596,7 +1705,7 @@ mod tests {
     fn no_mask_combination_changes_the_machine() {
         let (o, _s, _p) = opts("everymask");
         let mut m = machine();
-        let start = m.snapshot();
+        let start = cps1_ref(&m).snapshot();
 
         /// The 24-tick script that subtracts the rows in `bits`, one bit per row.
         ///
@@ -1627,38 +1736,45 @@ mod tests {
         // The baseline: the same tick count with nothing subtracted, which `bits == 0`
         // is exactly — the script still walks to the layers view and moves the row
         // selection, so the two runs differ in the mask and in nothing else.
-        let base = (m.board.trace.acks, m.board.trace.vblanks);
+        let base = (
+            cps1_ref(&m).board.trace.acks,
+            cps1_ref(&m).board.trace.vblanks,
+        );
         let mut d = Fake::new(script(0));
         let s_off = run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        let b = cps1_ref(&m);
         let want = (
-            m.total_cycles,
-            m.cpu.d,
-            m.cpu.a,
-            m.cpu.pc,
-            m.line,
-            m.board.trace.acks - base.0,
-            m.board.trace.vblanks - base.1,
+            b.total_cycles,
+            b.cpu.d,
+            b.cpu.a,
+            b.cpu.pc,
+            b.line,
+            b.board.trace.acks - base.0,
+            b.board.trace.vblanks - base.1,
         );
-        let want_ram = m.board.ram.clone();
+        let want_ram = cps1_ref(&m).board.ram.clone();
         assert_ne!(want.0, 0, "the premise: the machine ran");
         assert_eq!(s_off.frames, 24, "and the script is 24 ticks long");
         assert_eq!(
-            m.video.enable,
+            cps1_ref(&m).video.enable,
             machine::video::compose::LayerMask::all(),
             "the premise: the baseline subtracted nothing"
         );
 
         for bits in 1u8..16 {
-            m.restore(&start);
+            cps1(&mut m).restore(&start);
             // `restore` leaves `enable` alone — it is not machine state — so each run
             // starts from the identity by hand.
-            m.video.enable = machine::video::compose::LayerMask::all();
-            let base = (m.board.trace.acks, m.board.trace.vblanks);
+            cps1(&mut m).video.enable = machine::video::compose::LayerMask::all();
+            let base = (
+                cps1_ref(&m).board.trace.acks,
+                cps1_ref(&m).board.trace.vblanks,
+            );
             let mut d = Fake::new(script(bits));
             let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
             // Row 0 is the sprites, then the three scrolls in order.
             assert_eq!(
-                m.video.enable,
+                cps1_ref(&m).video.enable,
                 machine::video::compose::LayerMask {
                     sprites: bits & 1 == 0,
                     scroll1: bits & 2 == 0,
@@ -1668,20 +1784,25 @@ mod tests {
                 "the premise: {bits:04b} reached the mask it names"
             );
             assert_eq!(s.frames, s_off.frames, "the same frames were asked for");
+            let b = cps1_ref(&m);
             assert_eq!(
                 want,
                 (
-                    m.total_cycles,
-                    m.cpu.d,
-                    m.cpu.a,
-                    m.cpu.pc,
-                    m.line,
-                    m.board.trace.acks - base.0,
-                    m.board.trace.vblanks - base.1,
+                    b.total_cycles,
+                    b.cpu.d,
+                    b.cpu.a,
+                    b.cpu.pc,
+                    b.line,
+                    b.board.trace.acks - base.0,
+                    b.board.trace.vblanks - base.1,
                 ),
                 "mask {bits:04b} moved the machine"
             );
-            assert_eq!(want_ram, m.board.ram, "mask {bits:04b} wrote its memory");
+            assert_eq!(
+                want_ram,
+                cps1_ref(&m).board.ram,
+                "mask {bits:04b} wrote its memory"
+            );
         }
     }
 
@@ -1701,23 +1822,27 @@ mod tests {
         // One machine, put back between the two runs — 525 KB on the stack means two do
         // not fit in a test thread. `restore` leaves the trace alone deliberately, so
         // the trace figures are compared as deltas from each run's own baseline.
-        let start = m.snapshot();
-        let base = (m.board.trace.acks, m.board.trace.vblanks);
+        let start = cps1_ref(&m).snapshot();
+        let base = (
+            cps1_ref(&m).board.trace.acks,
+            cps1_ref(&m).board.trace.vblanks,
+        );
 
         let mut script = vec![Fake::held(&[Key::F1])];
         script.extend(Fake::idle(3));
         let mut d = Fake::new(script);
         let s_on = run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        let b = cps1_ref(&m);
         let on = (
-            m.total_cycles,
-            m.cpu.d,
-            m.cpu.a,
-            m.cpu.pc,
-            m.line,
-            m.board.trace.acks - base.0,
-            m.board.trace.vblanks - base.1,
+            b.total_cycles,
+            b.cpu.d,
+            b.cpu.a,
+            b.cpu.pc,
+            b.line,
+            b.board.trace.acks - base.0,
+            b.board.trace.vblanks - base.1,
         );
-        let ram_on = m.board.ram.clone();
+        let ram_on = cps1_ref(&m).board.ram.clone();
         assert_ne!(on.0, 0, "the premise: the machine ran");
         // And the overlay really was on, or this compares two identical runs.
         let first = d.first.expect("a tick presents");
@@ -1726,27 +1851,35 @@ mod tests {
             "the premise: the overlay was drawn"
         );
 
-        m.restore(&start);
-        let base = (m.board.trace.acks, m.board.trace.vblanks);
+        cps1(&mut m).restore(&start);
+        let base = (
+            cps1_ref(&m).board.trace.acks,
+            cps1_ref(&m).board.trace.vblanks,
+        );
         let mut d = Fake::new(Fake::idle(4));
         let s_off = run(&mut m, &mut d, &mut NullAudio::default(), &o);
 
         assert_eq!(s_on.frames, s_off.frames, "the same frames were asked for");
         assert_eq!(s_on.frames, 4, "and there were some");
+        let b = cps1_ref(&m);
         assert_eq!(
             on,
             (
-                m.total_cycles,
-                m.cpu.d,
-                m.cpu.a,
-                m.cpu.pc,
-                m.line,
-                m.board.trace.acks - base.0,
-                m.board.trace.vblanks - base.1,
+                b.total_cycles,
+                b.cpu.d,
+                b.cpu.a,
+                b.cpu.pc,
+                b.line,
+                b.board.trace.acks - base.0,
+                b.board.trace.vblanks - base.1,
             ),
             "the overlay must not move the machine"
         );
-        assert_eq!(ram_on, m.board.ram, "nor write a word of its memory");
+        assert_eq!(
+            ram_on,
+            cps1_ref(&m).board.ram,
+            "nor write a word of its memory"
+        );
     }
 
     /// The debugger's stepping path reaches the same machine as `run_frame`.
@@ -1760,56 +1893,64 @@ mod tests {
     fn the_stepping_path_reaches_the_same_machine_as_run_frame() {
         let (o, _s, _p) = opts("stepping-path");
         let mut m = machine();
-        let start = m.snapshot();
+        let start = cps1_ref(&m).snapshot();
         // `restore` deliberately leaves the trace alone — a reset or a load is part of
         // the session the trace records — so the trace figures are compared as deltas
         // from each run's own baseline rather than as absolutes.
+        let b = cps1_ref(&m);
         let base = (
-            m.board.trace.frames,
-            m.board.trace.acks,
-            m.board.trace.vblanks,
+            b.board.trace.frames,
+            b.board.trace.acks,
+            b.board.trace.vblanks,
         );
 
         let mut d = Fake::new(Fake::idle(4));
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 4, "the premise: four frames ran");
+        let b = cps1_ref(&m);
         let stepped = (
-            m.total_cycles,
-            m.cpu.d,
-            m.cpu.a,
-            m.cpu.pc,
-            m.line,
-            m.board.trace.frames - base.0,
-            m.board.trace.acks - base.1,
-            m.board.trace.vblanks - base.2,
+            b.total_cycles,
+            b.cpu.d,
+            b.cpu.a,
+            b.cpu.pc,
+            b.line,
+            b.board.trace.frames - base.0,
+            b.board.trace.acks - base.1,
+            b.board.trace.vblanks - base.2,
         );
-        let ram_stepped = m.board.ram.clone();
+        let ram_stepped = cps1_ref(&m).board.ram.clone();
         assert_ne!(stepped.0, 0, "and the machine moved");
 
-        m.restore(&start);
+        cps1(&mut m).restore(&start);
+        let b = cps1_ref(&m);
         let base = (
-            m.board.trace.frames,
-            m.board.trace.acks,
-            m.board.trace.vblanks,
+            b.board.trace.frames,
+            b.board.trace.acks,
+            b.board.trace.vblanks,
         );
         for _ in 0..4 {
             m.run_frame();
         }
+        let b = cps1_ref(&m);
         assert_eq!(
             stepped,
             (
-                m.total_cycles,
-                m.cpu.d,
-                m.cpu.a,
-                m.cpu.pc,
-                m.line,
-                m.board.trace.frames - base.0,
-                m.board.trace.acks - base.1,
-                m.board.trace.vblanks - base.2,
+                b.total_cycles,
+                b.cpu.d,
+                b.cpu.a,
+                b.cpu.pc,
+                b.line,
+                b.board.trace.frames - base.0,
+                b.board.trace.acks - base.1,
+                b.board.trace.vblanks - base.2,
             ),
             "instruction by instruction must reach where `run_frame` reaches"
         );
-        assert_eq!(ram_stepped, m.board.ram, "down to the last word of memory");
+        assert_eq!(
+            ram_stepped,
+            cps1_ref(&m).board.ram,
+            "down to the last word of memory"
+        );
     }
 
     /// A closed display runs nothing.
@@ -2062,7 +2203,7 @@ mod tests {
             ..FakeAudio::default()
         };
         run(&mut m, &mut d, &mut a, &o);
-        let t = m.sound.trace();
+        let t = cps1_ref(&m).sound.trace();
         assert_eq!(t.audio_drops, 17, "drops is the first argument");
         assert_eq!(t.audio_underruns, 4, "and underruns the second");
 
@@ -2072,8 +2213,8 @@ mod tests {
         run(&mut m2, &mut d2, &mut FakeAudio::default(), &o2);
         assert_eq!(
             (
-                m2.sound.trace().audio_drops,
-                m2.sound.trace().audio_underruns
+                cps1_ref(&m2).sound.trace().audio_drops,
+                cps1_ref(&m2).sound.trace().audio_underruns
             ),
             (0, 0),
             "a healthy sink leaves them at zero"
@@ -2105,9 +2246,14 @@ mod tests {
         };
         run(&mut failing, &mut d2, &mut a2, &o2);
 
-        assert_eq!(working.board.ram, failing.board.ram, "the same memory");
         assert_eq!(
-            working.total_cycles, failing.total_cycles,
+            cps1_ref(&working).board.ram,
+            cps1_ref(&failing).board.ram,
+            "the same memory"
+        );
+        assert_eq!(
+            cps1_ref(&working).total_cycles,
+            cps1_ref(&failing).total_cycles,
             "the same cycle count"
         );
         assert!(

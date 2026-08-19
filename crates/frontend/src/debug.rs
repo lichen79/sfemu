@@ -215,16 +215,16 @@ impl Debugger {
 
     /// Draws the enabled panels, if any.
     ///
-    /// ⚠️ `m` is the one board-typed parameter left in this file, and only to hand
-    /// through to the sound panel, which has not been forked per board yet. Task 18
-    /// replaces it. `peek` is how the memory and disassembly panels read memory, which
-    /// a [`CpuView`] deliberately does not carry.
+    /// ⚠️ `m` is here for the sound panel alone, which is the one panel that forks per
+    /// board and dispatches on the variant itself. It is a `&Machine` and not a board:
+    /// nothing in this file names one. `peek` is how the memory and disassembly panels
+    /// read memory, which a [`CpuView`] deliberately does not carry.
     pub fn draw(
         &self,
         buf: &mut [u32],
         v: &CpuView<'_>,
         peek: &dyn Fn(u32) -> Option<u16>,
-        m: &machine::Cps1,
+        m: &machine::Machine,
     ) {
         if !self.panels.any() {
             return;
@@ -248,17 +248,21 @@ mod tests {
     use crate::keys::{Controls, Key, KeySet};
     use machine::config::BoardConfig;
     use machine::timing::Timing;
-    use machine::Cps1;
 
     /// A [`CpuView`] over a board without moving it.
     ///
     /// ⚠️ Duplicates [`machine::Machine::cpu_view`]'s five field assignments, and only
-    /// here: the tests below step a board and draw it in the same scope, and
-    /// `Machine::Cps1(Box::new(m))` would move it. `CpuView`'s fields are `pub` because
-    /// a panel reads them directly. It must not be copied into non-test code — two
-    /// producers of this view is two places for `vblank_pending` to disagree. A field
-    /// added to `CpuView` stops this compiling, which is the right failure.
-    fn view(m: &Cps1) -> CpuView<'_> {
+    /// here: most tests below never build a `Machine` at all — they step a board and ask
+    /// `should_break` about it — and `cpu_view` would need one. `CpuView`'s fields are
+    /// `pub` because a panel reads them directly. It must not be copied into non-test
+    /// code — two producers of this view is two places for `vblank_pending` to
+    /// disagree. A field added to `CpuView` stops this compiling, which is the right
+    /// failure.
+    ///
+    /// ⚠️ `machine::Cps1` spelled out rather than imported: `use machine::Cps1;` being
+    /// gone from this file is the measure that Task 18 landed, and an import here would
+    /// put it back. Task 21 deletes this twin outright.
+    fn view(m: &machine::Cps1) -> CpuView<'_> {
         CpuView {
             cpu: &m.cpu,
             trace: &m.board.trace,
@@ -268,13 +272,33 @@ mod tests {
         }
     }
 
+    /// The board inside a [`machine::Machine`], and the machine around a board.
+    ///
+    /// `draw`'s last argument is a `&Machine` now, for the sound panel, but `view` above
+    /// wants the board — so the two `draw` tests wrap once and read the board back out
+    /// of the very machine they draw. Reading it out rather than keeping a second board
+    /// beside a decoy machine is the point: a decoy would let the frame comparison in
+    /// `the_listing_is_drawn_where_the_debugger_is_looking` hold for a `Machine` no
+    /// panel ever saw.
+    fn wrap(m: machine::Cps1) -> machine::Machine {
+        machine::Machine::Cps1(Box::new(m))
+    }
+
+    /// See [`wrap`]. The `unreachable!` is honest: every caller wrapped a `Cps1`.
+    fn as_cps1(m: &machine::Machine) -> &machine::Cps1 {
+        match m {
+            machine::Machine::Cps1(c) => c,
+            machine::Machine::Sf1(_) => unreachable!("wrapped from a_machine"),
+        }
+    }
+
     /// A machine stopped at a multi-word instruction at 0x1000.
     ///
     /// The multi-word instruction is load-bearing, not decoration: with one-word
     /// instructions only, `pc - 4`, `pc - 2`, and a stale `pc` all land on
     /// instruction boundaries, so a breakpoint test cannot tell a correct
     /// implementation from any of three wrong ones.
-    fn a_machine() -> Cps1 {
+    fn a_machine() -> machine::Cps1 {
         let mut rom = vec![0u8; 0x2000];
         rom[0..8].copy_from_slice(&[0x00, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00]);
         rom[0x1000..0x100E].copy_from_slice(&[
@@ -289,7 +313,7 @@ mod tests {
             0x60, 0xF4, // bra.s 0x1000
             0x4E, 0x71, // nop
         ]);
-        let mut m = Cps1::new(&rom, BoardConfig::sf2(), Timing::cps1_10mhz());
+        let mut m = machine::Cps1::new(&rom, BoardConfig::sf2(), Timing::cps1_10mhz());
         m.reset();
         m
     }
@@ -661,17 +685,18 @@ mod tests {
     /// decision `Debugger` makes about drawing: whether to.
     #[test]
     fn drawing_is_skipped_when_the_overlay_is_off() {
-        let m = a_machine();
+        let mach = wrap(a_machine());
+        let m = as_cps1(&mach);
         let blank = vec![0x00AB_CDEF_u32; machine::video::WIDTH * machine::video::HEIGHT];
         let mut d = Debugger::new();
 
         let mut buf = blank.clone();
-        d.draw(&mut buf, &view(&m), &|a| m.peek_word(a), &m);
+        d.draw(&mut buf, &view(m), &|a| m.peek_word(a), &mach);
         assert_eq!(buf, blank, "off: not a pixel");
 
         d.panels = Panels::on();
         let mut buf = blank.clone();
-        d.draw(&mut buf, &view(&m), &|a| m.peek_word(a), &m);
+        d.draw(&mut buf, &view(m), &|a| m.peek_word(a), &mach);
         assert_ne!(buf, blank, "on: something was drawn");
     }
 
@@ -683,23 +708,24 @@ mod tests {
     /// moves.
     #[test]
     fn the_listing_is_drawn_where_the_debugger_is_looking() {
-        let m = a_machine();
+        let mach = wrap(a_machine());
+        let m = as_cps1(&mach);
         let mut d = Debugger::new();
         d.panels = Panels::on();
         d.disasm_at = Some(0x1006);
         d.breakpoints.push(0x1006);
 
         let mut mine = vec![0u32; machine::video::WIDTH * machine::video::HEIGHT];
-        d.draw(&mut mine, &view(&m), &|a| m.peek_word(a), &m);
+        d.draw(&mut mine, &view(m), &|a| m.peek_word(a), &mach);
 
         // The same frame drawn by `overlay::draw` directly, with the arguments this
         // module is supposed to be passing.
         let mut expected = vec![0u32; machine::video::WIDTH * machine::video::HEIGHT];
         overlay::draw(
             &mut expected,
-            &view(&m),
+            &view(m),
             &|a| m.peek_word(a),
-            &m,
+            &mach,
             Panels::on(),
             0x1006,
             0,
@@ -712,9 +738,9 @@ mod tests {
         let mut other = vec![0u32; machine::video::WIDTH * machine::video::HEIGHT];
         overlay::draw(
             &mut other,
-            &view(&m),
+            &view(m),
             &|a| m.peek_word(a),
-            &m,
+            &mach,
             Panels::on(),
             0x1000,
             0,

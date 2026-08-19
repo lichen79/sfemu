@@ -228,6 +228,16 @@ fn run(args: Vec<String>) -> Result<String, Fault> {
         let mut win = display::Window::open("sfemu").map_err(Fault::Failed)?;
         let mut sink = open_audio();
         let opts = loop_opts(&args);
+        // The wrap is here and not at construction, because this branch returns and the
+        // headless path below still reads the board directly — `m.board.trace`,
+        // `m.video`, `Cpu::of(&m)`. Wrapping earlier would put a `match` in front of each
+        // of those for no gain: `Machine` deliberately exposes no accessor that reaches
+        // inside a variant.
+        //
+        // ⚠️ One arm until Task 21 adds the SF1 driver's, at which point the board comes
+        // from the ROM set rather than a flag — a user who has sf2.zip should not have to
+        // tell the emulator what sf2.zip is.
+        let mut m = machine::Machine::Cps1(Box::new(m));
         let summary = loop_::run(&mut m, &mut win, sink.as_mut(), &opts);
         return Ok(play_report(&summary));
     }

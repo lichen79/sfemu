@@ -285,6 +285,26 @@ impl Adpcm2Board {
         self.trace = Adpcm2Trace::default();
     }
 
+    /// Sets every counter to its maximum, for a frontend panel-width test.
+    ///
+    /// See [`crate::sf1::Sf1::saturate_counters_for_test`], which is the only caller
+    /// and which explains why this is `pub` rather than `#[cfg(test)]`. Assigns the
+    /// whole struct rather than each field, so a counter added to [`Adpcm2Trace`] later
+    /// is saturated by this without anyone remembering to: a literal missing a field
+    /// fails the build, which is the property that makes that true.
+    pub fn saturate_trace_for_test(&mut self) {
+        self.trace = Adpcm2Trace {
+            msm_writes: [u32::MAX; CHIPS],
+            latch_reads: u32::MAX,
+            bank_writes: u32::MAX,
+            bank_overruns: u32::MAX,
+            rom_fetches: u32::MAX,
+            bank_fetches: u32::MAX,
+            writes_discarded: u32::MAX,
+            unmapped_ports: u32::MAX,
+        };
+    }
+
     /// Read a byte without moving a counter.
     ///
     /// Mirrors [`z80::Bus::read`]'s map arm for arm, and
