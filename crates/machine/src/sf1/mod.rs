@@ -10,4 +10,5 @@
 //! (`sf.cpp:1421`), the one set with neither an i8751 protection MCU nor
 //! pneumatic buttons.
 
+pub mod board;
 pub mod inputs;

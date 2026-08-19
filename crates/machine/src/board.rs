@@ -129,6 +129,10 @@ pub struct Board {
 /// that models byte writes as read-modify-write gets write-only ports wrong — the
 /// read half returns 0xFFFF from a port that does not read, and the "preserved"
 /// neighbouring byte becomes 0xFF.
+///
+/// Shared with [`crate::sf1::board`]: the lane model is the 68000's bus, not
+/// CPS-1's, and both boards branch on it for exactly the same reason — a
+/// write-only port has no old word to merge with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lanes {
     /// A full word: both UDS and LDS.
@@ -432,7 +436,7 @@ impl Board {
 impl Lanes {
     /// The lanes a byte access at `addr` asserts.
     #[inline]
-    fn of_byte(addr: u32) -> Self {
+    pub(crate) fn of_byte(addr: u32) -> Self {
         if addr & 1 == 0 {
             Self::High
         } else {
@@ -447,7 +451,7 @@ impl Lanes {
     /// makes a consumer that *isn't* gated fail a test instead of coincidentally
     /// working.
     #[inline]
-    fn place(self, val: u8) -> u16 {
+    pub(crate) fn place(self, val: u8) -> u16 {
         match self {
             Self::Word | Self::Low => u16::from(val),
             Self::High => u16::from(val) << 8,
@@ -457,7 +461,7 @@ impl Lanes {
     /// `old` with the asserted lanes of `new` written over it — MAME's
     /// `COMBINE_DATA`.
     #[inline]
-    fn merge(self, old: u16, new: u16) -> u16 {
+    pub(crate) fn merge(self, old: u16, new: u16) -> u16 {
         match self {
             Self::Word => new,
             Self::High => (new & 0xFF00) | (old & 0x00FF),
@@ -471,7 +475,7 @@ impl Lanes {
     /// write(data >> 8);`. A full word therefore latches the **low** byte —
     /// counter-intuitive for a big-endian CPU, and what the hardware does.
     #[inline]
-    fn byte_written(self, val: u16) -> u8 {
+    pub(crate) fn byte_written(self, val: u16) -> u8 {
         match self {
             Self::Word | Self::Low => val as u8,
             Self::High => (val >> 8) as u8,
