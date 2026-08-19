@@ -4,8 +4,8 @@
 //!
 //! ```text
 //! offset  size  field
-//! 0       8     MAGIC          b"SFEMU\0\0\x03"; the last byte is the version
-//! 8       4     board          little-endian; BOARD_SF2 = b"SF2\0"
+//! 0       8     MAGIC          b"SFEMU\0\0\x04"; the last byte is the version
+//! 8       4     board          little-endian; BOARD_SF2 = b"SF2\0", BOARD_SF1 = b"SF1\0"
 //! 12      8     payload length little-endian
 //! 20      len   payload
 //! 20+len  4     CRC-32 of the payload, little-endian
@@ -34,6 +34,22 @@
 //! and refusing a state over a padding byte of 2 is a rejection with no diagnostic
 //! value.
 //!
+//! # Version 4 added SF1
+//!
+//! A version-3 file cannot describe an SF1 machine — version 3 has one payload
+//! layout and it is CPS-1's, with a 32 KB main RAM, two CPS register files, an
+//! object latch and an MSM6295. There is no partial reading to attempt and no
+//! field to default, so a version-3 file is refused by [`StateError::Version`]
+//! like every earlier one.
+//!
+//! ⚠️ The bump also refuses version-3 **CPS-1** files, which are otherwise
+//! perfectly readable — nothing in their payload changed. That is the cost of one
+//! version byte shared by two formats, and it is accepted rather than worked
+//! around: a per-board version would be two version bytes to keep in step, and
+//! the alternative of leaving CPS-1 at 3 while SF1 starts at 4 makes the version
+//! byte mean different things depending on a field that comes after it. A save
+//! state is a convenience across runs of the same build, not an archive format.
+//!
 //! # Why hand-rolled and not `serde` + `bincode`
 //!
 //! Two more dependencies, and — the real reason — a format whose layout is
@@ -54,6 +70,8 @@
 //! than against each other.
 
 use machine::m68k::M68k;
+use machine::sf1::sound::RAM_BYTES as SF1_SOUND_RAM_BYTES;
+use machine::sf1::Sf1State;
 use machine::sound::RAM_BYTES as SOUND_RAM_BYTES;
 use machine::timing::{RationalAccumulator, Z80_T_DEN, Z80_T_NUM};
 use machine::video::sprites::{ObjLatch, OBJ_WORDS};
@@ -65,17 +83,21 @@ use machine::z80::Z80;
 use machine::{Inputs, MachineState, PlayerInput};
 
 /// The first eight bytes of every save state. The last byte is [`VERSION`].
-pub const MAGIC: [u8; 8] = *b"SFEMU\0\0\x03";
+pub const MAGIC: [u8; 8] = *b"SFEMU\0\0\x04";
 
 /// The format version, and the last byte of [`MAGIC`].
 ///
-/// 3 since the ADPCM chip joined the state, 2 since the sound board did — see the
-/// module docs on why an older file is refused rather than filled in.
-pub const VERSION: u8 = 3;
+/// 4 since SF1 joined, 3 since the ADPCM chip did, 2 since the sound board — see
+/// the module docs on why an older file is refused rather than filled in.
+pub const VERSION: u8 = 4;
 
 /// The board a state belongs to: `b"SF2\0"` big-endian, so it reads as ASCII in a
 /// hex dump.
 pub const BOARD_SF2: u32 = 0x5346_3200;
+
+/// The board a state belongs to: `b"SF1\0"` big-endian, so it reads as ASCII in a
+/// hex dump — [`BOARD_SF2`]'s convention.
+pub const BOARD_SF1: u32 = 0x5346_3100;
 
 /// Bytes before the payload: magic, board, and the declared length.
 const HEADER: usize = 8 + 4 + 8;
@@ -149,6 +171,88 @@ const PAYLOAD: usize = 8 * 4      // d[0..8]
     + 1                            // oki_command: 0xFF for none, else the phrase
     + 4                            // oki_acc_rem
     + 4; // oki_last
+
+/// SF1's main RAM, in words.
+const SF1_RAM_WORDS: usize = 0x3000;
+/// Sprite entries, in words.
+const SF1_OBJECTRAM_WORDS: usize = 0x1000;
+/// The text plane's tiles, in words.
+const SF1_VIDEORAM_WORDS: usize = 0x800;
+/// Palette entries, in words.
+const SF1_PALETTE_WORDS: usize = 0x400;
+/// One MSM5205's encoded size, a hand count for [`Z80_BYTES`]'s reason.
+const MSM_BYTES: usize = 2       // the decoder's signal
+    + 1                          // and its step index
+    + 1                          // data
+    + 1                          // vck
+    + 1                          // reset
+    + 1; // pending
+
+/// SF1's payload size, written out term by term.
+///
+/// ```text
+/// cpu        8*4 + 8*4 + 4 + 2 + 4+4 + 2*2 + 5           =     87
+/// ram        0x3000 * 2                                  = 24_576
+/// objectram  0x1000 * 2                                  =  8_192
+/// videoram   0x0800 * 2                                  =  4_096
+/// palette    0x0400 * 2                                  =  2_048
+/// board      1 + 2+2 + 1 + 1 + 2                         =      9
+/// inputs     5 + 2*10 + 2*2                              =     29
+/// schedule   8 + 4 + 8 + 4                               =     24
+/// fm         37 + 0x800 + 1919 + 1+1 + 8+8 + 4+4+4       =  4_034
+/// adpcm      37 + 1+1 + 2*7 + 8+8 + 4 + 4                =     77
+/// sample_acc 4                                           =      4
+///                                                          ------
+///                                                          43_176
+/// ```
+///
+/// The subtotals are here because each is one line of arithmetic a reader can
+/// redo, and the **sum** is checked against the encoder by
+/// `the_sf1_encoded_length_is_the_documented_size` — which is what makes this a
+/// format rather than whatever the encoder happens to emit. ⚠️ If a term changes,
+/// the test fails and this table is what tells you which block moved.
+const SF1_PAYLOAD: usize = 8 * 4  // d[0..8]
+    + 8 * 4                        // a[0..8]
+    + 4                            // pc
+    + 2                            // sr
+    + 4 + 4                        // usp, ssp
+    + 2 * 2                        // prefetch[0..2]
+    + 5                            // halted, stopped, pending_irq, in_exception, trace_pending
+    + SF1_RAM_WORDS * 2
+    + SF1_OBJECTRAM_WORDS * 2
+    + SF1_VIDEORAM_WORDS * 2
+    + SF1_PALETTE_WORDS * 2
+    + 1                            // active: four layer enables and flip
+    + 2 + 2                        // bgscroll, fgscroll
+    + 1                            // coin_ctrl
+    + 1                            // vblank_pending
+    + 2                            // sound_command: present flag, then the byte
+    + 5                            // coin1, coin2, service, start1, start2
+    + 2 * 10                       // p1 and p2: 4 stick, 3 punch, 3 kick
+    + 2 * 2                        // dsw[0..2], each a whole word
+    + 8                            // total_cycles
+    + 4                            // line
+    + 8                            // carry
+    + 4                            // line_remainder
+    // ---- Z80 #1 and the FM chip ----
+    + Z80_BYTES
+    + SF1_SOUND_RAM_BYTES
+    + YM_BYTES
+    + 1                            // ym_addr
+    + 1                            // fm_latch
+    + 8                            // fm_total
+    + 8                            // fm_debt
+    + 4 + 4 + 4                    // the FM Z80's accumulator: num, den, remainder
+    // ---- Z80 #2 and the two ADPCM chips ----
+    + Z80_BYTES
+    + 1                            // adpcm_bank
+    + 1                            // adpcm_latch
+    + machine::sf1::adpcm2::CHIPS * MSM_BYTES
+    + 8                            // adpcm_total
+    + 8                            // adpcm_debt
+    + 4                            // adpcm_remainder
+    + 4                            // adpcm_irq_remainder
+    + 4; // sample_acc
 
 /// Why a state was refused.
 ///
@@ -571,7 +675,125 @@ pub fn encode(s: &MachineState, board: u32) -> Vec<u8> {
     w.u32(s.oki_acc_rem);
     w.u32(s.oki_last as u32);
 
-    let payload = w.0;
+    frame(w.0, board)
+}
+
+/// Encodes an SF1 state as a file.
+///
+/// The field order here **is** the format, and [`decode_sf1`] reads the same list
+/// in the same order. A separate function from [`encode`] rather than a `match` on
+/// an enum: the two payloads share no field and no length, so one function would
+/// be two disjoint bodies behind a tag.
+#[must_use]
+pub fn encode_sf1(s: &Sf1State) -> Vec<u8> {
+    let mut w = Writer(Vec::with_capacity(SF1_PAYLOAD));
+
+    // The 68000, through the same helper CPS-1's encoder uses for it — inlined
+    // there and here because `M68k`'s fields are public and there is no third
+    // caller to justify a helper.
+    for &v in &s.cpu.d {
+        w.u32(v);
+    }
+    for &v in &s.cpu.a {
+        w.u32(v);
+    }
+    w.u32(s.cpu.pc);
+    w.u16(s.cpu.sr);
+    w.u32(s.cpu.usp);
+    w.u32(s.cpu.ssp);
+    for &v in &s.cpu.prefetch {
+        w.u16(v);
+    }
+    w.bool(s.cpu.halted);
+    w.bool(s.cpu.stopped);
+    w.u8(s.cpu.pending_irq);
+    w.bool(s.cpu.in_exception);
+    w.bool(s.cpu.trace_pending);
+
+    // The four RAMs.
+    w.words(&s.ram[..]);
+    w.words(&s.objectram[..]);
+    w.words(&s.videoram[..]);
+    w.words(&s.palette[..]);
+
+    // The rest of the board.
+    w.u8(s.active);
+    w.u16(s.bgscroll);
+    w.u16(s.fgscroll);
+    w.u8(s.coin_ctrl);
+    w.bool(s.vblank_pending);
+    // ⚠️ A flag and a byte, not a 0xFF sentinel. Any byte is a legal sound
+    // command on this board, so 0xFF cannot mean "none" — see
+    // `a_sound_command_of_0xff_is_not_read_as_none`.
+    w.bool(s.sound_command.is_some());
+    w.u8(s.sound_command.unwrap_or(0));
+
+    // Controls. ⚠️ No `test` here: SF1's service switch is on SYSTEM and there is
+    // no separate test input, so `Sf1Inputs` has five booleans where `Inputs` has
+    // six. And `dsw` is two **words**, not three bytes.
+    w.bool(s.inputs.coin1);
+    w.bool(s.inputs.coin2);
+    w.bool(s.inputs.service);
+    w.bool(s.inputs.start1);
+    w.bool(s.inputs.start2);
+    w.player(&s.inputs.p1);
+    w.player(&s.inputs.p2);
+    for &v in &s.inputs.dsw {
+        w.u16(v);
+    }
+
+    // The 68000's schedule.
+    w.u64(s.total_cycles);
+    w.u32(s.line);
+    w.i64(s.carry);
+    w.u32(s.line_remainder);
+
+    // Z80 #1 and the FM chip. The ratio goes out once here and covers both Z80s:
+    // they share `sf1_z80_t_per_line()`, and it is written so `decode_sf1` can
+    // refuse a file from a build with a different sound clock rather than resume
+    // its fractions against the wrong denominator.
+    w.z80(&s.fm_z80);
+    w.bytes(&s.fm_ram[..]);
+    w.ym(&s.ym);
+    w.u8(s.ym_addr);
+    w.u8(s.fm_latch);
+    w.u64(s.fm_total);
+    w.i64(s.fm_debt);
+    // ⚠️ `machine::timing::`, not `machine::` — `lib.rs:82` re-exports only
+    // `Timing` from that module, so the bare path does not resolve.
+    let (num, den) = machine::timing::sf1_z80_t_per_line();
+    w.u32(num);
+    w.u32(den);
+    w.u32(s.fm_remainder);
+
+    // Z80 #2 and the two ADPCM chips.
+    w.z80(&s.adpcm_z80);
+    w.u8(s.adpcm_bank);
+    w.u8(s.adpcm_latch);
+    for m in &s.msm {
+        w.u16(m.signal as u16);
+        w.u8(m.step);
+        w.u8(m.data);
+        w.bool(m.vck);
+        w.bool(m.reset);
+        w.u8(m.pending);
+    }
+    w.u64(s.adpcm_total);
+    w.i64(s.adpcm_debt);
+    w.u32(s.adpcm_remainder);
+    w.u32(s.adpcm_irq_remainder);
+    w.u32(s.sample_acc);
+
+    debug_assert_eq!(w.0.len(), SF1_PAYLOAD, "the documented payload size");
+    frame(w.0, BOARD_SF1)
+}
+
+/// Wraps a payload in the header and the CRC.
+///
+/// Shared by [`encode`] and [`encode_sf1`], because the *envelope* is one format
+/// even though the payloads are two. A second copy of this would be a second
+/// place the declared length could disagree with the payload.
+fn frame(payload: Vec<u8>, board: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER + payload.len() + 4);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&board.to_le_bytes());
@@ -582,17 +804,16 @@ pub fn encode(s: &MachineState, board: u32) -> Vec<u8> {
     out
 }
 
-/// Decodes a file into a state, or says which check refused it.
+/// Checks the header and returns the payload, or says why not.
 ///
-/// Validation order — magic, version, board, declared length, CRC, then the
-/// payload's length against what the fields need — is chosen so the error names the
-/// most useful thing. Checking the CRC before the version would report a
-/// next-version file as "damaged".
+/// Shared by [`decode`] and [`decode_sf1`]: the version, the board tag, the
+/// declared length and the CRC are checked in that order for both, because that
+/// order is what makes the error a user gets the most specific one available —
+/// "wrong game" before "wrong length", "wrong version" before "wrong game".
 ///
-/// **Never panics, on any input.** The declared length is checked against the bytes
-/// actually present *before* it is used for anything, so a file claiming a payload
-/// of 2^64 is `Truncated` and not an allocation failure.
-pub fn decode(bytes: &[u8], board: u32) -> Result<MachineState, StateError> {
+/// `expect_payload` is the caller's own payload size; a file that passes the CRC
+/// but is the wrong length is a well-formed file this build cannot read.
+fn unframe(bytes: &[u8], board: u32, expect_payload: usize) -> Result<&[u8], StateError> {
     if bytes.len() < MAGIC.len() {
         return Err(StateError::Truncated {
             need: MAGIC.len(),
@@ -649,13 +870,27 @@ pub fn decode(bytes: &[u8], board: u32) -> Result<MachineState, StateError> {
     // A payload that passes the CRC but is the wrong length is a well-formed file
     // this build cannot read — same version, same board, different field set. It
     // should not be possible, and it must not be a panic if it is.
-    if payload.len() != PAYLOAD {
+    if payload.len() != expect_payload {
         return Err(StateError::Truncated {
-            need: HEADER + PAYLOAD + 4,
+            need: HEADER + expect_payload + 4,
             got: bytes.len(),
         });
     }
+    Ok(payload)
+}
 
+/// Decodes a file into a state, or says which check refused it.
+///
+/// Validation order — magic, version, board, declared length, CRC, then the
+/// payload's length against what the fields need — is chosen so the error names the
+/// most useful thing. Checking the CRC before the version would report a
+/// next-version file as "damaged".
+///
+/// **Never panics, on any input.** The declared length is checked against the bytes
+/// actually present *before* it is used for anything, so a file claiming a payload
+/// of 2^64 is `Truncated` and not an allocation failure.
+pub fn decode(bytes: &[u8], board: u32) -> Result<MachineState, StateError> {
+    let payload = unframe(bytes, board, PAYLOAD)?;
     let mut r = Reader {
         bytes: payload,
         at: 0,
@@ -783,6 +1018,152 @@ pub fn decode(bytes: &[u8], board: u32) -> Result<MachineState, StateError> {
     })
 }
 
+/// Decodes an SF1 state, or says why not.
+pub fn decode_sf1(bytes: &[u8]) -> Result<Sf1State, StateError> {
+    let payload = unframe(bytes, BOARD_SF1, SF1_PAYLOAD)?;
+    let mut r = Reader {
+        bytes: payload,
+        at: 0,
+    };
+
+    // In `encode_sf1`'s order, top to bottom.
+    let mut cpu = M68k::new();
+    for v in cpu.d.iter_mut() {
+        *v = r.u32();
+    }
+    for v in cpu.a.iter_mut() {
+        *v = r.u32();
+    }
+    cpu.pc = r.u32();
+    // `sr` directly and not through `set_sr`, for `decode`'s reason: `set_sr`
+    // swaps the stack pointers and this is restoring a CPU whose `a[7]` the file
+    // already carries.
+    cpu.sr = r.u16();
+    cpu.usp = r.u32();
+    cpu.ssp = r.u32();
+    for v in cpu.prefetch.iter_mut() {
+        *v = r.u16();
+    }
+    cpu.halted = r.bool();
+    cpu.stopped = r.bool();
+    cpu.pending_irq = r.u8();
+    cpu.in_exception = r.bool();
+    cpu.trace_pending = r.bool();
+
+    let mut ram = vec![0u16; SF1_RAM_WORDS];
+    r.words(&mut ram);
+    let mut objectram = vec![0u16; SF1_OBJECTRAM_WORDS];
+    r.words(&mut objectram);
+    let mut videoram = vec![0u16; SF1_VIDEORAM_WORDS];
+    r.words(&mut videoram);
+    let mut palette = vec![0u16; SF1_PALETTE_WORDS];
+    r.words(&mut palette);
+
+    let active = r.u8();
+    let bgscroll = r.u16();
+    let fgscroll = r.u16();
+    let coin_ctrl = r.u8();
+    let vblank_pending = r.bool();
+    let has_command = r.bool();
+    let command_byte = r.u8();
+    // ⚠️ Both bytes are read unconditionally, whichever way the flag goes. A
+    // conditional read here would make the payload's length depend on its
+    // content, and every field after it would shift.
+    let sound_command = has_command.then_some(command_byte);
+
+    let inputs = machine::sf1::inputs::Sf1Inputs {
+        coin1: r.bool(),
+        coin2: r.bool(),
+        service: r.bool(),
+        start1: r.bool(),
+        start2: r.bool(),
+        p1: r.player(),
+        p2: r.player(),
+        dsw: [r.u16(), r.u16()],
+    };
+
+    let total_cycles = r.u64();
+    let line = r.u32();
+    let carry = r.i64();
+    let line_remainder = r.u32();
+
+    let fm_z80 = r.z80();
+    let mut fm_ram = vec![0u8; SF1_SOUND_RAM_BYTES];
+    r.bytes(&mut fm_ram);
+    let ym = r.ym();
+    let ym_addr = r.u8();
+    let fm_latch = r.u8();
+    let fm_total = r.u64();
+    let fm_debt = r.i64();
+    let found_ratio = (r.u32(), r.u32());
+    let expected_ratio = machine::timing::sf1_z80_t_per_line();
+    if found_ratio != expected_ratio {
+        return Err(StateError::WrongSoundClock {
+            found: found_ratio,
+            expected: expected_ratio,
+        });
+    }
+    let fm_remainder = r.u32();
+
+    let adpcm_z80 = r.z80();
+    let adpcm_bank = r.u8();
+    let adpcm_latch = r.u8();
+    let msm = core::array::from_fn(|_| machine::sf1::snapshot::MsmState {
+        signal: r.u16() as i16,
+        step: r.u8(),
+        data: r.u8(),
+        vck: r.bool(),
+        reset: r.bool(),
+        pending: r.u8(),
+    });
+    let adpcm_total = r.u64();
+    let adpcm_debt = r.i64();
+    let adpcm_remainder = r.u32();
+    let adpcm_irq_remainder = r.u32();
+    let sample_acc = r.u32();
+
+    // No validation of the ADPCM fields here: `Msm5205::restore` clamps the signal,
+    // the step index and `pending`, and masks `data` — which is where that belongs,
+    // because a file is not the only untrusted source of them. A bad byte is a
+    // wrong sound, not a panic, and refusing a whole state over a step index of 49
+    // would have no better answer to offer.
+    Ok(Sf1State {
+        cpu,
+        ram: boxed(ram),
+        objectram: boxed(objectram),
+        videoram: boxed(videoram),
+        palette: boxed(palette),
+        active,
+        bgscroll,
+        fgscroll,
+        coin_ctrl,
+        vblank_pending,
+        sound_command,
+        inputs,
+        total_cycles,
+        line,
+        carry,
+        line_remainder,
+        fm_z80,
+        fm_ram: boxed_bytes(fm_ram),
+        ym,
+        ym_addr,
+        fm_latch,
+        fm_total,
+        fm_debt,
+        fm_remainder,
+        adpcm_z80,
+        adpcm_bank,
+        adpcm_latch,
+        msm,
+        adpcm_total,
+        adpcm_debt,
+        adpcm_remainder,
+        adpcm_irq_remainder,
+        sample_acc,
+    })
+}
+
 /// A `Vec` of exactly `N` words as a boxed array, without a stack temporary.
 ///
 /// The same reasoning as `machine::snapshot::boxed_copy`: `Box::new([0u16; N])`
@@ -803,6 +1184,7 @@ fn boxed_bytes<const N: usize>(v: Vec<u8>) -> Box<[u8; N]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use machine::m68k::Bus as M68kBus;
     use machine::z80::Bus;
     use machine::{BoardConfig, Cps1, Timing};
 
@@ -1109,6 +1491,19 @@ mod tests {
     /// succeeds.
     fn err(bytes: &[u8], board: u32) -> StateError {
         match decode(bytes, board) {
+            Ok(_) => panic!("expected a refusal, but {} bytes decoded", bytes.len()),
+            Err(e) => e,
+        }
+    }
+
+    /// Why a [`decode_sf1`] failed.
+    ///
+    /// [`err`]'s twin, for [`err`]'s reason: `Sf1State` has no `PartialEq` either —
+    /// `machine::sf1::snapshot` gives the same argument for it, that a round-trip
+    /// checked by comparing two states is a round-trip checked against itself — so a
+    /// whole `Result` cannot be compared here either.
+    fn err_sf1(bytes: &[u8]) -> StateError {
+        match decode_sf1(bytes) {
             Ok(_) => panic!("expected a refusal, but {} bytes decoded", bytes.len()),
             Err(e) => e,
         }
@@ -1476,7 +1871,7 @@ mod tests {
     /// failure `a_version_two_file_is_refused` exists to make impossible.
     #[test]
     fn the_version_moved_with_the_payload() {
-        assert_eq!(VERSION, 3, "version 3: the ADPCM chip joined the payload");
+        assert_eq!(VERSION, 4, "version 4: SF1's payload joined the format");
         assert_eq!(
             MAGIC[7], VERSION,
             "the magic's last byte *is* the version, so a bump has to touch both"
@@ -1773,7 +2168,7 @@ mod tests {
     #[test]
     fn the_header_is_laid_out_as_documented() {
         let bytes = encode(&a_machine().snapshot(), BOARD_SF2);
-        assert_eq!(&bytes[0..8], b"SFEMU\0\0\x03", "magic, version in byte 7");
+        assert_eq!(&bytes[0..8], b"SFEMU\0\0\x04", "magic, version in byte 7");
         assert_eq!(MAGIC[7], VERSION, "the version *is* the magic's last byte");
         assert_eq!(
             &bytes[8..12],
@@ -2001,5 +2396,514 @@ mod tests {
             b[i] = !b[i];
             let _ = decode(&b, BOARD_SF2);
         }
+    }
+
+    /// A 68000 program that writes all four RAMs the state carries, forever.
+    ///
+    /// ```text
+    /// 0000  00FF D000        SSP, inside main RAM
+    /// 0004  0000 1000        PC
+    /// 0064  0000 1100        vector 25 -- autovector 1, this board's vblank
+    /// 1000  46FC 2000        move #$2000,sr     supervisor, mask 0 -- take IRQs
+    /// 1004  5240             addq.w #1,d0       a counter that never repeats
+    /// 1006  33C0 00FF 8000   move.w d0,$FF8000  main RAM
+    /// 100C  33C0 00FF E000   move.w d0,$FFE000  objectram
+    /// 1012  33C0 0080 0000   move.w d0,$800000  videoram
+    /// 1018  33C0 00B0 0000   move.w d0,$B00000  palette RAM
+    /// 101E  60E4             bra $1004
+    /// 1100  5241             addq.w #1,d1       the vblank handler
+    /// 1102  4E73             rte
+    /// ```
+    ///
+    /// ⚠️ The four addresses are **typed out here**, unlike `machine`'s copy of this
+    /// program, which imports `board.rs`'s `RAM_BASE` and its three siblings. Those
+    /// constants are `pub(crate)` — a guest address is no other crate's business —
+    /// so this crate cannot reach them. The guard against a typo landing in an
+    /// unmapped hole is therefore a test rather than an import: the four
+    /// `any(|&w| w != 0)` assertions in
+    /// `the_sf1_fixture_is_not_a_quiet_machine`. Without them a mistyped address
+    /// makes every round-trip test below pass while comparing zeros.
+    ///
+    /// The SSP is 0x00FFD000, inside main RAM and well clear of the RAM index the
+    /// program writes, so the handler's stack frames are more non-zero RAM rather
+    /// than a collision.
+    fn sf1_prog() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x2000];
+        rom[0..4].copy_from_slice(&0x00FF_D000u32.to_be_bytes());
+        rom[4..8].copy_from_slice(&0x0000_1000u32.to_be_bytes());
+        rom[0x64..0x68].copy_from_slice(&0x0000_1100u32.to_be_bytes());
+        rom[0x1000..0x1020].copy_from_slice(&[
+            0x46, 0xFC, 0x20, 0x00, 0x52, 0x40, 0x33, 0xC0, 0x00, 0xFF, 0x80, 0x00, 0x33, 0xC0,
+            0x00, 0xFF, 0xE0, 0x00, 0x33, 0xC0, 0x00, 0x80, 0x00, 0x00, 0x33, 0xC0, 0x00, 0xB0,
+            0x00, 0x00, 0x60, 0xE4,
+        ]);
+        rom[0x1100..0x1104].copy_from_slice(&[0x52, 0x41, 0x4E, 0x73]);
+        rom
+    }
+
+    /// Z80 #1: copy the command latch into sound RAM, forever, with a stack and an
+    /// NMI handler.
+    ///
+    /// ```text
+    /// 0000  31 FF C7    ld sp,$C7FF    the top of sound RAM
+    /// 0003  3A 00 C8    ld a,($C800)   the command latch
+    /// 0006  32 00 C0    ld ($C000),a   into the first byte of sound RAM
+    /// 0009  00          nop
+    /// 000A  18 F7       jr $0003
+    /// 0066  3A 00 C8    ld a,($C800)   the NMI handler: the same copy
+    /// 0069  32 00 C0    ld ($C000),a
+    /// 006C  ED 45       retn
+    /// ```
+    ///
+    /// # ⚠️ The stack pointer and the handler are both load-bearing
+    ///
+    /// `soundcmd_w` pulses this CPU's NMI, and `z80::Z80::ack_nmi` **pushes the
+    /// return address and jumps to 0x0066** — it is not a signal the CPU can ignore.
+    /// Two things follow, and getting either wrong makes this fixture quietly
+    /// useless rather than failing:
+    ///
+    /// - `Z80::reset` leaves `sp` at 0xFFFF (`cpu.rs:190`), which on
+    ///   [`machine::sf1::FmBoard`] is **unmapped** — writes there are discarded and
+    ///   reads return 0xFF. A push before `ld sp,$C7FF` is therefore lost, and the
+    ///   matching `retn` pops 0xFFFF and lands in unmapped space, which reads as
+    ///   `RST 38h` and pushes again. The CPU never returns to the loop: `pc` wanders
+    ///   a NOP field for the rest of the run and every FM assertion below stops
+    ///   meaning what it says. This is also why the fixture below writes the sound
+    ///   command *after* one scanline rather than before the run — the NMI must
+    ///   arrive with a stack already set.
+    /// - Without a handler at 0x0066 the same thing happens from the other end: the
+    ///   NMI jumps into a zero-filled ROM and NOPs forward out of it.
+    ///
+    /// The handler copies the latch itself rather than only `retn`-ing, which is
+    /// what a driver does, and makes `fm_ram[0]` carry the command even on the line
+    /// the NMI lands.
+    ///
+    /// The `nop` in the loop is load-bearing for `sound_rom`'s reason: it makes the
+    /// loop 42 T-states, which shares no factor with a line's 233.04, so the
+    /// snapshot lands on a different instruction each time rather than always the
+    /// same one — which is what makes the restored `pc` and `fm_debt` take many
+    /// values across a run.
+    ///
+    /// It reads the **latch** and not the YM2151's status port, so `fm_ram[0]`
+    /// carries the command the 68000 sent: a codec that dropped sound RAM restores a
+    /// zero there, and a codec that copied the 68000's latch into the sound side
+    /// instead of the Z80's own copy restores the wrong byte.
+    fn sf1_audiocpu() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0..12].copy_from_slice(&[
+            0x31, 0xFF, 0xC7, 0x3A, 0x00, 0xC8, 0x32, 0x00, 0xC0, 0x00, 0x18, 0xF7,
+        ]);
+        rom[0x66..0x6E].copy_from_slice(&[0x3A, 0x00, 0xC8, 0x32, 0x00, 0xC0, 0xED, 0x45]);
+        rom
+    }
+
+    /// Z80 #2: feed the two MSM5205s **opposite** nibbles, forever.
+    ///
+    /// ```text
+    /// 0000  3E 0F       ld a,$0F       reset pin clear, nibble F
+    /// 0002  D3 00       out ($00),a    chip 0
+    /// 0004  3E 02       ld a,$02       reset pin clear, nibble 2
+    /// 0006  D3 01       out ($01),a    chip 1
+    /// 0008  18 F6       jr $0000
+    /// ```
+    ///
+    /// ⚠️ The two nibbles are chosen so the chips end up **different in every
+    /// field**, which is what makes a codec that wrote chip 0's bytes twice — or
+    /// wrote the two in the wrong order — visible in a field comparison. Nibble 0xF
+    /// is `nbl2bit[15]`, negative with the largest step, and `0xF & 7 == 7` shifts
+    /// the step index by +8: chip 0 walks to step 48 and clamps at signal -2048.
+    /// Nibble 0x2 is positive, and `0x2 & 7 == 2` shifts by **-1**: chip 1 walks to
+    /// step 0 and climbs to +2047. So the pair ends at (-2048, 48) and (+2047, 0).
+    ///
+    /// A run long enough to saturate both is deliberate: nibbles that both shifted
+    /// the index upward would leave two chips at step 48, and the step byte would
+    /// stop discriminating.
+    ///
+    /// This board has no RAM at all, so the program cannot use a stack: no `call`,
+    /// no `push`. A `jr` loop is the whole vocabulary available.
+    fn sf1_audio2() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x4_0000];
+        rom[0..10].copy_from_slice(&[0x3E, 0x0F, 0xD3, 0x00, 0x3E, 0x02, 0xD3, 0x01, 0x18, 0xF6]);
+        rom
+    }
+
+    /// Puts SF1's FM chip where no default is: mid-note, LFO running, both timers
+    /// loaded.
+    ///
+    /// The same register sequence as [`patch_the_chip`], written through
+    /// [`machine::sf1::FmBoard`]'s bus at 0xE000/0xE001 rather than CPS-1's
+    /// 0xF000/0xF001. Reproduced rather than shared because the two boards decode
+    /// the chip at different addresses, and a helper taking an address pair would be
+    /// one parameter serving two call sites.
+    ///
+    /// **All four operators.** Algorithm 4's carriers sit at register offsets 0x10
+    /// and 0x18, so leaving their attack rates at 0 — "never attack" — makes the
+    /// patch silent, and a silent patch turns every sound assertion vacuous.
+    fn patch_the_sf1_chip(m: &mut machine::Sf1) {
+        let mut w = |addr: u8, val: u8| {
+            m.fm.write(0xE000, addr);
+            m.fm.write(0xE001, val);
+        };
+        w(0x20, 0xC4); // algorithm 4, both outputs
+        w(0x28, 0x4A); // key code
+        for op in 0..4u8 {
+            let off = op * 8;
+            w(0x40 + off, 0x01); // detune 0, multiple 1
+            w(0x80 + off, 0x1F); // attack rate 31: immediate
+        }
+        w(0x18, 0x40); // LFO frequency
+        w(0x19, 0x7F); // AM depth (bit 7 clear)
+        w(0x19, 0xFF); // and PM depth (bit 7 set), the same register address
+        w(0x1B, 0x03); // LFO waveform 3: noise, which fills the 256-entry table
+        w(0x0F, 0x94); // noise enable, frequency 0x14
+        w(0x10, 0x40); // timer A high
+        w(0x11, 0x02); // timer A low
+        w(0x12, 0x37); // timer B
+        w(0x14, 0x0F); // load and enable both timers, IRQ on both
+        w(0x08, 0x78); // key on, all four operators of channel 0
+    }
+
+    /// An SF1 machine whose state is distinctive in every field.
+    ///
+    /// Built by *running*, for [`a_machine`]'s reason. ⚠️ It also cannot be built any
+    /// other way here: `machine`'s own SF1 fixture lives in that crate's test module,
+    /// `machine::sf1::test_video()` is `pub(crate)`, and
+    /// `Sf1Board::write_sound_command_for_test` is `#[cfg(test)]` — so every one of
+    /// them is out of reach and this fixture drives the public bus instead.
+    ///
+    /// The five empty graphics regions are what `test_video()` passes. Empty is
+    /// legal: the tile decoder returns pen 0 for a ROM it cannot index, and nothing
+    /// here reads a framebuffer.
+    ///
+    /// 5,242 scanlines — one before the sound command and 5,241 after — is **20
+    /// frames and 122** on a 256-line frame, a partial frame at each end, so `line`
+    /// and `carry` are both non-zero and a whole-frame count cannot hide a dropped
+    /// one. It also leaves all four fractional remainders mid-step: the 68000's line
+    /// is 3,125/6 cycles, so `line_remainder` is `5_242 * 5 % 6 = 2`, and the 8 kHz
+    /// interrupt's is `5_242 * 25 % 48 = 10`.
+    ///
+    /// ⚠️ **Not 5,241, which the plan drafted: at that count `fm_debt` lands on
+    /// exactly 0** — the FM Z80 finishes a line owing nothing — and
+    /// `the_sf1_fixture_is_not_a_quiet_machine`'s `fm_debt` assertion fails. That
+    /// is the case the plan's own warning describes, and the fix it prescribes: one
+    /// more line, with the two remainders re-derived above, rather than a weaker
+    /// assertion.
+    fn sf1_for_test() -> machine::Sf1 {
+        let mut m = machine::Sf1::new(
+            &sf1_prog(),
+            machine::video::sf1::Sf1Video::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            sf1_audiocpu(),
+            sf1_audio2(),
+        );
+        m.reset();
+        patch_the_sf1_chip(&mut m);
+        // Bank 3, so a dropped bank reads other bytes. Written through the port the
+        // Z80 would use; the program never touches it, so it stays selected.
+        m.adpcm.port_out(0x02, 3);
+        // A pattern across sound RAM. The Z80 only ever writes 0xC000, so without it
+        // 2,046 of the 2,048 bytes would be zero and a codec that wrote the region
+        // short would restore an identical machine. Written before the run, so the
+        // Z80's own writes land on top of it rather than being overwritten by it.
+        for i in 0..SF1_SOUND_RAM_BYTES as u16 {
+            m.fm.write(0xC000 + i, (i as u8) ^ 0xA5);
+        }
+        // ⚠️ One scanline **before** the command, not after. The command's NMI pushes
+        // a return address, and the FM Z80's `ld sp,$C7FF` has not run yet at line
+        // zero — see [`sf1_audiocpu`] on what an NMI with `sp` at 0xFFFF does to the
+        // rest of the run. One line is ~5 passes of that loop, so the stack is set
+        // and the CPU is in it well before the NMI arrives.
+        m.run_scanline();
+        // Now the command, so the scheduler delivers it and both sound boards'
+        // `latch` copies end up non-zero — and the FM Z80 copies it into sound RAM,
+        // which is what makes `fm_ram[0]` say the byte came from the Z80 rather than
+        // from a codec copying the 68000's latch across.
+        m.board.write16(0xC0_001C, 0x005C);
+        for _ in 0..5_241 {
+            m.run_scanline();
+        }
+
+        // One more write to each ADPCM chip, *after* the run, so `data`, `vck`,
+        // `reset` and `pending` differ between the two as well as `signal` and
+        // `step`. Neither write decodes: `msm_w` only arms a capture, and the
+        // countdown has not elapsed by the snapshot.
+        m.adpcm.port_out(0x00, 0x0A); // reset pin clear, nibble A
+        m.adpcm.port_out(0x01, 0x85); // reset pin *set*, nibble 5
+                                      // Two master clocks on chip 0 alone, so the two countdowns disagree: 4
+                                      // against 6. `pending` is the field a codec is most likely to drop, because
+                                      // a chip restored with it at 0 sounds correct until the next write.
+        for _ in 0..2 {
+            m.adpcm.msm_mut(0).tick();
+        }
+        // And chip 1's VCK left high. A rising edge arms nothing, so this changes
+        // only the level the next write is compared against — which is exactly the
+        // field a `vck` the codec dropped would restore wrongly.
+        m.adpcm.msm_mut(1).vclk_w(true);
+
+        // The board's own registers, each a different value: the payload writes
+        // `bgscroll` and `fgscroll` adjacently and they are the same width, so two
+        // equal values would make a swapped pair invisible.
+        m.board.active = machine::video::sf1::ACTIVE_BG
+            | machine::video::sf1::ACTIVE_SPRITES
+            | machine::video::sf1::ACTIVE_FLIP;
+        m.board.bgscroll = 0x1234;
+        m.board.fgscroll = 0x5678;
+        m.board.coin_ctrl = 0x0B;
+        // Every control set to the *opposite* of the one encoded next to it, and p2
+        // as p1's complement. The payload is a run of one-byte booleans and the guest
+        // never reads a control, so two adjacent fields written in the wrong order is
+        // invisible unless the two disagree.
+        let inputs = &mut m.board.inputs;
+        inputs.coin1 = true;
+        inputs.coin2 = false;
+        inputs.service = true;
+        inputs.start1 = false;
+        inputs.start2 = true;
+        inputs.p1.right = true;
+        inputs.p1.left = false;
+        inputs.p1.down = true;
+        inputs.p1.up = false;
+        inputs.p1.punch = [true, false, true];
+        inputs.p1.kick = [false, true, false];
+        inputs.p2.right = false;
+        inputs.p2.left = true;
+        inputs.p2.down = false;
+        inputs.p2.up = true;
+        inputs.p2.punch = [false, true, false];
+        inputs.p2.kick = [true, false, true];
+        inputs.dsw = [0x5A5A, 0xA5A5];
+        // A command the scheduler has not polled yet, and a vblank the CPU has not
+        // acknowledged. Both are last, because a `run_scanline` would consume either.
+        m.board.write16(0xC0_001C, 0x0042);
+        m.board.assert_vblank();
+        m
+    }
+
+    /// The fixture's state, for the tests that only need the bytes.
+    ///
+    /// `Sf1State` unqualified: Step 11 imports it at the top of the file, and
+    /// `use super::*` brings it in here.
+    fn sf1_state_for_test() -> Sf1State {
+        sf1_for_test().snapshot()
+    }
+
+    /// SF1's payload is the documented size, term for term.
+    ///
+    /// The same guard `the_encoded_length_is_the_documented_size` puts on CPS-1:
+    /// without it, the format is whatever the encoder happens to emit, and a
+    /// dropped field is invisible because the reader drops it too.
+    #[test]
+    fn the_sf1_encoded_length_is_the_documented_size() {
+        let bytes = encode_sf1(&sf1_state_for_test());
+        assert_eq!(bytes.len(), HEADER + SF1_PAYLOAD + 4);
+    }
+
+    /// Every field survives the round trip, and the check is the *machine's*
+    /// future rather than a field-by-field comparison.
+    #[test]
+    fn an_sf1_state_round_trips_through_a_file() {
+        let mut m = sf1_for_test();
+        for _ in 0..401 {
+            m.run_scanline();
+        }
+        let bytes = encode_sf1(&m.snapshot());
+        let decoded = decode_sf1(&bytes).expect("a state this build just wrote");
+
+        let mut restored = sf1_for_test();
+        restored.restore(&decoded);
+        for _ in 0..200 {
+            m.run_scanline();
+            restored.run_scanline();
+        }
+        assert_eq!(restored.cpu.d, m.cpu.d);
+        assert_eq!(restored.total_cycles, m.total_cycles);
+        assert_eq!(restored.z80_cycles(), m.z80_cycles());
+        assert_eq!(restored.adpcm_z80_cycles(), m.adpcm_z80_cycles());
+        assert_eq!(restored.board.ram[..], m.board.ram[..]);
+    }
+
+    /// A CPS-1 state is refused by the SF1 decoder, and by board rather than by
+    /// corruption.
+    ///
+    /// The two payloads are 43,176 and 264,-odd bytes, so a length check would
+    /// also catch this — but it would report `Truncated`, which tells a user with
+    /// the wrong file nothing. The board tag is checked first for that reason.
+    #[test]
+    fn an_sf2_state_is_refused_by_board() {
+        let bytes = encode(&a_machine().snapshot(), BOARD_SF2);
+        assert_eq!(
+            err_sf1(&bytes),
+            StateError::WrongBoard {
+                found: BOARD_SF2,
+                expected: BOARD_SF1,
+            }
+        );
+    }
+
+    /// And an SF1 state is refused by the CPS-1 decoder, the same way.
+    #[test]
+    fn an_sf1_state_is_refused_by_the_cps1_decoder() {
+        let bytes = encode_sf1(&sf1_state_for_test());
+        assert_eq!(
+            err(&bytes, BOARD_SF2),
+            StateError::WrongBoard {
+                found: BOARD_SF1,
+                expected: BOARD_SF2,
+            }
+        );
+    }
+
+    /// A version-3 file is refused, and the message names the version.
+    ///
+    /// The bump exists because version 3's payload has no SF1 arm at all: a
+    /// version-3 file whose board tag said SF1 would be a file this build cannot
+    /// have written, and there is nothing to restore an SF1 machine from.
+    #[test]
+    fn a_version_3_file_is_refused() {
+        let mut bytes = encode_sf1(&sf1_state_for_test());
+        bytes[7] = 3;
+        assert_eq!(err_sf1(&bytes), StateError::Version { found: 3 });
+    }
+
+    /// A damaged SF1 payload is refused by CRC, not silently restored.
+    #[test]
+    fn a_damaged_sf1_payload_is_refused() {
+        let mut bytes = encode_sf1(&sf1_state_for_test());
+        // A byte deep in the payload, past every header field.
+        bytes[HEADER + 1000] ^= 0xFF;
+        assert!(matches!(err_sf1(&bytes), StateError::Corrupt { .. }));
+    }
+
+    /// Every truncation of an SF1 file is refused, and none of them panics.
+    ///
+    /// Every prefix length, not a sample: the loop is 43,196 iterations of a
+    /// decode that returns early, which costs milliseconds, and a decoder that
+    /// reads one field past a boundary fails at exactly one of them.
+    #[test]
+    fn every_truncated_sf1_file_is_refused() {
+        let bytes = encode_sf1(&sf1_state_for_test());
+        for n in 0..bytes.len() {
+            assert!(
+                decode_sf1(&bytes[..n]).is_err(),
+                "a {n}-byte prefix decoded as a state"
+            );
+        }
+    }
+
+    /// A pending sound command survives the file, as `None` and as `Some`.
+    ///
+    /// `Option<u8>` is one byte on the wire — 0xFF for none — so the value 0xFF is
+    /// the case to check: a command byte of 0xFF must not read back as no command.
+    #[test]
+    fn a_sound_command_of_0xff_is_not_read_as_none() {
+        let mut s = sf1_state_for_test();
+        s.sound_command = Some(0xFF);
+        let out = decode_sf1(&encode_sf1(&s)).expect("just written");
+        assert_eq!(out.sound_command, Some(0xFF));
+
+        s.sound_command = None;
+        let out = decode_sf1(&encode_sf1(&s)).expect("just written");
+        assert_eq!(out.sound_command, None);
+    }
+
+    /// The SF1 fixture's fields are actually distinctive.
+    ///
+    /// ⚠️ **This is the premise every test above rests on.** All of them compare
+    /// decoded against original, so every one of them passes for a fixture whose
+    /// fields are all zero *and* a codec that writes zeros. `a_machine` has the
+    /// same guard for the same reason, and it is also where the four typed-out
+    /// guest addresses in `sf1_prog` are checked: a mistyped address lands in an
+    /// unmapped hole, writes nothing, and shows up here as a zero RAM.
+    #[test]
+    fn the_sf1_fixture_is_not_a_quiet_machine() {
+        let s = sf1_state_for_test();
+
+        // The 68000 half.
+        assert_ne!(s.line, 0, "mid-frame");
+        assert_ne!(s.carry, 0, "and mid-scanline");
+        assert_ne!(s.line_remainder, 0, "the line is 3,125/6 cycles");
+        assert_ne!(s.total_cycles, 0, "the machine ran");
+        assert_ne!(s.cpu.d[0], 0, "the loop counted");
+        assert_ne!(s.cpu.d[1], 0, "and the vblank handler ran");
+        assert_ne!(s.cpu.prefetch, [0, 0], "the prefetch queue is primed");
+        // The four RAMs, which are also the check on `sf1_prog`'s addresses.
+        assert!(s.ram.iter().any(|&w| w != 0), "main RAM was written");
+        assert!(s.objectram.iter().any(|&w| w != 0), "and objectram");
+        assert!(s.videoram.iter().any(|&w| w != 0), "and videoram");
+        assert!(s.palette.iter().any(|&w| w != 0), "and palette RAM");
+        assert_ne!(s.active, 0, "layers enabled and the screen flipped");
+        assert_ne!(s.bgscroll, s.fgscroll, "the two scrolls disagree");
+        assert_ne!(s.coin_ctrl, 0, "the coin control is set");
+        assert_eq!(
+            s.sound_command,
+            Some(0x42),
+            "a command the scheduler has not polled"
+        );
+        assert!(s.vblank_pending, "and an unacknowledged vblank");
+        // Adjacent controls disagree, which is what makes a swapped pair visible.
+        assert_ne!(s.inputs.start1, s.inputs.start2, "start1 and start2");
+        assert_ne!(s.inputs.coin1, s.inputs.coin2, "coin1 and coin2");
+        assert_ne!(s.inputs.p1.right, s.inputs.p1.left, "p1 right and left");
+        assert_ne!(s.inputs.p1.down, s.inputs.p1.up, "p1 down and up");
+        assert_ne!(s.inputs.p1.punch[0], s.inputs.p1.punch[1], "p1 punches");
+        assert_ne!(s.inputs.p1.kick[0], s.inputs.p1.kick[1], "p1 kicks");
+        assert_ne!(s.inputs.p1.right, s.inputs.p2.right, "p1 against p2");
+        assert_eq!(s.inputs.dsw, [0x5A5A, 0xA5A5], "the DIPs are not 0xFFFF");
+
+        // Z80 #1 and the FM chip.
+        assert_ne!(s.fm_total, 0, "the FM Z80 ran");
+        assert_ne!(s.fm_debt, 0, "and is mid-line: a debt is owed or overspent");
+        assert_eq!(s.ym_addr, 0x08, "the last address the patch latched");
+        assert_eq!(
+            s.fm_latch, 0x5C,
+            "the delivered command, not the pending one"
+        );
+        assert_eq!(
+            s.fm_ram[0], 0x5C,
+            "the Z80 copied the latch it was given, so sound RAM came from the Z80"
+        );
+        assert_eq!(
+            s.fm_ram[1],
+            0x01 ^ 0xA5,
+            "and the byte beside it still carries the pattern, so the whole region \
+             is encoded rather than just the byte the Z80 writes"
+        );
+        assert_ne!(
+            s.fm_z80.sp, 0xFFFF,
+            "the FM Z80 set its stack pointer, so the command's NMI returned into \
+             the loop instead of into unmapped space -- see `sf1_audiocpu`"
+        );
+        assert_ne!(s.fm_z80.pc, 0, "and it is somewhere in that loop");
+
+        // Z80 #2 and the two ADPCM chips. Every field differs between the two, which
+        // is what makes writing chip 0's bytes twice — or the two in the wrong order
+        // — visible here rather than only in a divergence test.
+        assert_ne!(s.adpcm_total, 0, "the ADPCM Z80 ran");
+        assert_eq!(
+            s.adpcm_bank, 3,
+            "bank 3, so a dropped bank reads other bytes"
+        );
+        assert_eq!(s.adpcm_latch, 0x5C, "the ADPCM board's copy of the command");
+        let (a, b) = (&s.msm[0], &s.msm[1]);
+        assert_eq!((a.signal, a.step), (-2048, 48), "chip 0 saturated downward");
+        assert_eq!((b.signal, b.step), (2047, 0), "chip 1 saturated upward");
+        assert_ne!(a.data, b.data, "different latched nibbles");
+        assert_ne!(a.vck, b.vck, "different VCK levels");
+        assert_ne!(a.reset, b.reset, "and the reset pins disagree");
+        assert_eq!((a.pending, b.pending), (4, 6), "and the countdowns");
+
+        assert_ne!(
+            s.adpcm_irq_remainder, 0,
+            "mid-step toward the next 8 kHz IRQ"
+        );
+        assert_ne!(
+            s.sample_acc, 0,
+            "and mid-step toward the next YM2151 sample"
+        );
     }
 }

@@ -43,4 +43,6 @@ pub mod state;
 pub use keys::{Actions, Controls, Key, KeySet};
 pub use pace::{FramePacer, FRAME_NS, MAX_CATCH_UP};
 pub use pixels::pens_to_argb;
-pub use state::{decode, encode, StateError, BOARD_SF2, MAGIC, VERSION};
+pub use state::{
+    decode, decode_sf1, encode, encode_sf1, StateError, BOARD_SF1, BOARD_SF2, MAGIC, VERSION,
+};
