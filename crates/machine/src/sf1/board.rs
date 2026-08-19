@@ -203,6 +203,17 @@ impl Sf1Board {
         self.sound_latch.take()
     }
 
+    /// Fill the take-once slot as `soundcmd_w` does, for the scheduler's tests.
+    ///
+    /// The alternative is a 68000 program that writes 0xC0001D, which puts this
+    /// file's address decode into `sf1::machine`'s failure surface — a scheduler test
+    /// failing because a map arm moved is a test that names the wrong file.
+    #[cfg(test)]
+    pub(crate) fn write_sound_command_for_test(&mut self, val: u8) {
+        self.sound_latch = Some(val);
+        self.trace.sound_latch_writes += 1;
+    }
+
     #[inline]
     fn ram_index(addr: u32) -> usize {
         // 0x3000 is not a power of two, so a remainder rather than a mask. `%` on a

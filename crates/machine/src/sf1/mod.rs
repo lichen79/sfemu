@@ -13,11 +13,22 @@
 pub mod adpcm2;
 pub mod board;
 pub mod inputs;
+pub mod machine;
 pub mod mix;
 pub mod msm5205;
 pub mod sound;
 
 pub use adpcm2::{Adpcm2Board, Adpcm2Trace};
+pub use machine::{Sf1, MSM_TICKS_PER_LINE};
 pub use mix::mix;
 pub use msm5205::Msm5205;
 pub use sound::{FmBoard, FmTrace};
+
+/// A video subsystem with no graphics, for this crate's tests.
+///
+/// Every SF1 test in `machine` drives the schedule rather than the pixels, and a
+/// fixture that built graphics would make those files' runtime decoding.
+#[cfg(test)]
+pub(crate) fn test_video() -> video::sf1::Sf1Video {
+    video::sf1::Sf1Video::new(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+}

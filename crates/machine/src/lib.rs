@@ -79,6 +79,7 @@ pub use board::Board;
 pub use config::BoardConfig;
 pub use cps1::Cps1;
 pub use inputs::{Inputs, PlayerInput};
+pub use sf1::Sf1;
 pub use snapshot::MachineState;
 pub use timing::Timing;
 pub use trace::{Trace, UnmappedLog};
