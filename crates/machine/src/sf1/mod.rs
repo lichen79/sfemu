@@ -12,3 +12,6 @@
 
 pub mod board;
 pub mod inputs;
+pub mod msm5205;
+
+pub use msm5205::Msm5205;
