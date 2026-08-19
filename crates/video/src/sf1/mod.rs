@@ -18,4 +18,5 @@
 
 pub mod gfx;
 pub mod palette;
+pub mod sprites;
 pub mod tilemap;
