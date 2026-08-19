@@ -12,6 +12,8 @@
 
 pub mod board;
 pub mod inputs;
+pub mod mix;
 pub mod msm5205;
 
+pub use mix::mix;
 pub use msm5205::Msm5205;
