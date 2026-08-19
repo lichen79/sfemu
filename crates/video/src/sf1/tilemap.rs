@@ -248,6 +248,63 @@ pub fn tx_tile_info(videoram: &[u16], index: u32) -> TileInfo {
     }
 }
 
+/// Which map cell, and which pixel of it, a screen pixel reads.
+///
+/// `col`/`row` index the map; `x`/`y` are the pixel's position inside the tile
+/// *before* the tile's own flip flags are applied, because the flags come from the
+/// map entry this sample names and cannot be known until it has been fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sample {
+    /// Map column, `0..map.cols`.
+    pub col: u32,
+    /// Map row, `0..map.rows`.
+    pub row: u32,
+    /// Pixel column within the tile, `0..map.tile_w`.
+    pub x: u32,
+    /// Pixel row within the tile, `0..map.tile_h`.
+    pub y: u32,
+}
+
+/// Which map cell and tile pixel screen pixel `(sx, sy)` reads.
+///
+/// Published because a graphics viewer must name the cell the renderer fetched,
+/// and five decisions live in these six lines: the `VISIBLE_X`/`VISIBLE_Y` bias,
+/// the mirror about `X_EXTENT`/`Y_EXTENT` under flip, `rem_euclid` on both axes,
+/// the scroll added after the mirror rather than before it, and the scroll's
+/// reduction modulo the map's own width. A panel with a sixth reading of any of
+/// them would report a cell that was never drawn, which is a diagnostic that lies
+/// exactly when it is being trusted — the argument [`crate::layers::map_axis`]
+/// already makes for CPS-1.
+///
+/// A degenerate map — `cols` or `rows` zero, which `Tilemap`'s public fields
+/// permit and this module's constants never produce — samples the origin rather
+/// than dividing by zero.
+#[must_use]
+pub fn sample(map: &Tilemap, scroll_x: u32, flip: bool, sx: usize, sy: usize) -> Sample {
+    let (mw, mh) = (map.width() as i32, map.height() as i32);
+    if mw == 0 || mh == 0 {
+        return Sample {
+            col: 0,
+            row: 0,
+            x: 0,
+            y: 0,
+        };
+    }
+    // `u16` on the hardware, so this cannot overflow the i32 sums below.
+    let scroll = (scroll_x % map.width()) as i32;
+    let ry = VISIBLE_Y + sy as i32;
+    let my = if flip { Y_EXTENT - 1 - ry } else { ry }.rem_euclid(mh);
+    let rx = VISIBLE_X + sx as i32;
+    let base = if flip { X_EXTENT - 1 - rx } else { rx };
+    let mx = (base + scroll).rem_euclid(mw);
+    Sample {
+        col: (mx / map.tile_w as i32) as u32,
+        row: (my / map.tile_h as i32) as u32,
+        x: (mx % map.tile_w as i32) as u32,
+        y: (my % map.tile_h as i32) as u32,
+    }
+}
+
 /// Draw a tilemap into the 384×224 pen buffer.
 ///
 /// `scroll_x` is the register's value as written; `flip` is `flip_screen()`.
@@ -275,36 +332,25 @@ pub fn draw(
         WIDTH * HEIGHT,
         "destination must be WIDTH * HEIGHT"
     );
-    let (mw, mh) = (map.width() as i32, map.height() as i32);
     // Not constructible from this module's constants, but `Tilemap` is public and
-    // a zero would divide by zero below.
-    if mw == 0 || mh == 0 {
+    // `sample` would return the origin for every pixel rather than the map.
+    if map.width() == 0 || map.height() == 0 {
         return;
     }
-    // `u16` on the hardware, so this cannot overflow the i32 sums below.
-    let scroll = (scroll_x % map.width()) as i32;
     for sy in 0..HEIGHT {
-        let ry = VISIBLE_Y + sy as i32;
-        let my = if flip { Y_EXTENT - 1 - ry } else { ry }.rem_euclid(mh);
-        let row = (my / map.tile_h as i32) as u32;
-        let ty = (my % map.tile_h as i32) as u32;
         for sx in 0..WIDTH {
-            let rx = VISIBLE_X + sx as i32;
-            let base = if flip { X_EXTENT - 1 - rx } else { rx };
-            let mx = (base + scroll).rem_euclid(mw);
-            let col = (mx / map.tile_w as i32) as u32;
-            let tx = (mx % map.tile_w as i32) as u32;
-            let tile = info(map.scan.index(col, row, map.cols, map.rows));
+            let s = sample(map, scroll_x, flip, sx, sy);
+            let tile = info(map.scan.index(s.col, s.row, map.cols, map.rows));
             // Flip mirrors within the tile; the tile's screen position is fixed.
             let px = if tile.flags & FLIP_X != 0 {
-                map.tile_w - 1 - tx
+                map.tile_w - 1 - s.x
             } else {
-                tx
+                s.x
             };
             let py = if tile.flags & FLIP_Y != 0 {
-                map.tile_h - 1 - ty
+                map.tile_h - 1 - s.y
             } else {
-                ty
+                s.y
             };
             let Some(pen) = gfx.pen(tile.code, px, py) else {
                 continue;
@@ -789,5 +835,133 @@ mod tests {
     /// Tile 0, colour 0, no flip — the callback for the geometric tests.
     fn plain(_index: u32) -> TileInfo {
         TileInfo::default()
+    }
+
+    #[test]
+    fn a_sample_names_the_tile_and_the_pixel_within_it() {
+        let s = sample(&BG, 0, false, 0, 0);
+        // VISIBLE_X 64 / 16 = 4, VISIBLE_Y 16 / 16 = 1, both exactly on a tile edge.
+        assert_eq!(
+            s,
+            Sample {
+                col: 4,
+                row: 1,
+                x: 0,
+                y: 0
+            }
+        );
+        assert_eq!(BG.scan.index(s.col, s.row, BG.cols, BG.rows), 65);
+    }
+
+    #[test]
+    fn the_scroll_moves_the_sampled_pixel_not_the_tile() {
+        let s = sample(&BG, 1, false, 0, 0);
+        assert_eq!(
+            s,
+            Sample {
+                col: 4,
+                row: 1,
+                x: 1,
+                y: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_scroll_of_one_whole_tile_moves_one_whole_column() {
+        let s = sample(&BG, 16, false, 0, 0);
+        assert_eq!(
+            s,
+            Sample {
+                col: 5,
+                row: 1,
+                x: 0,
+                y: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_scroll_of_the_maps_whole_width_samples_the_same_pixel() {
+        assert_eq!(BG.width(), 32_768);
+        assert_eq!(
+            sample(&BG, 32_768, false, 0, 0),
+            sample(&BG, 0, false, 0, 0)
+        );
+    }
+
+    #[test]
+    fn flip_mirrors_the_screen_so_the_corners_swap() {
+        // The top-left pixel under flip is the bottom-right pixel without it.
+        assert_eq!(
+            sample(&BG, 0, true, 0, 0),
+            Sample {
+                col: 27,
+                row: 14,
+                x: 15,
+                y: 15
+            }
+        );
+        assert_eq!(
+            sample(&BG, 0, false, WIDTH - 1, HEIGHT - 1),
+            sample(&BG, 0, true, 0, 0)
+        );
+    }
+
+    #[test]
+    fn the_text_layers_geometry_is_its_own() {
+        let s = sample(&TX, 0, false, 0, 0);
+        // 64 / 8 = 8, 16 / 8 = 2. `Scan::Rows`, so the index is row-major.
+        assert_eq!(
+            s,
+            Sample {
+                col: 8,
+                row: 2,
+                x: 0,
+                y: 0
+            }
+        );
+        assert_eq!(TX.scan.index(s.col, s.row, TX.cols, TX.rows), 136);
+        assert_eq!(
+            sample(&TX, 0, true, 0, 0),
+            Sample {
+                col: 55,
+                row: 29,
+                x: 7,
+                y: 7
+            }
+        );
+        assert_eq!(
+            sample(&TX, 0, false, WIDTH - 1, HEIGHT - 1),
+            sample(&TX, 0, true, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_degenerate_map_samples_the_origin_rather_than_dividing_by_zero() {
+        let empty = Tilemap {
+            scan: Scan::Rows,
+            tile_w: 8,
+            tile_h: 8,
+            cols: 0,
+            rows: 0,
+        };
+        assert_eq!(
+            sample(&empty, 0, false, 0, 0),
+            Sample {
+                col: 0,
+                row: 0,
+                x: 0,
+                y: 0
+            }
+        );
+    }
+
+    #[test]
+    fn the_geometry_constants_are_what_the_panels_will_page_over() {
+        assert_eq!((BG.cols, BG.rows, BG.tiles()), (2048, 16, 32_768));
+        assert_eq!((TX.cols, TX.rows, TX.tiles()), (64, 32, 2048));
+        assert_eq!((BG.width(), BG.height()), (32_768, 256));
+        assert_eq!((TX.width(), TX.height()), (512, 256));
     }
 }
