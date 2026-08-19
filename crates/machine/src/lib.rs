@@ -31,6 +31,7 @@ pub mod config;
 pub mod cps1;
 pub mod inputs;
 pub mod resample;
+pub mod sf1;
 pub mod snapshot;
 pub mod sound;
 pub mod timing;
