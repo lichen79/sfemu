@@ -248,6 +248,127 @@ pub fn tx_tile_info(videoram: &[u16], index: u32) -> TileInfo {
     }
 }
 
+/// One of SF1's three tilemaps.
+///
+/// Each map is five decisions the renderer makes together — which geometry, which
+/// scroll register, which transparent pen, which entry decoder, and whether the
+/// entries live in ROM or in guest RAM. `sf.cpp` makes them at three separate call
+/// sites in `draw_common`. Naming them here lets a graphics viewer ask the same
+/// questions and get the same answers, rather than a fourth reading of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapKind {
+    /// The background map: 2,048 × 16 sixteen-pixel tiles, entries in ROM at 0.
+    Bg,
+    /// The foreground map: 2,048 × 16 sixteen-pixel tiles, entries in ROM at
+    /// 0x20000 — read it from [`MapKind::tilerom_base`] rather than typing it.
+    ///
+    /// ⚠️ Written as a number rather than as a link to the `FG_BASE` constant it
+    /// comes from: that constant is private, deliberately — a panel that read it
+    /// would be re-deriving `tilerom_entry`'s layout — and `cargo doc` refuses a
+    /// public link to a private item.
+    Fg,
+    /// The text map: 64 × 32 eight-pixel tiles, entries in guest `videoram`.
+    Tx,
+}
+
+impl MapKind {
+    /// Every map, in drawing order.
+    pub const ALL: [MapKind; 3] = [MapKind::Bg, MapKind::Fg, MapKind::Tx];
+
+    /// The plane this map draws into — its region, layout and colour base.
+    #[must_use]
+    pub const fn plane(self) -> crate::sf1::Plane {
+        match self {
+            Self::Bg => crate::sf1::Plane::Bg,
+            Self::Fg => crate::sf1::Plane::Fg,
+            Self::Tx => crate::sf1::Plane::Tx,
+        }
+    }
+
+    /// This map's geometry.
+    #[must_use]
+    pub const fn map(self) -> &'static Tilemap {
+        match self {
+            Self::Bg => &BG,
+            Self::Fg => &FG,
+            Self::Tx => &TX,
+        }
+    }
+
+    /// This map's horizontal scroll, from the board's two registers.
+    ///
+    /// The text layer has no scroll register at all — `sf.cpp` never gives its
+    /// tilemap a scroll — so it is a literal zero rather than a third field.
+    #[must_use]
+    pub const fn scroll(self, bgscroll: u16, fgscroll: u16) -> u32 {
+        match self {
+            Self::Bg => bgscroll as u32,
+            Self::Fg => fgscroll as u32,
+            Self::Tx => 0,
+        }
+    }
+
+    /// The pen this map treats as a hole, if any.
+    ///
+    /// `None` for the background: `draw_common` never calls
+    /// `set_transparent_pen` on it, so pen 15 draws.
+    #[must_use]
+    pub const fn transparent_pen(self) -> Option<u8> {
+        match self {
+            Self::Bg => None,
+            Self::Fg => Some(15),
+            Self::Tx => Some(3),
+        }
+    }
+
+    /// The byte offset in the tilemap ROM where this map's entries begin, or
+    /// `None` for a map whose entries live in guest RAM.
+    ///
+    /// A panel prints this so a reader can see *why* writing to RAM never changes
+    /// the background: there is a ROM offset here and no RAM address at all.
+    #[must_use]
+    pub const fn tilerom_base(self) -> Option<usize> {
+        match self {
+            Self::Bg => Some(0),
+            Self::Fg => Some(FG_BASE),
+            Self::Tx => None,
+        }
+    }
+
+    /// This map's entry at `index`.
+    ///
+    /// Takes both sources because which one it reads is the thing being named:
+    /// two of the three maps ignore `videoram` and the third ignores `tilerom`.
+    #[must_use]
+    pub fn tile_info(self, tilerom: &[u8], videoram: &[u16], index: u32) -> TileInfo {
+        match self {
+            Self::Bg => bg_tile_info(tilerom, index),
+            Self::Fg => fg_tile_info(tilerom, index),
+            Self::Tx => tx_tile_info(videoram, index),
+        }
+    }
+
+    /// A two-character label, for a panel with 4 pixels per character.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bg => "BG",
+            Self::Fg => "FG",
+            Self::Tx => "TX",
+        }
+    }
+
+    /// The next map, wrapping. [`MapKind::ALL`]'s order.
+    #[must_use]
+    pub const fn cycled(self) -> Self {
+        match self {
+            Self::Bg => Self::Fg,
+            Self::Fg => Self::Tx,
+            Self::Tx => Self::Bg,
+        }
+    }
+}
+
 /// Which map cell, and which pixel of it, a screen pixel reads.
 ///
 /// `col`/`row` index the map; `x`/`y` are the pixel's position inside the tile
@@ -963,5 +1084,94 @@ mod tests {
         assert_eq!((TX.cols, TX.rows, TX.tiles()), (64, 32, 2048));
         assert_eq!((BG.width(), BG.height()), (32_768, 256));
         assert_eq!((TX.width(), TX.height()), (512, 256));
+    }
+
+    #[test]
+    fn every_map_names_its_plane_and_its_geometry() {
+        assert_eq!(MapKind::Bg.plane(), crate::sf1::Plane::Bg);
+        assert_eq!(MapKind::Fg.plane(), crate::sf1::Plane::Fg);
+        assert_eq!(MapKind::Tx.plane(), crate::sf1::Plane::Tx);
+        assert_eq!((MapKind::Bg.map().cols, MapKind::Bg.map().rows), (2048, 16));
+        assert_eq!((MapKind::Fg.map().cols, MapKind::Fg.map().rows), (2048, 16));
+        assert_eq!((MapKind::Tx.map().cols, MapKind::Tx.map().rows), (64, 32));
+    }
+
+    #[test]
+    fn each_map_reads_its_own_scroll_register_and_the_text_layer_reads_none() {
+        assert_eq!(MapKind::Bg.scroll(0x0040, 0x0080), 0x40);
+        assert_eq!(MapKind::Fg.scroll(0x0040, 0x0080), 0x80);
+        assert_eq!(MapKind::Tx.scroll(0x0040, 0x0080), 0);
+    }
+
+    #[test]
+    fn only_the_background_draws_every_pen() {
+        // `draw_common` never calls `set_transparent_pen` for the background, so
+        // pen 15 draws there and is a hole on the other two.
+        assert_eq!(MapKind::Bg.transparent_pen(), None);
+        assert_eq!(MapKind::Fg.transparent_pen(), Some(15));
+        assert_eq!(MapKind::Tx.transparent_pen(), Some(3));
+    }
+
+    #[test]
+    fn the_two_rom_maps_name_their_byte_offset_and_the_ram_map_names_none() {
+        assert_eq!(MapKind::Bg.tilerom_base(), Some(0));
+        assert_eq!(MapKind::Fg.tilerom_base(), Some(0x2_0000));
+        assert_eq!(MapKind::Tx.tilerom_base(), None);
+    }
+
+    #[test]
+    fn a_maps_tile_info_is_the_free_function_it_names() {
+        let mut tilerom = vec![0u8; 0x4_0000];
+        // Cell 3 of the background: colour at +6, code low at +7, attr and code
+        // high one plane (0x10000) further on.
+        tilerom[6] = 0x0A;
+        tilerom[7] = 0x34;
+        tilerom[PLANE + 6] = 0x02;
+        tilerom[PLANE + 7] = 0x12;
+        let videoram = vec![0u16; 2048];
+        assert_eq!(
+            MapKind::Bg.tile_info(&tilerom, &videoram, 3),
+            TileInfo {
+                code: 0x1234,
+                colour: 0x0A,
+                flags: 0x02
+            }
+        );
+        assert_eq!(
+            MapKind::Bg.tile_info(&tilerom, &videoram, 3),
+            bg_tile_info(&tilerom, 3)
+        );
+        // The same bytes at FG_BASE are the foreground's cell 3.
+        tilerom[FG_BASE + 6] = 0x0B;
+        tilerom[FG_BASE + 7] = 0x56;
+        assert_eq!(
+            MapKind::Fg.tile_info(&tilerom, &videoram, 3),
+            fg_tile_info(&tilerom, 3)
+        );
+        assert_eq!(MapKind::Fg.tile_info(&tilerom, &videoram, 3).colour, 0x0B);
+        // The text layer ignores the tilerom entirely.
+        let mut videoram = vec![0u16; 2048];
+        videoram[3] = 0x5C21;
+        assert_eq!(
+            MapKind::Tx.tile_info(&tilerom, &videoram, 3),
+            TileInfo {
+                code: 0x021,
+                colour: 5,
+                flags: 0x03
+            }
+        );
+    }
+
+    #[test]
+    fn cycling_a_map_visits_all_three_and_returns() {
+        let mut k = MapKind::Bg;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(k.name());
+            k = k.cycled();
+        }
+        assert_eq!(seen, ["BG", "FG", "TX"]);
+        assert_eq!(k, MapKind::Bg);
+        assert_eq!(MapKind::ALL.len(), 3);
     }
 }
