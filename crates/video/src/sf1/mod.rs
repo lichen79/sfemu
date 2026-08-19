@@ -16,4 +16,5 @@
 //! (BSD-3-Clause, Olivier Galibert), and to `src/emu/{drawgfx,digfx,tilemap,
 //! emupal}.cpp` for the framework behaviour SF1 relies on. Read 2026-08-17.
 
+pub mod gfx;
 pub mod palette;
