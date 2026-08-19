@@ -22,7 +22,7 @@ pub mod sprites;
 pub mod tilemap;
 
 use crate::compose::Framebuffer;
-use gfx::{GfxSet, CHAR_LAYOUT, SPRITE_LAYOUT};
+use gfx::{GfxLayout, GfxSet, CHAR_LAYOUT, SPRITE_LAYOUT};
 
 /// `m_active` bit 2: screen flip (`sf.cpp:351`, "active when dip 8 (flip) on").
 pub const ACTIVE_FLIP: u8 = 0x04;
@@ -77,6 +77,133 @@ impl Default for LayerMask {
     /// blank screen for every caller that never heard of a mask.
     fn default() -> Self {
         Self::all()
+    }
+}
+
+/// One of SF1's four drawable planes.
+///
+/// The hardware has four separate graphics ROM regions with four fixed colour
+/// bases and two different tile layouts, and `sf.cpp` states each fact inline at
+/// the point of use. Naming them here states each once: the renderer and the
+/// graphics viewer then read the same statement, so a panel cannot report a colour
+/// base or a tile size the renderer did not use.
+///
+/// The order of [`Plane::ALL`] is the drawing order — background, foreground,
+/// sprites, text — which is also [`Plane::cycled`]'s order and
+/// [`Plane::index`]'s numbering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plane {
+    /// The background tilemap. `gfx1`, colour base 0.
+    Bg,
+    /// The foreground tilemap. `gfx2`, colour base 256.
+    Fg,
+    /// The object layer. `gfx3`, colour base 512.
+    Sprites,
+    /// The text tilemap. `gfx4`, colour base 768, and the only user of
+    /// [`crate::sf1::gfx::CHAR_LAYOUT`].
+    Tx,
+}
+
+impl Plane {
+    /// Every plane, in drawing order.
+    pub const ALL: [Plane; 4] = [Plane::Bg, Plane::Fg, Plane::Sprites, Plane::Tx];
+
+    /// The first palette entry this plane's colour 0 uses.
+    ///
+    /// `sf.cpp`'s `PALETTE_INIT` splits 1,024 entries into four fixed blocks of
+    /// 256; nothing in the guest can move them.
+    #[must_use]
+    pub const fn colour_base(self) -> u16 {
+        match self {
+            Self::Bg => 0,
+            Self::Fg => 256,
+            Self::Sprites => 512,
+            Self::Tx => 768,
+        }
+    }
+
+    /// The tile layout this plane's region is decoded with.
+    #[must_use]
+    pub const fn layout(self) -> &'static GfxLayout {
+        match self {
+            Self::Tx => &CHAR_LAYOUT,
+            _ => &SPRITE_LAYOUT,
+        }
+    }
+
+    /// The `gfxctrl` bit that enables this plane on the hardware.
+    #[must_use]
+    pub const fn active_bit(self) -> u8 {
+        match self {
+            Self::Bg => ACTIVE_BG,
+            Self::Fg => ACTIVE_FG,
+            Self::Sprites => ACTIVE_SPRITES,
+            Self::Tx => ACTIVE_TX,
+        }
+    }
+
+    /// Whether the viewer's mask permits this plane.
+    ///
+    /// A mask only ever subtracts: [`Sf1Video::render`] draws a plane when the
+    /// hardware bit is set **and** this returns true, never when either alone is.
+    #[must_use]
+    pub const fn permitted(self, mask: &LayerMask) -> bool {
+        match self {
+            Self::Bg => mask.bg,
+            Self::Fg => mask.fg,
+            Self::Sprites => mask.sprites,
+            Self::Tx => mask.tx,
+        }
+    }
+
+    /// A two-character label, for a panel with 4 pixels per character.
+    ///
+    /// "OB" rather than "SP" so it lines up with CPS-1's object row, which the
+    /// same overlay draws two panels away.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bg => "BG",
+            Self::Fg => "FG",
+            Self::Sprites => "OB",
+            Self::Tx => "TX",
+        }
+    }
+
+    /// The next plane, wrapping. [`Plane::ALL`]'s order.
+    #[must_use]
+    pub const fn cycled(self) -> Self {
+        match self {
+            Self::Bg => Self::Fg,
+            Self::Fg => Self::Sprites,
+            Self::Sprites => Self::Tx,
+            Self::Tx => Self::Bg,
+        }
+    }
+
+    /// This plane's decoder, over a region the caller supplies.
+    ///
+    /// Takes the region rather than reading it from a `Sf1Video` so that
+    /// [`Sf1Video::render`] can call it while `self.fb.pens` is mutably borrowed —
+    /// see the ⚠️ on `render`.
+    #[must_use]
+    pub const fn set(self, rom: &[u8]) -> GfxSet<'_> {
+        GfxSet {
+            rom,
+            layout: self.layout(),
+            colour_base: self.colour_base(),
+        }
+    }
+
+    /// `0..=3`, in [`Plane::ALL`]'s order, for indexing a four-element table.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Bg => 0,
+            Self::Fg => 1,
+            Self::Sprites => 2,
+            Self::Tx => 3,
+        }
     }
 }
 
@@ -139,6 +266,40 @@ impl Sf1Video {
     #[must_use]
     pub fn rgb(&self, pen: u16) -> [u8; 3] {
         self.colours.get(pen as usize).copied().unwrap_or([0, 0, 0])
+    }
+
+    /// This plane's graphics region, as the constructor was given it.
+    ///
+    /// Published for the graphics viewer: the four regions are private fields with
+    /// four different lengths, and a panel that browsed the wrong one would draw
+    /// tiles the renderer never fetches.
+    #[must_use]
+    pub fn region(&self, plane: Plane) -> &[u8] {
+        match plane {
+            Plane::Bg => &self.bg_gfx,
+            Plane::Fg => &self.fg_gfx,
+            Plane::Sprites => &self.obj_gfx,
+            Plane::Tx => &self.tx_gfx,
+        }
+    }
+
+    /// This plane's decoder — region, layout and colour base together.
+    ///
+    /// The one call a panel needs: it cannot assemble a correct [`GfxSet`] from
+    /// [`Sf1Video::region`] alone without repeating the layout and colour-base
+    /// choices, which is exactly the duplication [`Plane`] exists to prevent.
+    #[must_use]
+    pub fn gfx(&self, plane: Plane) -> GfxSet<'_> {
+        plane.set(self.region(plane))
+    }
+
+    /// The tilemap ROM.
+    ///
+    /// Published because SF1's background and foreground maps live in ROM rather
+    /// than in guest RAM, so a tilemap panel reads this and not `videoram`.
+    #[must_use]
+    pub fn tilerom(&self) -> &[u8] {
+        &self.tilerom
     }
 
     /// Render one frame — `screen_update`, `sf.cpp:453-467`.
@@ -652,5 +813,155 @@ mod tests {
     /// compositing tests read `fb.pens`, not colours, so any fill will do.
     fn flat_palette() -> Vec<u16> {
         vec![0u16; palette::ENTRIES]
+    }
+
+    #[test]
+    fn every_plane_names_the_colour_base_the_renderer_uses() {
+        assert_eq!(Plane::Bg.colour_base(), 0);
+        assert_eq!(Plane::Fg.colour_base(), 256);
+        assert_eq!(Plane::Sprites.colour_base(), 512);
+        assert_eq!(Plane::Tx.colour_base(), 768);
+    }
+
+    #[test]
+    fn only_the_text_plane_uses_the_char_layout() {
+        assert_eq!(Plane::Tx.layout().width, 8);
+        assert_eq!(Plane::Tx.layout().planes, 2);
+        for p in [Plane::Bg, Plane::Fg, Plane::Sprites] {
+            assert_eq!(p.layout().width, 16);
+            assert_eq!(p.layout().planes, 4);
+        }
+    }
+
+    #[test]
+    fn the_two_granularities_differ_and_the_text_plane_is_the_small_one() {
+        // Two planes need four pens, four planes need sixteen. A hardcoded 16 puts
+        // every text tile's colour four times too far up the palette.
+        let v = Sf1Video::new(
+            vec![0; 512],
+            vec![0; 512],
+            vec![0; 512],
+            vec![0; 128],
+            Vec::new(),
+        );
+        assert_eq!(v.gfx(Plane::Tx).granularity(), 4);
+        assert_eq!(v.gfx(Plane::Bg).granularity(), 16);
+    }
+
+    #[test]
+    fn every_plane_names_its_hardware_bit() {
+        assert_eq!(Plane::Bg.active_bit(), ACTIVE_BG);
+        assert_eq!(Plane::Fg.active_bit(), ACTIVE_FG);
+        assert_eq!(Plane::Sprites.active_bit(), ACTIVE_SPRITES);
+        assert_eq!(Plane::Tx.active_bit(), ACTIVE_TX);
+        assert_eq!(
+            [0x20u8, 0x40, 0x80, 0x08],
+            [
+                Plane::Bg.active_bit(),
+                Plane::Fg.active_bit(),
+                Plane::Sprites.active_bit(),
+                Plane::Tx.active_bit()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_planes_permission_reads_its_own_field_of_the_mask() {
+        let mut mask = LayerMask::all();
+        for p in Plane::ALL {
+            assert!(p.permitted(&mask), "{} starts permitted", p.name());
+        }
+        mask.fg = false;
+        assert!(!Plane::Fg.permitted(&mask));
+        assert!(Plane::Bg.permitted(&mask));
+        assert!(Plane::Sprites.permitted(&mask));
+        assert!(Plane::Tx.permitted(&mask));
+    }
+
+    #[test]
+    fn cycling_a_plane_visits_all_four_and_returns() {
+        let mut p = Plane::Bg;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(p.name());
+            p = p.cycled();
+        }
+        assert_eq!(seen, ["BG", "FG", "OB", "TX"]);
+        assert_eq!(p, Plane::Bg);
+    }
+
+    #[test]
+    fn the_index_agrees_with_all_so_a_lookup_table_can_use_it() {
+        for (i, p) in Plane::ALL.into_iter().enumerate() {
+            assert_eq!(p.index(), i, "{} is at {i}", p.name());
+        }
+    }
+
+    #[test]
+    fn each_planes_region_is_the_one_the_constructor_was_given() {
+        let v = Sf1Video::new(
+            vec![1; 16],
+            vec![2; 32],
+            vec![3; 64],
+            vec![4; 128],
+            vec![5; 256],
+        );
+        assert_eq!(v.region(Plane::Bg), &[1u8; 16][..]);
+        assert_eq!(v.region(Plane::Fg), &[2u8; 32][..]);
+        assert_eq!(v.region(Plane::Sprites), &[3u8; 64][..]);
+        assert_eq!(v.region(Plane::Tx), &[4u8; 128][..]);
+        assert_eq!(v.tilerom(), &[5u8; 256][..]);
+    }
+
+    #[test]
+    fn a_gfx_set_carries_the_planes_region_layout_and_colour_base() {
+        let v = Sf1Video::new(
+            vec![0; 512],
+            vec![0; 512],
+            vec![0; 512],
+            vec![0; 128],
+            Vec::new(),
+        );
+        let g = v.gfx(Plane::Tx);
+        assert_eq!(g.colour_base, 768);
+        assert_eq!(g.rom.len(), 128);
+        // `char_increment` is in bits: 128 bytes * 8 / 128 bits = 8 chars, frac 1/1.
+        assert_eq!(g.elements(), 8);
+        let g = v.gfx(Plane::Bg);
+        assert_eq!(g.colour_base, 0);
+        // 512 bytes * 8 / 512 bits = 8, halved by the sprite layout's frac 1/2.
+        assert_eq!(g.elements(), 4);
+    }
+
+    #[test]
+    fn the_element_count_is_exactly_the_last_code_that_decodes() {
+        // The tile browser's in-ROM test is `code < elements()`, with no bank
+        // mapper to complicate it. This is what makes that test correct.
+        let v = Sf1Video::new(
+            vec![0xFF; 1024],
+            Vec::new(),
+            Vec::new(),
+            vec![0xFF; 256],
+            Vec::new(),
+        );
+        for plane in [Plane::Bg, Plane::Tx] {
+            let g = v.gfx(plane);
+            let last = g.elements() - 1;
+            let (w, h) = (g.layout.width, g.layout.height);
+            for y in 0..h {
+                for x in 0..w {
+                    assert!(
+                        g.pen(last, x, y).is_some(),
+                        "{} code {last} ({x},{y})",
+                        plane.name()
+                    );
+                }
+            }
+            assert!(
+                g.pen(g.elements(), 0, 0).is_none(),
+                "{} one past the end",
+                plane.name()
+            );
+        }
     }
 }
