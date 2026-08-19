@@ -20,14 +20,15 @@
 //!
 //! # Nothing here writes to the machine
 //!
-//! `should_break` and `draw` take `&Cps1`. `update` takes `&Cps1` — it reads the PC
-//! to place a breakpoint and to reset the follow address, and that is all. Stepping
+//! Every method here takes a [`CpuView`] — a borrow of the 68000, its cycle count,
+//! the beam position and the board's trace. It is read, never written: the PC to place
+//! a breakpoint and to reset the follow address, and that is all. Stepping
 //! is the loop's to perform, because only the loop knows whether the machine is
 //! paused.
 
 use crate::keys::Actions;
 use crate::overlay::{self, executing_pc, Panels, DIS_ROWS, MEM_ROWS, MEM_WORDS};
-use machine::Cps1;
+use machine::CpuView;
 
 /// Which panel the scroll keys move.
 ///
@@ -118,9 +119,9 @@ impl Debugger {
 
     /// Applies one frame's debugger keys. Returns whether the overlay is on.
     ///
-    /// `m` is read, never written: the PC for `F7`'s breakpoint address and `Home`'s
+    /// `v` is read, never written: the PC for `F7`'s breakpoint address and `Home`'s
     /// memory address, and nothing else.
-    pub fn update(&mut self, a: &Actions, m: &Cps1) -> bool {
+    pub fn update(&mut self, a: &Actions, v: &CpuView<'_>) -> bool {
         if a.overlay_toggled {
             self.panels = if self.panels.any() {
                 Panels::none()
@@ -138,7 +139,7 @@ impl Debugger {
             }
         }
         if a.breakpoint_toggled {
-            let at = executing_pc(m);
+            let at = executing_pc(v);
             if let Some(i) = self.breakpoints.iter().position(|&b| b == at) {
                 self.breakpoints.remove(i);
             } else {
@@ -146,10 +147,10 @@ impl Debugger {
             }
         }
         if a.scroll_up {
-            self.scroll(m, false);
+            self.scroll(v, false);
         }
         if a.scroll_down {
-            self.scroll(m, true);
+            self.scroll(v, true);
         }
         if a.follow_reset {
             match self.focus {
@@ -157,7 +158,7 @@ impl Debugger {
                 // The stack pointer, from `a[7]` — never the `usp`/`ssp` shadows,
                 // which are stale inside an exception handler, which is where you are
                 // when you want to look at the stack.
-                Focus::Mem => self.mem_at = m.cpu.a[7],
+                Focus::Mem => self.mem_at = v.cpu.a[7],
             }
         }
         self.panels.any()
@@ -167,10 +168,10 @@ impl Debugger {
     ///
     /// The disassembly's first scroll has to materialise an address: while it is
     /// `None` it is following the PC, and the page it moves from is the one on screen.
-    fn scroll(&mut self, m: &Cps1, forward: bool) {
+    fn scroll(&mut self, v: &CpuView<'_>, forward: bool) {
         match self.focus {
             Focus::Disasm => {
-                let from = self.disasm_at.unwrap_or_else(|| executing_pc(m));
+                let from = self.disasm_at.unwrap_or_else(|| executing_pc(v));
                 self.disasm_at = Some(if forward {
                     from.wrapping_add(DIS_PAGE)
                 } else {
@@ -188,8 +189,8 @@ impl Debugger {
     }
 
     /// Where the listing starts: the follow address, or the executing instruction.
-    pub fn disasm_from(&self, m: &Cps1) -> u32 {
-        self.disasm_at.unwrap_or_else(|| executing_pc(m))
+    pub fn disasm_from(&self, v: &CpuView<'_>) -> u32 {
+        self.disasm_at.unwrap_or_else(|| executing_pc(v))
     }
 
     /// Whether the machine must stop before executing its next instruction.
@@ -198,8 +199,8 @@ impl Debugger {
     /// the instruction about to run, so `pc == addr` fires an instruction or two late,
     /// and for a multi-word instruction it fires at an address that is not an
     /// instruction boundary at all — a breakpoint that "works sometimes".
-    pub fn should_break(&self, m: &Cps1) -> bool {
-        self.stopped_at != Some(m.total_cycles) && self.breakpoints.contains(&executing_pc(m))
+    pub fn should_break(&self, v: &CpuView<'_>) -> bool {
+        self.stopped_at != Some(v.total_cycles) && self.breakpoints.contains(&executing_pc(v))
     }
 
     /// Records that the machine has stopped here, so resuming does not stop again.
@@ -208,20 +209,33 @@ impl Debugger {
     /// takes `&self` because it is also what a test and a status panel ask, and a
     /// predicate with a side effect would give a different answer the second time it
     /// was asked.
-    pub fn note_stopped(&mut self, m: &Cps1) {
-        self.stopped_at = Some(m.total_cycles);
+    pub fn note_stopped(&mut self, v: &CpuView<'_>) {
+        self.stopped_at = Some(v.total_cycles);
     }
 
     /// Draws the enabled panels, if any.
-    pub fn draw(&self, buf: &mut [u32], m: &Cps1) {
+    ///
+    /// ⚠️ `m` is the one board-typed parameter left in this file, and only to hand
+    /// through to the sound panel, which has not been forked per board yet. Task 18
+    /// replaces it. `peek` is how the memory and disassembly panels read memory, which
+    /// a [`CpuView`] deliberately does not carry.
+    pub fn draw(
+        &self,
+        buf: &mut [u32],
+        v: &CpuView<'_>,
+        peek: &dyn Fn(u32) -> Option<u16>,
+        m: &machine::Cps1,
+    ) {
         if !self.panels.any() {
             return;
         }
         overlay::draw(
             buf,
+            v,
+            peek,
             m,
             self.panels,
-            self.disasm_from(m),
+            self.disasm_from(v),
             self.mem_at,
             &self.breakpoints,
         );
@@ -234,6 +248,25 @@ mod tests {
     use crate::keys::{Controls, Key, KeySet};
     use machine::config::BoardConfig;
     use machine::timing::Timing;
+    use machine::Cps1;
+
+    /// A [`CpuView`] over a board without moving it.
+    ///
+    /// ⚠️ Duplicates [`machine::Machine::cpu_view`]'s five field assignments, and only
+    /// here: the tests below step a board and draw it in the same scope, and
+    /// `Machine::Cps1(Box::new(m))` would move it. `CpuView`'s fields are `pub` because
+    /// a panel reads them directly. It must not be copied into non-test code — two
+    /// producers of this view is two places for `vblank_pending` to disagree. A field
+    /// added to `CpuView` stops this compiling, which is the right failure.
+    fn view(m: &Cps1) -> CpuView<'_> {
+        CpuView {
+            cpu: &m.cpu,
+            trace: &m.board.trace,
+            total_cycles: m.total_cycles,
+            line: m.line,
+            vblank_pending: m.board.vblank_pending(),
+        }
+    }
 
     /// A machine stopped at a multi-word instruction at 0x1000.
     ///
@@ -282,12 +315,15 @@ mod tests {
         assert_eq!(m.cpu.pc, 0x1004, "the premise: the PC is four bytes ahead");
         let mut d = Debugger::new();
         d.breakpoints.push(0x1000);
-        assert!(d.should_break(&m), "the breakpoint is at the instruction");
+        assert!(
+            d.should_break(&view(&m)),
+            "the breakpoint is at the instruction"
+        );
 
         let mut wrong = Debugger::new();
         wrong.breakpoints.push(0x1004);
         assert!(
-            !wrong.should_break(&m),
+            !wrong.should_break(&view(&m)),
             "and not at the PC, which here is mid-instruction"
         );
 
@@ -298,7 +334,10 @@ mod tests {
             m.cpu.pc, 0x100A,
             "the premise: a three-word instruction ran"
         );
-        assert!(!d.should_break(&m), "the breakpoint is behind us now");
+        assert!(
+            !d.should_break(&view(&m)),
+            "the breakpoint is behind us now"
+        );
     }
 
     /// A breakpoint does not re-fire on the instruction it stopped at.
@@ -310,9 +349,12 @@ mod tests {
         let mut m = a_machine();
         let mut d = Debugger::new();
         d.breakpoints.push(0x1000);
-        assert!(d.should_break(&m), "the premise: it fires once");
-        d.note_stopped(&m);
-        assert!(!d.should_break(&m), "and not again at the same instruction");
+        assert!(d.should_break(&view(&m)), "the premise: it fires once");
+        d.note_stopped(&view(&m));
+        assert!(
+            !d.should_break(&view(&m)),
+            "and not again at the same instruction"
+        );
 
         // Run right round the loop and back to 0x1000: it must fire again, or a
         // breakpoint in a loop body works exactly once. This is the half that rejected
@@ -320,13 +362,20 @@ mod tests {
         for _ in 0..4 {
             m.step_instruction();
         }
-        assert_eq!(executing_pc(&m), 0x1000, "the premise: back at the top");
-        assert!(d.should_break(&m), "a second pass through must stop again");
+        assert_eq!(
+            executing_pc(&view(&m)),
+            0x1000,
+            "the premise: back at the top"
+        );
+        assert!(
+            d.should_break(&view(&m)),
+            "a second pass through must stop again"
+        );
 
         // And the suppression really is tied to this stop, not merely to time passing:
         // noting it again here silences it again.
-        d.note_stopped(&m);
-        assert!(!d.should_break(&m), "stopped here now");
+        d.note_stopped(&view(&m));
+        assert!(!d.should_break(&view(&m)), "stopped here now");
     }
 
     /// The suppression expires when the machine moves, and not before.
@@ -341,15 +390,15 @@ mod tests {
         // Every instruction in the loop is a breakpoint, so the address cannot be what
         // distinguishes the two answers below.
         d.breakpoints.extend([0x1000, 0x1006, 0x1008, 0x100A]);
-        d.note_stopped(&m);
-        assert!(!d.should_break(&m), "suppressed at this stop");
+        d.note_stopped(&view(&m));
+        assert!(!d.should_break(&view(&m)), "suppressed at this stop");
         let cycles = m.total_cycles;
         m.step_instruction();
         assert!(
             m.total_cycles > cycles,
             "the premise: an instruction costs cycles"
         );
-        assert!(d.should_break(&m), "and the next instruction stops");
+        assert!(d.should_break(&view(&m)), "and the next instruction stops");
     }
 
     /// `should_break` has no side effect.
@@ -362,9 +411,12 @@ mod tests {
         let m = a_machine();
         let mut d = Debugger::new();
         d.breakpoints.push(0x1000);
-        assert!(d.should_break(&m));
-        assert!(d.should_break(&m), "asking twice gives the same answer");
-        assert!(d.should_break(&m), "and a third time");
+        assert!(d.should_break(&view(&m)));
+        assert!(
+            d.should_break(&view(&m)),
+            "asking twice gives the same answer"
+        );
+        assert!(d.should_break(&view(&m)), "and a third time");
     }
 
     /// `F7` sets a breakpoint at the current instruction, then clears it.
@@ -372,13 +424,13 @@ mod tests {
     fn f7_sets_then_clears_a_breakpoint_at_the_current_instruction() {
         let m = a_machine();
         let mut d = Debugger::new();
-        d.update(&pressing(Key::F7), &m);
+        d.update(&pressing(Key::F7), &view(&m));
         assert_eq!(
             d.breakpoints,
             vec![0x1000],
             "set at the instruction, not the PC"
         );
-        d.update(&pressing(Key::F7), &m);
+        d.update(&pressing(Key::F7), &view(&m));
         assert!(d.breakpoints.is_empty(), "and pressed again, cleared");
     }
 
@@ -390,12 +442,12 @@ mod tests {
     fn two_breakpoints_at_different_addresses_both_stand() {
         let mut m = a_machine();
         let mut d = Debugger::new();
-        d.update(&pressing(Key::F7), &m);
+        d.update(&pressing(Key::F7), &view(&m));
         m.step_instruction();
-        d.update(&pressing(Key::F7), &m);
+        d.update(&pressing(Key::F7), &view(&m));
         assert_eq!(d.breakpoints, vec![0x1000, 0x1006], "both");
         // And clearing one leaves the other.
-        d.update(&pressing(Key::F7), &m);
+        d.update(&pressing(Key::F7), &view(&m));
         assert_eq!(d.breakpoints, vec![0x1000], "the first survives");
     }
 
@@ -406,24 +458,24 @@ mod tests {
         let mut d = Debugger::new();
         assert!(!d.panels.any(), "the overlay starts off");
 
-        assert!(d.update(&pressing(Key::F1), &m), "F1 turns it on");
+        assert!(d.update(&pressing(Key::F1), &view(&m)), "F1 turns it on");
         assert!(d.panels.regs && d.panels.disasm && d.panels.status);
-        assert!(!d.update(&pressing(Key::F1), &m), "and off again");
+        assert!(!d.update(&pressing(Key::F1), &view(&m)), "and off again");
         assert!(!d.panels.any());
 
-        d.update(&pressing(Key::F1), &m);
+        d.update(&pressing(Key::F1), &view(&m));
         assert_eq!(
             d.focus,
             Focus::Disasm,
             "the disassembly has the focus first"
         );
-        d.update(&pressing(Key::F6), &m);
+        d.update(&pressing(Key::F6), &view(&m));
         assert_eq!(d.focus, Focus::Mem, "F6 moves it to memory");
         assert!(
             d.panels.mem,
             "and shows the dump, or F6 appears to do nothing"
         );
-        d.update(&pressing(Key::F6), &m);
+        d.update(&pressing(Key::F6), &view(&m));
         assert_eq!(d.focus, Focus::Disasm, "and back: two states, not four");
     }
 
@@ -435,7 +487,7 @@ mod tests {
         d.mem_at = 0x00FF_0000;
 
         // Focus is the disassembly: PageDown moves it, and the dump does not move.
-        d.update(&pressing(Key::PageDown), &m);
+        d.update(&pressing(Key::PageDown), &view(&m));
         assert_eq!(
             d.disasm_at,
             Some(0x1000 + DIS_PAGE),
@@ -444,9 +496,9 @@ mod tests {
         assert_eq!(d.mem_at, 0x00FF_0000, "and the dump did not");
 
         // Focus the dump, and now the opposite.
-        d.update(&pressing(Key::F6), &m);
+        d.update(&pressing(Key::F6), &view(&m));
         let listing = d.disasm_at;
-        d.update(&pressing(Key::PageDown), &m);
+        d.update(&pressing(Key::PageDown), &view(&m));
         assert_eq!(d.mem_at, 0x00FF_0000 + MEM_PAGE, "the dump moved");
         assert_eq!(d.disasm_at, listing, "and the listing did not");
     }
@@ -465,8 +517,8 @@ mod tests {
             d.focus = focus;
             d.disasm_at = Some(0x2000);
             d.mem_at = 0x00FF_1000;
-            d.update(&pressing(key), &m);
-            d.update(&pressing(Key::PageDown), &m);
+            d.update(&pressing(key), &view(&m));
+            d.update(&pressing(Key::PageDown), &view(&m));
             assert_eq!(d.disasm_at, Some(0x2000), "the listing, focus {focus:?}");
             assert_eq!(d.mem_at, 0x00FF_1000, "the dump, focus {focus:?}");
         }
@@ -483,29 +535,33 @@ mod tests {
         let mut d = Debugger::new();
 
         // Scrolled to exactly the PC, but not following it.
-        d.disasm_at = Some(executing_pc(&m));
+        d.disasm_at = Some(executing_pc(&view(&m)));
         m.step_instruction();
         assert_eq!(
-            d.disasm_from(&m),
+            d.disasm_from(&view(&m)),
             0x1000,
             "a scrolled panel stays where it was put"
         );
         assert_ne!(
-            executing_pc(&m),
+            executing_pc(&view(&m)),
             0x1000,
             "the premise: the machine moved on"
         );
 
-        d.update(&pressing(Key::Home), &m);
+        d.update(&pressing(Key::Home), &view(&m));
         assert_eq!(d.disasm_at, None, "Home means follow, not `Some(pc)`");
         assert_eq!(
-            d.disasm_from(&m),
-            executing_pc(&m),
+            d.disasm_from(&view(&m)),
+            executing_pc(&view(&m)),
             "and following means it tracks"
         );
         // Which the `Some(pc)` version would fail on the very next step.
         m.step_instruction();
-        assert_eq!(d.disasm_from(&m), executing_pc(&m), "still following");
+        assert_eq!(
+            d.disasm_from(&view(&m)),
+            executing_pc(&view(&m)),
+            "still following"
+        );
     }
 
     /// `Home` sends the memory dump to the stack pointer.
@@ -522,7 +578,7 @@ mod tests {
         let mut d = Debugger::new();
         d.focus = Focus::Mem;
         d.mem_at = 0x1234;
-        d.update(&pressing(Key::Home), &m);
+        d.update(&pressing(Key::Home), &view(&m));
         assert_eq!(d.mem_at, 0x00FF_7FF0, "the active stack pointer, from a[7]");
     }
 
@@ -537,15 +593,15 @@ mod tests {
         let mut d = Debugger::new();
         d.focus = Focus::Mem;
         d.mem_at = 0xFFFF_FFF0;
-        d.update(&pressing(Key::PageDown), &m);
+        d.update(&pressing(Key::PageDown), &view(&m));
         assert_eq!(d.mem_at, 0xFFFF_FFF0u32.wrapping_add(MEM_PAGE));
         d.mem_at = 0;
-        d.update(&pressing(Key::PageUp), &m);
+        d.update(&pressing(Key::PageUp), &view(&m));
         assert_eq!(d.mem_at, 0u32.wrapping_sub(MEM_PAGE), "and back off zero");
 
         d.focus = Focus::Disasm;
         d.disasm_at = Some(0);
-        d.update(&pressing(Key::PageUp), &m);
+        d.update(&pressing(Key::PageUp), &view(&m));
         assert_eq!(
             d.disasm_at,
             Some(0u32.wrapping_sub(DIS_PAGE)),
@@ -565,10 +621,10 @@ mod tests {
         let mut c = Controls::new();
         let mut d = Debugger::new();
         let held = KeySet::from_keys(&[Key::F7]);
-        d.update(&c.update(held), &m);
+        d.update(&c.update(held), &view(&m));
         assert_eq!(d.breakpoints, vec![0x1000], "the press sets one");
         for _ in 0..8 {
-            d.update(&c.update(held), &m);
+            d.update(&c.update(held), &view(&m));
         }
         assert_eq!(
             d.breakpoints,
@@ -591,7 +647,10 @@ mod tests {
         d.breakpoints.push(0x1000);
         let before = format!("{d:?}");
         for _ in 0..10 {
-            assert!(d.update(&Actions::default(), &m), "the overlay stays on");
+            assert!(
+                d.update(&Actions::default(), &view(&m)),
+                "the overlay stays on"
+            );
         }
         assert_eq!(format!("{d:?}"), before, "and nothing else moved");
     }
@@ -607,18 +666,18 @@ mod tests {
         let mut d = Debugger::new();
 
         let mut buf = blank.clone();
-        d.draw(&mut buf, &m);
+        d.draw(&mut buf, &view(&m), &|a| m.peek_word(a), &m);
         assert_eq!(buf, blank, "off: not a pixel");
 
         d.panels = Panels::on();
         let mut buf = blank.clone();
-        d.draw(&mut buf, &m);
+        d.draw(&mut buf, &view(&m), &|a| m.peek_word(a), &m);
         assert_ne!(buf, blank, "on: something was drawn");
     }
 
     /// The listing is drawn from the follow address, and the breakpoints reach it.
     ///
-    /// `draw` passes four things to `overlay::draw` and passing the wrong one is
+    /// `draw` passes five things to `overlay::draw` and passing the wrong one is
     /// invisible in a test that only asks whether *anything* was drawn — a listing
     /// stuck at address 0 looks like a plausible debugger until you notice it never
     /// moves.
@@ -631,18 +690,36 @@ mod tests {
         d.breakpoints.push(0x1006);
 
         let mut mine = vec![0u32; machine::video::WIDTH * machine::video::HEIGHT];
-        d.draw(&mut mine, &m);
+        d.draw(&mut mine, &view(&m), &|a| m.peek_word(a), &m);
 
         // The same frame drawn by `overlay::draw` directly, with the arguments this
         // module is supposed to be passing.
         let mut expected = vec![0u32; machine::video::WIDTH * machine::video::HEIGHT];
-        overlay::draw(&mut expected, &m, Panels::on(), 0x1006, 0, &[0x1006]);
+        overlay::draw(
+            &mut expected,
+            &view(&m),
+            &|a| m.peek_word(a),
+            &m,
+            Panels::on(),
+            0x1006,
+            0,
+            &[0x1006],
+        );
         assert_eq!(mine, expected, "the same frame, so the arguments match");
 
         // And a *different* address gives a different frame, or the comparison above
         // would pass for a `draw` that ignored `disasm_at` entirely.
         let mut other = vec![0u32; machine::video::WIDTH * machine::video::HEIGHT];
-        overlay::draw(&mut other, &m, Panels::on(), 0x1000, 0, &[0x1006]);
+        overlay::draw(
+            &mut other,
+            &view(&m),
+            &|a| m.peek_word(a),
+            &m,
+            Panels::on(),
+            0x1000,
+            0,
+            &[0x1006],
+        );
         assert_ne!(mine, other, "the premise: the address changes the frame");
     }
 }

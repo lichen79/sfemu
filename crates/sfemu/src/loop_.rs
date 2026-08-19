@@ -31,6 +31,22 @@ use frontend::{pens_to_argb, FramePacer};
 use machine::Cps1;
 use std::path::PathBuf;
 
+/// A [`machine::CpuView`] over the board this loop is running.
+///
+/// ⚠️ Temporary, and Task 18 deletes it: once `run` takes a `&mut Machine`, the view
+/// comes from `machine::Machine::cpu_view` and this duplication goes away. It exists for
+/// one task so that the panel migration and the loop's board-generic conversion are two
+/// separately reviewable changes.
+fn view(m: &Cps1) -> machine::CpuView<'_> {
+    machine::CpuView {
+        cpu: &m.cpu,
+        trace: &m.board.trace,
+        total_cycles: m.total_cycles,
+        line: m.line,
+        vblank_pending: m.board.vblank_pending(),
+    }
+}
+
 /// A window, as far as the loop is concerned.
 ///
 /// Five methods, none of which decides anything. An implementation translates: keys
@@ -168,7 +184,7 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, audio: &mut dyn Audio, o: &LoopOp
         // Before the frames: a breakpoint set on this tick must be honoured by this
         // tick's frames, not by the next tick's. `dbg` reads the machine and never
         // writes it — see `frontend::debug`.
-        dbg.update(&a, m);
+        dbg.update(&a, &view(m));
 
         gfx.update(&a, m);
         // The mask is a view setting the loop applies, not something `frontend`
@@ -213,7 +229,7 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, audio: &mut dyn Audio, o: &LoopOp
             // The step moved the machine, so the breakpoint at the instruction just
             // *arrived* at must not fire on the next tick as if it were fresh — you
             // asked to be here.
-            dbg.note_stopped(m);
+            dbg.note_stopped(&view(m));
         }
 
         // The pause reaches the sink every tick it is in effect, not on its edge: the
@@ -256,7 +272,7 @@ pub fn run(m: &mut Cps1, d: &mut impl Display, audio: &mut dyn Audio, o: &LoopOp
         // `0x00RRGGBB`, while `m.video`'s are CPS-1 pens. Drawn into the pen buffer
         // they would be run through the palette and come out as whatever colours
         // those indices happen to name.
-        dbg.draw(&mut buf, m);
+        dbg.draw(&mut buf, &view(m), &|a| m.peek_word(a), m);
         // Over the debugger, not under it: both are opaque, and this one is the
         // whole screen while E2's are corners of it.
         gfx.draw(&mut buf, m);
@@ -299,8 +315,8 @@ fn run_frame_to_breakpoint(m: &mut Cps1, dbg: &mut Debugger) -> bool {
     // loop watching for the wrap would run a whole extra frame. The frame counter moves
     // exactly once per wrap.
     while m.board.trace.frames == start_frames {
-        if dbg.should_break(m) {
-            dbg.note_stopped(m);
+        if dbg.should_break(&view(m)) {
+            dbg.note_stopped(&view(m));
             return true;
         }
         m.step_instruction();
@@ -1142,7 +1158,7 @@ mod tests {
         assert_eq!(s.frames, 0, "the premise: no frame ran");
         assert_eq!(m.total_cycles, 20, "16 for the `move`, 4 for the `addq`");
         assert_eq!(
-            frontend::overlay::executing_pc(&m),
+            frontend::overlay::executing_pc(&view(&m)),
             0x1006,
             "and it is sitting at the third instruction"
         );
@@ -1163,7 +1179,7 @@ mod tests {
         let (o, _s, _p) = opts("bp-midframe");
         let mut m = machine_with_a_long_loop();
         assert_eq!(
-            frontend::overlay::executing_pc(&m),
+            frontend::overlay::executing_pc(&view(&m)),
             TARGET,
             "the premise: reset leaves the machine on the instruction F7 will mark"
         );
@@ -1179,7 +1195,7 @@ mod tests {
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
 
         assert_eq!(
-            frontend::overlay::executing_pc(&m),
+            frontend::overlay::executing_pc(&view(&m)),
             TARGET,
             "it stopped at the breakpoint"
         );
@@ -1290,7 +1306,7 @@ mod tests {
             "the resume must leave the instruction it was stepped onto"
         );
         assert_eq!(
-            frontend::overlay::executing_pc(&m),
+            frontend::overlay::executing_pc(&view(&m)),
             0x1002,
             "and stop at the breakpoint again on the way round, not run the frame out"
         );
@@ -1330,9 +1346,11 @@ mod tests {
         let mut expected = game.clone();
         frontend::overlay::draw(
             &mut expected,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             frontend::overlay::Panels::on(),
-            frontend::overlay::executing_pc(&m),
+            frontend::overlay::executing_pc(&view(&m)),
             0,
             &[],
         );

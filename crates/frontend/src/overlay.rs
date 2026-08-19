@@ -29,7 +29,9 @@
 
 use crate::font::{draw_text, fill_rect, ADVANCE, LINE};
 use machine::video::{HEIGHT, WIDTH};
-use machine::Cps1;
+// `Cps1` stays: `draw_sound` still takes one, because the sound panel is the one
+// panel that forks per board and Task 18 is where it forks.
+use machine::{Cps1, CpuView};
 
 /// Panel background: dark, and opaque rather than blended.
 ///
@@ -213,8 +215,11 @@ impl Panels {
 /// Defined once, here, because the disassembly marker and Task 5's breakpoints must
 /// agree about it. `wrapping_sub` because the arithmetic is the 68000's: a PC of 2
 /// after a reset vector pointing near zero is not a case to panic on.
-pub fn executing_pc(m: &Cps1) -> u32 {
-    m.cpu.pc.wrapping_sub(4)
+///
+/// Takes the view rather than a board: this is the arithmetic every CPU panel needs
+/// and no board is involved in it.
+pub fn executing_pc(v: &CpuView<'_>) -> u32 {
+    v.cpu.pc.wrapping_sub(4)
 }
 
 /// Draws the enabled panels into `buf`, over whatever the game rendered.
@@ -224,25 +229,50 @@ pub fn executing_pc(m: &Cps1) -> u32 {
 /// scrolling are decisions made in one place rather than remembered here. `bp` is the
 /// breakpoint list, marked in the listing.
 ///
+/// `peek` is how the memory and disassembly panels read the machine. A closure rather
+/// than a field on [`CpuView`], because a `&dyn Fn` in the view would make it neither
+/// `Copy` nor `Debug` and would hand a vtable to the twenty-odd functions that only
+/// want registers. See `draw_mem`'s own note (private) for why it must be the
+/// *side-effect-free* peek and not the CPU's read path.
+///
+/// ⚠️ `m: &Cps1` is still here for one reason: `draw_sound` has not been forked yet.
+/// Task 18 replaces that parameter and this note together. Every other panel below
+/// reads `v`.
+///
 /// # Panics
 ///
 /// If `buf` is not a `WIDTH × HEIGHT` frame, as [`draw_text`].
-pub fn draw(buf: &mut [u32], m: &Cps1, p: Panels, disasm_at: u32, mem_at: u32, bp: &[u32]) {
+// Eight parameters: the frame, the CPU view, the memory peek, the board (for the sound
+// panel, which is the one panel that forks per board and is not migrated here), the
+// panel flags, two scroll addresses and the breakpoint list. Every one is independent
+// — bundling them into a struct would move the same eight names one level down and
+// hand the caller a literal to fill in, which is not fewer decisions.
+#[allow(clippy::too_many_arguments)]
+pub fn draw(
+    buf: &mut [u32],
+    v: &CpuView<'_>,
+    peek: &dyn Fn(u32) -> Option<u16>,
+    m: &Cps1,
+    p: Panels,
+    disasm_at: u32,
+    mem_at: u32,
+    bp: &[u32],
+) {
     assert_eq!(buf.len(), WIDTH * HEIGHT, "not a frame");
     if p.regs {
-        draw_regs(buf, m);
+        draw_regs(buf, v);
     }
     if p.disasm {
-        draw_disasm(buf, m, disasm_at, bp);
+        draw_disasm(buf, v, peek, disasm_at, bp);
     }
     if p.mem {
-        draw_mem(buf, m, mem_at);
+        draw_mem(buf, peek, mem_at);
     }
     if p.sound {
         draw_sound(buf, m);
     }
     if p.status {
-        draw_status(buf, m);
+        draw_status(buf, v);
     }
 }
 
@@ -260,50 +290,56 @@ fn box_at(buf: &mut [u32], x: usize, y: usize, cols: usize, rows: usize) -> (usi
 }
 
 /// D0-D7 beside A0-A7, then PC, SR, and the cycle count.
-fn draw_regs(buf: &mut [u32], m: &Cps1) {
+fn draw_regs(buf: &mut [u32], v: &CpuView<'_>) {
     let (x, y) = box_at(buf, REGS_X, REGS_Y, REGS_COLS, REGS_ROWS);
     for i in 0..8 {
         // A7 comes from `a[7]`, never from `usp`/`ssp`: those are shadows written for
         // legibility and the active pointer is the one in `a[7]`. A panel reading the
         // shadow would show a plausible number that is wrong in exactly the situation
         // — inside an exception handler — where you are most likely reading it.
-        let line = format!("D{i} {:08X} A{i} {:08X}", m.cpu.d[i], m.cpu.a[i]);
+        let line = format!("D{i} {:08X} A{i} {:08X}", v.cpu.d[i], v.cpu.a[i]);
         draw_text(buf, x, y + i * LINE, &line, FG);
     }
     draw_text(
         buf,
         x,
         y + 8 * LINE,
-        &format!("PC {:08X} SR {:04X}", executing_pc(m), m.cpu.sr),
+        &format!("PC {:08X} SR {:04X}", executing_pc(v), v.cpu.sr),
         HI,
     );
     draw_text(
         buf,
         x,
         y + 9 * LINE,
-        &format!("CYC {:012}", m.total_cycles),
+        &format!("CYC {:012}", v.total_cycles),
         FG,
     );
     draw_text(
         buf,
         x,
         y + 10 * LINE,
-        &format!("FRM {:010}", m.board.trace.frames),
+        &format!("FRM {:010}", v.trace.frames),
         FG,
     );
 }
 
 /// The listing, marking the executing line and any breakpoint.
-fn draw_disasm(buf: &mut [u32], m: &Cps1, at: u32, bp: &[u32]) {
+fn draw_disasm(
+    buf: &mut [u32],
+    v: &CpuView<'_>,
+    peek: &dyn Fn(u32) -> Option<u16>,
+    at: u32,
+    bp: &[u32],
+) {
     let (x, y) = box_at(buf, DIS_X, DIS_Y, DIS_COLS, DIS_ROWS);
-    let pc = executing_pc(m);
+    let pc = executing_pc(v);
     let mut a = at;
     for row in 0..DIS_ROWS {
-        // `peek_word`, not the bus: a disassembly panel scrolled over $68 must not
+        // `peek`, not the bus: a disassembly panel scrolled over $68 must not
         // acknowledge the interrupt it is there to explain. An undecoded address
         // reads as all ones, which the disassembler renders `dc.w $FFFF` — the
         // honest answer for a listing pointed at nothing.
-        let insn = machine::m68k::disasm::disassemble(|w| m.peek_word(w).unwrap_or(0xFFFF), a);
+        let insn = machine::m68k::disasm::disassemble(|w| peek(w).unwrap_or(0xFFFF), a);
         let marker = if a == pc { '>' } else { ' ' };
         let brk = if bp.contains(&a) { '*' } else { ' ' };
         let fg = if a == pc { HI } else { FG };
@@ -325,7 +361,7 @@ fn draw_disasm(buf: &mut [u32], m: &Cps1, at: u32, bp: &[u32]) {
 }
 
 /// Four words per row, `--` for anything undecoded.
-fn draw_mem(buf: &mut [u32], m: &Cps1, at: u32) {
+fn draw_mem(buf: &mut [u32], peek: &dyn Fn(u32) -> Option<u16>, at: u32) {
     let (x, y) = box_at(buf, MEM_X, MEM_Y, MEM_COLS, MEM_ROWS);
     for row in 0..MEM_ROWS {
         let base = at.wrapping_add((row * MEM_WORDS * 2) as u32);
@@ -337,7 +373,7 @@ fn draw_mem(buf: &mut [u32], m: &Cps1, at: u32) {
             // would send you looking for a chip that is not there. $800020 genuinely
             // reads 0xFFFF and is decoded, which is what makes this distinction real
             // rather than theoretical.
-            match m.peek_word(a) {
+            match peek(a) {
                 Some(v) => line.push_str(&format!(" {v:04X}")),
                 None => line.push_str("   --"),
             }
@@ -573,9 +609,9 @@ fn draw_sound(buf: &mut [u32], m: &Cps1) {
 }
 
 /// Flags, the beam, and whether the CPU is running at all.
-fn draw_status(buf: &mut [u32], m: &Cps1) {
+fn draw_status(buf: &mut [u32], v: &CpuView<'_>) {
     let (x, y) = box_at(buf, STATUS_X, STATUS_Y, STATUS_COLS, 1);
-    let f = |bit: u16, c: char| if m.cpu.sr & bit != 0 { c } else { '-' };
+    let f = |bit: u16, c: char| if v.cpu.sr & bit != 0 { c } else { '-' };
     let flags: String = [
         f(0x0010, 'X'),
         f(0x0008, 'N'),
@@ -588,27 +624,26 @@ fn draw_status(buf: &mut [u32], m: &Cps1) {
     // `HALT` and `STOP` are different machines: a halted 68000 took a double bus
     // fault and will never run again, while a stopped one is waiting for an
     // interrupt and will. Showing one for the other sends you to the wrong question.
-    let run = if m.cpu.halted {
+    let run = if v.cpu.halted {
         "HALT"
-    } else if m.cpu.stopped {
+    } else if v.cpu.stopped {
         "STOP"
     } else {
         "RUN "
     };
-    let ipl = (m.cpu.sr >> 8) & 7;
-    let irq = if m.board.vblank_pending() {
-        "IRQ"
-    } else {
-        "   "
-    };
+    let ipl = (v.cpu.sr >> 8) & 7;
+    // A *field*, not a call: `Machine::cpu_view` filled it by asking the board. A
+    // mechanical `m.` → `v.` would leave `v.vblank_pending()` here, which does not
+    // compile — which is the right way for that to fail.
+    let irq = if v.vblank_pending { "IRQ" } else { "   " };
     draw_text(
         buf,
         x,
         y,
         &format!(
             "{run} {flags} IPL{ipl} {irq} LINE {:03} S{}",
-            m.line,
-            u8::from(m.cpu.sr & 0x2000 != 0)
+            v.line,
+            u8::from(v.cpu.sr & 0x2000 != 0)
         ),
         HI,
     );
@@ -645,6 +680,27 @@ mod tests {
             0x60, 0xFA, // bra.s back      (1 word)
         ]);
         rom
+    }
+
+    /// A [`CpuView`] over a board without moving it.
+    ///
+    /// ⚠️ This duplicates [`machine::Machine::cpu_view`]'s five field assignments, and
+    /// that is deliberate and bounded. The tests here need the board *as well as* the
+    /// view — `draw` still takes a `&Cps1` for the sound panel — and
+    /// `Machine::Cps1(Box::new(m))` moves the board out of reach. `CpuView`'s fields
+    /// are `pub` because a panel reads them directly, so a test can build one.
+    ///
+    /// It must not be copied into non-test code: two producers of this view is two
+    /// places for `vblank_pending` to disagree. If a field is added to `CpuView` this
+    /// helper stops compiling, which is the right failure.
+    fn view(m: &Cps1) -> CpuView<'_> {
+        CpuView {
+            cpu: &m.cpu,
+            trace: &m.board.trace,
+            total_cycles: m.total_cycles,
+            line: m.line,
+            vblank_pending: m.board.vblank_pending(),
+        }
     }
 
     fn a_machine() -> Cps1 {
@@ -725,6 +781,8 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 regs: true,
@@ -768,6 +826,8 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 regs: true,
@@ -788,11 +848,13 @@ mod tests {
     #[test]
     fn the_disassembly_panel_marks_the_executing_instruction() {
         let m = a_machine();
-        let at = executing_pc(&m);
+        let at = executing_pc(&view(&m));
         assert_eq!(at, m.cpu.pc - 4, "the premise of this whole panel");
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 disasm: true,
@@ -827,10 +889,12 @@ mod tests {
     #[test]
     fn only_the_executing_line_is_marked() {
         let m = a_machine();
-        let at = executing_pc(&m);
+        let at = executing_pc(&view(&m));
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 disasm: true,
@@ -874,6 +938,8 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 mem: true,
@@ -892,6 +958,8 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 mem: true,
@@ -923,6 +991,8 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 mem: true,
@@ -959,6 +1029,8 @@ mod tests {
         for at in [0x60, 0x40_0000] {
             draw(
                 &mut buf,
+                &view(&m),
+                &|a| m.peek_word(a),
                 &m,
                 Panels {
                     mem: true,
@@ -994,6 +1066,8 @@ mod tests {
         let mut after = before.clone();
         draw(
             &mut after,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 regs: true,
@@ -1103,7 +1177,16 @@ mod tests {
             },
         ] {
             let mut buf = blank.clone();
-            draw(&mut buf, &m, p, 0x1000, 0xFF_0000, &[]);
+            draw(
+                &mut buf,
+                &view(&m),
+                &|a| m.peek_word(a),
+                &m,
+                p,
+                0x1000,
+                0xFF_0000,
+                &[],
+            );
             let mut touched = 0usize;
             for i in 0..buf.len() {
                 if buf[i] != blank[i] {
@@ -1120,7 +1203,16 @@ mod tests {
         );
         // And all five together really is all five: the same pixel count.
         let mut buf = blank.clone();
-        draw(&mut buf, &m, all, 0x1000, 0xFF_0000, &[]);
+        draw(
+            &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
+            &m,
+            all,
+            0x1000,
+            0xFF_0000,
+            &[],
+        );
         let together = (0..buf.len()).filter(|&i| buf[i] != blank[i]).count();
         let separate = claimed.iter().filter(|&&n| n > 0).count();
         assert_eq!(together, separate, "all five drawn together cover all five");
@@ -1149,7 +1241,16 @@ mod tests {
         let m = a_machine();
         let before = vec![0x00AB_CDEF_u32; WIDTH * HEIGHT];
         let mut after = before.clone();
-        draw(&mut after, &m, Panels::none(), 0, 0, &[]);
+        draw(
+            &mut after,
+            &view(&m),
+            &|a| m.peek_word(a),
+            &m,
+            Panels::none(),
+            0,
+            0,
+            &[],
+        );
         assert_eq!(before, after);
         assert!(!Panels::none().any(), "and `any` agrees");
         assert!(Panels::on().any(), "while the default-on set does not");
@@ -1159,13 +1260,15 @@ mod tests {
     #[test]
     fn a_breakpoint_is_marked() {
         let m = a_machine();
-        let at = executing_pc(&m);
+        let at = executing_pc(&view(&m));
         // On the *second* line, not the current one: a marker only ever drawn on the
         // executing line would be indistinguishable from the `>` marker.
         let brk = at + 4;
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 disasm: true,
@@ -1201,18 +1304,18 @@ mod tests {
             ..Panels::none()
         };
         let mut buf = frame();
-        draw(&mut buf, &m, p, 0, 0, &[]);
+        draw(&mut buf, &view(&m), &|a| m.peek_word(a), &m, p, 0, 0, &[]);
         assert!(panel_contains(&buf, "RUN", HI), "a running CPU says so");
 
         m.cpu.stopped = true;
         let mut buf = frame();
-        draw(&mut buf, &m, p, 0, 0, &[]);
+        draw(&mut buf, &view(&m), &|a| m.peek_word(a), &m, p, 0, 0, &[]);
         assert!(panel_contains(&buf, "STOP", HI), "stopped");
         assert!(!panel_contains(&buf, "HALT", HI), "and not halted");
 
         m.cpu.halted = true;
         let mut buf = frame();
-        draw(&mut buf, &m, p, 0, 0, &[]);
+        draw(&mut buf, &view(&m), &|a| m.peek_word(a), &m, p, 0, 0, &[]);
         assert!(panel_contains(&buf, "HALT", HI), "a dead CPU is not paused");
     }
 
@@ -1225,6 +1328,8 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 status: true,
@@ -1246,6 +1351,8 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 status: true,
@@ -1283,6 +1390,8 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 sound: true,
@@ -1369,6 +1478,8 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 sound: true,
@@ -1448,6 +1559,8 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 sound: true,
@@ -1500,6 +1613,8 @@ mod tests {
         for _ in 0..8 {
             draw(
                 &mut buf,
+                &view(&m),
+                &|a| m.peek_word(a),
                 &m,
                 Panels {
                     sound: true,
@@ -1536,6 +1651,8 @@ mod tests {
             for _ in 0..4 {
                 draw(
                     &mut buf,
+                    &view(&m),
+                    &|a| m.peek_word(a),
                     &m,
                     Panels {
                         sound: true,
@@ -1565,6 +1682,8 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 sound: true,
@@ -1591,6 +1710,8 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 disasm: true,
@@ -1613,6 +1734,8 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
+            &view(&m),
+            &|a| m.peek_word(a),
             &m,
             Panels {
                 regs: true,
@@ -1626,5 +1749,113 @@ mod tests {
             &[0xFFFF_FFFE],
         );
         assert!(panel_contains(&buf, "FFFFFFF0", FG), "the dump wrapped");
+    }
+
+    /// The executing PC is computed from the view, and it is four bytes behind.
+    ///
+    /// The whole reason `executing_pc` exists: a 68000's `pc` after a prefetching
+    /// core's step points four bytes past the instruction that just ran, so a
+    /// breakpoint or a listing keyed on `pc` is one or two instructions late. Moving
+    /// to `CpuView` must not lose the subtraction.
+    #[test]
+    fn the_executing_pc_is_four_behind_the_views_pc() {
+        let mut m = machine::Machine::Cps1(Box::new(a_machine()));
+        m.step_instruction();
+        let v = m.cpu_view();
+        assert_eq!(
+            executing_pc(&v),
+            v.cpu.pc.wrapping_sub(4),
+            "the same arithmetic, now off the view"
+        );
+        assert_ne!(executing_pc(&v), v.cpu.pc, "and it is not just the PC");
+    }
+
+    /// The memory panel reads through the closure it was given, and nothing else.
+    ///
+    /// ⚠️ This is the test that would catch `peek` being wired to the wrong board
+    /// after Task 18 makes there be two. The closure counts its calls and answers a
+    /// constant, so the panel's output is a function of the closure alone — if a
+    /// future edit reached past it to a machine, the count would be wrong and the
+    /// digits would not be 0xBEEF.
+    #[test]
+    fn the_memory_panel_reads_only_through_the_closure() {
+        use core::cell::Cell;
+        // The board itself, not a `Machine`: `draw` still takes a `&Cps1` for the
+        // sound panel, and `Machine` deliberately has no accessor to reach inside one.
+        let m = a_machine();
+        let v = view(&m);
+        let calls = Cell::new(0usize);
+        let peek = |_addr: u32| -> Option<u16> {
+            calls.set(calls.get() + 1);
+            Some(0xBEEF)
+        };
+        let mut buf = frame();
+        draw(
+            &mut buf,
+            &v,
+            &peek,
+            &m,
+            Panels {
+                mem: true,
+                ..Panels::none()
+            },
+            0,
+            0x00FF_0000,
+            &[],
+        );
+        assert_eq!(
+            calls.get(),
+            MEM_ROWS * MEM_WORDS,
+            "one read per word shown, and no others"
+        );
+        // 0xBEEF's glyphs are on screen: the panel drew the closure's answer.
+        assert!(
+            panel_contains(&buf, "BEEF BEEF BEEF BEEF", FG),
+            "the panel drew the closure's answer and nothing else"
+        );
+    }
+
+    /// An undecoded word still prints as dashes, through the closure.
+    ///
+    /// `None` and `Some(0xFFFF)` are different facts and the panel prints them
+    /// differently. The migration must not flatten them — a closure returning `None`
+    /// has to reach the same `--` branch a board's `peek_word` did.
+    #[test]
+    fn a_none_from_the_closure_still_prints_dashes() {
+        let m = a_machine();
+        let v = view(&m);
+        let mut all_none = frame();
+        draw(
+            &mut all_none,
+            &v,
+            &|_| None,
+            &m,
+            Panels {
+                mem: true,
+                ..Panels::none()
+            },
+            0,
+            0,
+            &[],
+        );
+        let mut all_ffff = frame();
+        draw(
+            &mut all_ffff,
+            &v,
+            &|_| Some(0xFFFF),
+            &m,
+            Panels {
+                mem: true,
+                ..Panels::none()
+            },
+            0,
+            0,
+            &[],
+        );
+        assert_ne!(
+            all_none, all_ffff,
+            "`--` and `FFFF` are different pixels; the closure's None was not \
+             flattened to a value"
+        );
     }
 }
