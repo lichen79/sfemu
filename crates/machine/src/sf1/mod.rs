@@ -16,12 +16,14 @@ pub mod inputs;
 pub mod machine;
 pub mod mix;
 pub mod msm5205;
+pub mod snapshot;
 pub mod sound;
 
 pub use adpcm2::{Adpcm2Board, Adpcm2Trace};
 pub use machine::{Sf1, MSM_TICKS_PER_LINE};
 pub use mix::mix;
 pub use msm5205::Msm5205;
+pub use snapshot::{MsmState, Sf1State};
 pub use sound::{FmBoard, FmTrace};
 
 /// A video subsystem with no graphics, for this crate's tests.

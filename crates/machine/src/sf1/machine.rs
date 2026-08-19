@@ -68,7 +68,8 @@
 use crate::sf1::adpcm2::Adpcm2Board;
 use crate::sf1::board::Sf1Board;
 use crate::sf1::mix::mix;
-use crate::sf1::msm5205::MASTER_HZ;
+use crate::sf1::msm5205::{Msm5205, MASTER_HZ};
+use crate::sf1::snapshot::{MsmState, Sf1State};
 use crate::sf1::sound::FmBoard;
 use crate::timing::{
     sf1_adpcm_irq_per_line, sf1_line_rate, sf1_z80_t_per_line, RationalAccumulator, Timing,
@@ -686,6 +687,127 @@ impl Sf1 {
         for _ in 0..self.timing.lines_per_frame {
             self.run_scanline();
         }
+    }
+
+    /// Everything that decides the machine's future, copied out.
+    ///
+    /// Not the ROMs, the graphics regions, the decoded tiles, the framebuffer, the
+    /// layer mask, the traces, or the sample queue: see [`Sf1State`] for why each
+    /// is absent.
+    #[must_use]
+    pub fn snapshot(&self) -> Sf1State {
+        Sf1State {
+            cpu: self.cpu.clone(),
+            // `boxed_copy` and not `.clone()`: see its documentation.
+            ram: crate::snapshot::boxed_copy(&self.board.ram),
+            objectram: crate::snapshot::boxed_copy(&self.board.objectram),
+            videoram: crate::snapshot::boxed_copy(&self.board.videoram),
+            palette: crate::snapshot::boxed_copy(&self.board.palette),
+            active: self.board.active,
+            bgscroll: self.board.bgscroll,
+            fgscroll: self.board.fgscroll,
+            coin_ctrl: self.board.coin_ctrl,
+            vblank_pending: self.board.vblank_pending(),
+            // ⚠️ `sound_command`, not `take_sound_command`: a save must not
+            // consume the command it is saving. Task 19 added this door for it.
+            sound_command: self.board.sound_command(),
+            inputs: self.board.inputs,
+            total_cycles: self.total_cycles,
+            line: self.line,
+            carry: self.carry(),
+            line_remainder: self.line_cycles_remainder(),
+            fm_z80: self.fm_z80.clone(),
+            fm_ram: Box::new(*self.fm.ram()),
+            ym: self.fm.ym_ref().clone(),
+            ym_addr: self.fm.ym_addr(),
+            fm_latch: self.fm.latch(),
+            fm_total: self.z80_cycles(),
+            fm_debt: self.fm_debt(),
+            fm_remainder: self.fm_carry_remainder(),
+            adpcm_z80: self.adpcm_z80.clone(),
+            adpcm_bank: self.adpcm.bank(),
+            adpcm_latch: self.adpcm.latch(),
+            msm: core::array::from_fn(|i| {
+                let c = self.adpcm.msm(i);
+                MsmState {
+                    signal: c.signal(),
+                    step: c.step(),
+                    data: c.data(),
+                    vck: c.vck(),
+                    // ⚠️ The accessor is `in_reset`, not `reset` — `reset` is the
+                    // device reset and takes `&mut self`.
+                    reset: c.in_reset(),
+                    pending: c.pending(),
+                }
+            }),
+            adpcm_total: self.adpcm_z80_cycles(),
+            adpcm_debt: self.adpcm_debt(),
+            adpcm_remainder: self.adpcm_carry_remainder(),
+            adpcm_irq_remainder: self.adpcm_irq_remainder(),
+            sample_acc: self.sample_acc(),
+        }
+    }
+
+    /// Puts a snapshot back.
+    ///
+    /// The four boxed arrays are copied into the existing boxes rather than
+    /// replacing them, so a load does not allocate 42 KB per press of the load
+    /// key.
+    ///
+    /// Leaves the ROMs, the graphics regions, the decoded tiles, the layer mask,
+    /// the three traces and the sample queue alone. The traces especially: they
+    /// record the session rather than the machine, and rewinding them on every
+    /// load would make a divergence test compare a run's counters against a copy
+    /// of themselves.
+    pub fn restore(&mut self, s: &Sf1State) {
+        self.cpu = s.cpu.clone();
+        self.board.ram.copy_from_slice(&s.ram[..]);
+        self.board.objectram.copy_from_slice(&s.objectram[..]);
+        self.board.videoram.copy_from_slice(&s.videoram[..]);
+        self.board.palette.copy_from_slice(&s.palette[..]);
+        self.board.active = s.active;
+        self.board.bgscroll = s.bgscroll;
+        self.board.fgscroll = s.fgscroll;
+        self.board.coin_ctrl = s.coin_ctrl;
+        self.board.set_vblank_pending(s.vblank_pending);
+        self.board.set_sound_command(s.sound_command);
+        self.board.inputs = s.inputs;
+        self.fm_z80 = s.fm_z80.clone();
+        self.fm.restore(*s.fm_ram, s.ym_addr, s.fm_latch);
+        // The chip is rebuilt from the state's own YM2151, not from `Ym2151::new`.
+        // `FmBoard::restore` deliberately does not take it — the chip has its own
+        // codec — so this goes through the board's `&mut` door.
+        *self.fm.ym() = s.ym.clone();
+        self.adpcm_z80 = s.adpcm_z80.clone();
+        self.adpcm.restore(s.adpcm_bank, s.adpcm_latch);
+        for (i, m) in s.msm.iter().enumerate() {
+            // `Msm5205::restore` is an associated function returning a chip, and it
+            // clamps every field a file could corrupt — the step index especially,
+            // which panics in `oki`'s `diff` if out of range.
+            *self.adpcm.msm_mut(i) =
+                Msm5205::restore(m.signal, m.step, m.data, m.vck, m.reset, m.pending);
+        }
+        // Every schedule number in one call, remainders included. Twelve
+        // arguments in the order `restore_schedule` declares them — ⚠️ the FM
+        // triple comes before the ADPCM one, and each triple is
+        // (total, debt, remainder).
+        self.restore_schedule(
+            s.total_cycles,
+            s.line,
+            s.carry,
+            s.line_remainder,
+            s.fm_total,
+            s.fm_debt,
+            s.fm_remainder,
+            s.adpcm_total,
+            s.adpcm_debt,
+            s.adpcm_remainder,
+            s.adpcm_irq_remainder,
+            s.sample_acc,
+        );
+        // `samples` is deliberately untouched: it is output the host drains, not
+        // state, so a load must not retract audio already queued for playback.
+        // `video.enable` likewise — a debugger's subtraction, not machine state.
     }
 }
 

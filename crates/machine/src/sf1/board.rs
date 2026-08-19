@@ -42,13 +42,13 @@ pub const PALETTE_WORDS: usize = 0x400;
 const ROM_BYTES: usize = 0x5_0000;
 
 /// First byte of main RAM.
-const RAM_BASE: u32 = 0xFF_8000;
+pub(crate) const RAM_BASE: u32 = 0xFF_8000;
 /// First byte of objectram.
-const OBJECTRAM_BASE: u32 = 0xFF_E000;
+pub(crate) const OBJECTRAM_BASE: u32 = 0xFF_E000;
 /// First byte of videoram.
-const VIDEORAM_BASE: u32 = 0x80_0000;
+pub(crate) const VIDEORAM_BASE: u32 = 0x80_0000;
 /// First byte of palette RAM.
-const PALETTE_BASE: u32 = 0xB0_0000;
+pub(crate) const PALETTE_BASE: u32 = 0xB0_0000;
 
 /// What an unmapped read returns.
 ///
@@ -201,6 +201,28 @@ impl Sf1Board {
     /// 8-bit latch does. The trace counts both.
     pub fn take_sound_command(&mut self) -> Option<u8> {
         self.sound_latch.take()
+    }
+
+    /// The pending sound command without taking it, for a save state.
+    ///
+    /// ⚠️ **Not for the scheduler**, which must use
+    /// [`Sf1Board::take_sound_command`]: the take is what makes each command
+    /// raise exactly one NMI, and a scheduler reading through this door would
+    /// re-raise the same NMI on every line until the next write.
+    ///
+    /// This exists because [`crate::Sf1::snapshot`] takes `&self` and a save that
+    /// consumed the command would be a save that changed the machine.
+    #[must_use]
+    pub const fn sound_command(&self) -> Option<u8> {
+        self.sound_latch
+    }
+
+    /// Put a pending command back, for a save-state restore.
+    ///
+    /// Counts nothing, for [`Sf1Board::set_vblank_pending`]'s reason: the write
+    /// being restored was counted when the 68000 made it.
+    pub fn set_sound_command(&mut self, cmd: Option<u8>) {
+        self.sound_latch = cmd;
     }
 
     /// Fill the take-once slot as `soundcmd_w` does, for the scheduler's tests.
