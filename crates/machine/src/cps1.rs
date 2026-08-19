@@ -53,6 +53,12 @@ pub struct Cps1 {
     /// [`MachineState`] saved at a frame boundary carries the same value and means
     /// the same thing as before.
     carry: i64,
+    /// The 68000's per-line cycle grant, as a running fraction.
+    ///
+    /// CPS-1's ratio is 640/1, so this advances by exactly 640 every line and
+    /// its remainder is always zero — the field exists because SF1's is 3125/6
+    /// and both boards run this code. See [`Timing::line_cycles`].
+    line_cycles: RationalAccumulator,
     /// The video subsystem: the graphics ROM, the object latch, and the frame.
     pub video: Video,
     /// The sound Z80.
@@ -171,6 +177,7 @@ impl Cps1 {
         // The chip's rate follows the pin-7 state the board starts at, which MAME
         // constructs high — see `SoundBoard::new`.
         let (num, den) = oki_per_ym(sound.oki_pin7());
+        let (line_num, line_den) = timing.line_cycles;
         Self {
             cpu: M68k::new(),
             board: Board::new(prog, cfg),
@@ -178,6 +185,7 @@ impl Cps1 {
             total_cycles: 0,
             line: 0,
             carry: 0,
+            line_cycles: RationalAccumulator::new(line_num, line_den),
             video: Video::new(cfg.video, cfg.mapper, gfx),
             z80: z80::Z80::new(),
             sound,
@@ -242,6 +250,11 @@ impl Cps1 {
         self.total_cycles = 0;
         self.line = 0;
         self.carry = 0;
+        // The line grant's phase too, for the `z80_carry` reason below. CPS-1's
+        // remainder is always zero, so this is a no-op on this board and is
+        // written anyway: the same code runs SF1, whose 3125/6 does carry.
+        let (line_num, line_den) = self.timing.line_cycles;
+        self.line_cycles = RationalAccumulator::new(line_num, line_den);
         // The sound side too, accumulators included. A `z80_carry` surviving a reset
         // would make two runs from reset produce samples at different instants —
         // the same determinism argument `reset_restores_the_schedule_exactly` makes
@@ -297,7 +310,7 @@ impl Cps1 {
         // budget being spent so it happens once per line rather than once per
         // instruction.
         if self.carry <= 0 {
-            self.carry += i64::from(self.timing.cycles_per_line);
+            self.carry += i64::from(self.line_cycles.advance());
             // Vblank: IPL1 on the line the beam leaves the visible area
             // (`cps1.cpp:394-396`). CPS-1 wires the IPL pins individually —
             // `set_interrupt_mixer(false)`, `cps1.cpp:3913` — so IPL1 is level 2, not
@@ -568,6 +581,14 @@ impl Cps1 {
         self.total_cycles = s.total_cycles;
         self.line = s.line;
         self.carry = s.carry;
+        // The line grant is rebuilt at remainder zero, and no state field carries it.
+        // On this board that loses nothing: [`Timing::cps1_10mhz`]'s denominator is 1,
+        // so `advance` never carries and zero is the only remainder reachable — see
+        // `cps1_line_cycles_are_640_over_1`. A board whose ratio is fractional needs
+        // the remainder in its state, which is why `Sf1`'s state has a field for it
+        // and this one does not.
+        let (line_num, line_den) = self.timing.line_cycles;
+        self.line_cycles = RationalAccumulator::new(line_num, line_den);
         self.video.set_obj_latch(&s.obj);
         self.z80 = s.z80.clone();
         // The chip is rebuilt from the state's own voices, not from `Oki::new()`. Its
@@ -1125,7 +1146,7 @@ mod tests {
     fn a_different_timing_gives_a_different_frame() {
         let t = Timing {
             cpu_hz: 10_000_000,
-            cycles_per_line: 100,
+            line_cycles: (100, 1),
             lines_per_frame: 2,
             vblank_line: 1,
         };

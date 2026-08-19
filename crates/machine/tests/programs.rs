@@ -325,7 +325,7 @@ fn gfxram_word_writes_are_readable_as_big_endian_bytes() {
 fn a_masked_interrupt_stays_pending_across_scanlines_and_is_cleared_by_the_fetch() {
     let short_frame = Timing {
         cpu_hz: 10_000_000,
-        cycles_per_line: 640,
+        line_cycles: (640, 1),
         lines_per_frame: 20,
         vblank_line: 10,
     };

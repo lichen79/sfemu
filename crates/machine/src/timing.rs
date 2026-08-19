@@ -56,6 +56,67 @@ pub const Z80_T_NUM: u32 = 715_909;
 /// The denominator of [`Z80_T_NUM`]. 3,125 = 5^5.
 pub const Z80_T_DEN: u32 = 3_125;
 
+/// SF1's 68000 crystal — `sf.cpp:751`, `M68000(config, m_maincpu, XTAL(8'000'000))`.
+///
+/// Note this is the same 8 MHz as CPS-1's *pixel* clock ([`PIXEL_CLOCK`]) and
+/// serves a completely different purpose. SF1's 68000 is slower than CPS-1's
+/// 10 MHz one.
+pub const SF1_CPU_HZ: u32 = 8_000_000;
+
+/// SF1's raster height — `sf.cpp:768`, `set_size(64*8, 32*8)`.
+pub const SF1_VTOTAL: u32 = 256;
+
+/// The scanline SF1 asserts its vblank interrupt on: the first line past the
+/// visible area, from `set_visarea(8*8, (64-8)*8-1, 2*8, 30*8-1)`.
+pub const SF1_VBSTART: u32 = 240;
+
+/// SF1's nominal refresh — `sf.cpp:766`, `set_refresh_hz(60)`.
+///
+/// ⚠️ **Asserted, not derived.** `set_vblank_time(ATTOSECONDS_IN_USEC(0))` sets
+/// `m_oldstyle_vblank_supplied` (`screen.h:272`), so `screen.cpp:1001-1005`
+/// takes the vblank period as zero and the frame period as exactly this. A real
+/// board's refresh comes from its dot clock; nobody measured this one. Every
+/// fraction in [`Timing::sf1_8mhz`] follows from this number, so if it is wrong
+/// they are all wrong together — the board would run uniformly fast rather than
+/// drifting internally.
+pub const SF1_REFRESH_HZ: u32 = 60;
+
+/// The ADPCM Z80's periodic interrupt rate — `sf.cpp:761`,
+/// `set_periodic_int(FUNC(sf_state::irq0_line_hold), attotime::from_hz(8000))`.
+///
+/// ⚠️ MAME's own comment on that line is `// ?`. This is what paces ADPCM
+/// playback, and no test in this workspace can distinguish 8,000 from 8,192.
+pub const SF1_ADPCM_IRQ_HZ: u32 = 8_000;
+
+/// SF1's scanlines per second: the refresh times the line count.
+///
+/// Not the pixel clock over the raster width — that reading gives 61.035 Hz,
+/// which is not the rate MAME configures. See [`SF1_REFRESH_HZ`].
+#[must_use]
+pub const fn sf1_line_rate() -> u32 {
+    SF1_REFRESH_HZ * SF1_VTOTAL
+}
+
+/// SF1's Z80 T-states per scanline, as a reduced ratio.
+///
+/// ⚠️ **Not CPS-1's [`Z80_T_NUM`]/[`Z80_T_DEN`].** Both boards clock their Z80s
+/// at [`SOUND_XTAL`], so the numerators match after reduction and copying the
+/// wrong constant looks correct. The denominators differ because the line rates
+/// do: 3,072 here against CPS-1's 3,125, a 1.7% difference.
+#[must_use]
+pub const fn sf1_z80_t_per_line() -> (u32, u32) {
+    // 3_579_545 / 15_360, reduced by 5.
+    (715_909, 3_072)
+}
+
+/// The ADPCM Z80's interrupts per scanline, as a reduced ratio.
+///
+/// 8,000 / 15,360, reduced by 320. See [`SF1_ADPCM_IRQ_HZ`] for the `// ?`.
+#[must_use]
+pub const fn sf1_adpcm_irq_per_line() -> (u32, u32) {
+    (25, 48)
+}
+
 /// Input clocks per YM2151 sample. Exactly 64: the chip divides by 2 then by 32.
 ///
 /// This duplicates `ym2151::Ym2151::sample_clocks()`. The copy exists because this
@@ -192,8 +253,23 @@ impl RationalAccumulator {
 pub struct Timing {
     /// 68000 clock in Hz.
     pub cpu_hz: u32,
-    /// 68000 cycles the scheduler grants per scanline.
-    pub cycles_per_line: u32,
+    /// 68000 cycles per scanline, as a reduced `(numerator, denominator)`.
+    ///
+    /// # Why a ratio and not a count
+    ///
+    /// CPS-1 derives its refresh from the pixel clock, so 10 MHz over 15,625
+    /// lines per second is exactly 640 and the denominator is 1. SF1 asserts a
+    /// round 60 Hz refresh (`sf.cpp:766`), so 8 MHz over 15,360 lines per second
+    /// is 3125/6 — and rounding that to 520 or 521 is a 0.16% error, which is
+    /// the drift this module's header describes: audible over a match, never
+    /// broken enough to investigate.
+    ///
+    /// The **remainder is not here.** [`Timing`] is `Copy` configuration, and a
+    /// moving remainder inside it would let two copies of the same board's
+    /// timing disagree about the future. It lives in the machine, beside its
+    /// other fractional clocks — see [`RationalAccumulator::ratio`], which
+    /// makes the same distinction.
+    pub line_cycles: (u32, u32),
     /// Scanlines in a frame, counting blanking.
     pub lines_per_frame: u32,
     /// The scanline on which IPL1 is asserted. `cps1.cpp:394-396` —
@@ -205,28 +281,48 @@ pub struct Timing {
 impl Timing {
     /// The 10 MHz CPS-1 configuration — SF2's (`cps1.cpp:3909-3925`).
     ///
-    /// # Why the integer division is exact
+    /// # Why the division is exact
     ///
     /// 8 MHz / 512 = 15,625 lines per second with no remainder, and
-    /// 10 MHz / 15,625 = 640 cycles per line, also with no remainder. **Both
-    /// divisions are exact for this pair of clocks**, which removes accumulated
-    /// fractional error from the scheduler entirely. The 12 MHz variant gives 768,
-    /// exact as well. A board whose clocks did not divide evenly would need a
-    /// fractional accumulator here, and
-    /// `cps1_frame_geometry_is_384x224_at_59_63_hz` asserts the two remainders are
-    /// zero so that a future board needing one cannot be added without noticing.
+    /// 10 MHz / 15,625 = 640 cycles per line, also with no remainder — so
+    /// [`Timing::line_cycles`]'s denominator is 1 and the accumulator never
+    /// carries. The 12 MHz variant gives 768, exact as well.
+    ///
+    /// SF1 is the board this doc used to warn about: see [`Timing::sf1_8mhz`].
     pub const fn cps1_10mhz() -> Self {
         Self {
             cpu_hz: CPU_HZ_10M,
-            cycles_per_line: 640,
+            line_cycles: (640, 1),
             lines_per_frame: VTOTAL,
             vblank_line: VBSTART,
         }
     }
 
-    /// 68000 cycles in one frame.
+    /// The 8 MHz Street Fighter 1 configuration (`sf.cpp:751-771`).
+    ///
+    /// 8 MHz over [`sf1_line_rate`]'s 15,360 lines per second is **3125/6**,
+    /// which is not an integer. The number 512 is the raster *width*; using it
+    /// as a cycle count would silently assume a 61.035 Hz refresh.
+    pub const fn sf1_8mhz() -> Self {
+        Self {
+            cpu_hz: SF1_CPU_HZ,
+            // 8_000_000 / 15_360, reduced by 2_560.
+            line_cycles: (3125, 6),
+            lines_per_frame: SF1_VTOTAL,
+            vblank_line: SF1_VBSTART,
+        }
+    }
+
+    /// 68000 cycles in one frame, floored.
+    ///
+    /// Exact for a board whose denominator is 1 (CPS-1: 167,680). For SF1 the
+    /// true value is 400000/3 and this returns 133,333; the third of a cycle is
+    /// carried by the machine's accumulator, not lost — this function is a
+    /// reporting figure, and its one caller is an inequality.
+    #[must_use]
     pub const fn cycles_per_frame(&self) -> u32 {
-        self.cycles_per_line * self.lines_per_frame
+        let (num, den) = self.line_cycles;
+        num * self.lines_per_frame / den
     }
 }
 
@@ -268,6 +364,135 @@ mod tests {
         );
     }
 
+    /// SF1's line rate is the **frame** rate times the line count, not the
+    /// pixel clock divided by the raster width.
+    ///
+    /// MAME asserts 60 Hz (`sf.cpp:766`) and 256 lines (`set_size(64*8, 32*8)`),
+    /// so 60 × 256 = 15,360 lines per second. The dot-clock reading would give
+    /// 8,000,000 / (512 × 256) = 61.035 Hz, which is not what MAME configures.
+    #[test]
+    fn sf1_line_rate_is_the_refresh_times_the_line_count() {
+        assert_eq!(SF1_REFRESH_HZ, 60, "sf.cpp:766 set_refresh_hz(60)");
+        assert_eq!(SF1_VTOTAL, 256, "sf.cpp:768 set_size(64*8, 32*8)");
+        assert_eq!(sf1_line_rate(), 15_360, "and the literal");
+        assert_ne!(sf1_line_rate(), 15_625, "that is CPS-1's, at 262 lines");
+    }
+
+    /// 8 MHz over 15,360 lines/s is 3125/6, and it is not an integer.
+    ///
+    /// Three independent statements of the same number: the reduced pair as
+    /// literals, the unreduced division, and the sum over a whole frame. A
+    /// per-line assertion alone cannot catch a wrong reduction.
+    #[test]
+    fn sf1_line_cycles_are_3125_over_6() {
+        let t = Timing::sf1_8mhz();
+        assert_eq!(t.cpu_hz, 8_000_000, "sf.cpp:751 XTAL(8'000'000)");
+        assert_eq!(t.line_cycles, (3125, 6), "the reduced ratio, as literals");
+
+        let (num, den) = t.line_cycles;
+        assert_eq!(num * 15_360, 8_000_000 * den, "same fraction as 8MHz/15360");
+        assert_ne!(den, 1, "SF1 does not divide evenly; see cps1_10mhz's doc");
+
+        let mut acc = RationalAccumulator::new(num, den);
+        let total: u32 = (0..256).map(|_| acc.advance()).sum();
+        assert_eq!(total, 133_333, "floor(8_000_000 / 60)");
+        assert_eq!(acc.remainder(), 2, "2/6 = 1/3 of a cycle carried");
+    }
+
+    /// CPS-1 keeps its exact 640, now expressed as a ratio with denominator 1.
+    #[test]
+    fn cps1_line_cycles_are_640_over_1() {
+        let t = Timing::cps1_10mhz();
+        assert_eq!(t.line_cycles, (640, 1), "exact, so the denominator is 1");
+        let mut acc = RationalAccumulator::new(640, 1);
+        assert_eq!(acc.advance(), 640);
+        assert_eq!(acc.remainder(), 0, "and never carries");
+    }
+
+    /// SF1's geometry: 384×224 visible at (64,16), 512×256 raster, vblank at 240.
+    ///
+    /// The visible window is identical to CPS-1's; the raster is six lines
+    /// shorter (256 against 262).
+    #[test]
+    fn sf1_frame_geometry_is_384x224_at_60_hz() {
+        let t = Timing::sf1_8mhz();
+        assert_eq!(t.lines_per_frame, 256);
+        assert_eq!(
+            t.vblank_line, 240,
+            "VBSTART, sf.cpp:769 set_visarea 2*8..30*8-1"
+        );
+        assert_eq!(SF1_VBSTART, 240);
+        // The visible window, from set_visarea(8*8, (64-8)*8-1, 2*8, 30*8-1):
+        assert_eq!(
+            (8 * 8, (64 - 8) * 8 - 1, 2 * 8, 30 * 8 - 1),
+            (64, 447, 16, 239)
+        );
+        assert_eq!(447 - 64 + 1, 384, "visible width");
+        assert_eq!(239 - 16 + 1, 224, "visible height");
+        // draw_common's extents, which the screen-flip pivots depend on:
+        assert_eq!(447 + 64 + 1, 512, "xextent = the raster width exactly");
+        assert_eq!(239 + 16 + 1, 256, "yextent = the raster height exactly");
+    }
+
+    /// `cycles_per_frame` floors, and both boards' values are literals.
+    #[test]
+    fn cycles_per_frame_handles_both_denominators() {
+        assert_eq!(
+            Timing::cps1_10mhz().cycles_per_frame(),
+            167_680,
+            "640 × 262"
+        );
+        assert_eq!(
+            Timing::sf1_8mhz().cycles_per_frame(),
+            133_333,
+            "floor(3125 × 256 / 6) = floor(400000/3)"
+        );
+    }
+
+    /// SF1's Z80 fraction shares CPS-1's numerator and **not** its denominator.
+    ///
+    /// Both boards clock their Z80s at 3.579545 MHz, so copying CPS-1's
+    /// `715_909 / 3_125` looks right and is 1.7% wrong. SF1's line rate is
+    /// 15,360, giving 715_909 / 3_072.
+    #[test]
+    fn sf1_z80_t_states_per_line_is_not_cps1s() {
+        assert_eq!(sf1_z80_t_per_line(), (715_909, 3_072));
+        assert_eq!(
+            (Z80_T_NUM, Z80_T_DEN),
+            (715_909, 3_125),
+            "CPS-1's, for contrast"
+        );
+
+        let (num, den) = sf1_z80_t_per_line();
+        // `u64`: 715_909 × 15_360 is 10,996,362,240, which does not fit a `u32` —
+        // and `rustc` panics rather than wrapping, which is how this was caught.
+        // Same reason as the milli-hertz assertion in
+        // `cps1_frame_geometry_is_384x224_at_59_63_hz`.
+        assert_eq!(
+            u64::from(num) * 15_360,
+            u64::from(SOUND_XTAL) * u64::from(den),
+            "same fraction as 3579545/15360"
+        );
+        let mut acc = RationalAccumulator::new(num, den);
+        let total: u32 = (0..256).map(|_| acc.advance()).sum();
+        assert_eq!(total, 59_659, "floor(3_579_545 / 60)");
+    }
+
+    /// The ADPCM Z80's 8 kHz periodic IRQ, as interrupts per scanline.
+    ///
+    /// `sf.cpp:761` — `set_periodic_int(irq0_line_hold, from_hz(8000)); // ?`.
+    /// MAME's own comment records that the rate is a guess; ours does too.
+    #[test]
+    fn sf1_adpcm_irq_is_25_over_48_per_line() {
+        assert_eq!(SF1_ADPCM_IRQ_HZ, 8_000);
+        assert_eq!(sf1_adpcm_irq_per_line(), (25, 48));
+        let (num, den) = sf1_adpcm_irq_per_line();
+        assert_eq!(num * 15_360, SF1_ADPCM_IRQ_HZ * den);
+        let mut acc = RationalAccumulator::new(num, den);
+        let total: u32 = (0..256).map(|_| acc.advance()).sum();
+        assert_eq!(total, 133, "floor(8000 / 60)");
+    }
+
     /// `cps1_10mhz()`'s hard-coded 640 is checked against the derivation rather
     /// than merely asserted to equal itself.
     ///
@@ -277,8 +502,11 @@ mod tests {
     fn the_default_timing_matches_the_derivation() {
         let t = Timing::cps1_10mhz();
         assert_eq!(t.cpu_hz, 10_000_000);
-        assert_eq!(t.cycles_per_line, CPU_HZ_10M / (PIXEL_CLOCK / HTOTAL));
-        assert_eq!(t.cycles_per_line, 640, "and the literal, both ways");
+        assert_eq!(
+            t.line_cycles.0 / t.line_cycles.1,
+            CPU_HZ_10M / (PIXEL_CLOCK / HTOTAL)
+        );
+        assert_eq!(t.line_cycles, (640, 1), "and the literal, both ways");
         assert_eq!(t.lines_per_frame, 262);
         assert_eq!(t.cycles_per_frame(), 167_680);
         assert_eq!(t.vblank_line, 240);
@@ -293,7 +521,7 @@ mod tests {
     fn cycles_per_frame_is_the_product_and_not_a_constant() {
         let t = Timing {
             cpu_hz: 12_000_000,
-            cycles_per_line: 768,
+            line_cycles: (768, 1),
             lines_per_frame: 262,
             vblank_line: 240,
         };
@@ -306,12 +534,12 @@ mod tests {
         assert_eq!(12_000_000 % (PIXEL_CLOCK / HTOTAL), 0);
 
         // Both real CPS-1 variants have 262 lines, so the two cases above are also
-        // satisfied by `cycles_per_line * 262` — verified: that mutant survived
+        // satisfied by `line_cycles.0 * 262` — verified: that mutant survived
         // until this third case existed. A `lines_per_frame` no board uses is what
         // makes the second operand load-bearing.
         let odd = Timing {
             cpu_hz: 10_000_000,
-            cycles_per_line: 640,
+            line_cycles: (640, 1),
             lines_per_frame: 100,
             vblank_line: 90,
         };
@@ -343,7 +571,7 @@ mod tests {
         assert_eq!(38 * 640, 24_320);
         let t = Timing::cps1_10mhz();
         assert_eq!(
-            t.cycles_per_frame() - 224 * t.cycles_per_line,
+            t.cycles_per_frame() - 224 * t.line_cycles.0 / t.line_cycles.1,
             24_320,
             "the frame minus the visible lines"
         );
