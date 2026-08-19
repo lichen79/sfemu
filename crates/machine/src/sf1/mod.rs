@@ -10,12 +10,14 @@
 //! (`sf.cpp:1421`), the one set with neither an i8751 protection MCU nor
 //! pneumatic buttons.
 
+pub mod adpcm2;
 pub mod board;
 pub mod inputs;
 pub mod mix;
 pub mod msm5205;
 pub mod sound;
 
+pub use adpcm2::{Adpcm2Board, Adpcm2Trace};
 pub use mix::mix;
 pub use msm5205::Msm5205;
 pub use sound::{FmBoard, FmTrace};
