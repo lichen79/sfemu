@@ -417,7 +417,15 @@ fn draw_sf1(buf: &mut [u32], m: &Sf1) {
             }
         })
         .collect();
-    line(buf, &mut row, &format!("KEYON {keys}"), HI);
+    // `UND` rides along on the key-on row, which at 14 columns is the panel's widest
+    // slack; its partner `DRP` is on row 14. See the ⚠️ above row 12 for why the pair is
+    // split across two rows rather than sharing one.
+    line(
+        buf,
+        &mut row,
+        &format!("KEYON {keys} UND {:010}", m.audio_underruns()),
+        HI,
+    );
 
     // ---- A rule, then the second CPU. ----
     //
@@ -548,10 +556,13 @@ fn draw_sf1(buf: &mut [u32], m: &Sf1) {
     // assumed a scratchpad shows a climbing number here and nothing else wrong. `OVR`
     // is a bank entry past the region. `UNM` is an unmapped port.
     //
-    // ⚠️ **No `DRP`/`UND` here, unlike CPS-1.** Those two are the *host's* ring
-    // statistics; they arrive through `SoundBoard::set_audio_stats` and `Sf1` has no
-    // equivalent door. Printing two hardcoded zeroes would read as "the host is fine" on
-    // a board that has never been asked. Task 21 adds the door with the loop.
+    // ⚠️ **`DRP`/`UND` are not on this row, unlike CPS-1's, and they are not on the same
+    // row as each other.** Those two are the *host's* ring statistics, arriving through
+    // `Sf1::set_audio_stats`. They are split because this row is already 44 of the box's
+    // 45 columns: a fourth field does not fit, an eighteenth panel row would land at 218
+    // against a status line at 214, and a 46-column box is 388 pixels of a 384-pixel
+    // window. So `UND` goes on row 4 (`KEYON`, 14 columns → 29) and `DRP` on row 14
+    // (`FET`/`YM`, 28 columns → 43).
     line(
         buf,
         &mut row,
@@ -576,7 +587,12 @@ fn draw_sf1(buf: &mut [u32], m: &Sf1) {
     line(
         buf,
         &mut row,
-        &format!("FET {:010} YM {:010}", ft.audiocpu_fetches, ft.ym_writes),
+        &format!(
+            "FET {:010} YM {:010} DRP {:010}",
+            ft.audiocpu_fetches,
+            ft.ym_writes,
+            m.audio_drops()
+        ),
         FG,
     );
 
@@ -1234,5 +1250,72 @@ mod tests {
         let mut buf = vec![0u32; WIDTH * HEIGHT];
         draw(&mut buf, &m);
         assert!(buf.iter().any(|&p| p != 0), "it drew");
+    }
+
+    /// The SF1 panel prints the host ring's counters, and prints the machine's.
+    ///
+    /// # Why the glyphs and not a call count
+    ///
+    /// The failure this catches is two hardcoded zeroes — the thing Task 18's ⚠️ in
+    /// `draw_sf1` forbade until the door existed. A test that asserted `draw_sf1` reads
+    /// `m.audio_drops()` would pass on a panel that read it and printed a literal. So
+    /// the numbers go in through `set_audio_stats` and come back out of the pixels.
+    ///
+    /// # Why the two are on different rows
+    ///
+    /// Not tidy; it is what the box allows. Row 12 (`DSC`/`OVR`/`UNM`) is 44 of 45
+    /// columns, `SND_ROWS` is 17 and an eighteenth row would be 218 against a status
+    /// line at 214, and a 46-column box is 388 pixels of a 384-pixel window. Row 14
+    /// (`FET`/`YM`) is 28 columns, so one `DRP {:010}` fits at 43 and two do not at 57;
+    /// row 4 (`KEYON 01234567`) is the panel's widest slack at 14, taking `UND` to 29.
+    ///
+    /// ⚠️ 1,234 and 56, not one number twice: swapped arguments would render
+    /// identically if both fields carried the same value.
+    #[test]
+    fn the_sf1_panel_shows_the_host_rings_counters() {
+        let mut m = an_sf1_machine();
+        as_sf1(&mut m).set_audio_stats(1_234, 56);
+        let mut buf = vec![0u32; WIDTH * HEIGHT];
+        draw(&mut buf, &m);
+        assert!(
+            panel_contains(&buf, "DRP 0000001234", FG),
+            "the fetch row must carry the drop count"
+        );
+        assert!(
+            panel_contains(&buf, "UND 0000000056", HI),
+            "and the key-on row the underrun count"
+        );
+        // Neither number is anywhere else, so a panel that printed the pair twice — or
+        // printed `drops` into both fields — fails.
+        assert!(!panel_contains(&buf, "UND 0000001234", HI));
+        assert!(!panel_contains(&buf, "DRP 0000000056", FG));
+    }
+
+    /// And only those two rows respond to the host's counters.
+    ///
+    /// The pixel-difference half: a segment added to the wrong row would satisfy the
+    /// text assertions above — `panel_contains` scans the whole frame — while pushing
+    /// some other row's numbers sideways.
+    #[test]
+    fn only_two_sf1_rows_move_when_the_host_rings_counters_change() {
+        let mut m = an_sf1_machine();
+        let mut a = vec![0u32; WIDTH * HEIGHT];
+        let mut b = vec![0u32; WIDTH * HEIGHT];
+        as_sf1(&mut m).set_audio_stats(0, 0);
+        draw(&mut a, &m);
+        as_sf1(&mut m).set_audio_stats(1_234, 56);
+        draw(&mut b, &m);
+        assert_ne!(
+            a, b,
+            "the panel does not read the host ring's counters at all — two hardcoded \
+             zeroes render identically whatever the machine says"
+        );
+        let moved: Vec<usize> = (0..SND_ROWS)
+            .filter(|&r| {
+                let y0 = SND_Y + PAD + r * LINE;
+                (y0..y0 + LINE).any(|y| (0..WIDTH).any(|x| a[y * WIDTH + x] != b[y * WIDTH + x]))
+            })
+            .collect();
+        assert_eq!(moved, vec![4, 14], "row 4 carries UND and row 14 DRP");
     }
 }
