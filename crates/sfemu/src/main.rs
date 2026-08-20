@@ -57,8 +57,12 @@ fn main() -> ExitCode {
 fn usage() -> String {
     // The legal note is in the usage text and not only in the README because this
     // is where someone who does not have a ROM set arrives.
-    "usage: sfemu <path-to-sf2.zip-or-directory> [frames] [--ppm <path>]\n\
-     \x20      sfemu <path-to-sf2.zip-or-directory> --play [--state <path>]\n\
+    "usage: sfemu <path-to-rom-set> [frames] [--game <name>] [--ppm <path>]\n\
+     \x20      sfemu <path-to-rom-set> --play [--game <name>] [--state <path>]\n\
+     \n\
+     <name> is `sf2` (Street Fighter II on CPS-1, the default) or `sf1`\n\
+     (Street Fighter, on its own 1987 board). The board is not guessed from\n\
+     the path: a set of files does not say what hardware it came from.\n\
      \n\
      Without `--play`, runs a fixed number of frames and reports what the\n\
      board saw. With `--play`, opens a window: arrow keys and ASDZXC for\n\
@@ -92,6 +96,12 @@ struct Args {
     /// Defaults to the ROM set's own path with its extension replaced by `.sfs`, so
     /// a state lands next to the game it belongs to and two games do not share one.
     state: PathBuf,
+    /// Which game, and so which board. `sf2` or `sf1`; see [`board_for`].
+    ///
+    /// A `String` and not a [`machine::BoardKind`], because it is also the name
+    /// [`romset::games::by_name`] resolves — one name picking both the board and the
+    /// files it expects is what keeps them from being chosen apart.
+    game: String,
 }
 
 /// The save-state path implied by a ROM set's path.
@@ -105,6 +115,20 @@ fn default_state_path(rom: &str) -> PathBuf {
     p
 }
 
+/// The board a game name names.
+///
+/// Separate from [`romset::games::by_name`] and checked against it by a test: the
+/// name selects both the ROM spec and the hardware, and a crossed pair — SF2's files
+/// on SF1's bus — is a machine whose every symptom is downstream of a choice made
+/// here.
+fn board_for(game: &str) -> Option<machine::BoardKind> {
+    match game {
+        "sf2" => Some(machine::BoardKind::Cps1),
+        "sf1" => Some(machine::BoardKind::Sf1),
+        _ => None,
+    }
+}
+
 /// Parses the command line.
 ///
 /// Split out of [`run`] so it can be tested without a ROM set: everything after
@@ -115,6 +139,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, Fault> {
     let mut ppm = None;
     let mut play = false;
     let mut state = None;
+    let mut game = None;
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
         if a == "--play" {
@@ -125,6 +150,13 @@ fn parse_args(args: Vec<String>) -> Result<Args, Fault> {
                 .ok_or_else(|| Fault::Failed("`--state` needs a path".to_string()))?;
             if state.replace(p).is_some() {
                 return Err(Fault::Failed("`--state` given twice".to_string()));
+            }
+        } else if a == "--game" {
+            let g = args
+                .next()
+                .ok_or_else(|| Fault::Failed("`--game` needs a name".to_string()))?;
+            if game.replace(g).is_some() {
+                return Err(Fault::Failed("`--game` given twice".to_string()));
             }
         } else if a == "--ppm" {
             // An absent value is an error rather than a silent no-op: a run asked
@@ -164,54 +196,60 @@ fn parse_args(args: Vec<String>) -> Result<Args, Fault> {
         ));
     }
     let state = state.map_or_else(|| default_state_path(&path), PathBuf::from);
+    // `sf2` and not "whatever the path looks like": the board is a stated choice.
+    // See [`usage`], and the spec's "the selection is explicit, not inferred from a
+    // filename".
+    let game = game.unwrap_or_else(|| "sf2".to_string());
+    // Rejected here rather than at load time. `romset::load` would never be reached
+    // with an unknown name — there is no spec to hand it — and a user who typed a
+    // name this program does not know needs the names it does.
+    if board_for(&game).is_none() {
+        return Err(Fault::Failed(format!(
+            "`{game}` is not a game this program knows: try `sf1` or `sf2`"
+        )));
+    }
     Ok(Args {
         path,
         frames,
         ppm,
         play,
         state,
+        game,
     })
 }
 
-/// Loads the set, runs `frames` frames, and returns the report.
-fn run(args: Vec<String>) -> Result<String, Fault> {
-    let args = parse_args(args)?;
-
-    let set = romset::load(&romset::games::SF2, std::path::Path::new(&args.path))
-        .map_err(|e| Fault::Failed(e.to_string()))?;
+/// SF2 on CPS-1, from a loaded set.
+///
+/// The four region lookups are `expect`-free and `ok_or_else`-loud for the reason
+/// each message states: every one of these regions is in `games::SF2`, so a `None`
+/// is a bug in `romset::games` rather than anything about the user's files, and
+/// defaulting to an empty region turns each into a different silent wrong answer.
+fn build_cps1(set: &romset::RomSet) -> Result<machine::Cps1, Fault> {
     let prog = set.region("maincpu").ok_or_else(|| {
         Fault::Failed("internal: the sf2 spec has no `maincpu` region".to_string())
     })?;
-    // Required, not optional: the spec always has this region, so `None` here would
-    // be a bug in `romset::games` rather than something about the user's files — and
-    // defaulting to an empty region would turn it into a blank frame with no
-    // explanation, which is the one outcome the framebuffer line must never be
-    // ambiguous about.
     let gfx = set
         .region("gfx")
         .ok_or_else(|| Fault::Failed("internal: the sf2 spec has no `gfx` region".to_string()))?
         .to_vec();
-    // The sound region, on the same terms and for a sharper reason: an absent one is
-    // not silence, it is 0xFF on every fetch, which is `RST 38h` — a Z80 spinning in a
-    // deterministic loop that racks up a *larger* fetch count than a real driver. The
-    // debugger's sound panel would show that loop, and it would look like a working
-    // panel on a broken driver rather than a machine built without a sound ROM.
+    // An absent sound region is not silence, it is 0xFF on every fetch, which is
+    // `RST 38h` — a Z80 spinning in a deterministic loop that racks up a *larger*
+    // fetch count than a real driver. The debugger's sound panel would show that loop
+    // and look like a working panel on a broken driver.
     let audiocpu = set
         .region("audiocpu")
         .ok_or_else(|| {
             Fault::Failed("internal: the sf2 spec has no `audiocpu` region".to_string())
         })?
         .to_vec();
-
-    // The ADPCM samples, on the same terms again. An absent one is silence rather
-    // than noise — every phrase header would read as `start == stop == 0`, which the
-    // chip refuses — but it is silence with no explanation, and "no sound effects,
-    // music fine" is the hardest symptom here to attribute to a missing region.
+    // The ADPCM samples, on the same terms again. An absent one *is* silence — every
+    // phrase header reads `start == stop == 0`, which the chip refuses — but silence
+    // with no explanation, and "no sound effects, music fine" is the hardest symptom
+    // here to attribute to a missing region.
     let okirom = set
         .region("oki")
         .ok_or_else(|| Fault::Failed("internal: the sf2 spec has no `oki` region".to_string()))?
         .to_vec();
-
     let mut m = machine::Cps1::with_sound(
         prog,
         gfx,
@@ -221,15 +259,59 @@ fn run(args: Vec<String>) -> Result<String, Fault> {
         machine::Timing::cps1_10mhz(),
     );
     m.reset();
+    Ok(m)
+}
 
-    // The wrap is here and not inside the `--play` branch, because the headless path
-    // below now reads the board through the enum too: `Cpu::of` takes a
-    // [`machine::CpuView`], and [`machine::Machine::cpu_view`] is the only thing that
-    // makes one — Task 16 deliberately did not add one to `Cps1`.
-    //
-    // ⚠️ One arm until Task 21's `--game` step, which replaces this with the board the
-    // selected game names.
-    let mut machine = machine::Machine::Cps1(Box::new(m));
+/// SF1 on its own board, from a loaded set.
+///
+/// Eight regions against CPS-1's four, and the messages are as loud for the same
+/// reason. Two of the eight deserve their own note:
+///
+/// - `tilerom` is not graphics, it is the **tile maps** — SF1's background and
+///   foreground layouts live in ROM rather than in guest RAM, which is the single
+///   biggest way this board differs from CPS-1. An absent one draws a screen of
+///   tile 0 in colour 0, which looks exactly like a renderer that is not working.
+/// - `audio2` is the second sound CPU, the one that drives the two MSM5205s. An
+///   absent one is 0xFF on every fetch, which is `RST 38h`: see [`build_cps1`].
+///
+/// ⚠️ **No `proms` region.** `games::SF1` deliberately has none — SF1's PROMs are
+/// priority and timing logic this emulator does not model — so there is nothing to
+/// look up and nothing to fail loudly about.
+fn build_sf1(set: &romset::RomSet) -> Result<machine::Sf1, Fault> {
+    let need = |name: &'static str| -> Result<Vec<u8>, Fault> {
+        set.region(name)
+            .ok_or_else(|| Fault::Failed(format!("internal: the sf1 spec has no `{name}` region")))
+            .map(<[u8]>::to_vec)
+    };
+    let prog = need("maincpu")?;
+    let video = machine::video::sf1::Sf1Video::new(
+        need("gfx1")?,
+        need("gfx2")?,
+        need("gfx3")?,
+        need("gfx4")?,
+        need("tilerom")?,
+    );
+    let mut m = machine::Sf1::new(&prog, video, need("audiocpu")?, need("audio2")?);
+    m.reset();
+    Ok(m)
+}
+
+/// Loads the set, runs `frames` frames, and returns the report.
+fn run(args: Vec<String>) -> Result<String, Fault> {
+    let args = parse_args(args)?;
+
+    let spec =
+        romset::games::by_name(&args.game).expect("parse_args rejects a name that has no spec");
+    let set = romset::load(spec, std::path::Path::new(&args.path))
+        .map_err(|e| Fault::Failed(e.to_string()))?;
+    // One name, two consequences, chosen here together: the spec above says which
+    // files, and this says which hardware.
+    // `each_game_name_selects_its_own_board_and_its_own_rom_spec` is what holds them
+    // to the same name.
+    let mut machine = match board_for(&args.game).expect("parse_args rejected the rest") {
+        machine::BoardKind::Cps1 => machine::Machine::Cps1(Box::new(build_cps1(&set)?)),
+        machine::BoardKind::Sf1 => machine::Machine::Sf1(Box::new(build_sf1(&set)?)),
+    };
 
     if args.play {
         // The window is opened *after* the ROM set loads, so a bad path reports the
@@ -304,21 +386,24 @@ fn open_audio() -> Box<dyn audio::Audio> {
     }
 }
 
-/// The two paths the loop writes to, from the parsed arguments.
+/// The two paths and the state tag the loop is given.
 ///
 /// Split out of [`run`] for the same reason [`parse_args`] is: everything else in
 /// `run` needs a ROM set, so a `LoopOpts` built inline could only be checked by a
-/// test that owns one. And it is worth checking — the struct has two same-typed
-/// fields, so swapping them compiles, and the symptom is F5 overwriting your
-/// screenshot with a save state.
+/// test that owns one. And it is worth checking — the struct has two same-typed path
+/// fields, so swapping them compiles and the symptom is F5 overwriting your
+/// screenshot; and the board tag is the second of two choices `main` makes about the
+/// board, which [`loop_::run`]'s assertion checks against the first.
 fn loop_opts(args: &Args) -> loop_::LoopOpts {
     loop_::LoopOpts {
         state_path: args.state.clone(),
         shot_path: default_shot_path(&args.path),
-        // Still CPS-1 unconditionally: `main` has no `--game` yet, so this is the only
-        // board it can build. Task 21's later steps add the flag and make this follow
-        // it — `loop_::run`'s `debug_assert_eq!` is what will check the pairing.
-        board: loop_::state_tag(machine::BoardKind::Cps1),
+        // `expect` and not a `Result`: `parse_args` rejected an unknown name before
+        // this can be reached, and threading a second error type through a function
+        // whose job is two paths would be worse than saying so.
+        board: loop_::state_tag(
+            board_for(&args.game).expect("parse_args rejects an unknown game name"),
+        ),
     }
 }
 
@@ -867,6 +952,7 @@ mod tests {
                 ppm: None,
                 play: false,
                 state: PathBuf::from("/some/sf2.sfs"),
+                game: "sf2".to_string(),
             })
         );
         assert_eq!(
@@ -877,6 +963,7 @@ mod tests {
                 ppm: None,
                 play: false,
                 state: PathBuf::from("/some/sf2.sfs"),
+                game: "sf2".to_string(),
             }),
             "and an explicit count is taken as given"
         );
@@ -896,6 +983,7 @@ mod tests {
             ppm: Some("/tmp/f.ppm".to_string()),
             play: false,
             state: PathBuf::from("/some/sf2.sfs"),
+            game: "sf2".to_string(),
         };
         assert_eq!(
             args(vec!["/some/sf2.zip", "7", "--ppm", "/tmp/f.ppm"]).ok(),
@@ -1193,6 +1281,7 @@ mod tests {
                 ppm: None,
                 play: true,
                 state: PathBuf::from("/some/sf2.sfs"),
+                game: "sf2".to_string(),
             }),
         );
         assert_eq!(
@@ -1203,6 +1292,7 @@ mod tests {
                 ppm: None,
                 play: true,
                 state: PathBuf::from("/tmp/mine.sfs"),
+                game: "sf2".to_string(),
             }),
             "an explicit state path wins over the derived one"
         );
@@ -1259,6 +1349,7 @@ mod tests {
             ppm: None,
             play: true,
             state: PathBuf::from("/tmp/mine.sfs"),
+            game: "sf2".to_string(),
         };
         let o = loop_opts(&args);
         assert_eq!(o.state_path, PathBuf::from("/tmp/mine.sfs"));
@@ -1474,5 +1565,95 @@ mod tests {
             Frame { drawn: 4, pages: 4 },
             "1024 is past the palette: not drawn, and no fifth block"
         );
+    }
+    /// `--game` selects the board, and the default is stated rather than sniffed.
+    #[test]
+    fn the_game_option_selects_the_board_and_defaults_to_sf2() {
+        let args = |v: Vec<&str>| parse_args(v.into_iter().map(String::from).collect());
+        assert_eq!(
+            args(vec!["/some/sf2.zip"]).map(|a| a.game).ok(),
+            Some("sf2".to_string()),
+            "the default is a constant in this program"
+        );
+        assert_eq!(
+            args(vec!["/wherever/it/is.zip", "--game", "sf1"])
+                .map(|a| a.game)
+                .ok(),
+            Some("sf1".to_string()),
+            "and a path that says nothing about the board is fine, because the \
+             board does not come from the path"
+        );
+        // Order-independent, like `--ppm` and `--state`.
+        assert_eq!(
+            args(vec!["--game", "sf1", "/x.zip", "7"])
+                .map(|a| a.game)
+                .ok(),
+            Some("sf1".to_string())
+        );
+    }
+
+    /// A game this program does not know is a usage error, not a load error.
+    ///
+    /// The distinction is the point: `romset::load` on an unknown spec cannot happen
+    /// — there is no spec — and a user who typed `sf3` needs to be told which names
+    /// exist, not handed a missing-region message about files they got right.
+    #[test]
+    fn an_unknown_game_name_is_rejected_with_the_names_that_exist() {
+        let args = |v: Vec<&str>| parse_args(v.into_iter().map(String::from).collect());
+        match args(vec!["/some/set.zip", "--game", "sf3"]) {
+            Err(Fault::Failed(m)) => {
+                assert!(m.contains("sf3"), "names what was asked for: {m}");
+                assert!(m.contains("sf1"), "and both names that exist: {m}");
+                assert!(m.contains("sf2"), "{m}");
+            }
+            other => panic!("expected an error, got {:?}", other.is_ok()),
+        }
+        // A missing value is an error rather than a silently ignored flag, like the
+        // other two options.
+        match args(vec!["/some/set.zip", "--game"]) {
+            Err(Fault::Failed(m)) => assert_eq!(m, "`--game` needs a name"),
+            other => panic!("expected an error, got {:?}", other.is_ok()),
+        }
+        match args(vec!["/x.zip", "--game", "sf1", "--game", "sf2"]) {
+            Err(Fault::Failed(m)) => assert_eq!(m, "`--game` given twice"),
+            other => panic!("expected an error, got {:?}", other.is_ok()),
+        }
+    }
+
+    /// Each name maps to its own board, and to the spec of the same name.
+    ///
+    /// Two halves, because the failure that matters is a crossed pair: `--game sf1`
+    /// loading SF2's ROM spec into SF1's board is a machine that fetches CPS-1 code
+    /// through an SF1 bus, and every symptom of that is downstream and confusing.
+    #[test]
+    fn each_game_name_selects_its_own_board_and_its_own_rom_spec() {
+        assert_eq!(board_for("sf2"), Some(machine::BoardKind::Cps1));
+        assert_eq!(board_for("sf1"), Some(machine::BoardKind::Sf1));
+        assert_eq!(board_for("sf3"), None);
+        // And the name that picks the board is the name that picks the files.
+        assert_eq!(romset::games::by_name("sf2").map(|g| g.name), Some("sf2"));
+        assert_eq!(romset::games::by_name("sf1").map(|g| g.name), Some("sf1"));
+    }
+
+    /// The loop's board tag follows the selected game.
+    ///
+    /// `loop_opts` is where `main`'s two independent choices — the board and the tag
+    /// — are made together, and `loop_::run`'s `debug_assert_eq!` is what checks it.
+    /// This is the test on this side of that assertion.
+    #[test]
+    fn the_loops_board_tag_follows_the_selected_game() {
+        let a = |game: &str| Args {
+            path: "/a/b/set.zip".to_string(),
+            frames: 60,
+            ppm: None,
+            play: true,
+            state: PathBuf::from("/tmp/mine.sfs"),
+            game: game.to_string(),
+        };
+        // Literals, not `state_tag(..)`: this asserts what reaches the loop, and
+        // calling the function under test to produce the expectation would pass for
+        // any mapping at all. Big-endian ASCII `SF2\0` and `SF1\0`.
+        assert_eq!(loop_opts(&a("sf2")).board, 0x5346_3200);
+        assert_eq!(loop_opts(&a("sf1")).board, 0x5346_3100);
     }
 }
