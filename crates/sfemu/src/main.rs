@@ -222,41 +222,53 @@ fn run(args: Vec<String>) -> Result<String, Fault> {
     );
     m.reset();
 
+    // The wrap is here and not inside the `--play` branch, because the headless path
+    // below now reads the board through the enum too: `Cpu::of` takes a
+    // [`machine::CpuView`], and [`machine::Machine::cpu_view`] is the only thing that
+    // makes one — Task 16 deliberately did not add one to `Cps1`.
+    //
+    // ⚠️ One arm until Task 21's `--game` step, which replaces this with the board the
+    // selected game names.
+    let mut machine = machine::Machine::Cps1(Box::new(m));
+
     if args.play {
         // The window is opened *after* the ROM set loads, so a bad path reports the
         // load error rather than flashing a window onto a machine that never booted.
         let mut win = display::Window::open("sfemu").map_err(Fault::Failed)?;
         let mut sink = open_audio();
         let opts = loop_opts(&args);
-        // The wrap is here and not at construction, because this branch returns and the
-        // headless path below still reads the board directly — `m.board.trace`,
-        // `m.video`, `Cpu::of(&m)`. Wrapping earlier would put a `match` in front of each
-        // of those for no gain: `Machine` deliberately exposes no accessor that reaches
-        // inside a variant.
-        //
-        // ⚠️ One arm until Task 21 adds the SF1 driver's, at which point the board comes
-        // from the ROM set rather than a flag — a user who has sf2.zip should not have to
-        // tell the emulator what sf2.zip is.
-        let mut m = machine::Machine::Cps1(Box::new(m));
-        let summary = loop_::run(&mut m, &mut win, sink.as_mut(), &opts);
+        let summary = loop_::run(&mut machine, &mut win, sink.as_mut(), &opts);
         return Ok(play_report(&summary));
     }
 
     for _ in 0..args.frames {
-        m.run_frame();
+        machine.run_frame();
     }
-    m.render();
+    machine.render();
 
+    // The frame summary and the screenshot are the two things that cannot come
+    // through `Machine`: one counts pens against a board-specific palette, the other
+    // assembles a file out of them. Both forks are one line.
+    let frame = match &machine {
+        machine::Machine::Cps1(c) => Frame::of(&c.video),
+        machine::Machine::Sf1(f) => Frame::of_sf1(&f.video),
+    };
     if let Some(path) = &args.ppm {
-        std::fs::write(path, ppm(&m.video))
+        let bytes = match &machine {
+            machine::Machine::Cps1(c) => ppm(&c.video),
+            machine::Machine::Sf1(f) => ppm_sf1(&f.video),
+        };
+        std::fs::write(path, bytes)
             .map_err(|e| Fault::Failed(format!("cannot write `{path}`: {e}")))?;
     }
 
+    let v = machine.cpu_view();
     Ok(report(
-        &m.board.trace,
-        m.total_cycles,
-        Cpu::of(&m),
-        Frame::of(&m.video),
+        machine.board(),
+        v.trace,
+        v.total_cycles,
+        Cpu::of(&v),
+        frame,
     ))
 }
 
@@ -397,11 +409,16 @@ struct Cpu {
 }
 
 impl Cpu {
-    fn of(m: &machine::Cps1) -> Self {
+    /// From the shared view, so one implementation serves both boards.
+    ///
+    /// [`machine::CpuView::cpu`] is a `&M68k` on either board — the same core, the
+    /// same three fields — which is the whole argument for `CpuView` existing. A
+    /// `match` here would be a match on a difference that does not exist.
+    fn of(v: &machine::CpuView<'_>) -> Self {
         Self {
-            pc: m.cpu.pc,
-            halted: m.cpu.halted,
-            stopped: m.cpu.stopped,
+            pc: v.cpu.pc,
+            halted: v.cpu.halted,
+            stopped: v.cpu.stopped,
         }
     }
 }
@@ -450,6 +467,54 @@ impl Frame {
             pages: pages.iter().filter(|&&p| p).count(),
         }
     }
+
+    /// The same two facts about an SF1 frame.
+    ///
+    /// Separate from [`Frame::of`] and not a parameter, for the reason [`ppm_sf1`] is
+    /// separate from [`ppm`]: there is no shared type to take, and the three things
+    /// this has to know are all different.
+    ///
+    /// # The three differences, and the trap in the first
+    ///
+    /// 1. **The blank pen is 0**, from `Sf1Video::render`'s `self.fb.pens.fill(0)`,
+    ///    where CPS-1's is `BACKGROUND_PEN` (0xBFF). ⚠️ But `Framebuffer::new` fills
+    ///    with 0xBFF on **both** boards, so a never-rendered SF1 frame is 86,016 pens
+    ///    of 0xBFF — and a bare `pen != 0` test would report a machine that never drew
+    ///    a frame as having drawn every pixel of one. Hence the upper bound as well as
+    ///    the lower: a pen is drawn when it is neither the blank pen nor past the
+    ///    palette.
+    /// 2. **1,024 entries**, not 3,072.
+    /// 3. **Four 256-entry blocks**, one per [`video::sf1::Plane`]'s `colour_base`, not
+    ///    six 512-entry `PAGE_ENTRIES` pages. Nothing selects between them, which is
+    ///    why [`report`] calls them colour blocks rather than pages.
+    ///
+    /// ⚠️ `drawn` is a **lower bound on SF1**, and knowingly so. BG has no transparent
+    /// pen (`MapKind::Bg`'s `transparent_pen()` is `None`), so a rendered BG covers the
+    /// frame — and any of its pixels that legitimately resolve to pen 0 are counted as
+    /// not drawn. The number is still the one worth printing: what it distinguishes is
+    /// nothing-drew from something-drew, and nothing-drew is exactly 0.
+    fn of_sf1(v: &video::sf1::Sf1Video) -> Self {
+        const BLOCK: usize = 256;
+        let mut blocks = [false; video::sf1::palette::ENTRIES / BLOCK];
+        let mut drawn = 0;
+        for &pen in v.fb.pens.iter() {
+            let pen = usize::from(pen);
+            if pen == 0 || pen >= video::sf1::palette::ENTRIES {
+                continue;
+            }
+            drawn += 1;
+            // `get_mut` for `Frame::of`'s reason: the report must not be the thing
+            // that panics on a pen it did not expect. The bound above makes this
+            // unreachable, and it stays because the bound is one edit from moving.
+            if let Some(b) = blocks.get_mut(pen / BLOCK) {
+                *b = true;
+            }
+        }
+        Self {
+            drawn,
+            pages: blocks.iter().filter(|&&b| b).count(),
+        }
+    }
 }
 
 /// Formats a run's trace and its last frame.
@@ -458,11 +523,24 @@ impl Frame {
 /// itself — the loader path needs a ROM set and therefore cannot be tested here at
 /// all, but the report is pure and gets literals like everything else.
 ///
-fn report(t: &Trace, cycles: u64, cpu: Cpu, frame: Frame) -> String {
+fn report(board: machine::BoardKind, t: &Trace, cycles: u64, cpu: Cpu, frame: Frame) -> String {
     let mut s = String::new();
     let line = |s: &mut String, k: &str, v: String| {
         s.push_str(&format!("{k:<14}{v}\n"));
     };
+    // First, because two later decisions are consequences of it: three counters are
+    // omitted on SF1 and the framebuffer line's noun changes. Without this line a
+    // reader cannot tell a board that has no CPS-A registers from a report that
+    // stopped printing them.
+    line(
+        &mut s,
+        "board",
+        match board {
+            machine::BoardKind::Cps1 => "CPS-1",
+            machine::BoardKind::Sf1 => "SF1",
+        }
+        .to_string(),
+    );
     line(&mut s, "frames", t.frames.to_string());
     line(&mut s, "vblanks", format!("{}  acks {}", t.vblanks, t.acks));
     line(&mut s, "cycles", cycles.to_string());
@@ -486,15 +564,27 @@ fn report(t: &Trace, cycles: u64, cpu: Cpu, frame: Frame) -> String {
         &mut s,
         "framebuffer",
         format!(
-            "{} of {} pixels drawn, {} palette page(s)",
+            "{} of {} pixels drawn, {} {}",
             frame.drawn,
             video::WIDTH * video::HEIGHT,
-            frame.pages
+            frame.pages,
+            // SF1's 1,024 entries divide into four `colour_base` blocks that nothing
+            // selects between; CPS-1's 3,072 into six pages that `palette_control`
+            // does. Calling both "pages" names a register SF1 has not got.
+            match board {
+                machine::BoardKind::Cps1 => "palette page(s)",
+                machine::BoardKind::Sf1 => "colour block(s)",
+            }
         ),
     );
-    line(&mut s, "cps-a writes", t.cps_a_writes.to_string());
-    line(&mut s, "cps-b writes", t.cps_b_writes.to_string());
-    line(&mut s, "gfxram writes", t.gfxram_writes.to_string());
+    // The three chips only CPS-1 has. See this function's `board` line: on SF1 these
+    // are fields of the shared `Trace` that nothing writes, and `cps-a writes  0`
+    // reads as a finding about a driver rather than a fact about a board.
+    if board == machine::BoardKind::Cps1 {
+        line(&mut s, "cps-a writes", t.cps_a_writes.to_string());
+        line(&mut s, "cps-b writes", t.cps_b_writes.to_string());
+        line(&mut s, "gfxram writes", t.gfxram_writes.to_string());
+    }
     line(&mut s, "sound latch", t.sound_latch_writes.to_string());
     line(&mut s, "rom writes", t.rom_writes.to_string());
     line(
@@ -537,15 +627,41 @@ mod tests {
     /// A frame in which nothing drew, for those same tests.
     const BLANK: Frame = Frame { drawn: 0, pages: 0 };
 
+    /// The CPS-1 board inside a test's machine.
+    ///
+    /// These tests are about this crate's report and its PPM, not about the enum:
+    /// matching on `Machine` at each of a dozen field reads would make every one of
+    /// them a test of `Machine`'s shape. `panic` because every fixture here builds
+    /// the CPS-1 arm, and a test that wired up the wrong one should fail loudly on
+    /// the first read rather than skip its assertions.
+    fn cps1(m: &machine::Machine) -> &machine::Cps1 {
+        match m {
+            machine::Machine::Cps1(c) => c,
+            machine::Machine::Sf1(_) => panic!("this fixture builds a CPS-1"),
+        }
+    }
+
+    fn cps1_mut(m: &mut machine::Machine) -> &mut machine::Cps1 {
+        match m {
+            machine::Machine::Cps1(c) => c,
+            machine::Machine::Sf1(_) => panic!("this fixture builds a CPS-1"),
+        }
+    }
+
     /// A machine running a program this test writes, so the report has real
     /// numbers in it without a ROM set.
+    ///
+    /// Returns a `Machine` and not a `Cps1` because `Cpu::of` takes a `CpuView` and
+    /// [`machine::Machine::cpu_view`] is the only thing that makes one — Task 16
+    /// deliberately did **not** add a `cpu_view` to `Cps1`. The board-specific reads
+    /// below go through `cps1`, like the loop's tests.
     ///
     /// ```text
     /// 1000  33FC 0040 0080 010C   move.w #$0040,$80010C   CPS-A
     /// 1008  33FC FFFF 0081 0000   move.w #$FFFF,$810000   unmapped
     /// 1010  4E72 2700             stop #$2700
     /// ```
-    fn one_frame() -> machine::Cps1 {
+    fn one_frame() -> machine::Machine {
         let mut rom = vec![0u8; 0x2000];
         let words: &[u16] = &[
             0x00FF, 0x8000, 0x0000, 0x1000, // SSP, PC
@@ -568,7 +684,7 @@ mod tests {
         );
         m.reset();
         m.run_frame();
-        m
+        machine::Machine::Cps1(Box::new(m))
     }
 
     /// The report names every counter and prints the worst unmapped addresses.
@@ -584,9 +700,16 @@ mod tests {
     fn the_report_prints_every_counter_with_its_value() {
         let m = one_frame();
         assert_eq!(
-            report(&m.board.trace, m.total_cycles, Cpu::of(&m), BLANK),
+            report(
+                machine::BoardKind::Cps1,
+                &cps1(&m).board.trace,
+                cps1(&m).total_cycles,
+                Cpu::of(&m.cpu_view()),
+                BLANK,
+            ),
             format!(
-                "frames        1\n\
+                "board         CPS-1\n\
+                 frames        1\n\
                  vblanks       1  acks 0\n\
                  cycles        {}\n\
                  cpu           pc 0x001014  stopped (waiting for an interrupt)\n\
@@ -598,7 +721,7 @@ mod tests {
                  rom writes    0\n\
                  unmapped      0 reads, 1 writes\n\
                  \x20 W 0x810000  1\n",
-                m.total_cycles
+                cps1(&m).total_cycles
             ),
         );
     }
@@ -613,17 +736,23 @@ mod tests {
     fn the_reported_cycle_count_is_one_frames_worth() {
         let m = one_frame();
         assert!(
-            (167_680..167_680 + 16).contains(&m.total_cycles),
+            (167_680..167_680 + 16).contains(&cps1(&m).total_cycles),
             "got {}",
-            m.total_cycles
+            cps1(&m).total_cycles
         );
-        let r = report(&m.board.trace, m.total_cycles, Cpu::of(&m), BLANK);
+        let r = report(
+            machine::BoardKind::Cps1,
+            &cps1(&m).board.trace,
+            cps1(&m).total_cycles,
+            Cpu::of(&m.cpu_view()),
+            BLANK,
+        );
         // The exact total depends on where the `stop` lands relative to the budget,
         // so the printed digits are checked against the machine's own value — but
         // the *bound* above is the hand-written 640 × 262, so this pair pins both
         // that the number is right and that it reaches the page.
         assert!(
-            r.contains(&format!("cycles        {}\n", m.total_cycles)),
+            r.contains(&format!("cycles        {}\n", cps1(&m).total_cycles)),
             "the cycle line is missing or reformatted: {r}"
         );
     }
@@ -633,8 +762,14 @@ mod tests {
     #[test]
     fn a_halted_cpu_is_reported_as_a_double_bus_fault() {
         let mut m = one_frame();
-        m.cpu.halted = true;
-        let r = report(&m.board.trace, m.total_cycles, Cpu::of(&m), BLANK);
+        cps1_mut(&mut m).cpu.halted = true;
+        let r = report(
+            machine::BoardKind::Cps1,
+            &cps1(&m).board.trace,
+            cps1(&m).total_cycles,
+            Cpu::of(&m.cpu_view()),
+            BLANK,
+        );
         assert!(
             r.contains("HALTED (double bus fault)"),
             "the report must say so plainly: {r}"
@@ -652,7 +787,7 @@ mod tests {
     #[test]
     fn a_clean_run_prints_no_per_address_lines() {
         let t = Trace::default();
-        let r = report(&t, 0, IDLE, BLANK);
+        let r = report(machine::BoardKind::Cps1, &t, 0, IDLE, BLANK);
         assert!(r.contains("unmapped      0 reads, 0 writes\n"));
         assert!(!r.contains("  W "), "no write rows: {r}");
         assert!(!r.contains("  R "), "no read rows");
@@ -677,7 +812,7 @@ mod tests {
                 t.unmapped_writes.record(0x81_0000 + i * 2);
             }
         }
-        let r = report(&t, 0, IDLE, BLANK);
+        let r = report(machine::BoardKind::Cps1, &t, 0, IDLE, BLANK);
         for i in 0..8u32 {
             let row = format!("  W {:#08x}  {}\n", 0x81_0000 + i * 2, 9 - i);
             assert!(r.contains(&row), "row {i} missing: {r}");
@@ -702,7 +837,7 @@ mod tests {
         for i in 0..1030u32 {
             t.unmapped_writes.record(0x40_0000 + i * 2);
         }
-        let r = report(&t, 0, IDLE, BLANK);
+        let r = report(machine::BoardKind::Cps1, &t, 0, IDLE, BLANK);
         assert!(
             r.contains("  W …6 more accesses to addresses past the 1024-address cap\n"),
             "1030 - 1024 = 6: {r}"
@@ -825,7 +960,7 @@ mod tests {
     /// Built through `machine`, not by hand: what these tests are for is the wiring,
     /// and a `Video` constructed here directly would test `video` a second time
     /// while proving nothing about this crate's path to it.
-    fn a_drawn_frame() -> machine::Cps1 {
+    fn a_drawn_frame() -> machine::Machine {
         // A 16x16 tile solid in pen 0x0A: plane bytes all 0x00 or all 0xFF, four
         // per group, two groups per row of a 16-wide tile.
         let mut gfx = vec![0u8; 128];
@@ -869,7 +1004,7 @@ mod tests {
         m.board.gfxram[0x3A] = 0x0F00;
         m.run_frame();
         m.render();
-        m
+        machine::Machine::Cps1(Box::new(m))
     }
 
     /// The PPM is a binary P6 with the frame's exact dimensions and one byte per
@@ -881,7 +1016,7 @@ mod tests {
     #[test]
     fn the_ppm_header_is_a_binary_p6_of_the_right_size() {
         let m = a_drawn_frame();
-        let bytes = ppm(&m.video);
+        let bytes = ppm(&cps1(&m).video);
         let header = b"P6\n384 224\n255\n";
         assert_eq!(&bytes[..header.len()], header, "the exact header");
         assert_eq!(
@@ -969,10 +1104,16 @@ mod tests {
     #[test]
     fn the_report_names_the_framebuffer() {
         let m = a_drawn_frame();
-        let f = Frame::of(&m.video);
+        let f = Frame::of(&cps1(&m).video);
         assert_eq!(f.drawn, 256, "one 16x16 sprite");
         assert_eq!(f.pages, 1, "pen 0x3A is in page 0");
-        let r = report(&m.board.trace, m.total_cycles, Cpu::of(&m), f);
+        let r = report(
+            machine::BoardKind::Cps1,
+            &cps1(&m).board.trace,
+            cps1(&m).total_cycles,
+            Cpu::of(&m.cpu_view()),
+            f,
+        );
         assert!(
             r.contains("framebuffer   256 of 86016 pixels drawn, 1 palette page(s)\n"),
             "384 * 224 = 86016: {r}"
@@ -980,7 +1121,7 @@ mod tests {
 
         // A blank frame says so rather than omitting the line, which is the state a
         // stalled boot leaves and the one this line has to be able to report.
-        let r = report(&Trace::default(), 0, IDLE, BLANK);
+        let r = report(machine::BoardKind::Cps1, &Trace::default(), 0, IDLE, BLANK);
         assert!(
             r.contains("framebuffer   0 of 86016 pixels drawn, 0 palette page(s)\n"),
             "{r}"
@@ -997,18 +1138,30 @@ mod tests {
     fn the_page_count_counts_distinct_pages() {
         assert_eq!(video::palette::PAGE_ENTRIES, 0x200, "512 pens per page");
         let mut m = a_drawn_frame();
-        assert_eq!(Frame::of(&m.video).pages, 1, "the premise");
+        assert_eq!(Frame::of(&cps1(&m).video).pages, 1, "the premise");
 
         // Move one of the sprite's pixels into page 1 by hand. Reaching into the
         // framebuffer is legitimate here: the subject is the *counting*, and a
         // second page from a second sprite would need a second colour scheme and
         // tell us less clearly.
-        m.video.fb.pens[0] = 0x200;
-        assert_eq!(Frame::of(&m.video).pages, 2, "0x200 is the start of page 1");
-        assert_eq!(Frame::of(&m.video).drawn, 256, "still 256 drawn pixels");
+        cps1_mut(&mut m).video.fb.pens[0] = 0x200;
+        assert_eq!(
+            Frame::of(&cps1(&m).video).pages,
+            2,
+            "0x200 is the start of page 1"
+        );
+        assert_eq!(
+            Frame::of(&cps1(&m).video).drawn,
+            256,
+            "still 256 drawn pixels"
+        );
 
-        m.video.fb.pens[1] = 0xBFE;
-        assert_eq!(Frame::of(&m.video).pages, 3, "0xBFE is in page 5, the last");
+        cps1_mut(&mut m).video.fb.pens[1] = 0xBFE;
+        assert_eq!(
+            Frame::of(&cps1(&m).video).pages,
+            3,
+            "0xBFE is in page 5, the last"
+        );
     }
 
     /// The usage text names the legal sources and promises no download.
@@ -1192,5 +1345,134 @@ mod tests {
         // A clean session says nothing extra.
         let clean = play_report(&loop_::Summary::default());
         assert!(!clean.contains("notice"), "{clean}");
+    }
+
+    /// A CPU summary comes from the shared view, so one implementation serves both.
+    #[test]
+    fn the_cpu_summary_comes_from_the_shared_view() {
+        let m = one_frame();
+        let c = Cpu::of(&m.cpu_view());
+        // Literals: `stop #$2700` is at 0x1010 and `STOP` leaves the PC past its own
+        // extension word.
+        assert_eq!(c.pc, 0x0000_1014);
+        assert!(!c.halted);
+        assert!(c.stopped, "the program ends in `stop`");
+    }
+
+    /// An SF1 report names the board and prints no CPS-A, CPS-B or gfxram line.
+    ///
+    /// Both halves matter. The absent lines are the ruling; the `board` line is what
+    /// makes their absence mean "this board has no such chip" rather than "this
+    /// report lost three counters".
+    #[test]
+    fn an_sf1_report_omits_the_chips_sf1_does_not_have() {
+        // A trace with all eleven counters non-zero, including the three CPS ones —
+        // which SF1's board never writes, but this test must not depend on that to
+        // prove the *report* drops them. A zero would pass against a report that
+        // printed the line.
+        //
+        // A struct literal and not eight assignments to a `default()`: clippy's
+        // `field_reassign_with_default` rejects the latter, and the values are the
+        // same either way.
+        let t = Trace {
+            frames: 3,
+            vblanks: 3,
+            acks: 2,
+            cps_a_writes: 11,
+            cps_b_writes: 12,
+            gfxram_writes: 13,
+            sound_latch_writes: 4,
+            rom_writes: 5,
+            ..Trace::default()
+        };
+        let r = report(machine::BoardKind::Sf1, &t, 100, IDLE, BLANK);
+        assert!(
+            r.starts_with("board         SF1\n"),
+            "names the board first: {r}"
+        );
+        for absent in ["cps-a", "cps-b", "gfxram", "11", "12", "13"] {
+            assert!(
+                !r.contains(absent),
+                "`{absent}` names a chip SF1 does not have: {r}"
+            );
+        }
+        // And every counter both boards do have is still there.
+        assert!(r.contains("frames        3\n"), "{r}");
+        assert!(r.contains("vblanks       3  acks 2\n"), "{r}");
+        assert!(r.contains("sound latch   4\n"), "{r}");
+        assert!(r.contains("rom writes    5\n"), "{r}");
+        assert!(r.contains("unmapped      0 reads, 0 writes\n"), "{r}");
+        // The noun follows the board.
+        assert!(
+            r.contains("framebuffer   0 of 86016 pixels drawn, 0 colour block(s)\n"),
+            "SF1's palette has no pages: {r}"
+        );
+
+        // The same trace on CPS-1 prints all three, so the assertions above are
+        // about the board and not about the counters being unreachable.
+        let r = report(machine::BoardKind::Cps1, &t, 100, IDLE, BLANK);
+        assert!(r.starts_with("board         CPS-1\n"), "{r}");
+        assert!(r.contains("cps-a writes  11\n"), "{r}");
+        assert!(r.contains("cps-b writes  12\n"), "{r}");
+        assert!(r.contains("gfxram writes 13\n"), "{r}");
+        assert!(
+            r.contains("framebuffer   0 of 86016 pixels drawn, 0 palette page(s)\n"),
+            "{r}"
+        );
+    }
+
+    /// SF1's frame summary counts its own blank pen and its own palette division.
+    ///
+    /// Three separate traps, one per assertion block:
+    ///
+    /// 1. A **never-rendered** SF1 frame is not zeroes. `Framebuffer::new` fills every
+    ///    pen with CPS-1's `BACKGROUND_PEN` (0xBFF), which is past SF1's 1,024
+    ///    entries — so a `pen != 0` test would report a stalled boot as **86,016 of
+    ///    86,016 pixels drawn**, which is the exact opposite of the truth and the one
+    ///    reading this line exists to make impossible.
+    /// 2. A **rendered** frame's blank pen is 0, from `render`'s `self.fb.pens.fill(0)`.
+    /// 3. The division is four 256-entry blocks, one per `Plane::colour_base`, not six
+    ///    512-entry pages.
+    #[test]
+    fn an_sf1_frame_summary_uses_sf1s_blank_pen_and_palette_division() {
+        let mut v = machine::video::sf1::Sf1Video::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        // 1. Never rendered: every pen is 0xBFF, past 1,024.
+        assert_eq!(
+            Frame::of_sf1(&v),
+            Frame { drawn: 0, pages: 0 },
+            "a frame that was never rendered drew nothing"
+        );
+
+        // 2. Rendered and blank. `render` with a zero `active` byte draws no layer and
+        // fills with 0.
+        v.render(&[], &[], &[], 0, 0, 0);
+        assert_eq!(Frame::of_sf1(&v), Frame { drawn: 0, pages: 0 });
+
+        // 3. Four blocks at 256 apart, and the fourth is the last.
+        v.fb.pens[0] = 1;
+        assert_eq!(Frame::of_sf1(&v), Frame { drawn: 1, pages: 1 });
+        v.fb.pens[1] = 256;
+        assert_eq!(Frame::of_sf1(&v), Frame { drawn: 2, pages: 2 }, "FG's base");
+        v.fb.pens[2] = 512;
+        assert_eq!(Frame::of_sf1(&v), Frame { drawn: 3, pages: 3 }, "OB's base");
+        v.fb.pens[3] = 1023;
+        assert_eq!(
+            Frame::of_sf1(&v),
+            Frame { drawn: 4, pages: 4 },
+            "1023 is the last entry, in TX's block"
+        );
+        // A pen past the palette is counted in neither, and does not panic.
+        v.fb.pens[4] = 1024;
+        assert_eq!(
+            Frame::of_sf1(&v),
+            Frame { drawn: 4, pages: 4 },
+            "1024 is past the palette: not drawn, and no fifth block"
+        );
     }
 }
