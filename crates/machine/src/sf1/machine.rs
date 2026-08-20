@@ -169,6 +169,14 @@ pub struct Sf1 {
     /// column reads 0 forever and a distorted mix has no diagnostic at all. An
     /// instrument, like the four counters above.
     mix_clips: u32,
+    /// Frames the host's audio ring had to drop, as reported by the host.
+    ///
+    /// Not counted here: the ring lives in `sfemu`, sized from the host device's
+    /// sample rate, which `machine` has no business knowing. This arrives through
+    /// [`Sf1::set_audio_stats`] and exists so the debug panel can show it.
+    audio_drops: u32,
+    /// Times the host's audio ring ran dry, on the same terms.
+    audio_underruns: u32,
     /// Built once. `Decoder::new` fills a 65,536-entry table.
     ///
     /// # ⚠️ Boxed, and that is load-bearing
@@ -194,6 +202,8 @@ impl core::fmt::Debug for Sf1 {
             .field("fm_total", &self.fm_total)
             .field("adpcm_total", &self.adpcm_total)
             .field("samples", &self.samples.len())
+            .field("audio_drops", &self.audio_drops)
+            .field("audio_underruns", &self.audio_underruns)
             .finish_non_exhaustive()
     }
 }
@@ -243,6 +253,8 @@ impl Sf1 {
             fm_nmis: 0,
             adpcm_nmis: 0,
             mix_clips: 0,
+            audio_drops: 0,
+            audio_underruns: 0,
             dec: Box::new(Decoder::new()),
         }
     }
@@ -378,6 +390,30 @@ impl Sf1 {
         self.mix_clips
     }
 
+    /// Record the host audio ring's counters, so the debug panel can show them.
+    ///
+    /// The ring lives in `sfemu` — it is sized from the host's sample rate, which
+    /// `machine` has no business knowing — so these arrive from outside rather than
+    /// being counted here. This is [`crate::sound::SoundBoard::set_audio_stats`]'s job,
+    /// moved up a level: CPS-1 has one sound board to hang them on and SF1 has two, so
+    /// on this board they belong to the machine.
+    pub fn set_audio_stats(&mut self, drops: u32, underruns: u32) {
+        self.audio_drops = drops;
+        self.audio_underruns = underruns;
+    }
+
+    /// Frames the host's ring dropped. See [`Sf1::set_audio_stats`].
+    #[must_use]
+    pub const fn audio_drops(&self) -> u32 {
+        self.audio_drops
+    }
+
+    /// Times the host's ring ran dry. See [`Sf1::set_audio_stats`].
+    #[must_use]
+    pub const fn audio_underruns(&self) -> u32 {
+        self.audio_underruns
+    }
+
     /// Sets every instrument counter to its maximum, for a frontend test.
     ///
     /// ⚠️ **Public and not `#[cfg(test)]` on purpose.** `frontend` is a different
@@ -407,6 +443,10 @@ impl Sf1 {
         self.fm_nmis = u32::MAX;
         self.adpcm_nmis = u32::MAX;
         self.mix_clips = u32::MAX;
+        // These two are the one pair in this helper where the field and the accessor
+        // share a name; every other line above does not.
+        self.audio_drops = u32::MAX;
+        self.audio_underruns = u32::MAX;
         self.fm_total = 1 << 40;
         self.adpcm_total = 1 << 40;
         self.fm.saturate_trace_for_test();
@@ -1592,5 +1632,57 @@ mod tests {
             m.mix_clips() > before,
             "a mix past the rails did not report a clip"
         );
+    }
+
+    /// The host's ring statistics arrive from outside and are readable.
+    ///
+    /// # Why these live on `Sf1` and not on a sound board
+    ///
+    /// CPS-1 keeps them on [`crate::sound::SoundBoard`], where they sit beside the
+    /// OKI's clip count, because CPS-1 has one sound board. SF1 has two — the FM board
+    /// and the ADPCM board — and the host's ring belongs to neither: it is downstream
+    /// of the *mix*. Putting them on `Sf1` is the only placement that does not make one
+    /// of the two boards arbitrarily the owner.
+    ///
+    /// # Why two unequal numbers
+    ///
+    /// `sound.rs:887` records that swapping the two assignments in CPS-1's version of
+    /// this setter left 156 tests passing. Equal values, or reading back only one, is
+    /// what let that mutant live.
+    #[test]
+    fn the_host_ring_counters_arrive_from_outside_and_read_back_apart() {
+        let mut m = machine();
+        assert_eq!(m.audio_drops(), 0, "a fresh machine has dropped nothing");
+        assert_eq!(m.audio_underruns(), 0, "and starved nothing");
+        m.set_audio_stats(17, 4);
+        assert_eq!(m.audio_drops(), 17);
+        assert_eq!(m.audio_underruns(), 4);
+    }
+
+    /// Running the machine does not disturb them, because it does not own them.
+    ///
+    /// The counters describe the host's ring, and `run_frame` cannot see the host. A
+    /// `+= 1` written into the sample path by mistake would climb here.
+    #[test]
+    fn running_does_not_change_the_host_ring_counters() {
+        let mut m = machine();
+        m.set_audio_stats(17, 4);
+        m.run_frame();
+        assert_eq!((m.audio_drops(), m.audio_underruns()), (17, 4));
+    }
+
+    /// The saturating helper covers them, so the panel's width test covers them too.
+    ///
+    /// `frontend`'s `no_sf1_row_overflows_its_box_with_every_counter_saturated`
+    /// asserts nothing about *which* counters `saturate_counters_for_test` sets; it
+    /// draws the panel and looks for ink outside the box. A counter the helper misses
+    /// is a column that test silently never widens. This is the assertion that makes
+    /// the helper's coverage of these two checkable here, where the fields live.
+    #[test]
+    fn saturating_covers_the_host_ring_counters() {
+        let mut m = machine();
+        m.saturate_counters_for_test();
+        assert_eq!(m.audio_drops(), u32::MAX);
+        assert_eq!(m.audio_underruns(), u32::MAX);
     }
 }
