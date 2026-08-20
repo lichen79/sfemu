@@ -92,6 +92,50 @@ impl Sf1Inputs {
         }
     }
 
+    /// The shared [`crate::inputs::Inputs`] as this board's ports see it.
+    ///
+    /// # Why the conversion is here and not in `frontend`
+    ///
+    /// The keyboard produces the shared struct — one boolean per key, `true` for
+    /// pressed, and `frontend/src/keys.rs`'s module doc forbids that crate from
+    /// knowing anything more. What this function knows is which of SF1's four ports
+    /// each name lands on, and three of them land somewhere different from CPS-1:
+    /// `service`, `start1` and `start2` are on `SYSTEM` here where CPS-1 has them on
+    /// `IN0`, and two of the six attack buttons are on `IN0` here where CPS-1 has all
+    /// six across `IN1` and `IN2`. That knowledge is this module's, so the conversion
+    /// is too.
+    ///
+    /// # What does not cross
+    ///
+    /// - **`dsw`.** Three 8-bit ports against two 16-bit ones, with no pair
+    ///   corresponding. This starts from [`Sf1Inputs::idle`] and leaves the switches
+    ///   alone, which matters more than it looks: Demo_Sounds is the one setting in
+    ///   `sf.cpp`'s table whose default is a *clear* bit, so anything that widened
+    ///   `[0xFF; 3]` into `[0xFFFF; 2]` would mute the attract mode and say nothing.
+    /// - **`test`.** CPS-1's `PORT_SERVICE` bit on `IN0`. This board has no such
+    ///   button: service mode is `DSW1_SERVICE_MODE`, a switch on `DSW1`, and a
+    ///   momentary keypress is not what one of those is.
+    ///
+    /// `p1` and `p2` cross whole, because [`crate::inputs::PlayerInput`] is one type
+    /// shared by both boards — six attack buttons and a four-way stick is six attack
+    /// buttons and a four-way stick, whatever the wiring does with them.
+    #[must_use]
+    pub const fn from_shared(i: &crate::inputs::Inputs) -> Self {
+        Self {
+            coin1: i.coin1,
+            coin2: i.coin2,
+            service: i.service,
+            start1: i.start1,
+            start2: i.start2,
+            p1: i.p1,
+            p2: i.p2,
+            // Not `i.dsw`: see the note above on Demo_Sounds. `idle()` is `const`,
+            // so this is the switch defaults with no runtime cost and no second
+            // copy of the two constants.
+            dsw: Self::idle().dsw,
+        }
+    }
+
     /// `IN0`, 0xC00000 — the two coins and, oddly, four attack buttons.
     ///
     /// `sf.cpp:636-640`. The four buttons are the ones a six-button `sfus` panel
@@ -410,5 +454,128 @@ mod tests {
             p2: all,
             ..Sf1Inputs::idle()
         }
+    }
+
+    /// One row of [`each_shared_button_reaches_its_own_sf1_bit`]'s table: a name, the
+    /// setter that presses it on the shared struct, the SF1 port it must reach, and
+    /// the bit that must clear there.
+    ///
+    /// An alias only because the tuple written out inline is a `clippy::type_complexity`
+    /// error, and an `#[allow]` would hide the next one too.
+    type Crossing = (
+        &'static str,
+        fn(&mut crate::inputs::Inputs),
+        fn(&Sf1Inputs) -> u16,
+        u16,
+    );
+
+    /// Every pressed button crosses from the shared struct, one at a time.
+    ///
+    /// # Why one field per iteration and not one struct with everything set
+    ///
+    /// A `from_shared` that ignored `coin2` and copied `coin1` twice passes a test
+    /// that presses everything and checks the ports are not idle. Each iteration
+    /// here presses exactly one thing and asserts exactly which bit moved, so a
+    /// crossed wire between any two of the five names fails on both of them.
+    #[test]
+    fn each_shared_button_reaches_its_own_sf1_bit() {
+        // (name, the setter, the port to read, the bit that must clear)
+        // Every value is a literal from `sf.cpp`'s `sfus` port block, not read from
+        // this module's constants: SYSTEM's START1/START2/SERVICE1 at 0x0001/0x0002/
+        // 0x0004 (`sf.cpp:701-703`) and IN0's COIN1/COIN2 at 0x0001/0x0002.
+        let cases: [Crossing; 5] = [
+            ("coin1", |i| i.coin1 = true, |s| s.in0(), 0x0001),
+            ("coin2", |i| i.coin2 = true, |s| s.in0(), 0x0002),
+            ("start1", |i| i.start1 = true, |s| s.system(), 0x0001),
+            ("start2", |i| i.start2 = true, |s| s.system(), 0x0002),
+            ("service", |i| i.service = true, |s| s.system(), 0x0004),
+        ];
+        for (name, press, port, bit) in cases {
+            let mut shared = crate::inputs::Inputs::idle();
+            press(&mut shared);
+            let idle = Sf1Inputs::idle();
+            let got = Sf1Inputs::from_shared(&shared);
+            assert_eq!(
+                port(&idle) & !port(&got),
+                bit,
+                "{name} must clear exactly {bit:#06X}: idle {:#06X}, pressed {:#06X}",
+                port(&idle),
+                port(&got)
+            );
+        }
+    }
+
+    /// The stick and all six attack buttons cross, on both players.
+    ///
+    /// `PlayerInput` is the same type on both boards — Task 8 keeps it verbatim —
+    /// so this is a move, not a translation. What it catches is a `from_shared` that
+    /// forgot `p2`, or one that assigned `p1` to both.
+    #[test]
+    fn both_players_sticks_and_buttons_cross_whole() {
+        let mut shared = crate::inputs::Inputs::idle();
+        shared.p1.left = true;
+        shared.p1.punch = [true, true, true];
+        shared.p2.up = true;
+        shared.p2.kick = [true, true, true];
+        let got = Sf1Inputs::from_shared(&shared);
+        // Read back through the fields rather than the ports: the ports are
+        // `in0()`/`in1()`'s business and Task 8's tests already pin their packing.
+        // What is under test here is that the struct arrived intact.
+        assert!(got.p1.left, "p1 left");
+        assert_eq!(got.p1.punch, [true, true, true], "p1 punches");
+        assert!(got.p2.up, "p2 up");
+        assert_eq!(got.p2.kick, [true, true, true], "p2 kicks");
+        assert!(!got.p1.up, "and nothing p1 did not press");
+        assert!(!got.p2.left, "nor p2");
+    }
+
+    /// The DIP switches do not cross, and the attract music survives.
+    ///
+    /// # The trap this exists for
+    ///
+    /// `Inputs::dsw` is `[0xFF; 3]` when idle. `Sf1Inputs::dsw` is `[u16; 2]` and
+    /// its first entry is *not* all ones: Demo_Sounds is 0x2000 and on this board a
+    /// **clear** bit means on, which is the opposite polarity to every other default
+    /// in `sf.cpp`'s table. A conversion that widened CPS-1's bytes — or that reached
+    /// for a "default = all bits set" shortcut — would set 0x2000 and silently mute
+    /// the attract mode.
+    ///
+    /// This asserts against `idle()`'s output rather than against `DSW1_DEFAULT`,
+    /// which is private and is the constant the code reads: a test that read it
+    /// would be checking the code against itself.
+    #[test]
+    fn the_dip_switches_keep_their_own_defaults() {
+        let mut shared = crate::inputs::Inputs::idle();
+        shared.dsw = [0xFF, 0xFF, 0xFF];
+        shared.test = true; // and this has nowhere to go on SF1 — see below.
+        let got = Sf1Inputs::from_shared(&shared);
+        assert_eq!(
+            got.dsw,
+            Sf1Inputs::idle().dsw,
+            "the shared struct's three bytes must not reach these two words"
+        );
+        // Demo sounds are on, which is what a clear 0x2000 means. Stated as the
+        // literal from `sf.cpp`'s table and not as `DSW1_DEMO_SOUNDS`.
+        assert_eq!(got.dsw[0] & 0x2000, 0, "attract music must not be muted");
+        // Service mode is off, which is what a *set* 0x8000 means on the same port.
+        assert_eq!(got.dsw[0] & 0x8000, 0x8000, "service mode must be off");
+    }
+
+    /// A wholly idle shared struct converts to a wholly idle SF1 one.
+    ///
+    /// The floor under the three tests above: if `from_shared` set a bit nobody
+    /// pressed, one of them would still pass and this one would not.
+    #[test]
+    fn idle_converts_to_idle() {
+        let got = Sf1Inputs::from_shared(&crate::inputs::Inputs::idle());
+        let want = Sf1Inputs::idle();
+        // The four ports, as literals: `in0()` and `in1()` all ones, `system()`
+        // 0xFF7F because `sf.cpp:709` makes bit 7 active *high*.
+        assert_eq!((got.in0(), got.in1()), (0xFFFF, 0xFFFF));
+        assert_eq!(got.system(), 0xFF7F);
+        assert_eq!(
+            (got.in0(), got.in1(), got.system()),
+            (want.in0(), want.in1(), want.system())
+        );
     }
 }
