@@ -15,6 +15,7 @@
 
 use machine::video::compose::Video;
 use machine::video::palette::entry_to_rgb;
+use machine::video::sf1::Sf1Video;
 
 /// One palette entry as `0x00RRGGBB`.
 ///
@@ -46,10 +47,38 @@ pub fn pens_to_argb(v: &Video, out: &mut Vec<u32>) {
     out.extend(v.fb.pens.iter().map(|&pen| argb(pal[usize::from(pen)])));
 }
 
+/// One SF1 palette entry as a window word.
+///
+/// SF1's DAC is four bits per channel repeated — `0x0F` is full brightness — where
+/// CPS-1's is four bits halved through a brightness register. The two cannot share
+/// a converter: [`argb`] on `0x0FFF` is mid-grey and this is white.
+pub(crate) fn argb_sf1(entry: u16) -> u32 {
+    let [r, g, b] = machine::video::sf1::palette::entry_to_rgb(entry);
+    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+}
+
+/// An SF1 frame's pens as window words, reusing `out`'s allocation.
+///
+/// Reads each pixel's colour through [`Sf1Video::rgb`] rather than indexing a
+/// palette slice. [`Framebuffer::new`] fills every pen with CPS-1's
+/// `BACKGROUND_PEN` (0xBFF), which is past SF1's 1,024 entries, so a never-rendered
+/// `Sf1Video` would index out of bounds — and `rgb` is the accessor that already
+/// answers "black" for a pen the palette does not hold. This is not the dead
+/// defensiveness [`pens_to_argb`]'s doc argues against: for CPS-1 the pen is
+/// provably in range and here it provably is not.
+pub fn pens_to_argb_sf1(v: &Sf1Video, out: &mut Vec<u32>) {
+    out.clear();
+    out.extend(v.fb.pens.iter().map(|&pen| {
+        let [r, g, b] = v.rgb(pen);
+        (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use machine::video::{palette, regs, HEIGHT, WIDTH};
+    use machine::video::sf1::Sf1Video;
     use machine::BoardConfig;
 
     /// A `Video` whose palette holds known entries, built through the real render
@@ -203,5 +232,96 @@ mod tests {
             pens_to_argb(&v, &mut out);
             assert_eq!(out.len(), 86_016);
         }
+    }
+
+    fn an_sf1_video_with_palette(entries: &[u16]) -> Sf1Video {
+        // Four empty regions and no tilerom: this tests the conversion, not the
+        // renderer, and `render` clears every pen to 0 on every path.
+        let mut v = Sf1Video::new(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut palette = vec![0u16; machine::video::sf1::palette::ENTRIES];
+        palette[..entries.len()].copy_from_slice(entries);
+        let videoram = vec![0u16; 0x800];
+        let objectram = vec![0u16; 0x1000];
+        v.render(&videoram, &objectram, &palette, 0, 0, 0);
+        v
+    }
+
+    #[test]
+    fn an_sf1_entry_expands_each_nibble_by_repeating_it() {
+        assert_eq!(argb_sf1(0x0000), 0x0000_0000);
+        assert_eq!(argb_sf1(0x0FFF), 0x00FF_FFFF);
+        assert_eq!(argb_sf1(0x0F00), 0x00FF_0000);
+        assert_eq!(argb_sf1(0x00F0), 0x0000_FF00);
+        assert_eq!(argb_sf1(0x000F), 0x0000_00FF);
+        assert_eq!(argb_sf1(0x0135), 0x0011_3355);
+        assert_eq!(argb_sf1(0x0999), 0x0099_9999);
+        assert_eq!(argb_sf1(0x0357), 0x0033_5577);
+    }
+
+    #[test]
+    fn the_top_nibble_is_ignored() {
+        assert_eq!(argb_sf1(0xFFFF), 0x00FF_FFFF);
+        assert_eq!(argb_sf1(0xF000), 0x0000_0000);
+        for high in 0..16u16 {
+            assert_eq!(argb_sf1((high << 12) | 0x0135), 0x0011_3355);
+        }
+    }
+
+    #[test]
+    fn sf1s_conversion_is_not_cps1s() {
+        // The same entry, two boards, two colours. A shared `argb` would make one
+        // of the two screenshots wrong and neither test would say which.
+        assert_eq!(argb(0x0FFF), 0x0055_5555);
+        assert_eq!(argb_sf1(0x0FFF), 0x00FF_FFFF);
+        assert_ne!(argb(0x0FFF), argb_sf1(0x0FFF));
+    }
+
+    #[test]
+    fn the_sf1_buffer_is_one_word_per_pixel_of_the_visible_frame() {
+        let v = an_sf1_video_with_palette(&[0x0135]);
+        let mut out = Vec::new();
+        pens_to_argb_sf1(&v, &mut out);
+        assert_eq!(out.len(), 86_016);
+    }
+
+    #[test]
+    fn each_sf1_pixel_takes_its_own_pens_colour() {
+        let v = an_sf1_video_with_palette(&[0x0135, 0x0F00]);
+        let mut out = Vec::new();
+        pens_to_argb_sf1(&v, &mut out);
+        // `render` cleared every pen to 0, so every pixel is entry 0.
+        assert!(out.iter().all(|&w| w == 0x0011_3355), "every pixel is entry 0");
+    }
+
+    #[test]
+    fn the_sf1_window_and_the_sf1_screenshot_cannot_disagree() {
+        // Every entry a guest can write, through both paths.
+        let v = an_sf1_video_with_palette(&[]);
+        for entry in 0..=u16::MAX {
+            let rgb = machine::video::sf1::palette::entry_to_rgb(entry);
+            let packed = (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]);
+            assert_eq!(argb_sf1(entry), packed, "entry {entry:#06X}");
+        }
+        let _ = v;
+    }
+
+    #[test]
+    fn a_pen_past_the_sf1_palette_is_black_rather_than_a_panic() {
+        // `Framebuffer::new` fills every pen with CPS-1's 0xBFF, which is past
+        // SF1's 1,024 entries. A never-rendered `Sf1Video` must convert, not crash.
+        let v = Sf1Video::new(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut out = Vec::new();
+        pens_to_argb_sf1(&v, &mut out);
+        assert_eq!(out.len(), 86_016);
+        assert!(out.iter().all(|&w| w == 0x0000_0000), "out of range reads black");
+    }
+
+    #[test]
+    fn a_reused_sf1_buffer_does_not_grow() {
+        let v = an_sf1_video_with_palette(&[0x0135]);
+        let mut out = Vec::new();
+        pens_to_argb_sf1(&v, &mut out);
+        pens_to_argb_sf1(&v, &mut out);
+        assert_eq!(out.len(), 86_016);
     }
 }
