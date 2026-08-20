@@ -1,19 +1,25 @@
-//! Run a CPS-1 ROM set and report what the board saw.
+//! Run a ROM set on the board it came from, and report what that board saw.
 //!
 //! ```text
-//! sfemu <path-to-rom-set> [frames] [--ppm <path>]
+//! sfemu <path-to-rom-set> [frames] [--game <name>] [--ppm <path>]
+//! sfemu <path-to-rom-set> --play [--game <name>] [--state <path>]
 //! ```
 //!
 //! `<path-to-rom-set>` is a MAME-format zip or a directory of loose files that
 //! **you supply**. This program contains no ROM data and no way to obtain any.
 //!
-//! # Why a report and not a window
+//! `--game` picks the hardware: `sf2` is Street Fighter II on CPS-1 and is the
+//! default, `sf1` is Street Fighter on its own 1987 board. It is a choice and not a
+//! guess — a set of files does not say what machine it came out of.
 //!
-//! There is still no window: opening one is sub-project E's. A black window would
-//! be indistinguishable from a boot that hangs on the first instruction, whereas a
-//! count of vblanks, acknowledges, and video-register writes tells you which — and
-//! `--ppm` writes the last frame out as a file, which is a picture you can look at
-//! without this program having to draw one.
+//! # Why there is a report as well as a window
+//!
+//! `--play` opens a window; without it, the program runs a fixed number of frames and
+//! prints counters instead. Both exist because a black window is indistinguishable
+//! from a boot that hangs on the first instruction, whereas a count of vblanks,
+//! acknowledges and video-register writes says which — and it says it in a form CI, a
+//! bisect and a commit message can hold. `--ppm` writes the last frame out as a file,
+//! so a headless run still produces a picture to look at.
 
 mod audio;
 #[cfg(test)]

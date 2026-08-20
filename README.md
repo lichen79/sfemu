@@ -1,20 +1,22 @@
 # sfemu
 
-A Street Fighter arcade emulator, built from the hardware up. Point it at a
-CPS-1 ROM set you own and `--play` opens a window:
+A Street Fighter arcade emulator, built from the hardware up. Point it at a ROM
+set you own and `--play` opens a window:
 
 ```bash
 cargo run -p sfemu --release -- /path/to/your/sf2.zip --play
+cargo run -p sfemu --release -- /path/to/your/sf.zip --play --game sf1
 ```
 
-Nine sub-projects are complete: the **68000 core** (A), the **bus and timing
+Ten sub-projects are complete: the **68000 core** (A), the **bus and timing
 framework with a MAME ROM-set loader** (B), the **CPS-1 scanline renderer** (C),
 the **Z80 audio CPU** (D1), the **YM2151 FM chip and the sound board's wiring**
 (D2), the **OKI MSM6295 ADPCM chip, the mono mix and host audio** (D3), the
 **frontend** — window, frame clock, keyboard, and save states (E1) — the
 **debugger** (E2): `F1` for an in-window overlay, `F4` to step one instruction,
-`F7` for a breakpoint — and the **graphics viewers** (E3): `F9` for a tile,
-tilemap, palette and layer browser, `F10` to cycle it.
+`F7` for a breakpoint — the **graphics viewers** (E3): `F9` for a tile, tilemap,
+palette and layer browser, `F10` to cycle it — and the **Street Fighter 1
+driver** (F): a second board on the same core, selected with `--game sf1`.
 
 **There is sound.** The chain runs end to end: the Z80 executes SF2's driver from
 `audiocpu`, reads the 68000's command latch, and programs a YM2151 and an MSM6295
@@ -24,8 +26,10 @@ output the cabinet's one speaker gets, at MAME's own weights, and handed to the
 host device through a bounded ring. The one link in that chain that is *not* exact
 is the last: no host sample rate is a rational multiple of the board's
 55,930.390625 Hz, so the final conversion interpolates, and what it costs is
-[written down](#the-oki-msm6295-and-the-mix) rather than glossed. The Street
-Fighter 1 driver (F) is not built yet.
+[written down](#the-oki-msm6295-and-the-mix) rather than glossed. Street Fighter 1
+runs on its own board with `--game sf1`: no CPS-A or CPS-B, tile maps in ROM
+instead of RAM, one YM2151 and two MSM5205s mixed in genuine stereo, and a
+second sound Z80 driving them.
 
 ## The 68000 core
 
@@ -208,12 +212,13 @@ contain no game code — but they are still fetched at runtime rather than vendo
 If a vector file is missing, the harness fails loudly, naming the file and the
 command that fetches it. It does not skip, warn, or silently pass.
 
-**Three tests are the documented exception, and they are `#[ignore]`d for the reason
+**Six tests are the documented exception, and they are `#[ignore]`d for the reason
 the rule itself gives.** "Fail loudly naming the command that fetches it" holds
 because the vector data *is* fetchable and there is a command to name. A ROM set is
 not, and there is no command we may put in a failure message. So `boot.rs`,
-`sound_boot.rs` and `audio_boot.rs` — the three tests that need real Capcom code —
-skip by default and read a path you supply:
+`sound_boot.rs` and `audio_boot.rs` for SF2, and `sf1_boot.rs`,
+`sf1_sound_boot.rs` and `sf1_audio_boot.rs` for SF1 — the six tests that need real
+Capcom code — skip by default and read a path you supply:
 
 ```bash
 SFEMU_ROMS=/path/to/your/sf2.zip cargo test -p sfemu --test audio_boot -- --ignored
@@ -221,7 +226,11 @@ SFEMU_ROMS=/path/to/your/sf2.zip cargo test -p sfemu --test audio_boot -- --igno
 
 One variable, one panic message per test, no second escape hatch. `SFEMU_ROMS` is
 **not** how the binary is pointed at a ROM set — that is a positional argument; the
-variable exists only for these three. What they add over the unconditional suites is
+variable exists only for these six. It holds **one** path and the two trios want
+different sets, so a user with both runs the suite twice with it pointing at each in
+turn — a second variable would be the second escape hatch this rule forbids by name,
+and pointing it at the wrong set fails loudly with a `romset` error naming the file
+it could not find. What they add over the unconditional suites is
 narrow and specific: that SF2's own driver talks to the chips *where this code expects
 it to*. `audio_boot.rs` exists because of one trap in particular — with no sample ROM,
 every phrase-table entry reads `start == stop == 0`, the chip refuses every command,
@@ -298,6 +307,10 @@ dependencies optimised anyway; the suite itself takes 0.08 s of it.
 ```bash
 # A window, at 59.6374 Hz, until you close it or press Esc.
 cargo run -p sfemu --release -- /path/to/your/sf2.zip --play
+
+# Street Fighter 1, on its own board. The board is chosen, not guessed from the
+# path: a set of files does not say what hardware it came from.
+cargo run -p sfemu --release -- /path/to/your/sf.zip --play --game sf1
 
 # Somewhere other than beside the ROM set for the save state:
 cargo run -p sfemu --release -- /path/to/your/sf2.zip --play --state /tmp/mine.sfs
@@ -678,7 +691,7 @@ pass is distinguishable from a harness that reports success without running.
 | **E1** | Frontend: window, frame clock, keyboard, save states | **complete** — `--play` |
 | **E2** | Debugger: single-step, breakpoints, disassembly, register and memory views | **complete** — `F1`, in-window, and it does not perturb the machine |
 | **E3** | Graphics viewers: tile browser, tilemap and palette views, layer toggles | **complete** — `F9`, four views, and the mask subtracts only |
-| F | Street Fighter 1 driver | a second board against a proven core |
+| **F** | Street Fighter 1 driver: pre-CPS board, ROM-resident tile maps, two MSM5205s in stereo, second sound Z80 | **complete** — `--game sf1`, a second board on the same core, and the abstraction held: `m68k`, `z80` and `ym2151` took no changes at all, and `video` and `machine` each gained an `sf1` module beside the CPS-1 one rather than growing a board flag through the existing code |
 
 E was split because its three surfaces are independent and only the first changes
 what the project *is* rather than what can be inspected about it. E3 came last for
