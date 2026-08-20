@@ -48,33 +48,33 @@ use machine::video::{HEIGHT, VISIBLE_X, VISIBLE_Y, WIDTH};
 use machine::Cps1;
 
 /// The viewer's box: the whole frame, inset by two pixels.
-const VX: usize = 2;
+pub(crate) const VX: usize = 2;
 /// Ditto.
-const VY: usize = 2;
+pub(crate) const VY: usize = 2;
 /// Ditto.
-const VW: usize = WIDTH - 4;
+pub(crate) const VW: usize = WIDTH - 4;
 /// Ditto.
-const VH: usize = HEIGHT - 4;
+pub(crate) const VH: usize = HEIGHT - 4;
 
 /// Background: darker than E2's panels, because this box is the whole screen and
 /// E2's sits on top of it — two identical backgrounds would make the boundary
 /// between them invisible.
-const BG: u32 = 0x0000_0010;
+pub(crate) const BG: u32 = 0x0000_0010;
 
 /// Ordinary text.
-const FG: u32 = 0x00D0_D0D0;
+pub(crate) const FG: u32 = 0x00D0_D0D0;
 
 /// A heading, and the cursored item.
-const HI: u32 = 0x0060_FF60;
+pub(crate) const HI: u32 = 0x0060_FF60;
 
 /// A value the hardware says no to: a disabled layer, an unmapped code.
-const OFF: u32 = 0x00FF_6060;
+pub(crate) const OFF: u32 = 0x00FF_6060;
 
 /// A swatch's border.
-const EDGE: u32 = 0x0080_8080;
+pub(crate) const EDGE: u32 = 0x0080_8080;
 
 /// Padding inside the box.
-const PAD: usize = 2;
+pub(crate) const PAD: usize = 2;
 
 /// The sixteen greys a tile pen is drawn as, black to white.
 ///
@@ -82,7 +82,7 @@ const PAD: usize = 2;
 /// ramp typed a second time from the channel values, so the two agree only if both
 /// are right — a test comparing this against `pen * 17` would be the same expression
 /// written twice.
-const GREYS: [u32; 16] = [
+pub(crate) const GREYS: [u32; 16] = [
     0x0000_0000,
     0x0011_1111,
     0x0022_2222,
@@ -242,7 +242,7 @@ const fn kind_name(kind: TileKind) -> &'static str {
 /// it, so a string long enough to reach the frame's edge would draw over the two
 /// columns the box leaves alone. `every_view_stays_inside_its_box` is what would
 /// catch that, and this is what stops it happening.
-fn text(buf: &mut [u32], x: usize, y: usize, s: &str, fg: u32) {
+pub(crate) fn text(buf: &mut [u32], x: usize, y: usize, s: &str, fg: u32) {
     if y + GLYPH_H > VY + VH || x >= VX + VW {
         return;
     }
@@ -252,19 +252,19 @@ fn text(buf: &mut [u32], x: usize, y: usize, s: &str, fg: u32) {
 }
 
 /// One pixel, if it is inside the box.
-fn put(buf: &mut [u32], x: usize, y: usize, c: u32) {
+pub(crate) fn put(buf: &mut [u32], x: usize, y: usize, c: u32) {
     if (VX..VX + VW).contains(&x) && (VY..VY + VH).contains(&y) {
         buf[y * WIDTH + x] = c;
     }
 }
 
 /// The first line of text inside the box: every view's title.
-const fn title_at() -> (usize, usize) {
+pub(crate) const fn title_at() -> (usize, usize) {
     (VX + PAD, VY + PAD)
 }
 
 /// Where a view's content starts: one line below its title.
-const fn content_y() -> usize {
+pub(crate) const fn content_y() -> usize {
     VY + PAD + LINE + 1
 }
 
@@ -274,7 +274,7 @@ const fn content_y() -> usize {
 /// `tiles::TRANSPARENT_PEN`. A browser exists to show what is *in* the ROM, and a
 /// transparent pen and an absent tile are different facts — see
 /// [`tile_in_rom`], which is how the second one is shown.
-const fn grey(pen: u8) -> u32 {
+pub(crate) const fn grey(pen: u8) -> u32 {
     GREYS[(pen & 0x0F) as usize]
 }
 
