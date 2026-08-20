@@ -339,71 +339,64 @@ impl Sf1Video {
         self.fb.pens.fill(0);
 
         let flip = active & ACTIVE_FLIP != 0;
+        // ⚠️ Four borrows of four fields, taken before `&mut self.fb.pens`.
+        // `self.region(plane)` inside the loop borrows the whole of `self`, and the
+        // mutable framebuffer borrow below is then rejected — E0502, at both
+        // `tilemap::draw` calls. Indexed by `Plane::index` so this array and
+        // `Sf1Video::region` cannot disagree about which region is which. The
+        // per-field form is not a style preference; it is what makes this compile.
+        let regions = [
+            &self.bg_gfx[..],
+            &self.fg_gfx[..],
+            &self.obj_gfx[..],
+            &self.tx_gfx[..],
+        ];
+        let rom = &self.tilerom;
+        // `LayerMask` is `Copy`; `&self.enable` is another borrow of `self` that
+        // would outlive `pens`.
+        let enable = self.enable;
+        let pens = &mut self.fb.pens;
 
-        if active & ACTIVE_BG != 0 && self.enable.bg {
-            let gfx = GfxSet {
-                rom: &self.bg_gfx,
-                layout: &SPRITE_LAYOUT,
-                colour_base: 0,
-            };
-            let rom = &self.tilerom;
+        // ⚠️ `[Bg, Fg]` rather than `MapKind::ALL`: sprites draw **between** the
+        // foreground and the text layer, so iterating all three maps first would put
+        // the text layer under the sprites and hide every score digit behind a
+        // fighter.
+        for kind in [tilemap::MapKind::Bg, tilemap::MapKind::Fg] {
+            let plane = kind.plane();
+            // Hardware bit AND mask: a mask only ever subtracts.
+            if active & plane.active_bit() == 0 || !plane.permitted(&enable) {
+                continue;
+            }
+            let gfx = plane.set(regions[plane.index()]);
             tilemap::draw(
-                &mut self.fb.pens,
+                pens,
                 &gfx,
-                &tilemap::BG,
-                |i| tilemap::bg_tile_info(rom, i),
-                u32::from(bgscroll),
+                kind.map(),
+                |i| kind.tile_info(rom, videoram, i),
+                kind.scroll(bgscroll, fgscroll),
                 flip,
-                // The background never calls `set_transparent_pen`, so pen 15 draws.
-                None,
+                kind.transparent_pen(),
             );
         }
 
-        if active & ACTIVE_FG != 0 && self.enable.fg {
-            let gfx = GfxSet {
-                rom: &self.fg_gfx,
-                layout: &SPRITE_LAYOUT,
-                colour_base: 256,
-            };
-            let rom = &self.tilerom;
-            tilemap::draw(
-                &mut self.fb.pens,
-                &gfx,
-                &tilemap::FG,
-                |i| tilemap::fg_tile_info(rom, i),
-                u32::from(fgscroll),
-                flip,
-                // `set_transparent_pen(15)`, `sf.cpp:764`.
-                Some(15),
-            );
+        if active & Plane::Sprites.active_bit() != 0 && Plane::Sprites.permitted(&enable) {
+            let gfx = Plane::Sprites.set(regions[Plane::Sprites.index()]);
+            sprites::draw(pens, &gfx, objectram, flip);
         }
 
-        if active & ACTIVE_SPRITES != 0 && self.enable.sprites {
-            let gfx = GfxSet {
-                rom: &self.obj_gfx,
-                layout: &SPRITE_LAYOUT,
-                colour_base: 512,
-            };
-            sprites::draw(&mut self.fb.pens, &gfx, objectram, flip);
-        }
-
-        if active & ACTIVE_TX != 0 && self.enable.tx {
-            let gfx = GfxSet {
-                rom: &self.tx_gfx,
-                layout: &CHAR_LAYOUT,
-                colour_base: 768,
-            };
+        // Text last: it draws over everything.
+        let kind = tilemap::MapKind::Tx;
+        let plane = kind.plane();
+        if active & plane.active_bit() != 0 && plane.permitted(&enable) {
+            let gfx = plane.set(regions[plane.index()]);
             tilemap::draw(
-                &mut self.fb.pens,
+                pens,
                 &gfx,
-                &tilemap::TX,
-                |i| tilemap::tx_tile_info(videoram, i),
-                // The text plane has no scroll register at all.
-                0,
+                kind.map(),
+                |i| kind.tile_info(rom, videoram, i),
+                kind.scroll(bgscroll, fgscroll),
                 flip,
-                // `set_transparent_pen(3)`, `sf.cpp:765`. Three, because the char
-                // layout has two planes and therefore four pens.
-                Some(3),
+                kind.transparent_pen(),
             );
         }
     }
@@ -963,5 +956,213 @@ mod tests {
                 plane.name()
             );
         }
+    }
+
+    /// A region whose pens are `(x + y) & ((1 << planes) - 1)`, encoded through the
+    /// layout rule **forwards**, so the expected pens in the tests below are
+    /// arithmetic rather than a copy of [`GfxLayout::pen`]'s output.
+    ///
+    /// ⚠️ The two bit-offset formulas are written out with literal numbers rather
+    /// than read from `plane_offsets`/`x_offsets`/`y_step`. The plan's first draft
+    /// called a `GfxLayout::bit_offset` accessor; there is none — Task 4 keeps that
+    /// arithmetic inside `pen`, deliberately — and a fixture that assembled the
+    /// offset from the layout's own fields would be `pen` again, so a fixture that
+    /// agreed with a broken decoder would still agree with it. These are
+    /// `sf.cpp:701-722`'s numbers, the same way `gfxpanels.rs`'s `gfx_rom` writes
+    /// CPS-1's.
+    fn gfx_rom(plane: Plane, tiles: u32) -> Vec<u8> {
+        let layout = plane.layout();
+        let (fw, fh, planes) = (layout.width, layout.height, layout.planes);
+        // `elements()` inverted: bits = tiles * char_increment * frac_den / frac_num.
+        let bits = tiles as usize * layout.char_increment as usize * layout.frac_den as usize
+            / layout.frac_num as usize;
+        let mut rom = vec![0u8; bits / 8];
+        let mask = (1u32 << planes) - 1;
+        for code in 0..tiles {
+            for y in 0..fh {
+                for x in 0..fw {
+                    let pen = (x + y) & mask;
+                    for p in 0..planes {
+                        // Plane 0 is the most significant pen bit.
+                        if pen & (1 << (planes - 1 - p)) == 0 {
+                            continue;
+                        }
+                        let off = if planes == 2 {
+                            char_bit(code, x, y, p)
+                        } else {
+                            sprite_bit(code, x, y, p, bits / 2)
+                        };
+                        rom[off / 8] |= 0x80 >> (off % 8);
+                    }
+                }
+            }
+        }
+        rom
+    }
+
+    /// `char_layout`'s bit for one plane of one pixel: `{4, 0}`, `STEP4` twice,
+    /// rows 16 bits apart, 128 bits per element, whole region.
+    fn char_bit(code: u32, x: u32, y: u32, plane: u32) -> usize {
+        let xoff = [0usize, 1, 2, 3, 8, 9, 10, 11][x as usize];
+        code as usize * 128 + if plane == 0 { 4 } else { 0 } + y as usize * 16 + xoff
+    }
+
+    /// `sprite_layout`'s bit: planes 2 and 3 live `RGN_FRAC(1,2)` into the region,
+    /// so `half_bits` is where their half starts.
+    fn sprite_bit(code: u32, x: u32, y: u32, plane: u32, half_bits: usize) -> usize {
+        let (half, p) = if plane < 2 {
+            (0, plane)
+        } else {
+            (1, plane - 2)
+        };
+        let xoff = [
+            0usize, 1, 2, 3, 8, 9, 10, 11, 256, 257, 258, 259, 264, 265, 266, 267,
+        ][x as usize];
+        half * half_bits + code as usize * 512 + if p == 0 { 4 } else { 0 } + y as usize * 16 + xoff
+    }
+
+    #[test]
+    fn the_fixtures_pens_are_the_arithmetic_it_claims() {
+        // The premise the three render tests below rest on: a fixture that encoded
+        // nothing would make every one of them compare zero against zero.
+        let rom = gfx_rom(Plane::Tx, 8);
+        let g = Plane::Tx.set(&rom);
+        assert_eq!(g.elements(), 8, "eight char elements");
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(g.pen(3, x, y), Some(((x + y) & 3) as u8), "tx ({x},{y})");
+            }
+        }
+        let rom = gfx_rom(Plane::Bg, 4);
+        let g = Plane::Bg.set(&rom);
+        assert_eq!(g.elements(), 4, "four sprite elements");
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(g.pen(2, x, y), Some(((x + y) & 15) as u8), "bg ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn rendering_uses_the_same_decoder_the_accessor_publishes() {
+        let mut v = Sf1Video::new(
+            gfx_rom(Plane::Bg, 4),
+            gfx_rom(Plane::Fg, 4),
+            gfx_rom(Plane::Sprites, 4),
+            gfx_rom(Plane::Tx, 8),
+            vec![0u8; 0x4_0000],
+        );
+        let videoram = blank_vram();
+        let objectram = blank_oram();
+        let palette = flat_palette();
+        v.render(&videoram, &objectram, &palette, ACTIVE_BG, 0, 0);
+        // The pixel at the screen origin reads BG cell 65 (see `tilemap::sample`),
+        // whose entry is all zeroes: code 0, colour 0, no flip. Tile pixel (0,0)
+        // of code 0 has pen 0, and the background has no transparent pen.
+        let g = v.gfx(Plane::Bg);
+        let pen = g.pen(0, 0, 0).expect("code 0 decodes");
+        assert_eq!(pen, 0);
+        assert_eq!(v.fb.pens[0], g.palette_base(0) + u16::from(pen));
+        assert_eq!(v.fb.pens[0], 0);
+    }
+
+    #[test]
+    fn a_plane_the_mask_forbids_is_not_drawn_even_with_its_hardware_bit_set() {
+        let mut v = Sf1Video::new(
+            gfx_rom(Plane::Bg, 4),
+            Vec::new(),
+            Vec::new(),
+            gfx_rom(Plane::Tx, 8),
+            vec![0xFFu8; 0x4_0000],
+        );
+        let mut videoram = blank_vram();
+        // TX cell 136 is the screen origin; code 1, colour 2, no flip.
+        videoram[136] = 0x2001;
+        let objectram = blank_oram();
+        let palette = flat_palette();
+        v.render(&videoram, &objectram, &palette, ACTIVE_TX, 0, 0);
+        let drawn = v.fb.pens[0];
+        v.enable.tx = false;
+        v.render(&videoram, &objectram, &palette, ACTIVE_TX, 0, 0);
+        assert_ne!(
+            drawn, v.fb.pens[0],
+            "masking the text layer changed the pixel"
+        );
+        assert_eq!(v.fb.pens[0], 0, "and left it at the cleared pen");
+    }
+
+    #[test]
+    fn the_text_planes_colour_scales_by_four_not_by_sixteen() {
+        let mut v = Sf1Video::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            gfx_rom(Plane::Tx, 8),
+            Vec::new(),
+        );
+        let mut videoram = blank_vram();
+        // Colour 2, code 1. Screen x 1 is tile pixel (1,0), whose pen is
+        // `(1 + 0) & 3` = 1 — and 1 is not the text layer's transparent pen, which
+        // is 3. Colour 2 * granularity 4 = 8, plus base 768 = 776.
+        videoram[136] = 0x2001;
+        let objectram = blank_oram();
+        let palette = flat_palette();
+        v.render(&videoram, &objectram, &palette, ACTIVE_TX, 0, 0);
+        assert_eq!(v.gfx(Plane::Tx).granularity(), 4);
+        assert_eq!(v.fb.pens[1], 776 + 1, "base 768 + 4*2 + pen 1");
+    }
+
+    /// The text layer draws **over** the sprites, not under them.
+    ///
+    /// ⚠️ `the_planes_composite_in_mames_order` covers the same ordering through the
+    /// four solid fixtures; this states the sprite-versus-text case directly, with
+    /// both pens opaque and in the same pixel, because that is the pairing a reader
+    /// of `render` has to check the trailing TX block for. Verified by mutation:
+    /// moving the sprite block after the text block fails both.
+    #[test]
+    fn the_text_layer_draws_over_the_sprites() {
+        let mut v = Sf1Video::new(
+            Vec::new(),
+            Vec::new(),
+            gfx_rom(Plane::Sprites, 4),
+            gfx_rom(Plane::Tx, 8),
+            Vec::new(),
+        );
+        let mut videoram = blank_vram();
+        // TX cell 136 is the screen origin, code 1 colour 0. At screen x 1 its pen
+        // is `(1 + 0) & 3` = 1 — opaque, since the text layer's hole is pen 3.
+        videoram[136] = 0x0001;
+        // Sprite entry 0 also covers the origin, code 0 colour 0. Its pen at (1,0)
+        // is `(1 + 0) & 15` = 1 — opaque, since a sprite's hole is pen 15.
+        let objectram = solid_oram();
+        let palette = flat_palette();
+        v.render(
+            &videoram,
+            &objectram,
+            &palette,
+            ACTIVE_SPRITES | ACTIVE_TX,
+            0,
+            0,
+        );
+        assert_eq!(
+            v.fb.pens[1],
+            Plane::Tx.colour_base() + 1,
+            "the text plane's pen 1, at base 768 -- the sprite under it would be 513"
+        );
+        // And the sprite really is there to be covered: masking the text off shows it.
+        v.enable.tx = false;
+        v.render(
+            &videoram,
+            &objectram,
+            &palette,
+            ACTIVE_SPRITES | ACTIVE_TX,
+            0,
+            0,
+        );
+        assert_eq!(
+            v.fb.pens[1],
+            Plane::Sprites.colour_base() + 1,
+            "the sprite was underneath all along"
+        );
     }
 }
