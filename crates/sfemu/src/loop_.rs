@@ -777,6 +777,80 @@ mod tests {
         Machine::Sf1(Box::new(m))
     }
 
+    /// An SF1 whose rendered frame is not one flat colour.
+    ///
+    /// [`an_sf1_machine`]'s counterpart to [`machine_that_draws`], and needed for the
+    /// same reason: a frame of pen 0 cannot distinguish "converted" from "zeroed", or
+    /// "masked" from "unmasked".
+    ///
+    /// The text plane, because it is the cheapest of the four to make draw: its tile
+    /// map lives in guest `videoram` rather than in a tilerom, so one word there and a
+    /// 2-plane 8×8 tile ROM are the whole setup. `video::sf1`'s own render tests use
+    /// this cell and this entry.
+    ///
+    /// - `active = ACTIVE_TX` — the hardware's own enable, which the mask ANDs with.
+    /// - `videoram[136] = 0x2001` — TX cell 136 is the screen origin; colour 2, code 1.
+    /// - `palette[776] = 0x0135` — colour 2 × granularity 4 + base 768. `Sf1Video::rgb`
+    ///   returns black for an unwritten entry, so a drawn pixel with no palette entry
+    ///   is indistinguishable from an undrawn one.
+    fn an_sf1_machine_that_draws() -> Machine {
+        use machine::video::sf1::Plane;
+
+        // The same 8×8 2-plane tile ROM shape `video::sf1`'s tests use: `pen(x, y)` is
+        // `(x + y) & 3`, so pixel (0,0) of any code is pen 0 and (1,0) is pen 1. Two
+        // codes, because cell 136's entry names code 1.
+        let mut tx = vec![0u8; 2 * 128 / 8 * 2];
+        let layout = Plane::Tx.layout();
+        for code in 0..2u32 {
+            for y in 0..layout.height {
+                for x in 0..layout.width {
+                    let pen = (x + y) & 3;
+                    for p in 0..layout.planes {
+                        if pen & (1 << (layout.planes - 1 - p)) == 0 {
+                            continue;
+                        }
+                        let off = (code * layout.char_increment
+                            + layout.plane_offsets[p as usize].bits
+                            + y * layout.y_step
+                            + layout.x_offsets[x as usize])
+                            as usize;
+                        tx[off / 8] |= 0x80 >> (off % 8);
+                    }
+                }
+            }
+        }
+
+        let mut rom = vec![0u8; 0x2000];
+        rom[0..8].copy_from_slice(&[0x00, 0xFF, 0xE0, 0x00, 0x00, 0x00, 0x10, 0x00]);
+        rom[0x64..0x68].copy_from_slice(&[0x00, 0x00, 0x11, 0x00]);
+        rom[0x1000..0x100E].copy_from_slice(&[
+            0x46, 0xFC, 0x20, 0x00, 0x52, 0x40, 0x33, 0xC0, 0x00, 0xFF, 0x80, 0x00, 0x60, 0xF6,
+        ]);
+        rom[0x1100..0x1104].copy_from_slice(&[0x52, 0x41, 0x4E, 0x73]);
+        let mut m = machine::Sf1::new(
+            &rom,
+            machine::video::sf1::Sf1Video::new(Vec::new(), Vec::new(), Vec::new(), tx, Vec::new()),
+            vec![0x18, 0xFE],
+            vec![0x00, 0x18, 0xFE],
+        );
+        m.reset();
+        m.board.active = machine::video::sf1::ACTIVE_TX;
+        m.board.videoram[136] = 0x2001;
+        m.board.palette[776] = 0x0135;
+        Machine::Sf1(Box::new(m))
+    }
+
+    /// The SF1 board inside [`an_sf1_machine`]'s machine.
+    ///
+    /// The mirror of [`cps1`], for the same reason: the SF1-arm tests read fields —
+    /// `board.inputs.in0()`, `audio_drops()` — and the fixture builds exactly one arm.
+    fn sf1(m: &Machine) -> &machine::Sf1 {
+        match m {
+            Machine::Sf1(f) => f,
+            Machine::Cps1(_) => unreachable!("this fixture builds an Sf1"),
+        }
+    }
+
     /// A unique temp path, removed when the guard drops.
     ///
     /// The process id keeps two `cargo test` runs from colliding, and the name keeps
@@ -1436,6 +1510,295 @@ mod tests {
             "the coin reached the board anyway"
         );
         assert_ne!(cps1(&m).board.inputs.in1(), 0xFFFF, "and so did the stick");
+    }
+
+    /// On an SF1 the same held keys reach the board *through the conversion*.
+    ///
+    /// The sibling above would pass on this board with the loop's SF1 arm assigning
+    /// `Sf1Inputs::idle()` — nothing there reads an SF1 port. The three ports are
+    /// asserted whole, as literals, because that is the only form in which "the
+    /// conversion ran" and "a constant was written" differ:
+    ///
+    /// | port | idle | with these three keys |
+    /// |---|---|---|
+    /// | `IN0` 0xC00000 | 0xFFFF | 0xFFFE — coin 1 at bit 0 |
+    /// | `IN1` 0xC00002 | 0xFFFF | 0xFFFD — P1 left at bit 1 |
+    /// | `SYSTEM` 0xC0000C | 0xFF7F | 0xFF7E — start 1 at bit 0 |
+    ///
+    /// One key per port, deliberately: a conversion that dropped `start1` while
+    /// carrying `coin1` is the failure a single-port assertion would miss, and the
+    /// three ports do not overlap. `SYSTEM`'s 0xFF7F baseline is bit 7, the board's one
+    /// active-high line — see `machine::sf1::inputs`.
+    #[test]
+    fn sf1_inputs_reach_the_board_through_the_conversion() {
+        let (mut o, _s, _p) = opts("sf1-inputs");
+        o.board = state_tag(machine::BoardKind::Sf1);
+        let mut m = an_sf1_machine();
+        let mut d = Fake::new(vec![Fake::held(&[Key::Num5, Key::Num1, Key::Left])]);
+        run(&mut m, &mut d, &mut NullAudio::default(), &o);
+
+        let i = &sf1(&m).board.inputs;
+        assert_eq!(i.in0(), 0xFFFE, "coin 1 reached IN0");
+        assert_eq!(i.in1(), 0xFFFD, "P1's left reached IN1");
+        assert_eq!(i.system(), 0xFF7E, "and start 1 reached SYSTEM");
+    }
+
+    /// An SF1's frame reaches the window through SF1's pen conversion.
+    ///
+    /// The end-to-end claim for the pen fork: CPS-1's converter reads a 3,072-entry
+    /// palette and shifts each 5-bit component; SF1's asks `Sf1Video::rgb` per pen, and
+    /// that expands each nibble to `(n << 4) | n`. Entry 0x0135 is (0x11, 0x33, 0x55)
+    /// under SF1's rule — the literal `main`'s `ppm_sf1` test uses — and would be
+    /// (0x08, 0x18, 0x28) under CPS-1's, so a loop that ran the wrong converter, or
+    /// none, presents a different number here.
+    ///
+    /// The pixel is the screen origin, which is TX cell 136's tile pixel (0,0): pen 0
+    /// of colour 2, palette entry 776. Pen 0 is not the text layer's transparent pen
+    /// (that is 3), so it draws.
+    #[test]
+    fn an_sf1_frame_reaches_the_window_through_sf1s_pen_conversion() {
+        let (mut o, _s, _p) = opts("sf1-pens");
+        o.board = state_tag(machine::BoardKind::Sf1);
+        let mut m = an_sf1_machine_that_draws();
+        let mut d = Fake::new(Fake::idle(2));
+        run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        let shown = d.last.expect("a tick presents");
+        assert_eq!(
+            shown.len(),
+            384 * 224,
+            "one ARGB word per pixel of SF1's screen"
+        );
+        assert_eq!(
+            shown[0], 0x0011_3355,
+            "SF1's `(n << 4) | n` on entry 0x0135, not CPS-1's shift"
+        );
+    }
+
+    /// Subtracting SF1's text layer changes the frame the window is given.
+    ///
+    /// The mirror of [`subtracting_a_layer_changes_the_presented_frame`], and the only
+    /// test of the SF1 mask fork: that one runs a CPS-1, where `gfx.mask()` is read and
+    /// `sf1_mask()` never is. A loop assigning `LayerMask::all()` on the SF1 arm — or
+    /// CPS-1's mask, which does not typecheck, or nothing — passes it and fails here.
+    ///
+    /// The key script is that test's, with the selection walked to row 3 first. SF1's
+    /// layers view has rows BG, FG, sprites, TX and the selection starts at 0, so
+    /// reaching TX means three `]` presses — and this fixture draws only the text plane,
+    /// because that is the plane whose map lives in guest RAM. `Enter` on row 0 would
+    /// subtract the background, which draws nothing here, and the frame would not
+    /// change.
+    ///
+    /// ⚠️ **A released tick between every press, including between the three `]`s.**
+    /// They are edge-triggered, so three consecutive held ticks are one press: written
+    /// that way first, the selection stopped at row 1 and the frame did not change.
+    #[test]
+    fn subtracting_an_sf1_layer_changes_the_presented_frame() {
+        let (mut o, _s, _p) = opts("sf1-mask-wired");
+        o.board = state_tag(machine::BoardKind::Sf1);
+
+        // Scoped, so the first machine is gone before the second is built.
+        let full = {
+            let mut m = an_sf1_machine_that_draws();
+            let mut d = Fake::new(Fake::idle(20));
+            run(&mut m, &mut d, &mut NullAudio::default(), &o);
+            d.last.expect("a tick presents")
+        };
+        assert_ne!(
+            full[0], 0,
+            "the premise: the unmasked frame draws at the origin"
+        );
+
+        // Show the viewer, cycle to the layers view, walk the selection to row 3, act,
+        // and hide the viewer again — the box would otherwise cover the frame and every
+        // pixel would differ for the wrong reason.
+        //
+        // Twenty ticks, matching the run above tick for tick: both must render the same
+        // number of frames, or the pictures differ because the machines are at different
+        // points and the mask is not what the comparison sees.
+        let mut m = an_sf1_machine_that_draws();
+        let mut d = Fake::new(vec![
+            Fake::held(&[Key::GfxToggled]),
+            Fake::held(&[]),
+            Fake::held(&[Key::GfxView]),
+            Fake::held(&[]),
+            Fake::held(&[Key::GfxView]),
+            Fake::held(&[]),
+            Fake::held(&[Key::GfxView]),
+            Fake::held(&[]),
+            Fake::held(&[Key::BracketRight]),
+            Fake::held(&[]),
+            Fake::held(&[Key::BracketRight]),
+            Fake::held(&[]),
+            Fake::held(&[Key::BracketRight]),
+            Fake::held(&[]),
+            Fake::held(&[Key::Enter]),
+            Fake::held(&[]),
+            Fake::held(&[Key::GfxToggled]),
+            Fake::held(&[]),
+            Fake::held(&[]),
+            Fake::held(&[]),
+        ]);
+        run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        let masked = d.last.expect("a tick presents");
+        assert_ne!(
+            full, masked,
+            "subtracting the text layer must change the picture"
+        );
+        assert_eq!(
+            masked[0], 0,
+            "and leave the origin at the cleared pen, whose colour is black"
+        );
+    }
+
+    /// F5 then F8 round-trips an SF1 through a real file.
+    ///
+    /// The mirror of [`a_save_and_load_round_trip_through_the_real_file`], which runs a
+    /// CPS-1 and so exercises `encode`/`decode` only. This is the one test of
+    /// `encode_sf1`/`decode_sf1` from inside the loop: a save arm that wrote an empty
+    /// `Vec` leaves a file the load arm then refuses, so the notice assertions are what
+    /// catch it, and the divergence is what catches a load that decoded and dropped the
+    /// state.
+    ///
+    /// Divergence, not comparison — the sibling's argument: save, run on, load, run the
+    /// same number of frames, and require the machine to arrive at the same place.
+    #[test]
+    fn an_sf1_save_and_load_round_trip_through_the_real_file() {
+        let (mut o, _s, _p) = opts("sf1-roundtrip");
+        o.board = state_tag(machine::BoardKind::Sf1);
+        let mut m = an_sf1_machine();
+
+        let mut script = vec![Fake::held(&[Key::F5])];
+        script.extend(Fake::idle(4));
+        let mut d = Fake::new(script);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        assert!(
+            s.notices.is_empty(),
+            "the save must succeed: {:?}",
+            s.notices
+        );
+        assert!(o.state_path.exists(), "and leave a file behind");
+        let after = {
+            let v = m.cpu_view();
+            (v.total_cycles, v.cpu.d[0], v.cpu.d[1], v.line)
+        };
+        assert_ne!(after.0, 0, "the premise: the machine moved");
+
+        // Run four more, then load and run the same four again.
+        let mut d = Fake::new(Fake::idle(4));
+        run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        let mut script = vec![Fake::held(&[Key::F8])];
+        script.extend(Fake::idle(4));
+        let mut d = Fake::new(script);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        assert!(
+            s.notices.is_empty(),
+            "the load must succeed: {:?}",
+            s.notices
+        );
+        let v = m.cpu_view();
+        assert_eq!(
+            (v.total_cycles, v.cpu.d[0], v.cpu.d[1], v.line),
+            after,
+            "the loaded machine must reach the same place"
+        );
+    }
+
+    /// F12 writes an SF1 screenshot, and it is SF1's PPM.
+    ///
+    /// The screenshot fork's only test from inside the loop. `main`'s
+    /// `the_sf1_screenshot_uses_sf1s_dac_rule_and_not_cps1s` pins `ppm_sf1` itself; this
+    /// pins that the loop calls it on this arm — a fork writing an empty `Vec`, or
+    /// CPS-1's `ppm`, leaves a different file.
+    ///
+    /// The literals are `main`'s: a 15-byte `P6\n384 224\n255\n` header and 258,048
+    /// bytes of body. The first pixel is entry 0x0135 through SF1's rule, which is the
+    /// byte triple CPS-1's converter cannot produce from the same entry.
+    #[test]
+    fn f12_writes_an_sf1_screenshot() {
+        let (mut o, _s, _p) = opts("sf1-shot");
+        o.board = state_tag(machine::BoardKind::Sf1);
+        let mut m = an_sf1_machine_that_draws();
+        let mut d = Fake::new(vec![Fake::held(&[Key::F12]), Fake::held(&[])]);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        assert!(
+            s.notices.is_empty(),
+            "the screenshot must succeed: {:?}",
+            s.notices
+        );
+        let bytes = std::fs::read(&o.shot_path).expect("F12 must write the file");
+        assert_eq!(&bytes[..15], b"P6\n384 224\n255\n", "the exact header");
+        assert_eq!(bytes.len(), 258_063, "and 384 * 224 * 3 bytes after it");
+        assert_eq!(
+            &bytes[15..18],
+            &[0x11, 0x33, 0x55],
+            "SF1's DAC rule on entry 0x0135, not CPS-1's"
+        );
+    }
+
+    /// The pacer runs each board at its own frame period.
+    ///
+    /// SF1's is 16,666,667 ns (60.0 Hz) against CPS-1's 16,768,000 (59.63) — the
+    /// shorter one, which is what makes one tick able to tell them apart. A tick of
+    /// exactly SF1's period owes a whole frame on SF1 and falls 101,333 ns short on
+    /// CPS-1, so:
+    ///
+    /// | board | tick of 16,666,667 ns |
+    /// |---|---|
+    /// | SF1 | 1 frame |
+    /// | CPS-1 | 0 frames |
+    ///
+    /// Both halves, because only the pair distinguishes "the period follows the board"
+    /// from "the period is a constant that happens to be SF1's". A loop hardcoding
+    /// `FramePacer::cps1()` fails the first row; one hardcoding SF1's fails the second.
+    ///
+    /// The literals are the periods themselves, not `m.frame_ns()`: reading the number
+    /// the code under test reads would assert nothing. `machine`'s own tests pin the two
+    /// constants against their refresh rates.
+    #[test]
+    fn each_boards_pacer_runs_at_that_boards_frame_period() {
+        /// SF1's frame period in nanoseconds. See `machine`'s `SF1_FRAME_NS`.
+        const SF1_NS: u64 = 16_666_667;
+
+        let (mut o, _s, _p) = opts("sf1-pace");
+        o.board = state_tag(machine::BoardKind::Sf1);
+        let mut m = an_sf1_machine();
+        let mut d = Fake::new(vec![(KeySet::new(), SF1_NS)]);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        assert_eq!(s.frames, 1, "SF1 owes a frame at its own period");
+
+        let (o2, _s2, _p2) = opts("cps1-pace");
+        let mut m2 = machine();
+        let mut d2 = Fake::new(vec![(KeySet::new(), SF1_NS)]);
+        let s2 = run(&mut m2, &mut d2, &mut NullAudio::default(), &o2);
+        assert_eq!(
+            s2.frames, 0,
+            "and CPS-1's period is longer, so the same tick owes nothing"
+        );
+    }
+
+    /// A `LoopOpts` whose tag does not match its machine is a panic in debug.
+    ///
+    /// The pairing `main` makes by hand — a board from the ROM set, a tag from
+    /// [`state_tag`] — is the thing this checks. Get it wrong and a session writes
+    /// states its own machine then refuses to load, which is silent until someone
+    /// presses `F8`.
+    ///
+    /// `#[cfg(debug_assertions)]`, because that is the build the assertion exists in: a
+    /// `panic!` inside `run` in a release build takes a window down mid-game, and the
+    /// mismatch is a bug in `main` that no user input can cause. `crates/m68k`'s
+    /// `set_irq_panics_on_an_out_of_range_level_in_debug` is the same shape.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "does not match the machine's board")]
+    fn a_mismatched_board_tag_panics_in_debug() {
+        // SF2's tag, an SF1 machine — the pairing that compiles, runs, and is wrong.
+        let (o, _s, _p) = opts("board-mismatch");
+        run(
+            &mut an_sf1_machine(),
+            &mut Fake::new(Fake::idle(1)),
+            &mut NullAudio::default(),
+            &o,
+        );
     }
 
     /// `F4` steps one instruction per press, and no frames.
@@ -2410,6 +2773,44 @@ mod tests {
             ),
             (0, 0),
             "a healthy sink leaves them at zero"
+        );
+    }
+
+    /// The same counters, on an SF1, where they land on the machine and not a board.
+    ///
+    /// ⚠️ **This is the asymmetric fork.** CPS-1 hangs the pair on its one sound board;
+    /// SF1 has two and the host ring is downstream of the mix, so `Sf1::set_audio_stats`
+    /// takes them. The sibling above cannot cover this arm, and without this test the
+    /// SF1 arm's two arguments could be swapped — 17 clicks reported as 17 starvations —
+    /// with nothing to say so. `17` and `4` are the sibling's numbers on purpose: two
+    /// distinct values, so a swap is visible, and the same two so the two tests read as
+    /// one pair.
+    #[test]
+    fn the_rings_counters_reach_an_sf1_machine() {
+        let (mut o, _s, _p) = opts("sf1-audio-stats");
+        o.board = state_tag(machine::BoardKind::Sf1);
+        let mut m = an_sf1_machine();
+        let mut d = Fake::new(Fake::idle(2));
+        let mut a = FakeAudio {
+            stats: machine::resample::RingStats {
+                drops: 17,
+                underruns: 4,
+            },
+            ..FakeAudio::default()
+        };
+        run(&mut m, &mut d, &mut a, &o);
+        assert_eq!(sf1(&m).audio_drops(), 17, "drops is the first argument");
+        assert_eq!(sf1(&m).audio_underruns(), 4, "and underruns the second");
+
+        let (mut o2, _s2, _p2) = opts("sf1-audio-stats-quiet");
+        o2.board = state_tag(machine::BoardKind::Sf1);
+        let mut m2 = an_sf1_machine();
+        let mut d2 = Fake::new(Fake::idle(2));
+        run(&mut m2, &mut d2, &mut FakeAudio::default(), &o2);
+        assert_eq!(
+            (sf1(&m2).audio_drops(), sf1(&m2).audio_underruns()),
+            (0, 0),
+            "a healthy sink leaves them at zero here too"
         );
     }
 
