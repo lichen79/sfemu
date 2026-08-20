@@ -23,37 +23,62 @@
 //!
 //! # Nothing here writes to the machine
 //!
-//! Every entry point takes `&Cps1`. The viewer reads the scroll registers through
-//! [`gfxpanels::map_origin`] and gfxram through the views, and that is all.
+//! Every entry point takes `&Machine`. The viewer reads the scroll registers through
+//! [`gfxpanels::map_origin`] or [`crate::sf1panels::map_origin`], and each board's
+//! graphics regions through its own views, and that is all. `&Machine` rather than
+//! `&Cps1` is also why there is no `as_cps1()` on `Machine`: a viewer that silently
+//! did nothing on one board is a panel that goes blank with no error.
 
 use crate::gfxpanels::{self, View, ViewState};
 use crate::keys::Actions;
+use crate::sf1panels::Sf1ViewState;
 use machine::video::compose::LayerMask;
 use machine::video::layers::{Layer, MAP_TILES};
 use machine::video::palette::PENS;
+use machine::video::sf1::tilemap::MapKind;
+use machine::video::sf1::{LayerMask as Sf1LayerMask, Plane};
 use machine::video::tiles::TileKind;
-use machine::Cps1;
+use machine::Machine;
 
 /// How far `[` and `]` move the palette cursor: one row of swatches.
 ///
-/// A row rather than one entry, because the palette is 3072 entries and stepping
-/// through it one at a time is not navigation. The colour schemes CPS-1 uses are 16
-/// pens wide, so a 64-wide row is four of them — and `PEN_GRANULARITY` is not the
-/// right step here for the same reason: you are looking for a *scheme*, and they sit
-/// in blocks.
+/// A row rather than one entry, because the palette is 3072 entries on CPS-1 and
+/// 1024 on SF1, and stepping through either one at a time is not navigation. Both
+/// boards' colour schemes are 16 pens wide, so a 64-wide row is four of them — and
+/// `PEN_GRANULARITY` is not the right step here for the same reason: you are looking
+/// for a *scheme*, and they sit in blocks.
 const PAL_PAGE: usize = 64;
+
+/// SF1's palette, for the same wrap CPS-1 does at [`PENS`].
+///
+/// A third of CPS-1's, so a shared constant would let `]` walk two thirds of the way
+/// off the end of SF1's palette and show sixteen rows of entry 0.
+const SF1_PENS: usize = machine::video::sf1::palette::ENTRIES;
 
 /// The graphics viewer's whole state.
 ///
 /// `on` is separate from the view: hiding and showing must not lose where you were
 /// looking, because `F9` is how you compare the viewer's answer against the game's
 /// own screen and you will press it repeatedly.
+///
+/// # Why `view` is hoisted out of the two states
+///
+/// The two boards' cursors are genuinely separate — a CPS-1 `TileKind` means nothing
+/// to SF1 and an SF1 `Plane` means nothing to CPS-1 — but *which view* is chrome.
+/// With a `view` inside each state, `F10` on one board would leave the other looking
+/// somewhere else, and a save state loaded across a board change would open a
+/// different panel than the one you were reading. One field cannot desynchronise, and
+/// [`GfxViewer::view`] keeps its no-argument signature because of it.
 #[derive(Debug, Clone)]
 pub struct GfxViewer {
     /// Whether the box is drawn.
     on: bool,
-    /// Everything the views read.
-    state: ViewState,
+    /// Which view is shown, on either board.
+    view: View,
+    /// Where CPS-1's four views are looking.
+    cps1: ViewState,
+    /// Where SF1's four views are looking.
+    sf1: Sf1ViewState,
 }
 
 impl Default for GfxViewer {
@@ -74,7 +99,8 @@ impl GfxViewer {
     pub fn new() -> Self {
         Self {
             on: false,
-            state: ViewState {
+            view: View::Tiles,
+            cps1: ViewState {
                 view: View::Tiles,
                 kind: TileKind::Tile16x16,
                 layer: Layer::Scroll2,
@@ -84,6 +110,16 @@ impl GfxViewer {
                 row: 0,
                 mask: LayerMask::all(),
             },
+            sf1: Sf1ViewState {
+                view: View::Tiles,
+                plane: Plane::Bg,
+                map: MapKind::Bg,
+                tile_at: 0,
+                pal_at: 0,
+                map_at: None,
+                row: 0,
+                mask: Sf1LayerMask::all(),
+            },
         }
     }
 
@@ -92,34 +128,55 @@ impl GfxViewer {
         self.on
     }
 
-    /// Which view is shown.
+    /// Which view is shown, on either board.
     pub const fn view(&self) -> View {
-        self.state.view
+        self.view
     }
 
-    /// Everything the views read.
+    /// Everything CPS-1's views read.
     ///
-    /// For the loop's `draw` and for tests. Outside this crate a [`ViewState`] is
-    /// `gfxpanels`' business, and the loop needs it only to hand back.
-    pub const fn state(&self) -> &ViewState {
-        &self.state
+    /// ⚠️ By value, not by reference: `view` is the viewer's field and the two
+    /// states', so this composes the answer rather than pointing at a stored one. A
+    /// `&ViewState` would have to point at a `view` that could be stale.
+    pub const fn state(&self) -> ViewState {
+        ViewState {
+            view: self.view,
+            ..self.cps1
+        }
     }
 
-    /// The mask the loop must give `Video`.
+    /// Everything SF1's views read.
+    pub const fn sf1_state(&self) -> Sf1ViewState {
+        Sf1ViewState {
+            view: self.view,
+            ..self.sf1
+        }
+    }
+
+    /// The mask the loop must give a CPS-1's `Video`.
     ///
     /// Never enables anything: `LayerMask::all()` is the start and every toggle
     /// clears or restores one bit. The hardware's own `&&` in `Video::render` is what
     /// makes that structural — see `compose`'s `the_mask_can_only_subtract`.
     pub const fn mask(&self) -> LayerMask {
-        self.state.mask
+        self.cps1.mask
+    }
+
+    /// The mask the loop must give an `Sf1Video`.
+    ///
+    /// The same "subtracts only" guarantee, over SF1's own four fields — see
+    /// `Plane::permitted` and `Sf1Video::render`'s `&&`.
+    pub const fn sf1_mask(&self) -> Sf1LayerMask {
+        self.sf1.mask
     }
 
     /// Applies one frame's viewer keys. Returns whether the viewer is shown.
     ///
-    /// `m` is read, never written: [`gfxpanels::map_origin`] reads the scroll
-    /// registers when the tilemap cursor leaves the beam, and the graphics ROM's
-    /// length bounds the tile view's paging. Nothing else.
-    pub fn update(&mut self, a: &Actions, m: &Cps1) -> bool {
+    /// `m` is read, never written: [`gfxpanels::map_origin`] and
+    /// [`crate::sf1panels::map_origin`] read the scroll registers when a tilemap
+    /// cursor leaves the beam, and a region's length bounds the tile view's paging.
+    /// Nothing else.
+    pub fn update(&mut self, a: &Actions, m: &Machine) -> bool {
         if a.gfx_toggled {
             self.on = !self.on;
         }
@@ -129,8 +186,10 @@ impl GfxViewer {
         if !self.on {
             return false;
         }
+        // The view cycles before the board is looked at, because it is the one piece
+        // of state both boards share.
         if a.gfx_view_cycled {
-            self.state.view = self.state.view.cycled();
+            self.view = self.view.cycled();
         }
         if a.gfx_back {
             self.step(m, false);
@@ -139,78 +198,135 @@ impl GfxViewer {
             self.step(m, true);
         }
         if a.gfx_act {
-            self.act();
+            self.act(m);
         }
         true
     }
 
-    /// `Enter`: one key, four meanings, one per view.
-    fn act(&mut self) {
-        match self.state.view {
-            View::Tiles => self.state.kind = next_kind(self.state.kind),
-            View::Tilemap => {
-                self.state.layer = next_layer(self.state.layer);
-                // A new layer's tiles are a different size, so a cell index from the
-                // old one means nothing. Back to following the beam.
-                self.state.map_at = None;
-            }
-            // The palette's cursor is moved by `[`/`]` and there is nothing else to
-            // act on — the view has one axis. Deliberately nothing, and named so,
-            // because a silent `_ => {}` reads as an oversight.
-            View::Palette => {}
-            View::Layers => self.toggle_row(),
+    /// `Enter`: one key, four meanings per board, one per view.
+    fn act(&mut self, m: &Machine) {
+        match m {
+            Machine::Cps1(_) => match self.view {
+                View::Tiles => self.cps1.kind = next_kind(self.cps1.kind),
+                View::Tilemap => {
+                    // A new layer's tiles are a different size, so a cell index from
+                    // the old one means nothing. Back to following the beam.
+                    self.cps1.layer = next_layer(self.cps1.layer);
+                    self.cps1.map_at = None;
+                }
+                // The palette's cursor is moved by `[`/`]` and there is nothing else
+                // to act on — the view has one axis. Deliberately nothing, and named
+                // so, because a silent `_ => {}` reads as an oversight.
+                View::Palette => {}
+                View::Layers => self.toggle_row(),
+            },
+            Machine::Sf1(_) => match self.view {
+                // Four regions, not four tile sizes: each SF1 plane has a fixed
+                // layout, so cycling the plane is what cycling the kind was.
+                View::Tiles => self.sf1.plane = self.sf1.plane.cycled(),
+                View::Tilemap => {
+                    // A new map has different dimensions, so a cell from the old one
+                    // means nothing — BG's (2000, 3) is not a cell of TX at all.
+                    self.sf1.map = self.sf1.map.cycled();
+                    self.sf1.map_at = None;
+                }
+                View::Palette => {}
+                View::Layers => self.toggle_sf1_row(),
+            },
         }
     }
 
-    /// `[` and `]`: also one meaning per view.
-    fn step(&mut self, m: &Cps1, forward: bool) {
-        match self.state.view {
-            View::Tiles => {
-                let (cols, rows) = gfxpanels::tile_grid(self.state.kind);
-                self.state.tile_at = paged(self.state.tile_at, (cols * rows) as u32, forward);
-            }
-            View::Tilemap => {
-                // The first move materialises the cursor from wherever the beam is —
-                // the same "`None` is not a value" step `Debugger::scroll` takes.
-                let (c, r) = self
-                    .state
-                    .map_at
-                    .unwrap_or_else(|| gfxpanels::map_origin(m, self.state.layer));
-                // Wrapping, because the map itself wraps at 64: this is a coordinate
-                // in a torus, not an address.
-                let c = if forward {
-                    (c + 1) % MAP_TILES
-                } else {
-                    (c + MAP_TILES - 1) % MAP_TILES
-                };
-                self.state.map_at = Some((c, r));
-            }
-            View::Palette => {
-                self.state.pal_at = if forward {
-                    (self.state.pal_at + PAL_PAGE) % PENS
-                } else {
-                    (self.state.pal_at + PENS - PAL_PAGE) % PENS
-                };
-            }
-            // Four rows, so both directions wrap — a selection that stuck at the ends
-            // would need two keys to reach the row you can see is there.
-            View::Layers => {
-                self.state.row = if forward {
-                    (self.state.row + 1) % ROWS
-                } else {
-                    (self.state.row + ROWS - 1) % ROWS
-                };
-            }
+    /// `[` and `]`: also one meaning per view, per board.
+    fn step(&mut self, m: &Machine, forward: bool) {
+        match m {
+            Machine::Cps1(c) => match self.view {
+                View::Tiles => {
+                    let (cols, rows) = gfxpanels::tile_grid(self.cps1.kind);
+                    self.cps1.tile_at = paged(self.cps1.tile_at, (cols * rows) as u32, forward);
+                }
+                View::Tilemap => {
+                    // The first move materialises the cursor from wherever the beam
+                    // is — the same "`None` is not a value" step `Debugger::scroll`
+                    // takes.
+                    let (col, r) = self
+                        .cps1
+                        .map_at
+                        .unwrap_or_else(|| gfxpanels::map_origin(c, self.cps1.layer));
+                    // Wrapping, because the map itself wraps at 64: this is a
+                    // coordinate in a torus, not an address.
+                    let col = if forward {
+                        (col + 1) % MAP_TILES
+                    } else {
+                        (col + MAP_TILES - 1) % MAP_TILES
+                    };
+                    self.cps1.map_at = Some((col, r));
+                }
+                View::Palette => {
+                    self.cps1.pal_at = if forward {
+                        (self.cps1.pal_at + PAL_PAGE) % PENS
+                    } else {
+                        (self.cps1.pal_at + PENS - PAL_PAGE) % PENS
+                    };
+                }
+                // Four rows, so both directions wrap — a selection that stuck at the
+                // ends would need two keys to reach the row you can see is there.
+                View::Layers => {
+                    self.cps1.row = if forward {
+                        (self.cps1.row + 1) % ROWS
+                    } else {
+                        (self.cps1.row + ROWS - 1) % ROWS
+                    };
+                }
+            },
+            Machine::Sf1(s) => match self.view {
+                View::Tiles => {
+                    let (cols, rows) = crate::sf1panels::tile_grid(self.sf1.plane);
+                    self.sf1.tile_at = paged(self.sf1.tile_at, (cols * rows) as u32, forward);
+                }
+                View::Tilemap => {
+                    // ⚠️ Each map's own width, not a shared constant: BG and FG are
+                    // 2,048 columns and TX is 64. A `% MAP_TILES` here would wrap the
+                    // background at 64 and make 31/32 of the map unreachable.
+                    let cols = self.sf1.map.map().cols;
+                    let (col, r) = self
+                        .sf1
+                        .map_at
+                        .unwrap_or_else(|| crate::sf1panels::map_origin(s, self.sf1.map));
+                    let col = if forward {
+                        (col + 1) % cols
+                    } else {
+                        // ⚠️ `- 1 % cols` and not `- 1`: a one-column map would
+                        // underflow `col + cols - 1` at col 0 — the same guard
+                        // `sf1panels`' window wrap carries.
+                        (col + cols - 1 % cols) % cols
+                    };
+                    self.sf1.map_at = Some((col, r));
+                }
+                View::Palette => {
+                    self.sf1.pal_at = if forward {
+                        (self.sf1.pal_at + PAL_PAGE) % SF1_PENS
+                    } else {
+                        (self.sf1.pal_at + SF1_PENS - PAL_PAGE) % SF1_PENS
+                    };
+                }
+                View::Layers => {
+                    self.sf1.row = if forward {
+                        (self.sf1.row + 1) % ROWS
+                    } else {
+                        (self.sf1.row + ROWS - 1) % ROWS
+                    };
+                }
+            },
         }
     }
 
-    /// Subtracts, or restores, the selected row's layer.
+    /// Subtracts, or restores, the selected row's layer, on CPS-1.
     ///
     /// Row 0 is the sprites, because that is `layer_order`'s value 0 and the layers
     /// view lists them in that order.
     fn toggle_row(&mut self) {
-        let m = &mut self.state.mask;
-        match self.state.row {
+        let m = &mut self.cps1.mask;
+        match self.cps1.row {
             0 => m.sprites = !m.sprites,
             1 => m.scroll1 = !m.scroll1,
             2 => m.scroll2 = !m.scroll2,
@@ -221,12 +337,31 @@ impl GfxViewer {
         }
     }
 
-    /// Draws the current view, if shown.
-    pub fn draw(&self, buf: &mut [u32], m: &Cps1) {
+    /// Subtracts, or restores, the selected row's plane, on SF1.
+    ///
+    /// ⚠️ Row 0 is the *background*, not the sprites. SF1's drawing order is fixed at
+    /// BG, FG, OB, TX, which is `Plane::ALL`'s order and the layers panel's row
+    /// order; CPS-1's row 0 is the sprites because `layer_order`'s value 0 is. The
+    /// two boards' row 0 mean different things and the panels label them.
+    fn toggle_sf1_row(&mut self) {
+        let m = &mut self.sf1.mask;
+        match self.sf1.row {
+            0 => m.bg = !m.bg,
+            1 => m.fg = !m.fg,
+            2 => m.sprites = !m.sprites,
+            _ => m.tx = !m.tx,
+        }
+    }
+
+    /// Draws the current view of whichever board this is, if shown.
+    pub fn draw(&self, buf: &mut [u32], m: &Machine) {
         if !self.on {
             return;
         }
-        gfxpanels::draw(buf, m, &self.state);
+        match m {
+            Machine::Cps1(c) => gfxpanels::draw(buf, c, &self.state()),
+            Machine::Sf1(s) => crate::sf1panels::draw(buf, s, &self.sf1_state()),
+        }
     }
 }
 
@@ -283,23 +418,66 @@ mod tests {
     use machine::timing::Timing;
     use machine::video::{HEIGHT, WIDTH};
 
-    /// A booted machine with a small graphics ROM.
+    /// A booted CPS-1 machine with a small graphics ROM.
     ///
-    /// Boxed: a `Cps1` is half a megabyte by value, and returning one through a
-    /// fixture overflows a test thread's stack — which it did, in `gfxpanels`, as a
-    /// `SIGABRT` with no failing assertion.
-    fn a_machine() -> Box<Cps1> {
+    /// Boxed inside the enum: a `Cps1` is half a megabyte by value, and returning one
+    /// through a fixture overflows a test thread's stack — which it did, in
+    /// `gfxpanels`, as a `SIGABRT` with no failing assertion.
+    fn a_machine() -> Machine {
         let mut rom = vec![0u8; 0x2000];
         rom[0..8].copy_from_slice(&[0x00, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00]);
         rom[0x1000..0x1002].copy_from_slice(&[0x60, 0xFE]);
-        let mut m = Box::new(Cps1::with_gfx(
+        let mut m = Box::new(machine::Cps1::with_gfx(
             &rom,
             vec![0u8; 0x4000],
             BoardConfig::sf2(),
             Timing::cps1_10mhz(),
         ));
         m.reset();
-        m
+        Machine::Cps1(m)
+    }
+
+    /// The `Cps1` inside a `Machine` built by [`a_machine`].
+    ///
+    /// Test-only, and deliberately *not* a method on `Machine`: an
+    /// `as_cps1() -> Option<&Cps1>` in the library would let production code write
+    /// `if let Some(c) = m.as_cps1() { … }` and silently do nothing on SF1 — a panel
+    /// that goes blank on one board with no error. Here the panic is the point.
+    ///
+    /// ⚠️ Call this per use, never bound once across a test body: a
+    /// `let c = cps1_mut(&mut m);` held across a body holds `m` mutably, and the
+    /// `&Machine` the viewer needs is then rejected (E0502).
+    fn cps1(m: &Machine) -> &machine::Cps1 {
+        match m {
+            Machine::Cps1(c) => c,
+            Machine::Sf1(_) => unreachable!("a_machine builds a Cps1"),
+        }
+    }
+
+    /// Ditto, mutably, for the two tests that set a scroll register.
+    fn cps1_mut(m: &mut Machine) -> &mut machine::Cps1 {
+        match m {
+            Machine::Cps1(c) => c,
+            Machine::Sf1(_) => unreachable!("a_machine builds a Cps1"),
+        }
+    }
+
+    /// A reset SF1 wrapped in a `Machine`, with every plane enabled.
+    fn an_sf1_machine() -> Machine {
+        use machine::video::sf1::Sf1Video;
+        let mut prog = vec![0u8; 0x2000];
+        prog[0..4].copy_from_slice(&[0x00, 0xFF, 0x80, 0x00]);
+        prog[4..8].copy_from_slice(&[0x00, 0x00, 0x10, 0x00]);
+        prog[0x1000..0x1002].copy_from_slice(&[0x60, 0xFE]);
+        let mut m = machine::Sf1::new(
+            &prog,
+            Sf1Video::new(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            vec![0x18, 0xFE],
+            vec![0x00, 0x18, 0xFE],
+        );
+        m.reset();
+        m.board.active = 0x20 | 0x40 | 0x80 | 0x08;
+        Machine::Sf1(Box::new(m))
     }
 
     /// An `Actions` with one field set.
@@ -315,7 +493,7 @@ mod tests {
     }
 
     /// A shown viewer, since almost every test needs one.
-    fn shown(m: &Cps1) -> GfxViewer {
+    fn shown(m: &Machine) -> GfxViewer {
         let mut g = GfxViewer::new();
         g.update(&act(|a| a.gfx_toggled = true), m);
         assert!(g.shown(), "the premise: F9 showed it");
@@ -323,7 +501,7 @@ mod tests {
     }
 
     /// A shown viewer looking at `view`.
-    fn looking_at(m: &Cps1, view: View) -> GfxViewer {
+    fn looking_at(m: &Machine, view: View) -> GfxViewer {
         let mut g = shown(m);
         for _ in 0..4 {
             if g.view() == view {
@@ -550,8 +728,8 @@ mod tests {
         let mut m = a_machine();
         // Scroll 2 x = −80: visible pixel 0 is raster 64 − 80 = −16, which is map
         // column 63 after the wrap. So one step forward is column 0, not column 1.
-        m.board.cps_a[machine::video::regs::SCROLL2_X] = (-80i16) as u16;
-        let origin = gfxpanels::map_origin(&m, Layer::Scroll2);
+        cps1_mut(&mut m).board.cps_a[machine::video::regs::SCROLL2_X] = (-80i16) as u16;
+        let origin = gfxpanels::map_origin(cps1(&m), Layer::Scroll2);
         assert_eq!(origin.0, 63, "the premise: the beam is at column 63");
         let mut g = looking_at(&m, View::Tilemap);
         assert_eq!(g.state().layer, Layer::Scroll2, "the premise: scroll 2");
@@ -574,8 +752,8 @@ mod tests {
     fn the_tilemap_cursor_wraps_at_the_map_edge() {
         let m = a_machine();
         let mut g = looking_at(&m, View::Tilemap);
-        let row = gfxpanels::map_origin(&m, Layer::Scroll2).1;
-        g.state.map_at = Some((0, row));
+        let row = gfxpanels::map_origin(cps1(&m), Layer::Scroll2).1;
+        g.cps1.map_at = Some((0, row));
         g.update(&act(|a| a.gfx_back = true), &m);
         assert_eq!(
             g.state().map_at,
@@ -694,7 +872,7 @@ mod tests {
             let (cols, rows) = gfxpanels::tile_grid(g.state().kind);
             (cols * rows) as u32
         };
-        g.state.tile_at = u32::MAX - 1;
+        g.cps1.tile_at = u32::MAX - 1;
         g.update(&act(|a| a.gfx_forward = true), &m);
         assert_eq!(g.state().tile_at, u32::MAX, "saturated, not wrapped");
         g.update(&act(|a| a.gfx_back = true), &m);
@@ -829,7 +1007,7 @@ mod tests {
         let mut mine = vec![0u32; WIDTH * HEIGHT];
         g.draw(&mut mine, &m);
         let mut expected = vec![0u32; WIDTH * HEIGHT];
-        gfxpanels::draw(&mut expected, &m, g.state());
+        gfxpanels::draw(&mut expected, cps1(&m), &g.state());
         assert_eq!(mine, expected, "the same frame, so the state matches");
 
         // And a different cursor gives a different frame, or the comparison above
@@ -837,10 +1015,10 @@ mod tests {
         let mut other = vec![0u32; WIDTH * HEIGHT];
         gfxpanels::draw(
             &mut other,
-            &m,
+            cps1(&m),
             &ViewState {
                 pal_at: 0,
-                ..*g.state()
+                ..g.state()
             },
         );
         assert_ne!(mine, other, "the premise: the cursor changes the frame");
@@ -891,13 +1069,16 @@ mod tests {
 
     /// Using the viewer does not disturb the machine.
     ///
-    /// `&Cps1` is the compiler's half of this. The behavioural half is worth stating
-    /// because `map_origin` reads registers and a reader that went through the bus
-    /// would acknowledge an interrupt — the trap `peek_word` documents.
+    /// `&Machine` is the compiler's half of this. The behavioural half is worth
+    /// stating because `map_origin` reads registers and a reader that went through the
+    /// bus would acknowledge an interrupt — the trap `peek_word` documents.
     #[test]
     fn using_the_viewer_does_not_disturb_the_machine() {
         let m = a_machine();
-        let before = (m.total_cycles, m.cpu.pc, m.board.trace.acks);
+        let before = {
+            let c = cps1(&m);
+            (c.total_cycles, c.cpu.pc, c.board.trace.acks)
+        };
         let mut g = shown(&m);
         let mut buf = vec![0u32; WIDTH * HEIGHT];
         for _ in 0..4 {
@@ -911,10 +1092,185 @@ mod tests {
             g.draw(&mut buf, &m);
             g.update(&act(|a| a.gfx_view_cycled = true), &m);
         }
+        let after = {
+            let c = cps1(&m);
+            (c.total_cycles, c.cpu.pc, c.board.trace.acks)
+        };
         assert_eq!(
-            before,
-            (m.total_cycles, m.cpu.pc, m.board.trace.acks),
+            before, after,
             "the viewer reached the machine through something with side effects"
         );
+    }
+
+    /// `view` is one field, so cycling on one board moves the other's panel too.
+    #[test]
+    fn the_view_is_one_field_so_a_board_change_cannot_desynchronise_it() {
+        let cps = a_machine();
+        let sf1 = an_sf1_machine();
+        let mut g = GfxViewer::new();
+        g.update(&act(|a| a.gfx_toggled = true), &cps);
+        g.update(&act(|a| a.gfx_view_cycled = true), &cps);
+        assert_eq!(g.view(), View::Tilemap);
+        // The same viewer, now looking at an SF1: the view followed.
+        assert_eq!(g.sf1_state().view, View::Tilemap);
+        g.update(&act(|a| a.gfx_view_cycled = true), &sf1);
+        assert_eq!(g.view(), View::Palette);
+        assert_eq!(g.state().view, View::Palette, "and CPS-1's state agrees");
+    }
+
+    /// The cursors are not: `]` on one board leaves the other's alone.
+    #[test]
+    fn each_boards_cursor_is_its_own() {
+        let cps = a_machine();
+        let sf1 = an_sf1_machine();
+        let mut g = GfxViewer::new();
+        g.update(&act(|a| a.gfx_toggled = true), &cps);
+        g.update(&act(|a| a.gfx_forward = true), &cps);
+        let cps_at = g.state().tile_at;
+        assert_ne!(cps_at, 0, "CPS-1's tile cursor moved");
+        assert_eq!(g.sf1_state().tile_at, 0, "SF1's did not");
+        g.update(&act(|a| a.gfx_forward = true), &sf1);
+        assert_eq!(g.state().tile_at, cps_at, "and CPS-1's stayed where it was");
+        assert_ne!(g.sf1_state().tile_at, 0, "while SF1's moved");
+    }
+
+    /// SF1's tilemap cursor wraps at the selected map's own width.
+    ///
+    /// ⚠️ `g.sf1.map` is set directly rather than pressed to: reaching `MapKind::Tx`
+    /// costs one `act` per map, and a test that pressed its way there would be testing
+    /// `act` twice and the wrap not at all. Same reason
+    /// `the_tilemap_cursor_wraps_at_the_map_edge` writes `g.cps1.map_at`.
+    #[test]
+    fn the_sf1_tilemap_cursor_wraps_at_each_maps_own_edge() {
+        let sf1 = an_sf1_machine();
+        let mut g = GfxViewer::new();
+        g.update(&act(|a| a.gfx_toggled = true), &sf1);
+        g.update(&act(|a| a.gfx_view_cycled = true), &sf1);
+        assert_eq!(g.view(), View::Tilemap);
+        // The text map has 64 columns; sixty-six presses must not leave it.
+        g.sf1.map = MapKind::Tx;
+        for _ in 0..66 {
+            g.update(&act(|a| a.gfx_forward = true), &sf1);
+            let (c, _) = g.sf1_state().map_at.expect("the cursor materialised");
+            assert!(c < 64, "column {c} is inside the text map");
+        }
+        // And the background has 2048, so it does not wrap at 64.
+        g.sf1.map = MapKind::Bg;
+        g.sf1.map_at = Some((0, 0));
+        for _ in 0..70 {
+            g.update(&act(|a| a.gfx_forward = true), &sf1);
+        }
+        let (c, _) = g.sf1_state().map_at.expect("still set");
+        assert_eq!(c, 70, "a 64-wide wrap would have put this at 6");
+    }
+
+    /// SF1's palette cursor wraps at 1,024 entries, not CPS-1's 3,072.
+    #[test]
+    fn the_sf1_palette_cursor_wraps_at_1024_and_not_at_3072() {
+        let sf1 = an_sf1_machine();
+        let mut g = GfxViewer::new();
+        g.update(&act(|a| a.gfx_toggled = true), &sf1);
+        for _ in 0..2 {
+            g.update(&act(|a| a.gfx_view_cycled = true), &sf1);
+        }
+        assert_eq!(g.view(), View::Palette);
+        // Sixteen rows of 64 is the whole palette.
+        for _ in 0..16 {
+            g.update(&act(|a| a.gfx_forward = true), &sf1);
+        }
+        assert_eq!(g.sf1_state().pal_at, 0, "sixteen rows is one lap");
+        g.update(&act(|a| a.gfx_back = true), &sf1);
+        assert_eq!(g.sf1_state().pal_at, 1024 - 64);
+    }
+
+    /// `Enter` on SF1's tile view cycles the plane, because a plane's layout is fixed.
+    #[test]
+    fn acting_on_the_sf1_tile_view_cycles_the_plane_not_a_tile_kind() {
+        let sf1 = an_sf1_machine();
+        let mut g = GfxViewer::new();
+        g.update(&act(|a| a.gfx_toggled = true), &sf1);
+        assert_eq!(g.sf1_state().plane, Plane::Bg);
+        for want in [Plane::Fg, Plane::Sprites, Plane::Tx, Plane::Bg] {
+            g.update(&act(|a| a.gfx_act = true), &sf1);
+            assert_eq!(g.sf1_state().plane, want);
+        }
+    }
+
+    /// SF1's layers view toggles SF1's four fields, and row 0 is the background.
+    #[test]
+    fn the_sf1_layers_view_toggles_sf1s_own_four_fields() {
+        let sf1 = an_sf1_machine();
+        let mut g = GfxViewer::new();
+        g.update(&act(|a| a.gfx_toggled = true), &sf1);
+        for _ in 0..3 {
+            g.update(&act(|a| a.gfx_view_cycled = true), &sf1);
+        }
+        assert_eq!(g.view(), View::Layers);
+        assert_eq!(g.sf1_mask(), Sf1LayerMask::all());
+        // Row 0 is the background — SF1's drawing order, not CPS-1's sprites-first.
+        g.update(&act(|a| a.gfx_act = true), &sf1);
+        assert!(!g.sf1_mask().bg, "row 0 is the background");
+        assert!(g.sf1_mask().fg && g.sf1_mask().sprites && g.sf1_mask().tx);
+        // And CPS-1's mask is untouched by any of it.
+        assert_eq!(g.mask(), LayerMask::all());
+    }
+
+    /// A shown viewer draws whichever board it is handed, through that board's panels.
+    #[test]
+    fn a_shown_viewer_draws_the_board_it_is_given() {
+        let cps = a_machine();
+        let sf1 = an_sf1_machine();
+        let mut g = GfxViewer::new();
+        g.update(&act(|a| a.gfx_toggled = true), &sf1);
+        let mut on_sf1 = vec![0u32; WIDTH * HEIGHT];
+        g.draw(&mut on_sf1, &sf1);
+        let mut on_cps = vec![0u32; WIDTH * HEIGHT];
+        g.draw(&mut on_cps, &cps);
+        assert_ne!(on_sf1, on_cps, "two boards, two pictures");
+        // And each matches its own panel module, called directly.
+        let mut expected = vec![0u32; WIDTH * HEIGHT];
+        match &sf1 {
+            Machine::Sf1(s) => crate::sf1panels::draw(&mut expected, s, &g.sf1_state()),
+            Machine::Cps1(_) => unreachable!("built as Sf1"),
+        }
+        assert_eq!(on_sf1, expected);
+    }
+
+    /// A hidden viewer draws nothing, on either board.
+    #[test]
+    fn a_hidden_viewer_draws_nothing_on_either_board() {
+        let cps = a_machine();
+        let sf1 = an_sf1_machine();
+        let g = GfxViewer::new();
+        for m in [&cps, &sf1] {
+            let mut buf = vec![0u32; WIDTH * HEIGHT];
+            g.draw(&mut buf, m);
+            assert!(buf.iter().all(|&w| w == 0));
+        }
+    }
+
+    /// And it does not disturb an SF1 either.
+    #[test]
+    fn using_the_viewer_does_not_disturb_an_sf1() {
+        let mut sf1 = an_sf1_machine();
+        sf1.run_frame();
+        let before = match &sf1 {
+            Machine::Sf1(s) => (s.total_cycles, s.cpu.pc, s.board.active),
+            Machine::Cps1(_) => unreachable!("built as Sf1"),
+        };
+        let mut g = GfxViewer::new();
+        g.update(&act(|a| a.gfx_toggled = true), &sf1);
+        for _ in 0..4 {
+            g.update(&act(|a| a.gfx_forward = true), &sf1);
+            g.update(&act(|a| a.gfx_act = true), &sf1);
+            let mut buf = vec![0u32; WIDTH * HEIGHT];
+            g.draw(&mut buf, &sf1);
+            g.update(&act(|a| a.gfx_view_cycled = true), &sf1);
+        }
+        let after = match &sf1 {
+            Machine::Sf1(s) => (s.total_cycles, s.cpu.pc, s.board.active),
+            Machine::Cps1(_) => unreachable!("built as Sf1"),
+        };
+        assert_eq!(before, after);
     }
 }
