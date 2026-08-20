@@ -296,6 +296,59 @@ fn build_sf1(set: &romset::RomSet) -> Result<machine::Sf1, Fault> {
     Ok(m)
 }
 
+/// The machine a game name and a loaded set make.
+///
+/// One name, two consequences, chosen here together: [`romset::games::by_name`] says
+/// which files and [`board_for`] says which hardware.
+/// `each_game_name_selects_its_own_board_and_its_own_rom_spec` is what holds them to
+/// the same name.
+///
+/// Split out of [`run`] rather than written inline, so a test can hand it a
+/// [`romset::RomSet`] it builds itself: the struct is a map of region name to bytes,
+/// which this crate can fill with synthetic data and does. Inline, the fork would be
+/// reachable only from a path that needs a real ROM set, which is to say from no test
+/// at all.
+///
+/// # Errors
+///
+/// Whatever [`build_cps1`] or [`build_sf1`] returns: a region the spec names and the
+/// set has not got.
+fn build_machine(game: &str, set: &romset::RomSet) -> Result<machine::Machine, Fault> {
+    Ok(
+        match board_for(game).expect("parse_args rejects a name with no board") {
+            machine::BoardKind::Cps1 => machine::Machine::Cps1(Box::new(build_cps1(set)?)),
+            machine::BoardKind::Sf1 => machine::Machine::Sf1(Box::new(build_sf1(set)?)),
+        },
+    )
+}
+
+/// The report for a finished headless run.
+///
+/// The frame summary is the one thing that cannot come through [`machine::Machine`]:
+/// it counts pens against a board-specific palette. Split out with the board line for
+/// the same reason [`build_machine`] is — a test builds the machine and reads the
+/// string, where inline both would need a ROM set.
+fn summary(m: &machine::Machine) -> String {
+    let frame = match m {
+        machine::Machine::Cps1(c) => Frame::of(&c.video),
+        machine::Machine::Sf1(f) => Frame::of_sf1(&f.video),
+    };
+    let v = m.cpu_view();
+    report(m.board(), v.trace, v.total_cycles, Cpu::of(&v), frame)
+}
+
+/// The PPM bytes for whichever board this is.
+///
+/// The second fork that cannot go through `Machine`: [`ppm`] reads
+/// [`video::compose::Video`] and [`ppm_sf1`] reads [`video::sf1::Sf1Video`], and the
+/// two palettes reach the DAC by different rules.
+fn screenshot(m: &machine::Machine) -> Vec<u8> {
+    match m {
+        machine::Machine::Cps1(c) => ppm(&c.video),
+        machine::Machine::Sf1(f) => ppm_sf1(&f.video),
+    }
+}
+
 /// Loads the set, runs `frames` frames, and returns the report.
 fn run(args: Vec<String>) -> Result<String, Fault> {
     let args = parse_args(args)?;
@@ -304,14 +357,7 @@ fn run(args: Vec<String>) -> Result<String, Fault> {
         romset::games::by_name(&args.game).expect("parse_args rejects a name that has no spec");
     let set = romset::load(spec, std::path::Path::new(&args.path))
         .map_err(|e| Fault::Failed(e.to_string()))?;
-    // One name, two consequences, chosen here together: the spec above says which
-    // files, and this says which hardware.
-    // `each_game_name_selects_its_own_board_and_its_own_rom_spec` is what holds them
-    // to the same name.
-    let mut machine = match board_for(&args.game).expect("parse_args rejected the rest") {
-        machine::BoardKind::Cps1 => machine::Machine::Cps1(Box::new(build_cps1(&set)?)),
-        machine::BoardKind::Sf1 => machine::Machine::Sf1(Box::new(build_sf1(&set)?)),
-    };
+    let mut machine = build_machine(&args.game, &set)?;
 
     if args.play {
         // The window is opened *after* the ROM set loads, so a bad path reports the
@@ -328,30 +374,12 @@ fn run(args: Vec<String>) -> Result<String, Fault> {
     }
     machine.render();
 
-    // The frame summary and the screenshot are the two things that cannot come
-    // through `Machine`: one counts pens against a board-specific palette, the other
-    // assembles a file out of them. Both forks are one line.
-    let frame = match &machine {
-        machine::Machine::Cps1(c) => Frame::of(&c.video),
-        machine::Machine::Sf1(f) => Frame::of_sf1(&f.video),
-    };
     if let Some(path) = &args.ppm {
-        let bytes = match &machine {
-            machine::Machine::Cps1(c) => ppm(&c.video),
-            machine::Machine::Sf1(f) => ppm_sf1(&f.video),
-        };
-        std::fs::write(path, bytes)
+        std::fs::write(path, screenshot(&machine))
             .map_err(|e| Fault::Failed(format!("cannot write `{path}`: {e}")))?;
     }
 
-    let v = machine.cpu_view();
-    Ok(report(
-        machine.board(),
-        v.trace,
-        v.total_cycles,
-        Cpu::of(&v),
-        frame,
-    ))
+    Ok(summary(&machine))
 }
 
 /// The audio sink, or a silent one and a line on stderr saying why.
@@ -1655,5 +1683,201 @@ mod tests {
         // any mapping at all. Big-endian ASCII `SF2\0` and `SF1\0`.
         assert_eq!(loop_opts(&a("sf2")).board, 0x5346_3200);
         assert_eq!(loop_opts(&a("sf1")).board, 0x5346_3100);
+    }
+    /// A synthetic ROM set: one distinguishable byte pattern per region.
+    ///
+    /// Not a ROM and not a `romset::load` call — `RomSet` is a map of region name to
+    /// bytes, so this crate can fill it with data it invents. Each region's first
+    /// byte is a distinct tag, which is what lets the tests below tell a crossed pair
+    /// of regions from a correct one.
+    ///
+    /// The sizes are the specs' own, from `romset::games`: SF1's `maincpu` is
+    /// 0x60000 and its `gfx4` 0x4000, and a `Vec` shorter than the board's ROM window
+    /// is copied in and zero-filled, which is fine — the subject here is which bytes
+    /// land where, not how many.
+    fn a_synthetic_set(names: &[(&str, u8)]) -> romset::RomSet {
+        romset::RomSet {
+            regions: names
+                .iter()
+                .map(|&(name, tag)| (name.to_string(), vec![tag; 0x100]))
+                .collect(),
+        }
+    }
+
+    /// The SF1 regions `build_sf1` asks for, each tagged with its own byte.
+    fn an_sf1_set() -> romset::RomSet {
+        a_synthetic_set(&[
+            ("maincpu", 0x11),
+            ("audiocpu", 0x22),
+            ("audio2", 0x33),
+            ("gfx1", 0x44),
+            ("gfx2", 0x55),
+            ("gfx3", 0x66),
+            ("gfx4", 0x77),
+            ("tilerom", 0x88),
+        ])
+    }
+
+    /// The game name picks the board the machine is built on.
+    ///
+    /// `build_machine` is the one place `main` turns a name into hardware, and the
+    /// failure it guards is a machine built on the wrong board out of a set that
+    /// loaded cleanly: SF2's files on SF1's bus fetch garbage and every symptom is
+    /// thousands of instructions downstream.
+    #[test]
+    fn the_game_name_picks_the_board_the_machine_is_built_on() {
+        let sf1 = build_machine("sf1", &an_sf1_set()).expect("every sf1 region is present");
+        assert_eq!(sf1.board(), machine::BoardKind::Sf1);
+        assert!(matches!(sf1, machine::Machine::Sf1(_)), "and the Sf1 arm");
+
+        let sf2 = build_machine(
+            "sf2",
+            &a_synthetic_set(&[("maincpu", 1), ("gfx", 2), ("audiocpu", 3), ("oki", 4)]),
+        )
+        .expect("every sf2 region is present");
+        assert_eq!(sf2.board(), machine::BoardKind::Cps1);
+        assert!(matches!(sf2, machine::Machine::Cps1(_)), "and the Cps1 arm");
+    }
+
+    /// Each of SF1's five graphics regions reaches the plane that reads it.
+    ///
+    /// Eight regions arrive as eight `Vec<u8>`s of the same type, so any two can be
+    /// swapped without the compiler noticing — and a swap of `gfx1` and `gfx2` draws
+    /// the foreground's tiles in the background and vice versa, which looks like a
+    /// renderer bug in a renderer that is correct. The tags are literals, one per
+    /// region, and this asserts which tag arrives where.
+    #[test]
+    fn each_of_sf1s_graphics_regions_reaches_its_own_plane() {
+        let m = build_machine("sf1", &an_sf1_set()).expect("every sf1 region is present");
+        let machine::Machine::Sf1(f) = &m else {
+            panic!("`sf1` builds the Sf1 arm")
+        };
+        use machine::video::sf1::Plane;
+        assert_eq!(f.video.region(Plane::Bg)[0], 0x44, "gfx1 is the background");
+        assert_eq!(f.video.region(Plane::Fg)[0], 0x55, "gfx2 the foreground");
+        assert_eq!(f.video.region(Plane::Sprites)[0], 0x66, "gfx3 the sprites");
+        assert_eq!(f.video.region(Plane::Tx)[0], 0x77, "gfx4 the text plane");
+        assert_eq!(f.video.tilerom()[0], 0x88, "and the tilerom is its own");
+    }
+
+    /// A missing SF1 region is a loud error naming the region.
+    ///
+    /// Eight `ok_or_else` messages behind one closure, and the closure is what this
+    /// checks: a message that named the wrong region, or a builder that defaulted to
+    /// an empty one, would leave a machine that boots into garbage with nothing said.
+    #[test]
+    fn a_missing_sf1_region_is_named_in_the_error() {
+        let mut set = an_sf1_set();
+        set.regions.remove("tilerom");
+        match build_machine("sf1", &set) {
+            Err(Fault::Failed(m)) => {
+                assert!(m.contains("tilerom"), "names the region: {m}");
+                assert!(m.contains("sf1"), "and the spec: {m}");
+            }
+            other => panic!("expected an error, got {:?}", other.is_ok()),
+        }
+    }
+
+    /// A headless run's report names the board the machine actually is.
+    ///
+    /// `summary` is the seam between the machine and the text, and the failure it
+    /// guards is a report that hardcodes one board: an SF1 run headed `CPS-1` would
+    /// then print three counters about chips that are not there, which is the whole
+    /// thing `an_sf1_report_omits_the_chips_sf1_does_not_have` rules out one level
+    /// down.
+    #[test]
+    fn a_headless_runs_report_names_the_board_it_ran() {
+        let r = summary(&one_frame());
+        assert!(r.starts_with("board         CPS-1\n"), "{r}");
+
+        let sf1 = build_machine("sf1", &an_sf1_set()).expect("every sf1 region is present");
+        let r = summary(&sf1);
+        assert!(r.starts_with("board         SF1\n"), "{r}");
+        assert!(!r.contains("cps-a"), "and no CPS-A line: {r}");
+        // The frame summary is SF1's too: nothing rendered, so nothing drew — where
+        // CPS-1's blank pen rule would count every one of the 86,016 pens of 0xBFF
+        // that `Framebuffer::new` leaves behind.
+        assert!(
+            r.contains("framebuffer   0 of 86016 pixels drawn, 0 colour block(s)\n"),
+            "{r}"
+        );
+
+        // And a drawn SF1 frame is counted, not assumed empty: a fork that returned a
+        // zeroed `Frame` for the Sf1 arm would satisfy every assertion above, because
+        // an unrendered frame's honest answer is also zero. Two pens in two different
+        // 256-entry colour blocks, written straight into the framebuffer — the subject
+        // is which counter reads it, not how the renderer filled it.
+        let mut sf1 = sf1;
+        let machine::Machine::Sf1(f) = &mut sf1 else {
+            panic!("`sf1` builds the Sf1 arm")
+        };
+        f.video.fb.pens[0] = 1;
+        f.video.fb.pens[1] = 300;
+        let r = summary(&sf1);
+        assert!(
+            r.contains("framebuffer   2 of 86016 pixels drawn, 2 colour block(s)\n"),
+            "{r}"
+        );
+    }
+
+    /// SF1's two sound ROMs reach the two Z80s that run them.
+    ///
+    /// `Sf1::new` takes `audiocpu` and `audio2` as adjacent `Vec<u8>` parameters of
+    /// the same type, so swapping them compiles: the FM Z80 would then execute the
+    /// ADPCM program and neither chip would be driven. The tags are literals, and
+    /// `peek_byte` is the read that does not disturb the trace counters.
+    #[test]
+    fn sf1s_two_sound_roms_reach_their_own_processors() {
+        let m = build_machine("sf1", &an_sf1_set()).expect("every sf1 region is present");
+        let machine::Machine::Sf1(f) = &m else {
+            panic!("`sf1` builds the Sf1 arm")
+        };
+        assert_eq!(f.fm.peek_byte(0), 0x22, "audiocpu drives the YM2151 board");
+        assert_eq!(f.adpcm.peek_byte(0), 0x33, "audio2 the MSM5205 pair");
+    }
+
+    /// A screenshot is taken with the board's own DAC rule.
+    ///
+    /// One byte tells the two apart: SF1 doubles each nibble, so palette entry
+    /// 0x0135 is (0x11, 0x33, 0x55), where CPS-1's shift gives (0x08, 0x18, 0x28).
+    /// A `screenshot` that always called `ppm` would not compile for an `Sf1`, but
+    /// one that reached for the wrong palette rule would — and would write a picture
+    /// in the wrong colours.
+    #[test]
+    fn a_screenshot_uses_the_boards_own_dac_rule() {
+        let mut sf1 = build_machine("sf1", &an_sf1_set()).expect("every sf1 region is present");
+        let machine::Machine::Sf1(f) = &mut sf1 else {
+            panic!("`sf1` builds the Sf1 arm")
+        };
+        f.board.palette[0] = 0x0135;
+        f.render();
+        let bytes = screenshot(&sf1);
+        assert_eq!(&bytes[..15], b"P6\n384 224\n255\n", "the exact header");
+        assert_eq!(
+            &bytes[15..18],
+            &[0x11, 0x33, 0x55],
+            "SF1 doubles each nibble; CPS-1's shift would give 08 18 28"
+        );
+
+        let cps1 = a_drawn_frame();
+        let bytes = screenshot(&cps1);
+        assert_eq!(&bytes[..15], b"P6\n384 224\n255\n");
+        assert_eq!(bytes.len(), 258_063, "and a full CPS-1 frame behind it");
+    }
+
+    /// The usage text names both games and says the board is not guessed.
+    ///
+    /// `--game` with no usage line is an option nobody can find, and the sentence
+    /// about not guessing is the spec's ruling stated where a user reads it.
+    #[test]
+    fn the_usage_text_names_both_games() {
+        let u = usage();
+        assert!(u.contains("--game <name>"), "the option: {u}");
+        assert!(u.contains("`sf2`"), "and sf2: {u}");
+        assert!(u.contains("`sf1`"), "and sf1: {u}");
+        assert!(
+            u.contains("not guessed from"),
+            "and that the board is a stated choice: {u}"
+        );
     }
 }
