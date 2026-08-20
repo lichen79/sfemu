@@ -37,6 +37,7 @@ pub mod keys;
 pub mod overlay;
 pub mod pace;
 pub mod pixels;
+pub mod sf1panels;
 pub mod sndpanel;
 pub mod state;
 

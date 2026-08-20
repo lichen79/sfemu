@@ -60,7 +60,9 @@ pub(crate) fn argb_sf1(entry: u16) -> u32 {
 /// An SF1 frame's pens as window words, reusing `out`'s allocation.
 ///
 /// Reads each pixel's colour through [`Sf1Video::rgb`] rather than indexing a
-/// palette slice. [`Framebuffer::new`] fills every pen with CPS-1's
+/// palette slice. `video::Framebuffer::new` — not linked, because this module
+/// imports neither it nor its crate, and `cargo doc` refuses a link it cannot
+/// resolve — fills every pen with CPS-1's
 /// `BACKGROUND_PEN` (0xBFF), which is past SF1's 1,024 entries, so a never-rendered
 /// `Sf1Video` would index out of bounds — and `rgb` is the accessor that already
 /// answers "black" for a pen the palette does not hold. This is not the dead
@@ -77,8 +79,8 @@ pub fn pens_to_argb_sf1(v: &Sf1Video, out: &mut Vec<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use machine::video::{palette, regs, HEIGHT, WIDTH};
     use machine::video::sf1::Sf1Video;
+    use machine::video::{palette, regs, HEIGHT, WIDTH};
     use machine::BoardConfig;
 
     /// A `Video` whose palette holds known entries, built through the real render
@@ -290,7 +292,10 @@ mod tests {
         let mut out = Vec::new();
         pens_to_argb_sf1(&v, &mut out);
         // `render` cleared every pen to 0, so every pixel is entry 0.
-        assert!(out.iter().all(|&w| w == 0x0011_3355), "every pixel is entry 0");
+        assert!(
+            out.iter().all(|&w| w == 0x0011_3355),
+            "every pixel is entry 0"
+        );
     }
 
     #[test]
@@ -313,7 +318,10 @@ mod tests {
         let mut out = Vec::new();
         pens_to_argb_sf1(&v, &mut out);
         assert_eq!(out.len(), 86_016);
-        assert!(out.iter().all(|&w| w == 0x0000_0000), "out of range reads black");
+        assert!(
+            out.iter().all(|&w| w == 0x0000_0000),
+            "out of range reads black"
+        );
     }
 
     #[test]
