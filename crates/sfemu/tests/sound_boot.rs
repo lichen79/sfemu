@@ -60,9 +60,10 @@ fn the_sound_program_drives_the_ym2151() {
         .expect("the sf2 spec has a maincpu region");
     let gfx = set.region("gfx").expect("and a gfx region");
     // `with_sound`, not `with_gfx`: the sound region is the whole point here, and
-    // `with_gfx` hands the board an empty one. That is a real hazard rather than a
-    // theoretical one — `sfemu`'s own main loop still builds with `with_gfx`, so a
-    // test copied from it would assert a fetch count produced entirely by `RST 38h`.
+    // `with_gfx` hands the board an empty one — a test built that way would assert a
+    // fetch count produced entirely by `RST 38h`. `sfemu`'s own `main` uses
+    // `with_sound` too, and has since sound landed; `with_gfx` survives there only in
+    // a `#[cfg(test)]` fixture that renders and needs no audio.
     let audiocpu = set.region("audiocpu").expect("and an audiocpu region");
     // The ADPCM samples too, for the same reason: an absent sample ROM starts no
     // voice, so a driver that plays effects perfectly would still produce a mix with

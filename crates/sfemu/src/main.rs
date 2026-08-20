@@ -303,6 +303,10 @@ fn loop_opts(args: &Args) -> loop_::LoopOpts {
     loop_::LoopOpts {
         state_path: args.state.clone(),
         shot_path: default_shot_path(&args.path),
+        // Still CPS-1 unconditionally: `main` has no `--game` yet, so this is the only
+        // board it can build. Task 21's later steps add the flag and make this follow
+        // it — `loop_::run`'s `debug_assert_eq!` is what will check the pairing.
+        board: loop_::state_tag(machine::BoardKind::Cps1),
     }
 }
 
@@ -364,8 +368,6 @@ fn ppm(v: &video::compose::Video) -> Vec<u8> {
 /// `rgb` instead. Assembling the body here rather than adding a frame-wide `rgb` to
 /// `Sf1Video` keeps the allocation in the crate that is about to write a file, which
 /// is the crate that already owns a filesystem.
-// Wired to `screenshot` in the loop's board fork.
-#[allow(dead_code)]
 fn ppm_sf1(v: &video::sf1::Sf1Video) -> Vec<u8> {
     let mut out = format!("P6\n{} {}\n255\n", video::WIDTH, video::HEIGHT).into_bytes();
     assert_eq!(

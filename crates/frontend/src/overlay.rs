@@ -451,31 +451,6 @@ mod tests {
         rom
     }
 
-    /// A [`CpuView`] over a board without moving it.
-    ///
-    /// ⚠️ This duplicates [`machine::Machine::cpu_view`]'s five field assignments, and
-    /// that is deliberate and bounded. The tests here need the board *as well as* the
-    /// view — they mutate it and read its trace back — and `CpuView`'s fields are `pub`
-    /// because a panel reads them directly, so a test can build one.
-    ///
-    /// It must not be copied into non-test code: two producers of this view is two
-    /// places for `vblank_pending` to disagree. If a field is added to `CpuView` this
-    /// helper stops compiling, which is the right failure.
-    ///
-    /// ⚠️ `machine::Cps1` spelled out, here and in the three helpers below, rather than
-    /// imported: `use machine::Cps1;` being gone from this file is the measure that
-    /// Task 18 landed, and an import in the test module would put it back. Task 21
-    /// deletes this twin outright.
-    fn view(m: &machine::Cps1) -> CpuView<'_> {
-        CpuView {
-            cpu: &m.cpu,
-            trace: &m.board.trace,
-            total_cycles: m.total_cycles,
-            line: m.line,
-            vblank_pending: m.board.vblank_pending(),
-        }
-    }
-
     /// The board inside a [`Machine`], and the machine around a board.
     ///
     /// `draw`'s fourth argument is a `&Machine` now, because the sound panel forks per
@@ -540,7 +515,7 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(m),
+            &mach.cpu_view(),
             &|a| m.peek_word(a),
             &mach,
             Panels {
@@ -586,7 +561,7 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(m),
+            &mach.cpu_view(),
             &|a| m.peek_word(a),
             &mach,
             Panels {
@@ -609,12 +584,12 @@ mod tests {
     fn the_disassembly_panel_marks_the_executing_instruction() {
         let mach = wrap(a_machine());
         let m = as_cps1(&mach);
-        let at = executing_pc(&view(m));
+        let at = executing_pc(&mach.cpu_view());
         assert_eq!(at, m.cpu.pc - 4, "the premise of this whole panel");
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(m),
+            &mach.cpu_view(),
             &|a| m.peek_word(a),
             &mach,
             Panels {
@@ -651,11 +626,11 @@ mod tests {
     fn only_the_executing_line_is_marked() {
         let mach = wrap(a_machine());
         let m = as_cps1(&mach);
-        let at = executing_pc(&view(m));
+        let at = executing_pc(&mach.cpu_view());
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(m),
+            &mach.cpu_view(),
             &|a| m.peek_word(a),
             &mach,
             Panels {
@@ -702,7 +677,7 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(m),
+            &mach.cpu_view(),
             &|a| m.peek_word(a),
             &mach,
             Panels {
@@ -722,7 +697,7 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(m),
+            &mach.cpu_view(),
             &|a| m.peek_word(a),
             &mach,
             Panels {
@@ -756,7 +731,7 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(m),
+            &mach.cpu_view(),
             &|a| m.peek_word(a),
             &mach,
             Panels {
@@ -795,7 +770,7 @@ mod tests {
         for at in [0x60, 0x40_0000] {
             draw(
                 &mut buf,
-                &view(m),
+                &mach.cpu_view(),
                 &|a| m.peek_word(a),
                 &mach,
                 Panels {
@@ -833,7 +808,7 @@ mod tests {
         let mut after = before.clone();
         draw(
             &mut after,
-            &view(m),
+            &mach.cpu_view(),
             &|a| m.peek_word(a),
             &mach,
             Panels {
@@ -957,7 +932,7 @@ mod tests {
             let mut buf = blank.clone();
             draw(
                 &mut buf,
-                &view(m),
+                &mach.cpu_view(),
                 &|a| m.peek_word(a),
                 &mach,
                 p,
@@ -983,7 +958,7 @@ mod tests {
         let mut buf = blank.clone();
         draw(
             &mut buf,
-            &view(m),
+            &mach.cpu_view(),
             &|a| m.peek_word(a),
             &mach,
             all,
@@ -1022,7 +997,7 @@ mod tests {
         let mut after = before.clone();
         draw(
             &mut after,
-            &view(m),
+            &mach.cpu_view(),
             &|a| m.peek_word(a),
             &mach,
             Panels::none(),
@@ -1040,14 +1015,14 @@ mod tests {
     fn a_breakpoint_is_marked() {
         let mach = wrap(a_machine());
         let m = as_cps1(&mach);
-        let at = executing_pc(&view(m));
+        let at = executing_pc(&mach.cpu_view());
         // On the *second* line, not the current one: a marker only ever drawn on the
         // executing line would be indistinguishable from the `>` marker.
         let brk = at + 4;
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(m),
+            &mach.cpu_view(),
             &|a| m.peek_word(a),
             &mach,
             Panels {
@@ -1086,7 +1061,16 @@ mod tests {
         let mut buf = frame();
         {
             let m = as_cps1(&mach);
-            draw(&mut buf, &view(m), &|a| m.peek_word(a), &mach, p, 0, 0, &[]);
+            draw(
+                &mut buf,
+                &mach.cpu_view(),
+                &|a| m.peek_word(a),
+                &mach,
+                p,
+                0,
+                0,
+                &[],
+            );
         }
         assert!(panel_contains(&buf, "RUN", HI), "a running CPU says so");
 
@@ -1094,7 +1078,16 @@ mod tests {
         let mut buf = frame();
         {
             let m = as_cps1(&mach);
-            draw(&mut buf, &view(m), &|a| m.peek_word(a), &mach, p, 0, 0, &[]);
+            draw(
+                &mut buf,
+                &mach.cpu_view(),
+                &|a| m.peek_word(a),
+                &mach,
+                p,
+                0,
+                0,
+                &[],
+            );
         }
         assert!(panel_contains(&buf, "STOP", HI), "stopped");
         assert!(!panel_contains(&buf, "HALT", HI), "and not halted");
@@ -1103,7 +1096,16 @@ mod tests {
         let mut buf = frame();
         {
             let m = as_cps1(&mach);
-            draw(&mut buf, &view(m), &|a| m.peek_word(a), &mach, p, 0, 0, &[]);
+            draw(
+                &mut buf,
+                &mach.cpu_view(),
+                &|a| m.peek_word(a),
+                &mach,
+                p,
+                0,
+                0,
+                &[],
+            );
         }
         assert!(panel_contains(&buf, "HALT", HI), "a dead CPU is not paused");
     }
@@ -1119,7 +1121,7 @@ mod tests {
             let m = as_cps1(&mach);
             draw(
                 &mut buf,
-                &view(m),
+                &mach.cpu_view(),
                 &|a| m.peek_word(a),
                 &mach,
                 Panels {
@@ -1146,7 +1148,7 @@ mod tests {
             let m = as_cps1(&mach);
             draw(
                 &mut buf,
-                &view(m),
+                &mach.cpu_view(),
                 &|a| m.peek_word(a),
                 &mach,
                 Panels {
@@ -1188,7 +1190,7 @@ mod tests {
                     let m = as_cps1(&mach);
                     draw(
                         &mut buf,
-                        &view(m),
+                        &mach.cpu_view(),
                         &|a| m.peek_word(a),
                         &mach,
                         Panels {
@@ -1219,7 +1221,7 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(m),
+            &mach.cpu_view(),
             &|a| m.peek_word(a),
             &mach,
             Panels {
@@ -1244,7 +1246,7 @@ mod tests {
         let mut buf = frame();
         draw(
             &mut buf,
-            &view(m),
+            &mach.cpu_view(),
             &|a| m.peek_word(a),
             &mach,
             Panels {
@@ -1290,11 +1292,8 @@ mod tests {
     #[test]
     fn the_memory_panel_reads_only_through_the_closure() {
         use core::cell::Cell;
-        // Both, because `draw` wants the `Machine` and `view` wants the board inside
-        // it: `Machine` deliberately has no accessor that reaches inside a variant.
         let mach = wrap(a_machine());
-        let m = as_cps1(&mach);
-        let v = view(m);
+        let v = mach.cpu_view();
         let calls = Cell::new(0usize);
         let peek = |_addr: u32| -> Option<u16> {
             calls.set(calls.get() + 1);
@@ -1334,7 +1333,7 @@ mod tests {
     #[test]
     fn a_none_from_the_closure_still_prints_dashes() {
         let mach = wrap(a_machine());
-        let v = view(as_cps1(&mach));
+        let v = mach.cpu_view();
         let mut all_none = frame();
         draw(
             &mut all_none,

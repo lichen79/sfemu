@@ -27,25 +27,9 @@ use crate::audio::Audio;
 use frontend::debug::Debugger;
 use frontend::gfx::GfxViewer;
 use frontend::keys::{Actions, Controls, KeySet};
-use frontend::{pens_to_argb, FramePacer};
-use machine::{Cps1, Machine};
+use frontend::{pens_to_argb, pens_to_argb_sf1, FramePacer, MAX_CATCH_UP};
+use machine::Machine;
 use std::path::PathBuf;
-
-/// A [`machine::CpuView`] over the board this loop is running.
-///
-/// ⚠️ Temporary, and Task 21 deletes it: `machine::Machine::cpu_view` already produces
-/// this view, and the only reason this twin survives Task 18 is that its callers hold
-/// the `Cps1` the loop's eight unconverted helpers need anyway — see [`cps1_ref`].
-/// Converting it here would have meant touching those helpers, which is Task 21's.
-fn view(m: &Cps1) -> machine::CpuView<'_> {
-    machine::CpuView {
-        cpu: &m.cpu,
-        trace: &m.board.trace,
-        total_cycles: m.total_cycles,
-        line: m.line,
-        vblank_pending: m.board.vblank_pending(),
-    }
-}
 
 /// A window, as far as the loop is concerned.
 ///
@@ -82,6 +66,23 @@ pub struct LoopOpts {
     pub state_path: PathBuf,
     /// The screenshot file, for F12.
     pub shot_path: PathBuf,
+    /// The board tag this session's states carry, from [`state_tag`].
+    ///
+    /// # Why a field and not derived from the machine
+    ///
+    /// It could be — `state_tag(m.board())` is available everywhere it is read. It is
+    /// a field because it is a *session* fact that `main` establishes when it picks a
+    /// board, and because [`run`]'s `debug_assert_eq!` can then check `main`'s answer
+    /// against the machine it was handed. Deriving it would make the two agree by
+    /// construction and check nothing.
+    ///
+    /// ⚠️ **Read on the CPS-1 arm only.** [`frontend::encode_sf1`] and
+    /// [`frontend::decode_sf1`] take no board argument: Task 19 baked `BOARD_SF1`
+    /// into them, because SF1's payload length is validated in the same call and
+    /// there is exactly one board that length belongs to. So this field is what
+    /// CPS-1's `encode`/`decode` are given, and on an SF1 session it is checked by
+    /// the assertion and otherwise unused. That is the reason the assertion exists.
+    pub board: u32,
 }
 
 /// What a finished run did.
@@ -100,44 +101,21 @@ pub struct Summary {
     pub notices: Vec<String>,
 }
 
-/// The CPS-1 machine inside a [`Machine`], mutably.
+/// The save-state tag a board's states carry.
 ///
-/// ⚠️ **Temporary, and Task 21 deletes it.** Task 18 converted `run`'s signature so the
-/// panels can dispatch on the board, but the loop's eight other helpers — and the
-/// graphics viewer behind three of them — still take `&Cps1`. Task 20 forks the viewer
-/// and Task 21 converts the loop; splitting it here would put a rename and the graphics
-/// fork behind one review, which is the mistake Task 17 was split to avoid.
+/// One function with two callers — [`run`]'s assertion and `main`'s `loop_opts` — so
+/// that the tag in a [`LoopOpts`] and the board in the [`Machine`] beside it are
+/// checkably paired rather than conventionally paired.
 ///
-/// The `unreachable!` is honest rather than defensive: `main.rs` constructs only a
-/// `Machine::Cps1` until Task 21 adds the SF1 arm, and a silent `return` here would be
-/// a window that opens on nothing.
-///
-/// ⚠️ **Call this per use; never bind the result once.** `step(cps1(m))` on one line and
-/// `panel(m)` on the next both compile, because each reborrow ends with its statement. A
-/// single `let c = cps1(m);` held across the body holds `*m` mutably and the `&Machine`
-/// the panel needs is then rejected — `E0502`. The per-use form is not a style
-/// preference; it is what makes this shape work at all.
-fn cps1(m: &mut Machine) -> &mut Cps1 {
-    match m {
-        Machine::Cps1(c) => c,
-        Machine::Sf1(_) => unreachable!("main builds only Cps1 until Task 21"),
+/// The tags themselves live in `frontend`, next to the codec that writes and checks
+/// them. This is only the mapping from a board to its own.
+#[must_use]
+pub(crate) const fn state_tag(k: machine::BoardKind) -> u32 {
+    match k {
+        machine::BoardKind::Cps1 => frontend::BOARD_SF2,
+        machine::BoardKind::Sf1 => frontend::BOARD_SF1,
     }
 }
-
-/// The same, shared. See [`cps1`]; Task 21 deletes both.
-fn cps1_ref(m: &Machine) -> &Cps1 {
-    match m {
-        Machine::Cps1(c) => c,
-        Machine::Sf1(_) => unreachable!("main builds only Cps1 until Task 21"),
-    }
-}
-
-/// The board this build's states belong to.
-///
-/// Only SF2 exists so far. When the SF1 driver lands, this becomes a field on
-/// [`LoopOpts`] — the point of the tag is that loading one board's state into
-/// another is refused, which needs the loop to know which board it is running.
-const BOARD: u32 = frontend::BOARD_SF2;
 
 /// Runs until the display closes or the user quits.
 ///
@@ -161,15 +139,36 @@ const BOARD: u32 = frontend::BOARD_SF2;
 ///    this tick made, and every iteration, so a pause that is held stays reported;
 /// 10. render and present — **every** iteration, including a paused one, or the
 ///     window goes black the moment you pause. The overlays are drawn *after*
-///     [`pens_to_argb`], because they are ARGB and the pens are not, and the graphics
-///     viewer goes over the debugger rather than under it;
+///     the pen-to-ARGB conversion, because they are ARGB and the pens are not, and the
+///     graphics viewer goes over the debugger rather than under it;
 /// 11. screenshot, then the title.
+///
+/// Nine of those steps fork on the board — the pacer's period (through
+/// [`machine::Machine::frame_ns`], so not a match), the inputs, the layer mask, the
+/// host ring's counters, the pen conversion, save, load, screenshot and the state tag.
+/// The rest is board-agnostic because [`machine::Machine`] dispatches it.
 ///
 /// `audio` is `&mut dyn` where `d` is `impl`: `main` picks its sink at runtime — a real
 /// device or [`crate::audio::NullAudio`] when one cannot be opened — so it holds a
 /// `Box<dyn Audio>`, and a generic parameter would make that the caller's problem.
 pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &LoopOpts) -> Summary {
-    let mut pacer = FramePacer::cps1();
+    // `main` picks the board and the tag independently — one from the ROM set, one
+    // from `state_tag` — and a `LoopOpts` carrying SF2's tag beside an `Sf1` compiles,
+    // runs, and writes states the same machine will then refuse to load. This is the
+    // check that they were picked together.
+    //
+    // `debug_assert` and not `assert`: a mismatch is a bug in `main` that no user
+    // input can cause, and a panic here takes someone's window down mid-game.
+    debug_assert_eq!(
+        o.board,
+        state_tag(m.board()),
+        "the options' board tag does not match the machine's board"
+    );
+
+    // `frame_ns()` and not `FramePacer::cps1()`: the two boards' frame times differ —
+    // SF1's 60.0 Hz against CPS-1's 59.63 — and the machine is the one place that
+    // knows which. `cps1()` stays in `frontend` for its own tests.
+    let mut pacer = FramePacer::new(m.frame_ns(), MAX_CATCH_UP);
     let mut controls = Controls::new();
     let mut buf: Vec<u32> = Vec::new();
     let mut paused = false;
@@ -185,7 +184,16 @@ pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &Loo
             break;
         }
 
-        cps1(m).board.inputs = a.inputs;
+        // Level-triggered, so this happens whether or not a frame runs. The two
+        // boards read different structs — SF1 puts starts and service on SYSTEM and
+        // two of the six attack buttons on IN0 — and `Sf1Inputs::from_shared` is
+        // where that knowledge lives. See `machine::sf1::inputs`.
+        match &mut *m {
+            Machine::Cps1(c) => c.board.inputs = a.inputs,
+            Machine::Sf1(f) => {
+                f.board.inputs = machine::sf1::inputs::Sf1Inputs::from_shared(&a.inputs);
+            }
+        }
 
         if a.reset {
             m.reset();
@@ -207,26 +215,27 @@ pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &Loo
         }
 
         if a.save {
-            save(cps1_ref(m), o, &mut summary);
+            save(m, o, &mut summary);
         }
         if a.load {
-            load(cps1(m), o, &mut summary);
+            load(m, o, &mut summary);
         }
 
         // Before the frames: a breakpoint set on this tick must be honoured by this
         // tick's frames, not by the next tick's. `dbg` reads the machine and never
         // writes it — see `frontend::debug`.
-        dbg.update(&a, &view(cps1_ref(m)));
+        dbg.update(&a, &m.cpu_view());
 
-        // `&Machine`, unlike its seven neighbours here: the graphics viewer drives
-        // either board already, so handing it a `Cps1` no longer compiles. The rest of
-        // this function is still CPS-1-only, which is Task 21's subject.
         gfx.update(&a, m);
         // The mask is a view setting the loop applies, not something `frontend`
         // reaches into the machine to set. Before `render`, so this tick's frame is
-        // the masked one. Still `gfx.mask()` and not `sf1_mask()` because this line
-        // reaches for a `Cps1`; the board fork is Task 21's.
-        cps1(m).video.enable = gfx.mask();
+        // the masked one. Two mask types because the boards have different layers:
+        // CPS-1 has three scroll planes and a star field, SF1 has BG, FG, sprites and
+        // a text layer. `GfxViewer` keeps both and hands over whichever is asked for.
+        match &mut *m {
+            Machine::Cps1(c) => c.video.enable = gfx.mask(),
+            Machine::Sf1(f) => f.video.enable = gfx.sf1_mask(),
+        }
 
         // A step is one frame regardless of the clock, which is what makes it a
         // step. Checked before `paused` because stepping only means anything while
@@ -243,7 +252,7 @@ pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &Loo
         // otherwise would make the frame count disagree with `total_cycles`.
         let mut ran = 0u32;
         for _ in 0..frames {
-            if run_frame_to_breakpoint(cps1(m), &mut dbg) {
+            if run_frame_to_breakpoint(m, &mut dbg) {
                 // A breakpoint stopped this frame part-way through. Pause, so the next
                 // tick does not immediately run on past it, and abandon the frames this
                 // tick still owed: they are host time the user is no longer watching.
@@ -265,7 +274,7 @@ pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &Loo
             // The step moved the machine, so the breakpoint at the instruction just
             // *arrived* at must not fire on the next tick as if it were fresh — you
             // asked to be here.
-            dbg.note_stopped(&view(cps1_ref(m)));
+            dbg.note_stopped(&m.cpu_view());
         }
 
         // The pause reaches the sink every tick it is in effect, not on its edge: the
@@ -297,18 +306,31 @@ pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &Loo
         // included: a panel opened while paused would otherwise read zero and look like
         // a clean run.
         let stats = audio.stats();
-        cps1(m).sound.set_audio_stats(stats.drops, stats.underruns);
+        match &mut *m {
+            Machine::Cps1(c) => c.sound.set_audio_stats(stats.drops, stats.underruns),
+            // Not `f.fm.set_audio_stats(..)`: SF1 has two sound boards and the host's
+            // ring is downstream of the mix, so it belongs to neither and lives on the
+            // machine. CPS-1 has one board to hang it on, which is why that arm is
+            // the one that looks different from this file's other matches.
+            Machine::Sf1(f) => f.set_audio_stats(stats.drops, stats.underruns),
+        }
 
         // Outside the loop above: a paused iteration renders too. The frame does not
         // change, but the window is redrawn, and a windowing library that is not
         // given a buffer shows an undefined one.
         m.render();
-        pens_to_argb(&cps1_ref(m).video, &mut buf);
+        // Two converters and not one generic: the palettes are different sizes and
+        // different formats — CPS-1's 3,072 entries against SF1's 1,024, and SF1
+        // expands each nibble to `(n << 4) | n` where CPS-1 does not.
+        match &*m {
+            Machine::Cps1(c) => pens_to_argb(&c.video, &mut buf),
+            Machine::Sf1(f) => pens_to_argb_sf1(&f.video, &mut buf),
+        }
         // After the conversion, never before: the overlay's pixels are already
-        // `0x00RRGGBB`, while `m.video`'s are CPS-1 pens. Drawn into the pen buffer
-        // they would be run through the palette and come out as whatever colours
-        // those indices happen to name.
-        dbg.draw(&mut buf, &view(cps1_ref(m)), &|a| m.peek_word(a), m);
+        // `0x00RRGGBB`, while the video's are pens. Drawn into the pen buffer they
+        // would be run through the palette and come out as whatever colours those
+        // indices happen to name.
+        dbg.draw(&mut buf, &m.cpu_view(), &|a| m.peek_word(a), m);
         // Over the debugger, not under it: both are opaque, and this one is the
         // whole screen while E2's are corners of it.
         gfx.draw(&mut buf, m);
@@ -318,11 +340,11 @@ pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &Loo
         }
 
         if a.screenshot {
-            screenshot(cps1_ref(m), o, &mut summary);
+            screenshot(m, o, &mut summary);
         }
 
         summary.dropped = pacer.dropped();
-        let want = title_for(&summary, cps1_ref(m), paused, audio.is_running());
+        let want = title_for(&summary, &m.cpu_view(), paused, audio.is_running());
         if want != title {
             d.set_title(&want);
             title = want;
@@ -334,7 +356,7 @@ pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &Loo
 
 /// Runs one frame, or stops early at a breakpoint. Returns whether it stopped.
 ///
-/// Instruction by instruction rather than `Cps1::run_frame`, because a breakpoint that
+/// Instruction by instruction rather than `Machine::run_frame`, because a breakpoint that
 /// only stopped at frame boundaries would be the `.` key with extra steps: the whole
 /// point is to stop *at* the instruction, 167,680 cycles into the middle of a frame if
 /// that is where it is.
@@ -344,15 +366,19 @@ pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &Loo
 /// breakpoints set the check is a scan of an empty `Vec`, which is why the fast path is
 /// still a fast path — and `watching_the_machine_does_not_change_it` is what proves
 /// this path and `run_frame` reach the same machine.
-fn run_frame_to_breakpoint(m: &mut Cps1, dbg: &mut Debugger) -> bool {
-    let start_frames = m.board.trace.frames;
+fn run_frame_to_breakpoint(m: &mut Machine, dbg: &mut Debugger) -> bool {
+    let start_frames = m.frames();
     // `line` alone cannot say when a frame is done: a breakpoint on the very first
     // instruction of line 0 leaves `line == 0`, which is where the frame started, and a
     // loop watching for the wrap would run a whole extra frame. The frame counter moves
     // exactly once per wrap.
-    while m.board.trace.frames == start_frames {
-        if dbg.should_break(&view(m)) {
-            dbg.note_stopped(&view(m));
+    //
+    // `m.frames()` and not a board's `trace.frames`: `Machine::frames` reads exactly
+    // that field, on whichever board, so this and `m.cpu_view().trace.frames` cannot
+    // disagree.
+    while m.frames() == start_frames {
+        if dbg.should_break(&m.cpu_view()) {
+            dbg.note_stopped(&m.cpu_view());
             return true;
         }
         m.step_instruction();
@@ -370,12 +396,15 @@ fn run_frame_to_breakpoint(m: &mut Cps1, dbg: &mut Debugger) -> bool {
 /// unattributable between a device that would not open, a game that is silent, and a
 /// mix that is broken. The `eprintln!` in `main` names the reason and is gone from the
 /// scrollback five minutes later; this stays.
-fn title_for(s: &Summary, m: &Cps1, paused: bool, audio: bool) -> String {
+/// ⚠️ A [`machine::CpuView`] and not a `&Machine`: this reads exactly one field, and
+/// `CpuView` is the narrow type Task 16 built for that. A `&Machine` parameter would
+/// let a later edit reach the whole board from the title bar.
+fn title_for(s: &Summary, v: &machine::CpuView<'_>, paused: bool, audio: bool) -> String {
     let mut t = String::from("sfemu");
     if paused {
         t.push_str(" [paused]");
     }
-    if m.cpu.halted {
+    if v.cpu.halted {
         t.push_str(" [CPU halted]");
     }
     if !audio {
@@ -397,15 +426,35 @@ fn note(s: &mut Summary, msg: String) {
     }
 }
 
-fn save(m: &Cps1, o: &LoopOpts, s: &mut Summary) {
-    let bytes = frontend::encode(&m.snapshot(), BOARD);
+/// Writes the machine's state, or notes why it could not.
+///
+/// # Why the two boards' codecs have different signatures
+///
+/// CPS-1's [`frontend::encode`] takes the board tag; SF1's [`frontend::encode_sf1`]
+/// does not. That is Task 19's decision and it is right: SF1's payload has one
+/// hand-counted length, `unframe` validates the tag and the length in the same call,
+/// and there is exactly one board that length belongs to. A `board` parameter on
+/// `encode_sf1` could only ever be `BOARD_SF1`.
+///
+/// The consequence is here: `o.board` is read on one arm. [`run`]'s `debug_assert_eq!`
+/// is what keeps it honest on the other.
+fn save(m: &Machine, o: &LoopOpts, s: &mut Summary) {
+    let bytes = match m {
+        Machine::Cps1(c) => frontend::encode(&c.snapshot(), o.board),
+        Machine::Sf1(f) => frontend::encode_sf1(&f.snapshot()),
+    };
     match std::fs::write(&o.state_path, &bytes) {
         Ok(()) => {}
         Err(e) => note(s, format!("cannot write `{}`: {e}", o.state_path.display())),
     }
 }
 
-fn load(m: &mut Cps1, o: &LoopOpts, s: &mut Summary) {
+/// Restores the machine's state, or notes why it could not.
+///
+/// The machine is left untouched on any failure. A partial restore would be a machine
+/// that is neither the saved one nor the running one, and the loop would carry on
+/// running it.
+fn load(m: &mut Machine, o: &LoopOpts, s: &mut Summary) {
     let bytes = match std::fs::read(&o.state_path) {
         Ok(b) => b,
         Err(e) => {
@@ -413,17 +462,40 @@ fn load(m: &mut Cps1, o: &LoopOpts, s: &mut Summary) {
             return;
         }
     };
-    // The machine is left untouched on any failure. A partial restore would be a
-    // machine that is neither the saved one nor the running one, and the loop would
-    // carry on running it.
-    match frontend::decode(&bytes, BOARD) {
-        Ok(state) => m.restore(&state),
-        Err(e) => note(s, format!("cannot load `{}`: {e}", o.state_path.display())),
+    // The decode and the restore are inside one arm each, not a decode followed by a
+    // shared restore: the two codecs return different types — `MachineState` and
+    // `Sf1State` — and there is no supertype, deliberately. A state's shape is the
+    // board's, and a common one would be a struct with two thirds of its fields unused
+    // on whichever board was running.
+    //
+    // The notice text is identical on both arms and duplicated on purpose: it names the
+    // path and carries the codec's own reason, which is what
+    // `a_corrupt_state_file_does_not_stop_the_loop` asserts on. A closure over `s`
+    // would borrow it mutably across both arms while `note` also wants it, and the
+    // reader's question at this line — "what happens when a load fails" — is answered
+    // by two visible arms.
+    match m {
+        Machine::Cps1(c) => match frontend::decode(&bytes, o.board) {
+            Ok(state) => c.restore(&state),
+            Err(e) => note(s, format!("cannot load `{}`: {e}", o.state_path.display())),
+        },
+        Machine::Sf1(f) => match frontend::decode_sf1(&bytes) {
+            Ok(state) => f.restore(&state),
+            Err(e) => note(s, format!("cannot load `{}`: {e}", o.state_path.display())),
+        },
     }
 }
 
-fn screenshot(m: &Cps1, o: &LoopOpts, s: &mut Summary) {
-    let ppm = crate::ppm(&m.video);
+fn screenshot(m: &Machine, o: &LoopOpts, s: &mut Summary) {
+    // Two writers, not one: CPS-1's `ppm` asks `Video::rgb()` for a whole RGB buffer
+    // and SF1's `ppm_sf1` asks `Sf1Video::rgb(pen)` per pen. Different shapes, because
+    // a never-rendered SF1 frame holds CPS-1's `BACKGROUND_PEN` — past SF1's 1,024
+    // entries — and the per-pen form answers black for it where an index would be out
+    // of bounds. `ppm_sf1`'s own doc says so.
+    let ppm = match m {
+        Machine::Cps1(c) => crate::ppm(&c.video),
+        Machine::Sf1(f) => crate::ppm_sf1(&f.video),
+    };
     if let Err(e) = std::fs::write(&o.shot_path, &ppm) {
         note(s, format!("cannot write `{}`: {e}", o.shot_path.display()));
     }
@@ -437,8 +509,12 @@ mod tests {
     // would say nothing they check. The audio tests below use `FakeAudio`.
     use crate::audio::NullAudio;
     use frontend::keys::Key;
+    // Under `#[cfg(test)]` because production code in this file no longer names the
+    // type: the fixtures build a `Cps1` and `cps1`/`cps1_mut` hand it back, but every
+    // one of `run`'s own board decisions is a match on `Machine`.
     use frontend::FRAME_NS;
     use machine::video::{HEIGHT, WIDTH};
+    use machine::Cps1;
     use machine::{BoardConfig, Timing};
 
     /// A `Display` that returns a script and records what it was shown.
@@ -632,10 +708,73 @@ mod tests {
     ///
     /// The fixtures build a `Cps1` because that is what has a ROM, a `gfxram` and a
     /// `cps_a` to set up; `run` takes a `Machine`. The tests then read the board back out
-    /// with [`cps1`] and [`cps1_ref`] — the loop's own two helpers, so a test reaches its
-    /// board exactly the way the code under test does.
+    /// with [`cps1`] and [`cps1_mut`].
     fn wrap(m: Cps1) -> Machine {
         Machine::Cps1(Box::new(m))
+    }
+
+    /// The CPS-1 board inside a fixture's machine.
+    ///
+    /// ⚠️ **Not the `cps1`/`cps1_ref` pair Task 18 put in production code** — this task
+    /// deletes those. This is a test-module helper over fixtures that build exactly one
+    /// arm, and it exists so that ~130 field reads across ~55 tests stay field reads. A
+    /// test that matched on [`Machine`] in a hundred places to reach
+    /// `m.board.trace.frames` would be a test of the enum.
+    ///
+    /// `frontend`'s `gfx.rs` has the same pair for the same reason.
+    fn cps1(m: &Machine) -> &Cps1 {
+        match m {
+            Machine::Cps1(c) => c,
+            Machine::Sf1(_) => unreachable!("this fixture builds a Cps1"),
+        }
+    }
+
+    /// The same, mutable. See [`cps1`].
+    fn cps1_mut(m: &mut Machine) -> &mut Cps1 {
+        match m {
+            Machine::Cps1(c) => c,
+            Machine::Sf1(_) => unreachable!("this fixture builds a Cps1"),
+        }
+    }
+
+    /// An SF1 with just enough program to run a frame.
+    ///
+    /// Deliberately Task 18's `an_sf1_machine`, byte for byte in the parts that matter
+    /// for a machine that must merely run: a two-instruction 68000 program, `jr -2` on
+    /// the FM Z80, a `nop` and `jr -2` on the ADPCM one, and five empty graphics
+    /// regions. Two fixtures that differed would leave a failure here and a pass there
+    /// with nothing to compare.
+    ///
+    /// No ROM: the program is written inline and every region is `Vec::new()`.
+    ///
+    /// ⚠️ **The `move.w` target is 0xFF8000, not the CPS-1 fixture's 0xFF0000.** SF1's
+    /// map starts RAM at 0xFF8000, so CPS-1's address is this board's *unmapped* space,
+    /// and a fixture that quietly logged an unmapped write per frame would be a trap for
+    /// the next test written against it. `0xFFE000` in the SSP for the same reason: that
+    /// is `objectram`'s base, which is the top of RAM, which is where a stack goes.
+    fn an_sf1_machine() -> Machine {
+        let mut rom = vec![0u8; 0x2000];
+        rom[0..8].copy_from_slice(&[0x00, 0xFF, 0xE0, 0x00, 0x00, 0x00, 0x10, 0x00]);
+        // Vector 0x64 and not 0x68: SF1's vblank is level 1. `sf1/board.rs` says so.
+        rom[0x64..0x68].copy_from_slice(&[0x00, 0x00, 0x11, 0x00]);
+        rom[0x1000..0x100E].copy_from_slice(&[
+            0x46, 0xFC, 0x20, 0x00, 0x52, 0x40, 0x33, 0xC0, 0x00, 0xFF, 0x80, 0x00, 0x60, 0xF6,
+        ]);
+        rom[0x1100..0x1104].copy_from_slice(&[0x52, 0x41, 0x4E, 0x73]);
+        let mut m = machine::Sf1::new(
+            &rom,
+            machine::video::sf1::Sf1Video::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            vec![0x18, 0xFE],
+            vec![0x00, 0x18, 0xFE],
+        );
+        m.reset();
+        Machine::Sf1(Box::new(m))
     }
 
     /// A unique temp path, removed when the guard drops.
@@ -667,6 +806,9 @@ mod tests {
         let o = LoopOpts {
             state_path: state.0.clone(),
             shot_path: shot.0.clone(),
+            // Every fixture here builds a CPS-1 except `an_sf1_machine`, whose one test
+            // overwrites this field. `run`'s assertion checks the pairing either way.
+            board: state_tag(machine::BoardKind::Cps1),
         };
         (o, state, shot)
     }
@@ -756,7 +898,7 @@ mod tests {
         // built afterwards: a `Cps1` is 525 KB on the stack, and two live in one test
         // thread overflows it. Which also makes the check stronger — the comparison
         // is against this machine's own power-on state.
-        let fresh = (cps1_ref(&m).cpu.pc, cps1_ref(&m).cpu.prefetch);
+        let fresh = (cps1(&m).cpu.pc, cps1(&m).cpu.prefetch);
         let mut script = Fake::idle(3);
         // Zero elapsed on the F3 tick: the reset happens before the frame count is
         // decided, so a tick that owed a frame would run one *after* resetting and
@@ -765,27 +907,23 @@ mod tests {
         script.push((KeySet::from_keys(&[Key::F3]), 0));
         let mut d = Fake::new(script);
         run(&mut m, &mut d, &mut NullAudio::default(), &o);
-        assert_eq!(cps1_ref(&m).total_cycles, 0, "the cycle count restarts");
+        assert_eq!(cps1(&m).total_cycles, 0, "the cycle count restarts");
         // 0x1004 and not 0x1000: `M68k::reset` refills the prefetch queue, which
         // advances the PC past the two words it read. Compared against a freshly
         // reset machine rather than against a literal, so this states "F3 is a power
         // cycle" rather than restating the core's prefetch convention — which is
         // `m68k`'s to change.
         assert_eq!(
-            cps1_ref(&m).cpu.pc,
+            cps1(&m).cpu.pc,
             fresh.0,
             "the PC is where power-on leaves it"
         );
-        assert_eq!(cps1_ref(&m).cpu.prefetch, fresh.1, "and so is the queue");
-        assert_eq!(
-            cps1_ref(&m).line,
-            0,
-            "and the beam is at the top of a frame"
-        );
+        assert_eq!(cps1(&m).cpu.prefetch, fresh.1, "and so is the queue");
+        assert_eq!(cps1(&m).line, 0, "and the beam is at the top of a frame");
         // Not the trace: `reset` deliberately does not clear it, because the trace
         // records the session and a reset is part of the session.
         assert!(
-            cps1_ref(&m).board.trace.vblanks > 0,
+            cps1(&m).board.trace.vblanks > 0,
             "the trace keeps the whole session"
         );
     }
@@ -951,10 +1089,10 @@ mod tests {
         );
         assert!(o.state_path.exists(), "and leave a file behind");
         let after = (
-            cps1_ref(&m).total_cycles,
-            cps1_ref(&m).cpu.d[0],
-            cps1_ref(&m).cpu.d[1],
-            cps1_ref(&m).line,
+            cps1(&m).total_cycles,
+            cps1(&m).cpu.d[0],
+            cps1(&m).cpu.d[1],
+            cps1(&m).line,
         );
         assert_ne!(after.0, 0, "the premise: the machine moved");
 
@@ -972,10 +1110,10 @@ mod tests {
         );
         assert_eq!(
             (
-                cps1_ref(&m).total_cycles,
-                cps1_ref(&m).cpu.d[0],
-                cps1_ref(&m).cpu.d[1],
-                cps1_ref(&m).line
+                cps1(&m).total_cycles,
+                cps1(&m).cpu.d[0],
+                cps1(&m).cpu.d[1],
+                cps1(&m).line
             ),
             after,
             "a loaded machine must run the same four frames"
@@ -994,6 +1132,7 @@ mod tests {
         let o = LoopOpts {
             state_path: bad.clone(),
             shot_path: shot.0.clone(),
+            board: state_tag(machine::BoardKind::Cps1),
         };
         assert!(!bad.exists(), "the premise: the directory is really absent");
 
@@ -1050,15 +1189,11 @@ mod tests {
         // to being applied.
         let mut m = machine();
         m.run_frame();
-        let mut bytes = frontend::encode(&cps1_ref(&m).snapshot(), BOARD);
+        let mut bytes = frontend::encode(&cps1(&m).snapshot(), o.board);
         bytes[100_000] ^= 0x01;
         std::fs::write(&o.state_path, &bytes).expect("temp dir is writable");
 
-        let before = (
-            cps1_ref(&m).total_cycles,
-            cps1_ref(&m).cpu.d[0],
-            cps1_ref(&m).line,
-        );
+        let before = (cps1(&m).total_cycles, cps1(&m).cpu.d[0], cps1(&m).line);
         // Zero elapsed, so the tick owes no frame: what this test asserts is that
         // the *load* left the machine alone, and a frame run afterwards would move
         // it for a reason that has nothing to do with the load.
@@ -1067,11 +1202,7 @@ mod tests {
         assert_eq!(s.notices.len(), 1, "{:?}", s.notices);
         assert_eq!(s.frames, 0, "the load tick owed nothing");
         assert_eq!(
-            (
-                cps1_ref(&m).total_cycles,
-                cps1_ref(&m).cpu.d[0],
-                cps1_ref(&m).line
-            ),
+            (cps1(&m).total_cycles, cps1(&m).cpu.d[0], cps1(&m).line),
             before,
             "a refused load must not partially apply"
         );
@@ -1079,9 +1210,9 @@ mod tests {
 
     /// A saved state names the board it came from.
     ///
-    /// Nothing else here can see [`BOARD`]. `save` and `load` both use it, so a
-    /// round trip agrees with itself whatever the constant is — the file could be
-    /// tagged `SF1\0` and every other test in this module would still pass. The tag
+    /// Nothing else here reads the tag off disk. `save` and `load` both use
+    /// `o.board`, so a round trip agrees with itself whatever it holds — the file could
+    /// be tagged `SF1\0` and every other test in this module would still pass. The tag
     /// exists so that loading one board's state into another build is *refused*,
     /// which is a claim about the bytes on disk and has to be read off the bytes.
     ///
@@ -1111,23 +1242,21 @@ mod tests {
     ///
     /// The other half of the same claim: the tag is not decoration, it is a check
     /// `load` applies. Written by hand rather than by encoding under a different
-    /// constant, because [`BOARD`] is the only board this build has.
+    /// constant, because building a second board to produce one byte pattern would test
+    /// `Sf1`'s codec rather than this loop's refusal.
     #[test]
     fn another_boards_state_is_refused_by_the_loop() {
         let (o, _s, _p) = opts("board-refuse");
         let mut m = machine();
         m.run_frame();
-        let mut bytes = frontend::encode(&cps1_ref(&m).snapshot(), BOARD);
-        // `SF1\0` — a board that does not exist yet, which is exactly the file this
-        // check exists to reject once it does.
+        let mut bytes = frontend::encode(&cps1(&m).snapshot(), o.board);
+        // `SF1\0`, written by hand rather than by building an SF1 and encoding it:
+        // what is under test is that *this* machine refuses a foreign tag, and the
+        // sibling below is the same claim from SF1's side.
         bytes[8..12].copy_from_slice(&0x5346_3100_u32.to_le_bytes());
         std::fs::write(&o.state_path, &bytes).expect("temp dir is writable");
 
-        let before = (
-            cps1_ref(&m).total_cycles,
-            cps1_ref(&m).cpu.d[0],
-            cps1_ref(&m).line,
-        );
+        let before = (cps1(&m).total_cycles, cps1(&m).cpu.d[0], cps1(&m).line);
         let mut d = Fake::new(vec![(KeySet::from_keys(&[Key::F8]), 0)]);
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.notices.len(), 1, "{:?}", s.notices);
@@ -1137,13 +1266,102 @@ mod tests {
             s.notices[0]
         );
         assert_eq!(
-            (
-                cps1_ref(&m).total_cycles,
-                cps1_ref(&m).cpu.d[0],
-                cps1_ref(&m).line
-            ),
+            (cps1(&m).total_cycles, cps1(&m).cpu.d[0], cps1(&m).line),
             before,
             "and the running machine is untouched"
+        );
+    }
+
+    /// The SF1 loop refuses a CPS-1 state, and keeps running.
+    ///
+    /// The mirror of [`another_boards_state_is_refused_by_the_loop`]. Both directions,
+    /// because a codec that checked the tag in only one is a codec that lets exactly
+    /// one of the two dangerous loads through — and which one depends on which board
+    /// the user happens to be playing.
+    ///
+    /// # Why the notice's text is not asserted
+    ///
+    /// `decode_sf1` refuses this file, but *which* `StateError` depends on whether the
+    /// tag or the length is checked first, and CPS-1's payload and SF1's are not the
+    /// same size — so this file may well be `Truncated` rather than `WrongBoard`. One
+    /// notice and an untouched machine is the claim that matters and the one that does
+    /// not depend on that ordering. The `WrongBoard`-specifically assertion is in
+    /// `frontend`'s codec tests; the sibling above can assert on `"board"` because
+    /// there both payloads are the same length.
+    #[test]
+    fn a_cps1_state_is_refused_by_an_sf1_loop() {
+        let (mut o, _s, _p) = opts("sf1-board-refuse");
+        o.board = state_tag(machine::BoardKind::Sf1);
+        let mut m = an_sf1_machine();
+        m.run_frame();
+
+        // A well-formed CPS-1 state, produced by CPS-1's own codec so that the only
+        // thing wrong with it is the board it belongs to. A hand-mangled tag would
+        // also be caught by the length check, which is a different check.
+        let mut other = machine();
+        other.run_frame();
+        let bytes = frontend::encode(&cps1(&other).snapshot(), frontend::BOARD_SF2);
+        std::fs::write(&o.state_path, &bytes).expect("temp dir is writable");
+
+        // Destructured and dropped before `run`: a `CpuView` borrows the machine, and
+        // holding one across `run(&mut m, ..)` is `E0502`.
+        let before = {
+            let v = m.cpu_view();
+            (v.total_cycles, v.cpu.pc, v.line)
+        };
+        let mut d = Fake::new(vec![(KeySet::from_keys(&[Key::F8]), 0)]);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        assert_eq!(s.notices.len(), 1, "{:?}", s.notices);
+        let v = m.cpu_view();
+        assert_eq!(
+            (v.total_cycles, v.cpu.pc, v.line),
+            before,
+            "the running machine must be untouched by a refused load"
+        );
+    }
+
+    /// Each board's tag is the one its codec writes.
+    ///
+    /// Every value is a literal here, not `frontend::BOARD_SF2`: this is the mapping
+    /// under test and reading the constant the function returns would prove nothing.
+    /// The bytes are the format's documented form — big-endian ASCII, so a hex dump
+    /// of a state file reads `SF2\0` or `SF1\0`.
+    #[test]
+    fn each_board_has_its_own_state_tag() {
+        assert_eq!(state_tag(machine::BoardKind::Cps1), 0x5346_3200);
+        assert_eq!(state_tag(machine::BoardKind::Sf1), 0x5346_3100);
+        assert_eq!(&state_tag(machine::BoardKind::Cps1).to_be_bytes(), b"SF2\0");
+        assert_eq!(&state_tag(machine::BoardKind::Sf1).to_be_bytes(), b"SF1\0");
+        assert_ne!(
+            state_tag(machine::BoardKind::Cps1),
+            state_tag(machine::BoardKind::Sf1),
+            "two boards sharing a tag is the whole failure the tag exists to stop"
+        );
+    }
+
+    /// The tag `state_tag` answers is the tag the codec checks.
+    ///
+    /// # Why this is not the same test as the one above
+    ///
+    /// The one above pins `state_tag` against two literals. This pins it against
+    /// `frontend`'s codec, which is the thing that has to agree: a `state_tag` that
+    /// returned the right-looking number while `frontend::BOARD_SF2` was something
+    /// else would pass up there and fail here.
+    #[test]
+    fn the_state_tag_is_the_one_the_codec_accepts() {
+        let mut m = machine();
+        m.run_frame();
+        let bytes = frontend::encode(&cps1(&m).snapshot(), state_tag(machine::BoardKind::Cps1));
+        assert!(
+            frontend::decode(&bytes, state_tag(machine::BoardKind::Cps1)).is_ok(),
+            "a state written with this tag must decode under it"
+        );
+        assert!(
+            matches!(
+                frontend::decode(&bytes, state_tag(machine::BoardKind::Sf1)),
+                Err(frontend::StateError::WrongBoard { .. })
+            ),
+            "and must be refused under the other board's"
         );
     }
 
@@ -1185,7 +1403,7 @@ mod tests {
         let mut d = Fake::new(Fake::idle(3));
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert!(
-            cps1_ref(&m).cpu.halted,
+            cps1(&m).cpu.halted,
             "the premise: this program really halts"
         );
         assert_eq!(d.presented.len(), 3, "the loop ran to the end anyway");
@@ -1214,14 +1432,10 @@ mod tests {
         // P is held on both ticks, so there is no second edge and no unpause.
         assert_eq!(s.frames, 0, "the premise: no frame ran");
         assert!(
-            cps1_ref(&m).board.inputs.coin1,
+            cps1(&m).board.inputs.coin1,
             "the coin reached the board anyway"
         );
-        assert_ne!(
-            cps1_ref(&m).board.inputs.in1(),
-            0xFFFF,
-            "and so did the stick"
-        );
+        assert_ne!(cps1(&m).board.inputs.in1(), 0xFFFF, "and so did the stick");
     }
 
     /// `F4` steps one instruction per press, and no frames.
@@ -1248,12 +1462,12 @@ mod tests {
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 0, "the premise: no frame ran");
         assert_eq!(
-            cps1_ref(&m).total_cycles,
+            cps1(&m).total_cycles,
             20,
             "16 for the `move`, 4 for the `addq`"
         );
         assert_eq!(
-            frontend::overlay::executing_pc(&view(cps1_ref(&m))),
+            frontend::overlay::executing_pc(&m.cpu_view()),
             0x1006,
             "and it is sitting at the third instruction"
         );
@@ -1274,7 +1488,7 @@ mod tests {
         let (o, _s, _p) = opts("bp-midframe");
         let mut m = machine_with_a_long_loop();
         assert_eq!(
-            frontend::overlay::executing_pc(&view(cps1_ref(&m))),
+            frontend::overlay::executing_pc(&m.cpu_view()),
             TARGET,
             "the premise: reset leaves the machine on the instruction F7 will mark"
         );
@@ -1290,19 +1504,19 @@ mod tests {
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
 
         assert_eq!(
-            frontend::overlay::executing_pc(&view(cps1_ref(&m))),
+            frontend::overlay::executing_pc(&m.cpu_view()),
             TARGET,
             "it stopped at the breakpoint"
         );
         assert_ne!(
-            cps1_ref(&m).line,
+            cps1(&m).line,
             0,
             "mid-frame: the beam is not at a frame boundary"
         );
         assert!(
-            cps1_ref(&m).total_cycles < u64::from(cps1_ref(&m).timing.cycles_per_frame()),
+            cps1(&m).total_cycles < u64::from(cps1(&m).timing.cycles_per_frame()),
             "and well short of a whole frame: {} cycles",
-            cps1_ref(&m).total_cycles
+            cps1(&m).total_cycles
         );
         assert_eq!(s.frames, 0, "a frame cut in half is not a frame that ran");
         assert!(
@@ -1324,7 +1538,7 @@ mod tests {
         let mut m = machine_with_a_long_loop();
         // One machine, snapshotted and put back, rather than two: a `Cps1` is 525 KB on
         // the stack and two live in one test thread overflows it.
-        let start = cps1_ref(&m).snapshot();
+        let start = cps1(&m).snapshot();
 
         // Stop, then sit there for two more ticks.
         let mut script = vec![
@@ -1334,18 +1548,18 @@ mod tests {
         script.extend(Fake::idle(3));
         let mut d = Fake::new(script.clone());
         run(&mut m, &mut d, &mut NullAudio::default(), &o);
-        let stopped = cps1_ref(&m).total_cycles;
+        let stopped = cps1(&m).total_cycles;
         assert!(stopped > 0, "the premise: the machine ran up to the stop");
 
         // The same, but the third of those ticks presses `P`.
-        cps1(&mut m).restore(&start);
+        cps1_mut(&mut m).restore(&start);
         script[3] = Fake::held(&[Key::P]);
         let mut d = Fake::new(script);
         run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert!(
-            cps1_ref(&m).total_cycles > stopped,
+            cps1(&m).total_cycles > stopped,
             "resuming must run on: {} cycles against {stopped} stopped",
-            cps1_ref(&m).total_cycles
+            cps1(&m).total_cycles
         );
     }
 
@@ -1402,12 +1616,12 @@ mod tests {
         // back round. 18 is exactly the mutant's answer — stepped onto the breakpoint
         // and stuck there.
         assert_eq!(
-            cps1_ref(&m).total_cycles,
+            cps1(&m).total_cycles,
             32,
             "the resume must leave the instruction it was stepped onto"
         );
         assert_eq!(
-            frontend::overlay::executing_pc(&view(cps1_ref(&m))),
+            frontend::overlay::executing_pc(&m.cpu_view()),
             0x1002,
             "and stop at the breakpoint again on the way round, not run the frame out"
         );
@@ -1438,7 +1652,7 @@ mod tests {
         let shown = d.first.expect("a tick presents");
 
         let mut game: Vec<u32> = Vec::new();
-        pens_to_argb(&cps1_ref(&m).video, &mut game);
+        pens_to_argb(&cps1(&m).video, &mut game);
         assert_ne!(
             shown, game,
             "the premise: the overlay changed the presented frame"
@@ -1447,11 +1661,11 @@ mod tests {
         let mut expected = game.clone();
         frontend::overlay::draw(
             &mut expected,
-            &view(cps1_ref(&m)),
+            &m.cpu_view(),
             &|a| m.peek_word(a),
             &m,
             frontend::overlay::Panels::on(),
-            frontend::overlay::executing_pc(&view(cps1_ref(&m))),
+            frontend::overlay::executing_pc(&m.cpu_view()),
             0,
             &[],
         );
@@ -1481,7 +1695,7 @@ mod tests {
         run(&mut m, &mut d, &mut NullAudio::default(), &o);
         let shown = d.first.expect("a tick presents");
         let mut game: Vec<u32> = Vec::new();
-        pens_to_argb(&cps1_ref(&m).video, &mut game);
+        pens_to_argb(&cps1(&m).video, &mut game);
         assert_eq!(shown, game, "not a pixel of the game is disturbed");
     }
 
@@ -1585,7 +1799,7 @@ mod tests {
         run(&mut m, &mut d, &mut NullAudio::default(), &o);
         let masked = d.last.expect("a tick presents");
         assert_ne!(
-            cps1_ref(&m).video.enable,
+            cps1(&m).video.enable,
             machine::video::compose::LayerMask::all(),
             "the presses reached the layers view and subtracted a row"
         );
@@ -1613,7 +1827,7 @@ mod tests {
         let mut m = machine();
         // One machine, restored between the two runs — 525 KB on the stack means two
         // do not fit in a test thread.
-        let start = cps1_ref(&m).snapshot();
+        let start = cps1(&m).snapshot();
 
         // Every view, and a subtracted layer. Ten ticks, so the comparison run's ten
         // idle ticks ask for the same frames — the fake advances one frame per tick
@@ -1622,10 +1836,7 @@ mod tests {
         // A released tick after each press: these keys are all edge-triggered, so
         // consecutive held ticks are one press and the script would stop short of the
         // layers view.
-        let base = (
-            cps1_ref(&m).board.trace.acks,
-            cps1_ref(&m).board.trace.vblanks,
-        );
+        let base = (cps1(&m).board.trace.acks, cps1(&m).board.trace.vblanks);
         let mut d = Fake::new(vec![
             Fake::held(&[Key::GfxToggled]),
             Fake::held(&[]),
@@ -1639,7 +1850,7 @@ mod tests {
             Fake::held(&[]),
         ]);
         let s_on = run(&mut m, &mut d, &mut NullAudio::default(), &o);
-        let b = cps1_ref(&m);
+        let b = cps1(&m);
         let on = (
             b.total_cycles,
             b.cpu.d,
@@ -1649,29 +1860,26 @@ mod tests {
             b.board.trace.acks - base.0,
             b.board.trace.vblanks - base.1,
         );
-        let ram_on = cps1_ref(&m).board.ram.clone();
+        let ram_on = cps1(&m).board.ram.clone();
         assert_ne!(on.0, 0, "the premise: the machine ran");
         assert_ne!(
-            cps1_ref(&m).video.enable,
+            cps1(&m).video.enable,
             machine::video::compose::LayerMask::all(),
             "the premise: a layer really was subtracted"
         );
 
-        cps1(&mut m).restore(&start);
+        cps1_mut(&mut m).restore(&start);
         // `restore` leaves `enable` alone — it is not machine state — so the
         // comparison run must clear it by hand. That this is necessary is itself the
         // point of `machine`'s own `the_layer_mask_is_not_machine_state`.
-        cps1(&mut m).video.enable = machine::video::compose::LayerMask::all();
-        let base = (
-            cps1_ref(&m).board.trace.acks,
-            cps1_ref(&m).board.trace.vblanks,
-        );
+        cps1_mut(&mut m).video.enable = machine::video::compose::LayerMask::all();
+        let base = (cps1(&m).board.trace.acks, cps1(&m).board.trace.vblanks);
         let mut d = Fake::new(Fake::idle(10));
         let s_off = run(&mut m, &mut d, &mut NullAudio::default(), &o);
 
         assert_eq!(s_on.frames, s_off.frames, "the same frames were asked for");
         assert_eq!(s_on.frames, 10, "and there were some");
-        let b = cps1_ref(&m);
+        let b = cps1(&m);
         assert_eq!(
             on,
             (
@@ -1685,11 +1893,7 @@ mod tests {
             ),
             "the viewer must not move the machine"
         );
-        assert_eq!(
-            ram_on,
-            cps1_ref(&m).board.ram,
-            "nor write a word of its memory"
-        );
+        assert_eq!(ram_on, cps1(&m).board.ram, "nor write a word of its memory");
     }
 
     /// And the same claim for **all sixteen** mask combinations, not just one.
@@ -1709,7 +1913,7 @@ mod tests {
     fn no_mask_combination_changes_the_machine() {
         let (o, _s, _p) = opts("everymask");
         let mut m = machine();
-        let start = cps1_ref(&m).snapshot();
+        let start = cps1(&m).snapshot();
 
         /// The 24-tick script that subtracts the rows in `bits`, one bit per row.
         ///
@@ -1740,13 +1944,10 @@ mod tests {
         // The baseline: the same tick count with nothing subtracted, which `bits == 0`
         // is exactly — the script still walks to the layers view and moves the row
         // selection, so the two runs differ in the mask and in nothing else.
-        let base = (
-            cps1_ref(&m).board.trace.acks,
-            cps1_ref(&m).board.trace.vblanks,
-        );
+        let base = (cps1(&m).board.trace.acks, cps1(&m).board.trace.vblanks);
         let mut d = Fake::new(script(0));
         let s_off = run(&mut m, &mut d, &mut NullAudio::default(), &o);
-        let b = cps1_ref(&m);
+        let b = cps1(&m);
         let want = (
             b.total_cycles,
             b.cpu.d,
@@ -1756,29 +1957,26 @@ mod tests {
             b.board.trace.acks - base.0,
             b.board.trace.vblanks - base.1,
         );
-        let want_ram = cps1_ref(&m).board.ram.clone();
+        let want_ram = cps1(&m).board.ram.clone();
         assert_ne!(want.0, 0, "the premise: the machine ran");
         assert_eq!(s_off.frames, 24, "and the script is 24 ticks long");
         assert_eq!(
-            cps1_ref(&m).video.enable,
+            cps1(&m).video.enable,
             machine::video::compose::LayerMask::all(),
             "the premise: the baseline subtracted nothing"
         );
 
         for bits in 1u8..16 {
-            cps1(&mut m).restore(&start);
+            cps1_mut(&mut m).restore(&start);
             // `restore` leaves `enable` alone — it is not machine state — so each run
             // starts from the identity by hand.
-            cps1(&mut m).video.enable = machine::video::compose::LayerMask::all();
-            let base = (
-                cps1_ref(&m).board.trace.acks,
-                cps1_ref(&m).board.trace.vblanks,
-            );
+            cps1_mut(&mut m).video.enable = machine::video::compose::LayerMask::all();
+            let base = (cps1(&m).board.trace.acks, cps1(&m).board.trace.vblanks);
             let mut d = Fake::new(script(bits));
             let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
             // Row 0 is the sprites, then the three scrolls in order.
             assert_eq!(
-                cps1_ref(&m).video.enable,
+                cps1(&m).video.enable,
                 machine::video::compose::LayerMask {
                     sprites: bits & 1 == 0,
                     scroll1: bits & 2 == 0,
@@ -1788,7 +1986,7 @@ mod tests {
                 "the premise: {bits:04b} reached the mask it names"
             );
             assert_eq!(s.frames, s_off.frames, "the same frames were asked for");
-            let b = cps1_ref(&m);
+            let b = cps1(&m);
             assert_eq!(
                 want,
                 (
@@ -1804,7 +2002,7 @@ mod tests {
             );
             assert_eq!(
                 want_ram,
-                cps1_ref(&m).board.ram,
+                cps1(&m).board.ram,
                 "mask {bits:04b} wrote its memory"
             );
         }
@@ -1826,17 +2024,14 @@ mod tests {
         // One machine, put back between the two runs — 525 KB on the stack means two do
         // not fit in a test thread. `restore` leaves the trace alone deliberately, so
         // the trace figures are compared as deltas from each run's own baseline.
-        let start = cps1_ref(&m).snapshot();
-        let base = (
-            cps1_ref(&m).board.trace.acks,
-            cps1_ref(&m).board.trace.vblanks,
-        );
+        let start = cps1(&m).snapshot();
+        let base = (cps1(&m).board.trace.acks, cps1(&m).board.trace.vblanks);
 
         let mut script = vec![Fake::held(&[Key::F1])];
         script.extend(Fake::idle(3));
         let mut d = Fake::new(script);
         let s_on = run(&mut m, &mut d, &mut NullAudio::default(), &o);
-        let b = cps1_ref(&m);
+        let b = cps1(&m);
         let on = (
             b.total_cycles,
             b.cpu.d,
@@ -1846,7 +2041,7 @@ mod tests {
             b.board.trace.acks - base.0,
             b.board.trace.vblanks - base.1,
         );
-        let ram_on = cps1_ref(&m).board.ram.clone();
+        let ram_on = cps1(&m).board.ram.clone();
         assert_ne!(on.0, 0, "the premise: the machine ran");
         // And the overlay really was on, or this compares two identical runs.
         let first = d.first.expect("a tick presents");
@@ -1855,17 +2050,14 @@ mod tests {
             "the premise: the overlay was drawn"
         );
 
-        cps1(&mut m).restore(&start);
-        let base = (
-            cps1_ref(&m).board.trace.acks,
-            cps1_ref(&m).board.trace.vblanks,
-        );
+        cps1_mut(&mut m).restore(&start);
+        let base = (cps1(&m).board.trace.acks, cps1(&m).board.trace.vblanks);
         let mut d = Fake::new(Fake::idle(4));
         let s_off = run(&mut m, &mut d, &mut NullAudio::default(), &o);
 
         assert_eq!(s_on.frames, s_off.frames, "the same frames were asked for");
         assert_eq!(s_on.frames, 4, "and there were some");
-        let b = cps1_ref(&m);
+        let b = cps1(&m);
         assert_eq!(
             on,
             (
@@ -1879,11 +2071,7 @@ mod tests {
             ),
             "the overlay must not move the machine"
         );
-        assert_eq!(
-            ram_on,
-            cps1_ref(&m).board.ram,
-            "nor write a word of its memory"
-        );
+        assert_eq!(ram_on, cps1(&m).board.ram, "nor write a word of its memory");
     }
 
     /// The debugger's stepping path reaches the same machine as `run_frame`.
@@ -1897,11 +2085,11 @@ mod tests {
     fn the_stepping_path_reaches_the_same_machine_as_run_frame() {
         let (o, _s, _p) = opts("stepping-path");
         let mut m = machine();
-        let start = cps1_ref(&m).snapshot();
+        let start = cps1(&m).snapshot();
         // `restore` deliberately leaves the trace alone — a reset or a load is part of
         // the session the trace records — so the trace figures are compared as deltas
         // from each run's own baseline rather than as absolutes.
-        let b = cps1_ref(&m);
+        let b = cps1(&m);
         let base = (
             b.board.trace.frames,
             b.board.trace.acks,
@@ -1911,7 +2099,7 @@ mod tests {
         let mut d = Fake::new(Fake::idle(4));
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 4, "the premise: four frames ran");
-        let b = cps1_ref(&m);
+        let b = cps1(&m);
         let stepped = (
             b.total_cycles,
             b.cpu.d,
@@ -1922,11 +2110,11 @@ mod tests {
             b.board.trace.acks - base.1,
             b.board.trace.vblanks - base.2,
         );
-        let ram_stepped = cps1_ref(&m).board.ram.clone();
+        let ram_stepped = cps1(&m).board.ram.clone();
         assert_ne!(stepped.0, 0, "and the machine moved");
 
-        cps1(&mut m).restore(&start);
-        let b = cps1_ref(&m);
+        cps1_mut(&mut m).restore(&start);
+        let b = cps1(&m);
         let base = (
             b.board.trace.frames,
             b.board.trace.acks,
@@ -1935,7 +2123,7 @@ mod tests {
         for _ in 0..4 {
             m.run_frame();
         }
-        let b = cps1_ref(&m);
+        let b = cps1(&m);
         assert_eq!(
             stepped,
             (
@@ -1952,7 +2140,7 @@ mod tests {
         );
         assert_eq!(
             ram_stepped,
-            cps1_ref(&m).board.ram,
+            cps1(&m).board.ram,
             "down to the last word of memory"
         );
     }
@@ -2207,7 +2395,7 @@ mod tests {
             ..FakeAudio::default()
         };
         run(&mut m, &mut d, &mut a, &o);
-        let t = cps1_ref(&m).sound.trace();
+        let t = cps1(&m).sound.trace();
         assert_eq!(t.audio_drops, 17, "drops is the first argument");
         assert_eq!(t.audio_underruns, 4, "and underruns the second");
 
@@ -2217,8 +2405,8 @@ mod tests {
         run(&mut m2, &mut d2, &mut FakeAudio::default(), &o2);
         assert_eq!(
             (
-                cps1_ref(&m2).sound.trace().audio_drops,
-                cps1_ref(&m2).sound.trace().audio_underruns
+                cps1(&m2).sound.trace().audio_drops,
+                cps1(&m2).sound.trace().audio_underruns
             ),
             (0, 0),
             "a healthy sink leaves them at zero"
@@ -2251,13 +2439,13 @@ mod tests {
         run(&mut failing, &mut d2, &mut a2, &o2);
 
         assert_eq!(
-            cps1_ref(&working).board.ram,
-            cps1_ref(&failing).board.ram,
+            cps1(&working).board.ram,
+            cps1(&failing).board.ram,
             "the same memory"
         );
         assert_eq!(
-            cps1_ref(&working).total_cycles,
-            cps1_ref(&failing).total_cycles,
+            cps1(&working).total_cycles,
+            cps1(&failing).total_cycles,
             "the same cycle count"
         );
         assert!(
