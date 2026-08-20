@@ -1216,12 +1216,24 @@ mod tests {
     }
 
     /// A shown viewer draws whichever board it is handed, through that board's panels.
+    ///
+    /// ⚠️ The view is cycled off `View::Tiles` and the cursor moved before anything is
+    /// drawn. Without that, `draw` could pass `sf1panels` a default `Sf1ViewState` —
+    /// hardcoded view, cursor zero — and every assertion below would still hold,
+    /// because a fresh viewer's state *is* the default. A mutant that did exactly that
+    /// survived until this test moved off it.
     #[test]
     fn a_shown_viewer_draws_the_board_it_is_given() {
         let cps = a_machine();
         let sf1 = an_sf1_machine();
         let mut g = GfxViewer::new();
         g.update(&act(|a| a.gfx_toggled = true), &sf1);
+        for _ in 0..2 {
+            g.update(&act(|a| a.gfx_view_cycled = true), &sf1);
+        }
+        g.update(&act(|a| a.gfx_forward = true), &sf1);
+        assert_eq!(g.view(), View::Palette, "the premise: not the default view");
+        assert_ne!(g.sf1_state().pal_at, 0, "nor the default cursor");
         let mut on_sf1 = vec![0u32; WIDTH * HEIGHT];
         g.draw(&mut on_sf1, &sf1);
         let mut on_cps = vec![0u32; WIDTH * HEIGHT];
