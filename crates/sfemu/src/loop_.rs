@@ -218,10 +218,14 @@ pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &Loo
         // writes it — see `frontend::debug`.
         dbg.update(&a, &view(cps1_ref(m)));
 
-        gfx.update(&a, cps1_ref(m));
+        // `&Machine`, unlike its seven neighbours here: the graphics viewer drives
+        // either board already, so handing it a `Cps1` no longer compiles. The rest of
+        // this function is still CPS-1-only, which is Task 21's subject.
+        gfx.update(&a, m);
         // The mask is a view setting the loop applies, not something `frontend`
-        // reaches into the machine to set: every `frontend` entry point takes
-        // `&Cps1`. Before `render`, so this tick's frame is the masked one.
+        // reaches into the machine to set. Before `render`, so this tick's frame is
+        // the masked one. Still `gfx.mask()` and not `sf1_mask()` because this line
+        // reaches for a `Cps1`; the board fork is Task 21's.
         cps1(m).video.enable = gfx.mask();
 
         // A step is one frame regardless of the clock, which is what makes it a
@@ -307,7 +311,7 @@ pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &Loo
         dbg.draw(&mut buf, &view(cps1_ref(m)), &|a| m.peek_word(a), m);
         // Over the debugger, not under it: both are opaque, and this one is the
         // whole screen while E2's are corners of it.
-        gfx.draw(&mut buf, cps1_ref(m));
+        gfx.draw(&mut buf, m);
         if let Err(e) = d.present(&buf) {
             note(&mut summary, format!("cannot present a frame: {e}"));
             break;

@@ -354,6 +354,34 @@ fn ppm(v: &video::compose::Video) -> Vec<u8> {
     out
 }
 
+/// An SF1 frame as a binary PPM.
+///
+/// The same `P6\n384 224\n255\n` header as [`ppm`] — a screenshot of either board is
+/// the same file format, and a viewer must not have to know which machine wrote it.
+///
+/// Separate from `ppm` and not a parameter, because there is no shared type to take:
+/// `Video::rgb` returns an assembled `Vec<u8>` and `Sf1Video` publishes a per-pen
+/// `rgb` instead. Assembling the body here rather than adding a frame-wide `rgb` to
+/// `Sf1Video` keeps the allocation in the crate that is about to write a file, which
+/// is the crate that already owns a filesystem.
+// Wired to `screenshot` in the loop's board fork.
+#[allow(dead_code)]
+fn ppm_sf1(v: &video::sf1::Sf1Video) -> Vec<u8> {
+    let mut out = format!("P6\n{} {}\n255\n", video::WIDTH, video::HEIGHT).into_bytes();
+    assert_eq!(
+        v.fb.pens.len(),
+        video::WIDTH * video::HEIGHT,
+        "one pen per pixel of the visible frame"
+    );
+    for &pen in v.fb.pens.iter() {
+        // `rgb` and not a palette index: a never-rendered frame holds CPS-1's
+        // `BACKGROUND_PEN`, which is past SF1's 1,024 entries, and `rgb` answers
+        // black for it where an index would be out of bounds.
+        out.extend_from_slice(&v.rgb(pen));
+    }
+    out
+}
+
 /// The three CPU facts the report prints.
 ///
 /// A small struct rather than a `&M68k` so this crate needs no `m68k` dependency
@@ -870,6 +898,65 @@ mod tests {
         let sprite = pixel(0, 0);
         assert_ne!(sprite, pixel(200, 200), "the sprite is not the background");
         assert_eq!(sprite, pixel(15, 15), "and it is a whole 16x16 tile");
+    }
+
+    /// An `Sf1Video` with one palette entry set and one frame rendered.
+    ///
+    /// No ROM: the four graphics regions are empty, so `render` clears every pen to 0
+    /// and the whole frame is entry 0. That is enough to test the format, which is
+    /// what this tests.
+    fn an_sf1_frame() -> video::sf1::Sf1Video {
+        let mut v =
+            video::sf1::Sf1Video::new(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut palette = vec![0u16; video::sf1::palette::ENTRIES];
+        palette[0] = 0x0135;
+        let videoram = vec![0u16; 0x800];
+        let objectram = vec![0u16; 0x1000];
+        v.render(&videoram, &objectram, &palette, 0, 0, 0);
+        v
+    }
+
+    /// SF1's screenshot is the same file format as CPS-1's.
+    ///
+    /// Every number a literal, for the reason
+    /// `the_ppm_header_is_a_binary_p6_of_the_right_size` gives: a header interpolated
+    /// from the constants the body is sized from agrees with itself whatever they are.
+    #[test]
+    fn the_sf1_ppm_header_is_a_binary_p6_of_the_right_size() {
+        let v = an_sf1_frame();
+        let bytes = ppm_sf1(&v);
+        let header = b"P6\n384 224\n255\n";
+        assert_eq!(&bytes[..header.len()], header, "the exact header");
+        assert_eq!(
+            bytes.len() - header.len(),
+            258_048,
+            "384 * 224 * 3 bytes of body"
+        );
+        assert_eq!(bytes.len(), 258_063, "and nothing after it");
+    }
+
+    /// And its colours are SF1's, not CPS-1's.
+    #[test]
+    fn the_sf1_screenshot_uses_sf1s_dac_rule_and_not_cps1s() {
+        let v = an_sf1_frame();
+        let bytes = ppm_sf1(&v);
+        let header = 15;
+        // Entry 0x0135 through SF1's `(n << 4) | n` is (0x11, 0x33, 0x55). CPS-1's
+        // converter would give (0x08, 0x18, 0x28) and the screenshot would be dark.
+        assert_eq!(&bytes[header..header + 3], &[0x11, 0x33, 0x55]);
+        assert!(bytes[header..].chunks(3).all(|p| p == [0x11, 0x33, 0x55]));
+    }
+
+    /// A never-rendered frame screenshots black rather than panicking.
+    #[test]
+    fn a_never_rendered_sf1_screenshots_black_rather_than_panicking() {
+        // `Framebuffer::new` fills every pen with CPS-1's 0xBFF, past SF1's 1,024
+        // entries. `Sf1Video::rgb` answers black for it; indexing would not.
+        let v =
+            video::sf1::Sf1Video::new(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let bytes = ppm_sf1(&v);
+        assert_eq!(bytes.len(), 258_063);
+        assert!(bytes[15..].iter().all(|&b| b == 0));
     }
 
     /// The report names the framebuffer, with the drawn count and the page count.
