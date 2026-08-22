@@ -9,9 +9,10 @@ description = "A homebrew CPS-1 demo ROM this workspace generates from nothing"
 # writes bytes in the formats those crates read, and if it could call them it would
 # be tempting to build a table by asking the consumer where the table goes. Then a
 # wrong offset would agree with itself and the demo would render a picture that
-# proves nothing about the format. `m68k` is a dev-dependency only, for the
-# disassembler that checks the hand-encoded program.
+# proves nothing about the format. `m68k` and `z80` are dev-dependencies only, for
+# the disassemblers that check the hand-encoded programs.
 [dependencies]
 
 [dev-dependencies]
 m68k = { path = "../m68k" }
+z80 = { path = "../z80" }

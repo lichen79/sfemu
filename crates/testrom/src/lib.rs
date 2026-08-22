@@ -4,4 +4,5 @@
 #![warn(missing_docs)]
 
 pub mod asm68k;
+pub mod asmz80;
 pub mod gfx;
