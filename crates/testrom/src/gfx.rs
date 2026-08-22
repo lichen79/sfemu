@@ -157,6 +157,16 @@ pub const TRANSPARENT_PEN: u8 = 0x0F;
 /// The demo's text layer spells out a frame counter, which is the one thing on
 /// screen that proves the 68000 is still executing rather than showing a frozen
 /// first frame. A five-by-seven font is the smallest that stays legible at 8×8.
+///
+/// # Both halves of the frame
+///
+/// The glyph is written into [`Kind::Tile8x8`] *and* [`Kind::Tile8x8Odd`] — the
+/// two halves of one 64-byte frame. Scroll 1 chooses between them by bit 5 of
+/// the tile's scan index, which under its scan mapper is the column's low bit
+/// (`video::layers::draw_tilemap`), so one code renders as the even half in one
+/// column and the odd half in the next. A digit written to one half only would
+/// be legible at even columns and blank at odd ones, and as the layer scrolls
+/// each glyph would blink — a symptom that reads as a renderer fault.
 pub fn digit(rom: &mut [u8], code: u32, value: u8, pen: u8) {
     // Row bitmaps, bit 4 leftmost. Written out rather than generated: a font is
     // data, and the only check that matters is whether it reads as a number.
@@ -178,6 +188,7 @@ pub fn digit(rom: &mut [u8], code: u32, value: u8, pen: u8) {
             let on = y < 7 && x < 5 && glyph[y as usize] & (0x10 >> x) != 0;
             let p = if on { pen } else { TRANSPARENT_PEN };
             put_pixel(rom, Kind::Tile8x8, code, x, y, p);
+            put_pixel(rom, Kind::Tile8x8Odd, code, x, y, p);
         }
     }
 }
@@ -353,6 +364,31 @@ mod tests {
             assert!(rom.iter().any(|&b| b != 0), "digit {value} drew nothing");
             seen.push(rom);
         }
+    }
+
+    /// A digit reads the same through both halves of its 8×8 frame.
+    ///
+    /// Scroll 1 picks the odd layout on odd columns of the same code, so a glyph
+    /// present in only one half is legible in one column and blank in the next.
+    /// Asserting on both halves of the same tile is the only way to see that: a
+    /// single-half check passes on exactly the ROM that blinks.
+    #[test]
+    fn a_digit_is_drawn_into_both_halves_of_its_frame() {
+        let mut rom = vec![0u8; 64];
+        digit(&mut rom, 0, 7, 0x0C);
+        let mut drawn = 0;
+        for y in 0..8 {
+            for x in 0..8 {
+                let even = read_pen(&rom, Kind::Tile8x8, 0, x, y);
+                let odd = read_pen(&rom, Kind::Tile8x8Odd, 0, x, y);
+                assert_eq!(even, odd, "({x},{y}) differs between the halves");
+                if even != TRANSPARENT_PEN {
+                    drawn += 1;
+                }
+            }
+        }
+        // `7` is five pixels across the top plus one per row for six more rows.
+        assert_eq!(drawn, 11, "the glyph's own pixel count");
     }
 
     /// `digit` takes its argument modulo ten rather than panicking or reading

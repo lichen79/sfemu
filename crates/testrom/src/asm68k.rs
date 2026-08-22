@@ -133,6 +133,25 @@ impl Asm {
         self.long(imm);
     }
 
+    /// `movea.l #label,An`, the label's address resolved at `finish`.
+    ///
+    /// The demo's data tables sit after the code that reads them, so their
+    /// addresses are forward references. This and [`Asm::long_label`] are why the
+    /// program needs no second assembly pass.
+    pub fn movea_l_label_an(&mut self, label: &str, an: Reg) {
+        self.word(0x207C | (an << 9));
+        self.abs_long(label);
+    }
+
+    /// A raw longword holding the address of `label`, resolved at `finish`.
+    ///
+    /// The 68000's exception vectors are longwords holding handler addresses, and
+    /// every handler is defined after the table. A vector left at zero would send
+    /// the exception to the reset stack pointer and execute it.
+    pub fn long_label(&mut self, label: &str) {
+        self.abs_long(label);
+    }
+
     /// `move.w Dn,(An)` — `0011 aaa0 1000 0rrr`.
     pub fn move_w_dn_ind(&mut self, dn: Reg, an: Reg) {
         self.word(0x3080 | (an << 9) | dn);
@@ -141,6 +160,21 @@ impl Asm {
     /// `move.w Dn,(An)+` — `0011 aaa0 1100 0rrr`.
     pub fn move_w_dn_postinc(&mut self, dn: Reg, an: Reg) {
         self.word(0x30C0 | (an << 9) | dn);
+    }
+
+    /// `move.w (An)+,(Am)+` — `0011 mmm0 1101 1aaa`.
+    ///
+    /// The demo's block copy, and the one form here with a memory *source*: mode
+    /// 011 in both the destination field (bits 8-6) and the source field
+    /// (bits 5-3). Getting the source mode wrong is the quiet one — mode 010,
+    /// `(An)`, assembles and copies the same word forever.
+    pub fn move_w_postinc_postinc(&mut self, src: Reg, dst: Reg) {
+        self.word(0x30D8 | (dst << 9) | src);
+    }
+
+    /// `move.w (An)+,Dn` — `0011 rrr0 0001 1aaa`.
+    pub fn move_w_postinc_dn(&mut self, an: Reg, dn: Reg) {
+        self.word(0x3018 | (dn << 9) | an);
     }
 
     /// `move.w Dn,d(An)` — `0011 aaa1 0100 0rrr`, displacement word follows.
@@ -189,6 +223,51 @@ impl Asm {
     /// `add.w Dm,Dn` — `1101 nnn0 0100 0mmm`.
     pub fn add_w_dn_dn(&mut self, from: Reg, to: Reg) {
         self.word(0xD040 | (to << 9) | from);
+    }
+
+    /// `sub.w Dm,Dn` — `1001 nnn0 0100 0mmm`.
+    pub fn sub_w_dn_dn(&mut self, from: Reg, to: Reg) {
+        self.word(0x9040 | (to << 9) | from);
+    }
+
+    /// `neg.w Dn` — `0100 0100 0100 0rrr`.
+    ///
+    /// ⚠️ **Size in bits 7-6.** `01` is word; `00` is byte and `10` is long, so
+    /// `0x4400` here would negate only the low byte of a scroll value and leave
+    /// the high byte as it was — a layer that scrolls the wrong way for 256
+    /// pixels and then jumps.
+    pub fn neg_w(&mut self, dn: Reg) {
+        self.word(0x4440 | dn);
+    }
+
+    /// `divu Dm,Dn` — `1000 nnn0 1100 0mmm`. Quotient in the low word of `Dn`,
+    /// remainder in the high word.
+    ///
+    /// The demo divides by literal place values, so the divisor is never zero and
+    /// the zero-divide trap is unreachable. A `divu` by a *computed* zero would
+    /// vector through 0x14, which is why the program's spare vectors point at an
+    /// `rte` rather than at zero.
+    pub fn divu_dn_dn(&mut self, divisor: Reg, dn: Reg) {
+        self.word(0x80C0 | (dn << 9) | divisor);
+    }
+
+    /// `swap Dn` — `0100 1000 0100 0rrr`. Exchanges the halves of the register.
+    ///
+    /// Paired with [`Asm::divu_dn_dn`]: the remainder is in the high word, and
+    /// `swap` is how the demo gets at it without a shift by 16, which the 68000's
+    /// immediate shift form cannot express in one instruction.
+    pub fn swap(&mut self, dn: Reg) {
+        self.word(0x4840 | dn);
+    }
+
+    /// `adda.w Dn,Am` — `1101 aaa0 1100 0rrr`.
+    ///
+    /// Sign-extends the word to 32 bits before adding, which is what makes a
+    /// table walk by a computed offset one instruction. `adda.l` — opmode 7,
+    /// `0xD1C0` — would add the whole register including whatever is in its high
+    /// half, and the demo's offsets are computed as words.
+    pub fn adda_w_dn_an(&mut self, dn: Reg, an: Reg) {
+        self.word(0xD0C0 | (an << 9) | dn);
     }
 
     /// `andi.w #imm,Dn` — `0000 0010 0100 0rrr`.
@@ -242,14 +321,7 @@ impl Asm {
     /// `jsr label`, resolved at `finish`.
     pub fn jsr(&mut self, label: &str) {
         self.word(0x4EB9);
-        let at = self.code.len();
-        self.long(0);
-        self.fixups.push(Fixup {
-            at,
-            label: label.to_string(),
-            // `usize::MAX` marks an absolute fixup: see `finish`.
-            origin: usize::MAX,
-        });
+        self.abs_long(label);
     }
 
     /// `rts` — `0100 1110 0111 0101`.
@@ -271,6 +343,18 @@ impl Asm {
     pub fn move_to_sr(&mut self, imm: u16) {
         self.word(0x46FC);
         self.word(imm);
+    }
+
+    /// Reserves a longword holding `label`'s absolute address.
+    fn abs_long(&mut self, label: &str) {
+        let at = self.code.len();
+        self.long(0);
+        self.fixups.push(Fixup {
+            at,
+            label: label.to_string(),
+            // `usize::MAX` marks an absolute fixup: see `finish`.
+            origin: usize::MAX,
+        });
     }
 
     /// Emits a 16-bit branch displacement referring to `label`.
@@ -383,6 +467,11 @@ mod tests {
         assert_eq!(round(|a| a.move_w_dn_ind(2, 1)), "move.w d2,(a1)");
         assert_eq!(round(|a| a.move_w_dn_postinc(0, 3)), "move.w d0,(a3)+");
         assert_eq!(
+            round(|a| a.move_w_postinc_postinc(2, 1)),
+            "move.w (a2)+,(a1)+"
+        );
+        assert_eq!(round(|a| a.move_w_postinc_dn(2, 0)), "move.w (a2)+,d0");
+        assert_eq!(
             round(|a| a.move_w_dn_disp(4, 2, 0x10)),
             "move.w d4,($10,a2)"
         );
@@ -402,6 +491,11 @@ mod tests {
         assert_eq!(round(|a| a.addq_w(1, 0)), "addq.w #1,d0");
         assert_eq!(round(|a| a.addq_w(8, 2)), "addq.w #8,d2");
         assert_eq!(round(|a| a.add_w_dn_dn(1, 2)), "add.w d1,d2");
+        assert_eq!(round(|a| a.sub_w_dn_dn(1, 3)), "sub.w d1,d3");
+        assert_eq!(round(|a| a.neg_w(1)), "neg.w d1");
+        assert_eq!(round(|a| a.divu_dn_dn(1, 0)), "divu d1,d0");
+        assert_eq!(round(|a| a.swap(0)), "swap d0");
+        assert_eq!(round(|a| a.adda_w_dn_an(0, 2)), "adda.w d0,a2");
         assert_eq!(round(|a| a.andi_w(0x00FF, 3)), "andi.w #$00FF,d3");
         assert_eq!(round(|a| a.lsr_w_imm(4, 1)), "lsr.w #4,d1");
         assert_eq!(round(|a| a.lsr_w_imm(8, 1)), "lsr.w #8,d1");
@@ -469,6 +563,28 @@ mod tests {
         let target = u32::from_be_bytes([code[2], code[3], code[4], code[5]]);
         assert_eq!(target, 0x40_0008, "origin + the label's offset");
         assert_eq!(dis(&code[..6]), "jsr $400008");
+    }
+
+    /// A longword and a `movea.l` can both hold a forward label reference.
+    ///
+    /// The demo's vector table is longwords pointing at handlers defined after
+    /// it, and its data pointers are the same shape. A fixup kind that only
+    /// worked for `jsr` would leave those as zeros, and a vector of zero sends
+    /// the exception to address 0 — which on this board is the reset stack
+    /// pointer, executed as code.
+    #[test]
+    fn a_longword_and_a_movea_can_hold_a_forward_label() {
+        let mut a = Asm::new(0x40_0000);
+        a.long_label("data");
+        a.movea_l_label_an("data", 2);
+        a.label("data");
+        a.word(0xBEEF);
+        let code = a.finish();
+        // `long_label` is 4 bytes, `movea.l #imm` is 6, so `data` is at offset 10.
+        let want = 0x40_000Au32.to_be_bytes();
+        assert_eq!(code[0..4], want, "the vector longword");
+        assert_eq!(code[6..10], want, "the movea's immediate");
+        assert_eq!(dis(&code[4..10]), "movea.l #$0040000A,a2");
     }
 
     /// `label_addr` answers an absolute address.
