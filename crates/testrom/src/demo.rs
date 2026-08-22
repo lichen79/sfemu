@@ -676,13 +676,14 @@ fn path_words() -> Vec<u16> {
 /// produced just as well by a bug that wrote one coordinate into both registers.
 /// Triangles rather than sines because there is no floating point here, and the
 /// shape is a closed path either way.
+///
+/// `tri` reduces its own phase, so the vertical axis passes `3 * i` unreduced.
+/// Writing `3 * i % PATH_STEPS` here would read as the guard that keeps the path
+/// closed while doing nothing at all — and a mutation that removed it could not
+/// be caught by any test.
 fn path_step(i: u32) -> (u16, u16) {
     let x = tri(i, PATH_STEPS, u32::from(WIDTH) - 2 * SPRITE_EDGE);
-    let y = tri(
-        3 * i % PATH_STEPS,
-        PATH_STEPS,
-        u32::from(HEIGHT) - 2 * SPRITE_EDGE,
-    );
+    let y = tri(3 * i, PATH_STEPS, u32::from(HEIGHT) - 2 * SPRITE_EDGE);
     (
         (x + u32::from(VISIBLE_X) + SPRITE_EDGE) as u16,
         (y + u32::from(VISIBLE_Y) + SPRITE_EDGE) as u16,
