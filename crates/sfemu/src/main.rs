@@ -3,10 +3,16 @@
 //! ```text
 //! sfemu <path-to-rom-set> [frames] [--game <name>] [--ppm <path>]
 //! sfemu <path-to-rom-set> --play [--game <name>] [--state <path>]
+//! sfemu --demo [frames] [--play] [--ppm <path>] [--state <path>]
 //! ```
 //!
 //! `<path-to-rom-set>` is a MAME-format zip or a directory of loose files that
 //! **you supply**. This program contains no ROM data and no way to obtain any.
+//!
+//! `--demo` needs no files: it runs a CPS-1 image this workspace generates from
+//! nothing (`crates/testrom`). That is the whole reason it exists — the emulator
+//! must be runnable by someone who has no ROM set, and a black window is not a
+//! demonstration that anything works.
 //!
 //! `--game` picks the hardware: `sf2` is Street Fighter II on CPS-1 and is the
 //! default, `sf1` is Street Fighter on its own 1987 board. It is a choice and not a
@@ -65,10 +71,15 @@ fn usage() -> String {
     // is where someone who does not have a ROM set arrives.
     "usage: sfemu <path-to-rom-set> [frames] [--game <name>] [--ppm <path>]\n\
      \x20      sfemu <path-to-rom-set> --play [--game <name>] [--state <path>]\n\
+     \x20      sfemu --demo [frames] [--play] [--ppm <path>] [--state <path>]\n\
      \n\
      <name> is `sf2` (Street Fighter II on CPS-1, the default) or `sf1`\n\
      (Street Fighter, on its own 1987 board). The board is not guessed from\n\
      the path: a set of files does not say what hardware it came from.\n\
+     \n\
+     `--demo` runs a CPS-1 image this program generates itself — scrolling\n\
+     tilemaps, a sprite on a path, a frame counter and FM music — and needs\n\
+     no files and no path. It is a homebrew demo and not any Capcom game.\n\
      \n\
      Without `--play`, runs a fixed number of frames and reports what the\n\
      board saw. With `--play`, opens a window: arrow keys and ASDZXC for\n\
@@ -89,8 +100,8 @@ fn usage() -> String {
 /// next option would make it four.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Args {
-    /// The ROM set to load.
-    path: String,
+    /// Where the ROM image comes from.
+    source: Source,
     /// How many frames to run.
     frames: u64,
     /// Where to write the last frame as a binary PPM, if anywhere.
@@ -102,12 +113,57 @@ struct Args {
     /// Defaults to the ROM set's own path with its extension replaced by `.sfs`, so
     /// a state lands next to the game it belongs to and two games do not share one.
     state: PathBuf,
-    /// Which game, and so which board. `sf2` or `sf1`; see [`board_for`].
+}
+
+/// Where the ROM image comes from.
+///
+/// An enum and not a `path: String` beside a `demo: bool`, because those two fields
+/// have two meaningless combinations — a demo with a path, and a path-less run that
+/// is not the demo — and every one of them would need an error branch here and a
+/// decision at each of the four places downstream that read a path. The enum makes
+/// both unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Source {
+    /// A ROM set the user supplies, and the name that says how to read it.
     ///
-    /// A `String` and not a [`machine::BoardKind`], because it is also the name
-    /// [`romset::games::by_name`] resolves — one name picking both the board and the
-    /// files it expects is what keeps them from being chosen apart.
-    game: String,
+    /// `game` is a `String` and not a [`machine::BoardKind`] because it is also the
+    /// name [`romset::games::by_name`] resolves — one name picking both the board and
+    /// the files it expects is what keeps them from being chosen apart.
+    Set { path: String, game: String },
+    /// The demo image this workspace generates. No path, and CPS-1 by construction.
+    Demo,
+}
+
+/// The stem the demo's state and screenshot files are named from.
+///
+/// A relative name, so they land in the working directory: there is no ROM set to
+/// sit beside, and writing into a temporary directory would leave a user's F12
+/// screenshot somewhere they will not find it.
+const DEMO_STEM: &str = "sfemu-demo";
+
+impl Source {
+    /// The board this source runs on.
+    fn board(&self) -> machine::BoardKind {
+        match self {
+            // `expect`: `parse_args` rejects a name with no board before an `Args`
+            // exists, so this is unreachable rather than unhandled.
+            Self::Set { game, .. } => {
+                board_for(game).expect("parse_args rejects a name with no board")
+            }
+            // Not a lookup: the demo is a CPS-1 image, and [`demo_machine`] builds
+            // one directly. A name here would be a second, silently divergent
+            // statement of the same fact.
+            Self::Demo => machine::BoardKind::Cps1,
+        }
+    }
+
+    /// The path the state and screenshot files are derived from.
+    fn stem(&self) -> &str {
+        match self {
+            Self::Set { path, .. } => path,
+            Self::Demo => DEMO_STEM,
+        }
+    }
 }
 
 /// The save-state path implied by a ROM set's path.
@@ -144,12 +200,15 @@ fn parse_args(args: Vec<String>) -> Result<Args, Fault> {
     let mut rest = Vec::new();
     let mut ppm = None;
     let mut play = false;
+    let mut demo = false;
     let mut state = None;
     let mut game = None;
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
         if a == "--play" {
             play = true;
+        } else if a == "--demo" {
+            demo = true;
         } else if a == "--state" {
             let p = args
                 .next()
@@ -180,15 +239,28 @@ fn parse_args(args: Vec<String>) -> Result<Args, Fault> {
     }
 
     let mut rest = rest.into_iter();
-    let path = rest.next().ok_or(Fault::Usage)?;
+    // Under `--demo` there is no path to give, so the first positional is the frame
+    // count.
+    let path = if demo {
+        None
+    } else {
+        Some(rest.next().ok_or(Fault::Usage)?)
+    };
     // Parsed strictly. `unwrap_or(60)` on a typo — `6O` with a letter O — would
     // run a different number of frames than asked for and say nothing, and the
     // whole point of this program is that its numbers mean what they say.
     let frames: u64 = match rest.next() {
         None => 60,
-        Some(s) => s
-            .parse()
-            .map_err(|_| Fault::Failed(format!("`{s}` is not a frame count")))?,
+        Some(s) => s.parse().map_err(|_| {
+            // A path handed to `--demo` lands in this slot, and the message says so
+            // rather than only that it is not a number: the demo opens no files, so
+            // `sfemu --demo mysf2.zip` is a user expecting their set to be read.
+            Fault::Failed(if demo {
+                format!("`--demo` takes no ROM set path, and `{s}` is not a frame count")
+            } else {
+                format!("`{s}` is not a frame count")
+            })
+        })?,
     };
     if let Some(extra) = rest.next() {
         return Err(Fault::Failed(format!("unexpected argument `{extra}`")));
@@ -201,26 +273,40 @@ fn parse_args(args: Vec<String>) -> Result<Args, Fault> {
             "`--state` needs `--play`: only the window reads and writes states".to_string(),
         ));
     }
-    let state = state.map_or_else(|| default_state_path(&path), PathBuf::from);
-    // `sf2` and not "whatever the path looks like": the board is a stated choice.
-    // See [`usage`], and the spec's "the selection is explicit, not inferred from a
-    // filename".
-    let game = game.unwrap_or_else(|| "sf2".to_string());
-    // Rejected here rather than at load time. `romset::load` would never be reached
-    // with an unknown name — there is no spec to hand it — and a user who typed a
-    // name this program does not know needs the names it does.
-    if board_for(&game).is_none() {
-        return Err(Fault::Failed(format!(
-            "`{game}` is not a game this program knows: try `sf1` or `sf2`"
-        )));
-    }
+    let source = match path {
+        Some(path) => {
+            // `sf2` and not "whatever the path looks like": the board is a stated
+            // choice. See [`usage`], and the spec's "the selection is explicit, not
+            // inferred from a filename".
+            let game = game.unwrap_or_else(|| "sf2".to_string());
+            // Rejected here rather than at load time. `romset::load` would never be
+            // reached with an unknown name — there is no spec to hand it — and a user
+            // who typed a name this program does not know needs the names it does.
+            if board_for(&game).is_none() {
+                return Err(Fault::Failed(format!(
+                    "`{game}` is not a game this program knows: try `sf1` or `sf2`"
+                )));
+            }
+            Source::Set { path, game }
+        }
+        // `--game` with `--demo` is an error and not an ignored flag, on the same
+        // terms as `--state` without `--play`: the demo is one specific image, so
+        // `--demo --game sf1` would run CPS-1 code on a request for SF1 hardware and
+        // say nothing about having refused.
+        None if game.is_some() => {
+            return Err(Fault::Failed(
+                "`--game` and `--demo` cannot both be given: the demo is its own image".to_string(),
+            ));
+        }
+        None => Source::Demo,
+    };
+    let state = state.map_or_else(|| default_state_path(source.stem()), PathBuf::from);
     Ok(Args {
-        path,
+        source,
         frames,
         ppm,
         play,
         state,
-        game,
     })
 }
 
@@ -355,15 +441,44 @@ fn screenshot(m: &machine::Machine) -> Vec<u8> {
     }
 }
 
+/// The demo machine: a CPS-1 built from the image [`testrom::demo`] generates.
+///
+/// Goes through [`romset::RomSet`] and [`build_machine`] rather than calling
+/// [`machine::Cps1::with_sound`] directly, so the demo boots down the *same* path a
+/// real set does — the region names, the four lookups, the board config and the
+/// timing. A second construction site would let the two drift, and the one that
+/// nobody can test is the one that matters.
+///
+/// # Errors
+///
+/// Whatever [`build_cps1`] returns. `testrom::demo::build` answers all four regions
+/// CPS-1 needs, so a failure here is a mismatch between the generator's names and
+/// `build_cps1`'s — which is exactly what
+/// `the_demo_image_names_the_regions_the_cps1_builder_asks_for` pins.
+fn demo_machine() -> Result<machine::Machine, Fault> {
+    let set = romset::RomSet {
+        regions: testrom::demo::build()
+            .into_iter()
+            .map(|(name, bytes)| (name.to_string(), bytes))
+            .collect(),
+    };
+    build_machine("sf2", &set)
+}
+
 /// Loads the set, runs `frames` frames, and returns the report.
 fn run(args: Vec<String>) -> Result<String, Fault> {
     let args = parse_args(args)?;
 
-    let spec =
-        romset::games::by_name(&args.game).expect("parse_args rejects a name that has no spec");
-    let set = romset::load(spec, std::path::Path::new(&args.path))
-        .map_err(|e| Fault::Failed(e.to_string()))?;
-    let mut machine = build_machine(&args.game, &set)?;
+    let mut machine = match &args.source {
+        Source::Set { path, game } => {
+            let spec =
+                romset::games::by_name(game).expect("parse_args rejects a name that has no spec");
+            let set = romset::load(spec, std::path::Path::new(path))
+                .map_err(|e| Fault::Failed(e.to_string()))?;
+            build_machine(game, &set)?
+        }
+        Source::Demo => demo_machine()?,
+    };
 
     if args.play {
         // The window is opened *after* the ROM set loads, so a bad path reports the
@@ -431,13 +546,8 @@ fn open_audio() -> Box<dyn audio::Audio> {
 fn loop_opts(args: &Args) -> loop_::LoopOpts {
     loop_::LoopOpts {
         state_path: args.state.clone(),
-        shot_path: default_shot_path(&args.path),
-        // `expect` and not a `Result`: `parse_args` rejected an unknown name before
-        // this can be reached, and threading a second error type through a function
-        // whose job is two paths would be worse than saying so.
-        board: loop_::state_tag(
-            board_for(&args.game).expect("parse_args rejects an unknown game name"),
-        ),
+        shot_path: default_shot_path(args.source.stem()),
+        board: loop_::state_tag(args.source.board()),
     }
 }
 
@@ -981,25 +1091,53 @@ mod tests {
         assert_eq!(
             args(vec!["/some/sf2.zip"]),
             Some(Args {
-                path: "/some/sf2.zip".to_string(),
+                source: Source::Set {
+                    path: "/some/sf2.zip".to_string(),
+                    game: "sf2".to_string(),
+                },
                 frames: 60,
                 ppm: None,
                 play: false,
                 state: PathBuf::from("/some/sf2.sfs"),
-                game: "sf2".to_string(),
             })
         );
         assert_eq!(
             args(vec!["/some/sf2.zip", "7"]),
             Some(Args {
-                path: "/some/sf2.zip".to_string(),
+                source: Source::Set {
+                    path: "/some/sf2.zip".to_string(),
+                    game: "sf2".to_string(),
+                },
                 frames: 7,
                 ppm: None,
                 play: false,
                 state: PathBuf::from("/some/sf2.sfs"),
-                game: "sf2".to_string(),
             }),
             "and an explicit count is taken as given"
+        );
+        // And `--demo`'s first positional is the frame count, because it has no path
+        // to occupy the slot. A parser that kept a path slot under `--demo` would read
+        // `7` as the path and then run the default 60 frames.
+        assert_eq!(
+            args(vec!["--demo", "7"]),
+            Some(Args {
+                source: Source::Demo,
+                frames: 7,
+                ppm: None,
+                play: false,
+                state: PathBuf::from("sfemu-demo.sfs"),
+            })
+        );
+        assert_eq!(
+            args(vec!["--demo"]),
+            Some(Args {
+                source: Source::Demo,
+                frames: 60,
+                ppm: None,
+                play: false,
+                state: PathBuf::from("sfemu-demo.sfs"),
+            }),
+            "and the demo takes the same default"
         );
     }
 
@@ -1012,12 +1150,14 @@ mod tests {
     fn the_ppm_option_is_parsed_out_of_the_positional_arguments() {
         let args = |v: Vec<&str>| parse_args(v.into_iter().map(String::from).collect());
         let want = Args {
-            path: "/some/sf2.zip".to_string(),
+            source: Source::Set {
+                path: "/some/sf2.zip".to_string(),
+                game: "sf2".to_string(),
+            },
             frames: 7,
             ppm: Some("/tmp/f.ppm".to_string()),
             play: false,
             state: PathBuf::from("/some/sf2.sfs"),
-            game: "sf2".to_string(),
         };
         assert_eq!(
             args(vec!["/some/sf2.zip", "7", "--ppm", "/tmp/f.ppm"]).ok(),
@@ -1310,23 +1450,27 @@ mod tests {
         assert_eq!(
             args(vec!["/some/sf2.zip", "--play"]).ok(),
             Some(Args {
-                path: "/some/sf2.zip".to_string(),
+                source: Source::Set {
+                    path: "/some/sf2.zip".to_string(),
+                    game: "sf2".to_string(),
+                },
                 frames: 60,
                 ppm: None,
                 play: true,
                 state: PathBuf::from("/some/sf2.sfs"),
-                game: "sf2".to_string(),
             }),
         );
         assert_eq!(
             args(vec!["/some/sf2.zip", "--play", "--state", "/tmp/mine.sfs"]).ok(),
             Some(Args {
-                path: "/some/sf2.zip".to_string(),
+                source: Source::Set {
+                    path: "/some/sf2.zip".to_string(),
+                    game: "sf2".to_string(),
+                },
                 frames: 60,
                 ppm: None,
                 play: true,
                 state: PathBuf::from("/tmp/mine.sfs"),
-                game: "sf2".to_string(),
             }),
             "an explicit state path wins over the derived one"
         );
@@ -1378,16 +1522,32 @@ mod tests {
     #[test]
     fn the_loop_is_given_the_state_path_and_the_shot_path_the_right_way_round() {
         let args = Args {
-            path: "/a/b/sf2.zip".to_string(),
+            source: Source::Set {
+                path: "/a/b/sf2.zip".to_string(),
+                game: "sf2".to_string(),
+            },
             frames: 60,
             ppm: None,
             play: true,
             state: PathBuf::from("/tmp/mine.sfs"),
-            game: "sf2".to_string(),
         };
         let o = loop_opts(&args);
         assert_eq!(o.state_path, PathBuf::from("/tmp/mine.sfs"));
         assert_eq!(o.shot_path, PathBuf::from("/a/b/sf2.ppm"));
+
+        // The demo has no ROM set to sit beside, so both files come off its own
+        // stem — and they still differ by extension, which is what makes a swap of
+        // the two `PathBuf` fields visible here too.
+        let demo = Args {
+            source: Source::Demo,
+            frames: 60,
+            ppm: None,
+            play: true,
+            state: PathBuf::from("sfemu-demo.sfs"),
+        };
+        let o = loop_opts(&demo);
+        assert_eq!(o.state_path, PathBuf::from("sfemu-demo.sfs"));
+        assert_eq!(o.shot_path, PathBuf::from("sfemu-demo.ppm"));
     }
 
     /// `--state` without `--play` is an error naming both flags.
@@ -1603,25 +1763,27 @@ mod tests {
     /// `--game` selects the board, and the default is stated rather than sniffed.
     #[test]
     fn the_game_option_selects_the_board_and_defaults_to_sf2() {
-        let args = |v: Vec<&str>| parse_args(v.into_iter().map(String::from).collect());
+        let game = |v: Vec<&str>| match parse_args(v.into_iter().map(String::from).collect()) {
+            Ok(Args {
+                source: Source::Set { game, .. },
+                ..
+            }) => Some(game),
+            _ => None,
+        };
         assert_eq!(
-            args(vec!["/some/sf2.zip"]).map(|a| a.game).ok(),
+            game(vec!["/some/sf2.zip"]),
             Some("sf2".to_string()),
             "the default is a constant in this program"
         );
         assert_eq!(
-            args(vec!["/wherever/it/is.zip", "--game", "sf1"])
-                .map(|a| a.game)
-                .ok(),
+            game(vec!["/wherever/it/is.zip", "--game", "sf1"]),
             Some("sf1".to_string()),
             "and a path that says nothing about the board is fine, because the \
              board does not come from the path"
         );
         // Order-independent, like `--ppm` and `--state`.
         assert_eq!(
-            args(vec!["--game", "sf1", "/x.zip", "7"])
-                .map(|a| a.game)
-                .ok(),
+            game(vec!["--game", "sf1", "/x.zip", "7"]),
             Some("sf1".to_string())
         );
     }
@@ -1676,20 +1838,170 @@ mod tests {
     /// This is the test on this side of that assertion.
     #[test]
     fn the_loops_board_tag_follows_the_selected_game() {
-        let a = |game: &str| Args {
-            path: "/a/b/set.zip".to_string(),
+        let with = |source: Source| Args {
+            source,
             frames: 60,
             ppm: None,
             play: true,
             state: PathBuf::from("/tmp/mine.sfs"),
-            game: game.to_string(),
+        };
+        let named = |game: &str| {
+            with(Source::Set {
+                path: "/a/b/set.zip".to_string(),
+                game: game.to_string(),
+            })
         };
         // Literals, not `state_tag(..)`: this asserts what reaches the loop, and
         // calling the function under test to produce the expectation would pass for
         // any mapping at all. Big-endian ASCII `SF2\0` and `SF1\0`.
-        assert_eq!(loop_opts(&a("sf2")).board, 0x5346_3200);
-        assert_eq!(loop_opts(&a("sf1")).board, 0x5346_3100);
+        assert_eq!(loop_opts(&named("sf2")).board, 0x5346_3200);
+        assert_eq!(loop_opts(&named("sf1")).board, 0x5346_3100);
+        // The demo is CPS-1, so it carries SF2's tag — which is what stops a state
+        // saved from the demo from loading into an SF1 machine, and vice versa.
+        assert_eq!(loop_opts(&with(Source::Demo)).board, 0x5346_3200);
     }
+    /// The demo builds a CPS-1 out of the regions the generator answers.
+    ///
+    /// The seam this guards is a pair of string lists that never meet at compile
+    /// time: `testrom::demo::build` names four regions and `build_cps1` looks four
+    /// up. A rename on either side is a `Fault::Failed` at run time and nothing at
+    /// build time — and the whole point of `--demo` is that it works for someone who
+    /// cannot check it against a real set.
+    #[test]
+    fn the_demo_image_names_the_regions_the_cps1_builder_asks_for() {
+        let m = demo_machine().expect("the generator answers every region CPS-1 needs");
+        assert_eq!(m.board(), machine::BoardKind::Cps1);
+        assert!(matches!(m, machine::Machine::Cps1(_)), "and the Cps1 arm");
+    }
+
+    /// The demo boots, draws through the real renderer, and keeps running.
+    ///
+    /// This is the test that closes the loop `crates/testrom` deliberately leaves
+    /// open: `gfx`'s own tests read tiles back through a *second transcription* of
+    /// the tile format, so a shared error there would cancel out. Here the pens come
+    /// out of `video` itself.
+    ///
+    /// 70 frames, and the number is load-bearing: the demo's sound command goes out
+    /// every 64th frame, so a shorter run would assert a silent latch and pass on a
+    /// driver that never talks to the Z80.
+    #[test]
+    fn the_demo_runs_and_draws_and_talks_to_the_sound_board() {
+        let mut m = demo_machine().expect("the demo builds");
+        for _ in 0..70 {
+            m.run_frame();
+        }
+        m.render();
+
+        let t = m.cpu_view().trace;
+        assert_eq!(t.frames, 70, "seventy frames ran");
+        // One short of the vblanks: the last one is asserted at the end of the frame
+        // and acknowledged in the next, which has not run.
+        assert_eq!(
+            (t.vblanks, t.acks),
+            (70, 69),
+            "and the handler serviced them"
+        );
+        assert_eq!(
+            (t.unmapped_reads.total(), t.unmapped_writes.total()),
+            (0, 0),
+            "the demo touches nothing this board does not decode"
+        );
+        assert_eq!(t.sound_latch_writes, 1, "one command by frame 64");
+
+        // The picture: a `Frame` count through `video`'s own palette rule. Three
+        // pages, because the sprite's colour base is 0x00, scroll 1's is 0x20 and
+        // scroll 2's is 0x40 — pages 0, 1 and 2 of 512 pens each. A single page
+        // would mean every layer resolved to one base, which is what a broken
+        // colour base looks like.
+        let f = Frame::of(&cps1(&m).video);
+        assert!(f.drawn > 0, "something drew: {f:?}");
+        assert_eq!(f.pages, 3, "sprite, scroll 1 and scroll 2 bases: {f:?}");
+
+        // And it is still executing rather than halted on a bad vector — which a
+        // drawn frame alone does not rule out, because the tables were written
+        // before the fault.
+        let v = m.cpu_view();
+        assert!(!v.cpu.halted, "not halted");
+        assert!(!v.cpu.stopped, "and not stopped");
+    }
+
+    /// The demo's picture changes from frame to frame.
+    ///
+    /// The assertion a moving demo actually needs. Every check above is satisfied by
+    /// a machine that drew one frame and then wedged: the tables are in gfxram by the
+    /// end of `setup`, so a vblank handler that never ran would still leave a full,
+    /// plausible screen. Two renders at different frame counts, compared pen by pen,
+    /// is what says the 68000 is still doing work.
+    #[test]
+    fn the_demo_picture_moves() {
+        let pens = |frames: u32| {
+            let mut m = demo_machine().expect("the demo builds");
+            for _ in 0..frames {
+                m.run_frame();
+            }
+            m.render();
+            cps1(&m).video.fb.pens.to_vec()
+        };
+        // Ten frames apart: scroll 3 moves a pixel a frame and scroll 2 two the
+        // other way, so a single frame would also differ — ten is simply past any
+        // question of an off-by-one in the scroll registers.
+        assert_ne!(pens(5), pens(15), "the screen is not the same picture");
+    }
+
+    /// `--demo` takes no path, and a path given with it is a loud error.
+    ///
+    /// The error matters more than the parse: the demo opens no files, so
+    /// `sfemu --demo mysf2.zip` under a lenient parser would run the generated image
+    /// and print a healthy report about a set it never looked at.
+    #[test]
+    fn the_demo_flag_replaces_the_rom_set_path() {
+        let args = |v: Vec<&str>| parse_args(v.into_iter().map(String::from).collect());
+        assert_eq!(
+            args(vec!["--demo"]).ok().map(|a| a.source),
+            Some(Source::Demo)
+        );
+        match args(vec!["--demo", "/some/sf2.zip"]) {
+            Err(Fault::Failed(m)) => {
+                assert!(m.contains("--demo"), "names the flag: {m}");
+                assert!(m.contains("no ROM set path"), "and why: {m}");
+                assert!(m.contains("/some/sf2.zip"), "and what was given: {m}");
+            }
+            other => panic!("expected an error, got {:?}", other.is_ok()),
+        }
+        // `--game` with `--demo` is an error too: the demo is one specific CPS-1
+        // image, so `--demo --game sf1` is a request this program cannot honour and
+        // must not silently ignore.
+        match args(vec!["--demo", "--game", "sf1"]) {
+            Err(Fault::Failed(m)) => {
+                assert!(m.contains("--game"), "names both flags: {m}");
+                assert!(m.contains("--demo"), "{m}");
+            }
+            other => panic!("expected an error, got {:?}", other.is_ok()),
+        }
+        // And no arguments at all is still the usage error it was: `--demo` is a
+        // stated choice, not what happens when you forget the path.
+        assert!(matches!(args(vec![]), Err(Fault::Usage)));
+    }
+
+    /// The usage text tells a reader without a ROM set that `--demo` exists.
+    ///
+    /// This text is where someone who has no set arrives — the same argument
+    /// `the_usage_text_states_that_no_rom_is_supplied_or_fetched` makes about the
+    /// legal note. An option nobody can find is an option nobody has.
+    #[test]
+    fn the_usage_text_offers_the_demo_to_a_reader_with_no_rom_set() {
+        let u = usage();
+        assert!(u.contains("sfemu --demo"), "the invocation: {u}");
+        assert!(
+            u.contains("no files and no path"),
+            "and that it needs none of what the rest of this text asks for: {u}"
+        );
+        assert!(
+            u.contains("not any Capcom game"),
+            "and that it is homebrew, so nobody reads it as a bundled ROM: {u}"
+        );
+    }
+
     /// A synthetic ROM set: one distinguishable byte pattern per region.
     ///
     /// Not a ROM and not a `romset::load` call — `RomSet` is a map of region name to

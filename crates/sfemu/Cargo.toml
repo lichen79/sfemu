@@ -13,6 +13,11 @@ machine = { path = "../machine" }
 romset = { path = "../romset" }
 frontend = { path = "../frontend" }
 
+# The homebrew demo ROM, so `--demo` needs no files at all. A normal dependency
+# and not a dev-dependency: `--demo` is a shipped feature, and the whole point of
+# it is that a user who has no ROM set can still see the emulator run.
+testrom = { path = "../testrom" }
+
 # The window, and the only crates.io dependency in this workspace besides
 # romset's DEFLATE decoder. Reachable from `display.rs` alone: every decision a
 # frontend makes lives in `crates/frontend`, which has never heard of a window.
