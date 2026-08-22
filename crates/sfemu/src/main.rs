@@ -1908,14 +1908,20 @@ mod tests {
         );
         assert_eq!(t.sound_latch_writes, 1, "one command by frame 64");
 
-        // The picture: a `Frame` count through `video`'s own palette rule. Three
-        // pages, because the sprite's colour base is 0x00, scroll 1's is 0x20 and
-        // scroll 2's is 0x40 — pages 0, 1 and 2 of 512 pens each. A single page
-        // would mean every layer resolved to one base, which is what a broken
-        // colour base looks like.
+        // The picture: a `Frame` count through `video`'s own palette rule. Four
+        // pages, one per layer, because the four colour bases are far enough apart to
+        // land in four different 512-pen pages: sprites at scheme 0x00, scroll 1 at
+        // 0x20, scroll 2 at 0x40 and scroll 3 at 0x60, which is pen 0x600 and so
+        // page 3.
+        //
+        // The count is load-bearing and not decorative. A layer wholly hidden behind
+        // an opaque one still draws every register write, every gfxram write and a
+        // full screen of pens — so the counters above and a `drawn > 0` cannot see
+        // it, and the picture looks deliberate. Three pages here is exactly the
+        // symptom of scroll 2 covering scroll 3.
         let f = Frame::of(&cps1(&m).video);
         assert!(f.drawn > 0, "something drew: {f:?}");
-        assert_eq!(f.pages, 3, "sprite, scroll 1 and scroll 2 bases: {f:?}");
+        assert_eq!(f.pages, 4, "all four layers reach the screen: {f:?}");
 
         // And it is still executing rather than halted on a bad vector — which a
         // drawn frame alone does not rule out, because the tables were written

@@ -193,33 +193,38 @@ pub fn digit(rom: &mut [u8], code: u32, value: u8, pen: u8) {
     }
 }
 
+/// The reader this crate's tiles are ultimately read by, transcribed from
+/// `video::tiles::tile_pen`.
+///
+/// A copy and not a dependency, deliberately: `video` reading a tile `testrom`
+/// wrote is the property the demo relies on, and if this crate called `video`'s
+/// decoder then a shared sign error would cancel and every test here would pass
+/// on a ROM the real renderer draws as noise. Two independent transcriptions of
+/// one documented formula disagree when either is wrong. `crates/sfemu`'s demo
+/// tests close the loop by rendering through the real `video`.
+///
+/// Test-only, and outside the test module below so [`crate::demo`]'s tests can
+/// read the pens of the tiles they place. A second transcription over there
+/// would be a second thing to be wrong, and it would agree with the writer for
+/// the same reason a self-checking decoder does.
+#[cfg(test)]
+pub(crate) fn read_pen(rom: &[u8], kind: Kind, code: u32, x: u32, y: u32) -> u8 {
+    let start = (code as usize) * kind.bytes();
+    let tile = &rom[start..start + kind.bytes()];
+    let base = y * 4 * kind.frame_width() + 32 * (x >> 3) + (x & 7) + kind.x_bias();
+    let mut pen = 0u8;
+    for (p, off) in [24u32, 16, 8, 0].into_iter().enumerate() {
+        let bit = base + off;
+        if tile[(bit / 8) as usize] & (0x80 >> (bit % 8)) != 0 {
+            pen |= 0x08 >> p;
+        }
+    }
+    pen
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The reader this crate's tiles are ultimately read by, transcribed from
-    /// `video::tiles::tile_pen`.
-    ///
-    /// A copy and not a dependency, deliberately: `video` reading a tile
-    /// `testrom` wrote is the property the demo relies on, and if this crate
-    /// called `video`'s decoder then a shared sign error would cancel and every
-    /// test here would pass on a ROM the real renderer draws as noise. Two
-    /// independent transcriptions of one documented formula disagree when either
-    /// is wrong. `crates/sfemu`'s demo tests close the loop by rendering
-    /// through the real `video`.
-    fn read_pen(rom: &[u8], kind: Kind, code: u32, x: u32, y: u32) -> u8 {
-        let start = (code as usize) * kind.bytes();
-        let tile = &rom[start..start + kind.bytes()];
-        let base = y * 4 * kind.frame_width() + 32 * (x >> 3) + (x & 7) + kind.x_bias();
-        let mut pen = 0u8;
-        for (p, off) in [24u32, 16, 8, 0].into_iter().enumerate() {
-            let bit = base + off;
-            if tile[(bit / 8) as usize] & (0x80 >> (bit % 8)) != 0 {
-                pen |= 0x08 >> p;
-            }
-        }
-        pen
-    }
 
     /// Every pen of every pixel of every kind survives the round trip.
     ///

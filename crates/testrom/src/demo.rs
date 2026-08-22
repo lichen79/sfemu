@@ -607,10 +607,11 @@ fn palette_words() -> Vec<u16> {
     set(SPRITE_SCHEME, SPRITE_PEN, rgb(15, 15, 2));
     // The counter's digits.
     set(SCROLL1_SCHEME, DIGIT_PEN, rgb(15, 15, 15));
-    // Scroll 2's border and fill.
+    // Scroll 2's border. It has no fill entry, because its interior is the
+    // transparent pen — see [`graphics`]. A colour given here for a pen the tile
+    // never uses would read as the fill's colour and be unreachable.
     set(SCROLL2_SCHEME, S2_EDGE_PEN, rgb(2, 14, 6));
-    set(SCROLL2_SCHEME, S2_FILL_PEN, rgb(0, 5, 2));
-    // Scroll 3's.
+    // Scroll 3's, which is the layer that shows through scroll 2.
     set(SCROLL3_SCHEME, S3_EDGE_PEN, rgb(6, 6, 14));
     set(SCROLL3_SCHEME, S3_FILL_PEN, rgb(1, 1, 5));
     pal
@@ -620,10 +621,9 @@ fn palette_words() -> Vec<u16> {
 const SPRITE_PEN: u8 = 0x05;
 /// The pen the counter's digits are drawn on.
 const DIGIT_PEN: u8 = 0x06;
-/// Scroll 2's tile border.
+/// Scroll 2's tile border. Its interior is [`gfx::TRANSPARENT_PEN`], so scroll 3
+/// shows through — a fill pen here would hide the layer behind it entirely.
 const S2_EDGE_PEN: u8 = 0x03;
-/// Scroll 2's tile interior.
-const S2_FILL_PEN: u8 = 0x04;
 /// Scroll 3's tile border.
 const S3_EDGE_PEN: u8 = 0x01;
 /// Scroll 3's tile interior.
@@ -741,13 +741,21 @@ fn graphics() -> Vec<u8> {
         S3_EDGE_PEN,
     );
 
-    // Scroll 2's smaller one, in different pens so the two layers are told apart
-    // on screen and not only in a test.
+    // Scroll 2's smaller one over it, in different pens so the two layers are told
+    // apart on screen and not only in a test — and with a **transparent** interior,
+    // which is the whole reason scroll 3 is visible at all.
+    //
+    // An opaque fill here is not a subtle wrong colour: scroll 2's grid covers every
+    // pixel of the screen, so scroll 3 would be drawn, scrolled, and completely
+    // invisible. Every counter a headless run prints would be unchanged, and the
+    // picture would look like a deliberate one-layer demo. `sfemu`'s
+    // `the_demo_runs_and_draws_and_talks_to_the_sound_board` counts *four* palette
+    // pages for this reason.
     gfx::framed(
         &mut rom,
         Kind::Tile16x16,
         map_code(Gfx::Scroll2, T2_FRAME),
-        S2_FILL_PEN,
+        gfx::TRANSPARENT_PEN,
         S2_EDGE_PEN,
     );
 
@@ -1235,6 +1243,63 @@ mod tests {
         }
     }
 
+    /// Scroll 2's tile is hollow and scroll 3's is filled, so both layers reach
+    /// the screen.
+    ///
+    /// This pair of pens is the whole difference between a four-layer demo and a
+    /// three-layer one. Scroll 2's grid covers every pixel of the frame, so an
+    /// opaque interior there hides scroll 3 completely — and hides it in a way no
+    /// counter can see: the register writes, the gfxram writes and the pixel count
+    /// of a run with scroll 3 buried are identical to a correct one, and the
+    /// picture reads as a deliberate single-layer background.
+    ///
+    /// The other half is asserted too. A transparent *fill* on scroll 3 would
+    /// leave the back layer as a grid of hairlines on black, which is the same
+    /// mistake pointed the other way.
+    ///
+    /// Pens are read back through [`gfx::read_pen`] — `video::tiles`' own rule,
+    /// transcribed independently of the writer — rather than by inspecting the
+    /// bytes, so this fails if the pens land on the wrong pixels as well as if
+    /// they are the wrong pens.
+    #[test]
+    fn scroll_2_is_hollow_and_scroll_3_is_filled() {
+        let rom = graphics();
+        let s2 = map_code(Gfx::Scroll2, T2_FRAME);
+        let s3 = map_code(Gfx::Scroll3, T3_FRAME);
+
+        assert_eq!(
+            gfx::read_pen(&rom, Kind::Tile16x16, s2, 8, 8),
+            gfx::TRANSPARENT_PEN,
+            "scroll 2's interior lets scroll 3 through"
+        );
+        assert_eq!(
+            gfx::read_pen(&rom, Kind::Tile16x16, s2, 0, 0),
+            S2_EDGE_PEN,
+            "and its border is still drawn"
+        );
+        assert_eq!(
+            gfx::read_pen(&rom, Kind::Tile16x16, s2, 15, 15),
+            S2_EDGE_PEN,
+            "on the far corner as well as the near one"
+        );
+
+        assert_eq!(
+            gfx::read_pen(&rom, Kind::Tile32x32, s3, 16, 16),
+            S3_FILL_PEN,
+            "scroll 3's interior is opaque, so there is something to see through scroll 2"
+        );
+        assert_ne!(
+            S3_FILL_PEN,
+            gfx::TRANSPARENT_PEN,
+            "and the pen it is filled with is not the transparent one"
+        );
+        assert_eq!(
+            gfx::read_pen(&rom, Kind::Tile32x32, s3, 0, 0),
+            S3_EDGE_PEN,
+            "with its own border in its own pen"
+        );
+    }
+
     /// The ten digits land in ten different places in the ROM.
     ///
     /// Scroll 1 has the only mapper shift of zero, so its codes index frames
@@ -1267,7 +1332,6 @@ mod tests {
             ("the sprite", SPRITE_SCHEME, SPRITE_PEN),
             ("scroll 1's digits", SCROLL1_SCHEME, DIGIT_PEN),
             ("scroll 2's border", SCROLL2_SCHEME, S2_EDGE_PEN),
-            ("scroll 2's fill", SCROLL2_SCHEME, S2_FILL_PEN),
             ("scroll 3's border", SCROLL3_SCHEME, S3_EDGE_PEN),
             ("scroll 3's fill", SCROLL3_SCHEME, S3_FILL_PEN),
         ] {
