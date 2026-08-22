@@ -5,4 +5,5 @@
 
 pub mod asm68k;
 pub mod asmz80;
+pub mod demo;
 pub mod gfx;
