@@ -36,31 +36,42 @@
 ///
 /// # What each assertion would catch
 ///
-/// - `oki_writes > 0`: the driver wrote to the chip at all. **A floor, not a measured
-///   figure** — `sound_boot.rs` says outright that nobody has measured what SF2's OKI
-///   write count should be over two seconds, and asserting a guessed threshold would be
-///   inventing the number this test exists to discover. What is certain is that a driver
-///   which never touched the chip wrote zero times. When a run prints a real figure,
-///   raise this to a floor derived from it and record the measurement beside it.
+/// - `oki_writes > 20`: the driver played a phrase, rather than merely initialising
+///   the chip. This was `> 0` and marked "a floor, not a measured figure" until a run
+///   on the real set produced one: **91** writes over 1,200 frames, against **2** for
+///   a machine that initialises the chip and plays nothing. The gap between those two
+///   numbers is the whole assertion, and `> 0` sat on the wrong side of it.
 /// - a non-empty sample buffer: the scheduler produced samples at all, which is the
 ///   premise everything below reads.
 /// - a quarter of the samples non-zero: the mix is not silence with a click in it. A
-///   `.any(|&s| s != 0)` — which is what `sound_boot.rs` asks, correctly, of a different
-///   question — passes on one non-zero sample in 110,000, and that is what a driver
-///   whose key-on never lands produces.
+///   `.any(|&s| s != 0)` passes on one non-zero sample in 450,000, and that is what a
+///   driver whose key-on never lands produces. Measured: 99.97%.
 /// - `peak > 1000`: and it is loud enough to be music rather than a DC offset or the
-///   bottom bit of an envelope that never opened. 1,000 of 32,767 is about −30 dBFS.
+///   bottom bit of an envelope that never opened. 1,000 of 32,767 is about −30 dBFS;
+///   measured 17,088.
 #[test]
 #[ignore = "needs a user-supplied ROM set; set SFEMU_ROMS"]
 fn sf2_drives_the_oki_and_the_mix_is_audible() {
     let Ok(path) = std::env::var("SFEMU_ROMS") else {
         panic!("set SFEMU_ROMS to your own sf2.zip or a directory of loose files");
     };
-    let set = romset::load(&romset::games::SF2, std::path::Path::new(&path))
+    // `identify`, not `load(&games::SF2, ..)`: the user's revision is theirs, and
+    // the CPS-B row differs between SF2 revisions. Under the wrong row the program
+    // fails its ID check and parks in an idle loop — from which it never starts the
+    // music, so every assertion here would fail with no hint as to why. See
+    // `boot.rs` for the full account.
+    let (spec, set) = romset::identify(std::path::Path::new(&path))
         .unwrap_or_else(|e| panic!("cannot load {path}: {e}"));
+    eprintln!("identified {} at {path}", spec.name);
+    let cfg = machine::BoardConfig::for_game(spec.name).unwrap_or_else(|| {
+        panic!(
+            "`{}` is not a CPS-1 game; point SFEMU_ROMS at an SF2 set",
+            spec.name
+        )
+    });
     let prog = set
         .region("maincpu")
-        .expect("the sf2 spec has a maincpu region");
+        .expect("every CPS-1 spec has a maincpu region");
     let gfx = set.region("gfx").expect("and a gfx region");
     let audiocpu = set.region("audiocpu").expect("and an audiocpu region");
     // The one region this test cannot do without: see the module note on why an empty
@@ -71,20 +82,42 @@ fn sf2_drives_the_oki_and_the_mix_is_audible() {
         gfx.to_vec(),
         audiocpu.to_vec(),
         okirom.to_vec(),
-        machine::BoardConfig::sf2(),
+        cfg,
         machine::Timing::cps1_10mhz(),
     );
     m.reset();
 
-    // 120 frames is two seconds: long enough for the driver to initialise the chip and
-    // start a track, short enough to stay a test. The samples are never drained, so the
-    // buffer below holds the whole run — about 110,000 mono samples, 220 KB.
-    for _ in 0..120 {
+    // Demo sounds on: `Inputs::idle` leaves DSWC bit 0x20 set, which is Demo Sounds
+    // *off*, and with it set this program plays nothing in attract mode at all. See
+    // `sound_boot.rs`, which carries the same two lines and the full account.
+    m.board.inputs.dsw[2] &= !0x20;
+
+    // Warm up past the music onset at frame 916, draining so the buffer holds only
+    // the window measured below. See `sound_boot.rs` for why this is not 120 frames.
+    for _ in 0..960 {
+        m.run_frame();
+        let _ = m.drain_samples();
+    }
+    for _ in 0..240 {
         m.run_frame();
     }
     let t = m.sound_trace();
-    eprintln!("OKI writes in 120 frames: {}", t.oki_writes);
-    assert!(t.oki_writes > 0, "the driver never wrote to the OKI at all");
+    eprintln!("OKI writes: {}", t.oki_writes);
+    // Now a measured floor rather than the `> 0` this held before: 91 writes over
+    // these 1,200 frames on the real set, with two voices seen playing during the
+    // window. 20 is well under that and well over the 2 writes a run that only
+    // initialises the chip produces.
+    //
+    // ⚠️ Do not reach for a coin instead of the DIP switch here. Inserting a coin
+    // does produce a jingle — 157,410 non-zero samples, peak 7,033 — but with
+    // **zero** OKI writes, so this assertion cannot pass that way. The ADPCM chip
+    // carries the attract-mode demo's effects, not the coin sound.
+    assert!(
+        t.oki_writes > 20,
+        "only {} OKI writes — the driver initialised the chip and never played a \
+         phrase (measured 91; a chip merely initialised takes 2)",
+        t.oki_writes
+    );
 
     let chip = m.sound.oki_ref();
     eprintln!(
@@ -105,11 +138,16 @@ fn sf2_drives_the_oki_and_the_mix_is_audible() {
     eprintln!("{nonzero}/{} non-zero, peak {peak}", samples.len());
     assert!(
         nonzero * 4 > samples.len(),
-        "the mix is mostly silence: {nonzero} of {} samples carry anything",
+        "the mix is mostly silence: {nonzero} of {} samples carry anything \
+         (measured 450,044 of 450,164, 99.97%)",
         samples.len()
     );
+    // 1,000 of 32,767 is about −30 dBFS. The measured peak is 17,088, so this stays
+    // a floor on "audible at all" rather than a fingerprint of one mix — which is
+    // what it should be, since the waveform itself is what the OKI and YM2151 vector
+    // suites check, against ymfm, with no ROM involved.
     assert!(
         peak > 1000,
-        "the mix peaks at {peak} — too quiet to be music"
+        "the mix peaks at {peak} — too quiet to be music (measured 17,088)"
     );
 }
