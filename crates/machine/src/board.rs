@@ -244,6 +244,45 @@ impl Board {
         ((addr.wrapping_sub(GFXRAM_BASE) >> 1) as usize) % GFXRAM_WORDS
     }
 
+    /// The multiply protection's answer for CPS-B byte offset `off`, if `off` is one
+    /// of the two result registers on this board.
+    ///
+    /// `cps1_v.cpp:2145-2152`. The board holds a 16×16→32 multiplier: the program
+    /// writes two factors to two registers and reads the product back from two
+    /// others. A bootleg's discrete logic cannot do it, which is the point.
+    ///
+    /// The product is computed **on each read**, from whatever the factor registers
+    /// currently hold, rather than latched when a factor is written. That is MAME's
+    /// structure and it is observable: a program that writes one factor, reads the
+    /// result, writes the other factor and reads again gets two different answers
+    /// from one write each. Latching on write would make the second read stale.
+    ///
+    /// `u32::from` on both factors before multiplying. `u16 * u16` in Rust is a `u16`
+    /// multiply that **panics on overflow in debug builds** and wraps in release — and
+    /// `result_hi` is precisely the half that a `u16` multiply throws away, so a
+    /// 32-bit product is not an optimisation here but the whole feature. The
+    /// widening also means this function cannot panic on any guest input, which the
+    /// bus contract requires.
+    ///
+    /// `None` on a board with no `multiply` row, which is every board but Champion
+    /// Edition's so far; the caller then treats the offset as an ordinary register.
+    fn multiply_at(&self, off: u8) -> Option<u16> {
+        let p = self.cfg.multiply?;
+        let factors = || {
+            let a = u32::from(self.cps_b[usize::from(p.factor1 >> 1) & (CPS_REGS - 1)]);
+            let b = u32::from(self.cps_b[usize::from(p.factor2 >> 1) & (CPS_REGS - 1)]);
+            a * b
+        };
+        if off == p.result_lo {
+            // `& 0xffff`, spelled as the truncating cast it is.
+            Some(factors() as u16)
+        } else if off == p.result_hi {
+            Some((factors() >> 16) as u16)
+        } else {
+            None
+        }
+    }
+
     /// The word at `addr`, or `None` if `addr` is in no mapped range.
     ///
     /// `&mut self` because [`Bus::read16`] is, and because a later CPS-1 read
@@ -329,6 +368,15 @@ impl Board {
                 if self.cfg.cpsb_addr == Some(off) {
                     // The boot self-test. `cps1_v.cpp:2139-2140`.
                     Some(self.cfg.cpsb_value)
+                } else if let Some(p) = self.multiply_at(off) {
+                    // The multiply protection. `cps1_v.cpp:2145-2152`, tested
+                    // before IN2 there and here for the same reason: the arms are
+                    // an if-chain, so the order is the precedence, and a board
+                    // whose table put a factor port at `in2_addr` would answer
+                    // with whichever came first. No row in this workspace does —
+                    // `config.rs` asserts it for `sf2ce` — but the order is
+                    // MAME's, not ours to pick.
+                    Some(p)
                 } else if self.cfg.in2_addr == Some(off) {
                     // SF2's six kick buttons, on the C-board. `cps1_v.cpp:2155-2156`.
                     // An 8-bit port read into a 16-bit space: 0x00 above the byte.
@@ -1235,6 +1283,155 @@ mod tests {
         assert_eq!(b.read16(0x80_0172), 0xDEAD, "plain RAM");
         b.inputs.p1.kick = [true; 3];
         assert_eq!(b.read16(0x80_0176), 0x0000, "and no IN2 here");
+    }
+
+    /// The multiply ports answer with the product of the two factor registers.
+    ///
+    /// Champion Edition's protection check (`cps1_v.cpp:2145-2152`). Both halves of
+    /// a product that does not fit in 16 bits, so `result_hi` is not zero and a
+    /// truncating `u16` multiply could not produce these numbers.
+    ///
+    /// The expectations are hand-computed and written as literals: 0x1234 × 0x0100 =
+    /// 0x0012_3400, so lo is 0x3400 and hi is 0x0012. Deriving them in the test with
+    /// the same expression the code uses would pass under any factor pairing at all.
+    #[test]
+    fn the_multiply_ports_return_the_product_of_the_two_factors() {
+        let mut b = Board::new(&[], BoardConfig::sf2ce());
+        b.write16(0x80_0140, 0x1234); // factor1
+        b.write16(0x80_0142, 0x0100); // factor2
+        assert_eq!(b.read16(0x80_0144), 0x3400, "low word of 0x00123400");
+        assert_eq!(b.read16(0x80_0146), 0x0012, "high word of 0x00123400");
+    }
+
+    /// The two factor registers are not interchangeable in what they are read as.
+    ///
+    /// Multiplication commutes, so no product can tell `factor1` from `factor2`, and
+    /// a row with the two swapped computes identical results forever. What separates
+    /// them is that each is also an **ordinary register**: a write to 0x800140 must
+    /// read back at 0x800140, and if the row put `result_lo` at a factor's offset
+    /// that read would answer with a product instead.
+    ///
+    /// This is the assertion that a swap of `factor1`/`factor2` cannot pass — not
+    /// through the arithmetic, but through the register file.
+    #[test]
+    fn the_factor_registers_stay_ordinary_read_write_registers() {
+        let mut b = Board::new(&[], BoardConfig::sf2ce());
+        b.write16(0x80_0140, 0x1234);
+        b.write16(0x80_0142, 0x0100);
+        assert_eq!(b.read16(0x80_0140), 0x1234, "factor1 reads back as written");
+        assert_eq!(b.read16(0x80_0142), 0x0100, "and so does factor2");
+        // Word indices, written plainly: clippy rejects `0x00 / 2` (`erasing_op`)
+        // and `0x02 / 2` (`eq_op`), so the byte offsets they come from — CE's
+        // `factor1` at 0x00 and `factor2` at 0x02 — are named here instead.
+        assert_eq!(b.cps_b[0], 0x1234, "factor1, byte offset 0x00");
+        assert_eq!(b.cps_b[1], 0x0100, "factor2, byte offset 0x02");
+    }
+
+    /// A write to a result register lands in the file and is never read back.
+    ///
+    /// `cps1_cps_b_w`'s `COMBINE_DATA` runs before any read intercept, exactly as at
+    /// the ID register. The store is checked in the file directly, because a bus read
+    /// of these two addresses cannot show it: they answer with the product.
+    ///
+    /// Sub-project C reads `cps_b` directly for the layer and priority registers, so
+    /// an arm that skipped the store here would be a lost write with no bus read able
+    /// to reveal it — the same trap as
+    /// `a_write_to_the_cpsb_id_register_still_lands_in_the_file`.
+    #[test]
+    fn a_write_to_a_multiply_result_register_still_lands_in_the_file() {
+        let mut b = Board::new(&[], BoardConfig::sf2ce());
+        b.write16(0x80_0144, 0xDEAD);
+        b.write16(0x80_0146, 0xBEEF);
+        assert_eq!(b.cps_b[0x04 / 2], 0xDEAD, "word index 2");
+        assert_eq!(b.cps_b[0x06 / 2], 0xBEEF, "word index 3");
+        assert_eq!(b.read16(0x80_0144), 0x0000, "but the read is 0 × 0");
+        assert_eq!(b.read16(0x80_0146), 0x0000);
+    }
+
+    /// The product is recomputed on every read, not latched when a factor is written.
+    ///
+    /// MAME computes it inside the read handler. The difference is observable with
+    /// one write between two reads: a latching implementation would answer the second
+    /// read with the first read's product.
+    ///
+    /// Written with a **second factor that changes the answer**, and each expectation
+    /// hand-computed: 0x0003 × 0x0005 = 0x0F, then 0x0003 × 0x0007 = 0x15. A test
+    /// that re-read the same product twice would pass under a latch.
+    #[test]
+    fn the_product_is_recomputed_on_each_read() {
+        let mut b = Board::new(&[], BoardConfig::sf2ce());
+        b.write16(0x80_0140, 0x0003);
+        b.write16(0x80_0142, 0x0005);
+        assert_eq!(b.read16(0x80_0144), 0x000F);
+        b.write16(0x80_0142, 0x0007);
+        assert_eq!(b.read16(0x80_0144), 0x0015, "0x3 × 0x7, not the stale 0xF");
+    }
+
+    /// The largest product the ports can produce does not panic or wrap.
+    ///
+    /// 0xFFFF × 0xFFFF = 0xFFFE_0001, which overflows a `u16` multiply — a debug
+    /// build panics on it and a release build silently answers 0x0001 for both
+    /// halves. The bus contract is that no guest access panics, and the guest reaches
+    /// this by writing two words it is entirely entitled to write.
+    #[test]
+    fn the_widest_product_neither_panics_nor_wraps() {
+        let mut b = Board::new(&[], BoardConfig::sf2ce());
+        b.write16(0x80_0140, 0xFFFF);
+        b.write16(0x80_0142, 0xFFFF);
+        assert_eq!(b.read16(0x80_0144), 0x0001, "low word of 0xFFFE0001");
+        assert_eq!(b.read16(0x80_0146), 0xFFFE, "high word — not 0x0001 again");
+    }
+
+    /// The multiply behaviour comes from the config, not from the addresses.
+    ///
+    /// Under `sf2()` — a row whose `multiply` is `None` — all four of CE's offsets
+    /// are plain registers. Without this case a hardcoded `0x04`/`0x06` would pass
+    /// every test above, and every SF2 board in the workspace would answer 0x800144
+    /// with a product it never computed.
+    ///
+    /// The existing `other_cps_b_registers_are_read_write` already writes 0x1111 to
+    /// 0x800140 and reads it back, and passes for exactly this reason; it is asserted
+    /// here explicitly rather than left as a coincidence of that test's choice of
+    /// address.
+    #[test]
+    fn without_a_multiply_row_the_result_offsets_are_ordinary_registers() {
+        let mut b = board(); // sf2: multiply is None
+        b.write16(0x80_0140, 0x0003);
+        b.write16(0x80_0142, 0x0005);
+        b.write16(0x80_0144, 0xDEAD);
+        b.write16(0x80_0146, 0xBEEF);
+        assert_eq!(b.read16(0x80_0144), 0xDEAD, "not 0x000F");
+        assert_eq!(b.read16(0x80_0146), 0xBEEF, "not 0x0000");
+        // And on the plain row too, which shares no field with sf2's.
+        let mut p = Board::new(&[], BoardConfig::plain());
+        p.write16(0x80_0140, 0x0003);
+        p.write16(0x80_0142, 0x0005);
+        assert_eq!(p.read16(0x80_0144), 0x0000, "untouched, not a product");
+    }
+
+    /// CE's other two wired reads still work alongside the multiply ports.
+    ///
+    /// The read path is an if-chain, so an intercept inserted in the wrong place can
+    /// shadow a later arm. This checks the whole row at once: the ID register, IN2,
+    /// and a register that is none of the five.
+    ///
+    /// CE's `cpsb_value` is 0xFFFF — `uint16_t(-1)` — which is also this bus's
+    /// unmapped-read value, so the assertion is paired with a write that would show
+    /// through if the address were falling out of the CPS-B arm entirely.
+    #[test]
+    fn ces_id_register_and_in2_read_alongside_the_multiply_ports() {
+        let mut b = Board::new(&[], BoardConfig::sf2ce());
+        b.write16(0x80_0172, 0x1234);
+        assert_eq!(b.read16(0x80_0172), 0xFFFF, "wired, not the 0x1234 written");
+        assert_eq!(b.cps_b[0x32 / 2], 0x1234, "which did land in the file");
+
+        assert_eq!(b.read16(0x80_0176), 0x00FF, "IN2, idle");
+        b.inputs.p1.kick[1] = true;
+        assert_eq!(b.read16(0x80_0176), 0x00FD, "bit 1 low");
+
+        // A register in the window that is none of the five.
+        b.write16(0x80_0150, 0xABCD);
+        assert_eq!(b.read16(0x80_0150), 0xABCD);
     }
 
     /// CPS-A is indexed by word, and this is the boundary the plan warns about.
