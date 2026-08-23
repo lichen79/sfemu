@@ -76,6 +76,7 @@ CRATES: dict[str, str | list[str]] = {
     "peekcps1": "machine",
     "loop": "sfemu",
     "wiring": "sfemu",
+    "layout": "sfemu",
     # `z80` and not the workspace, and that is the load-bearing choice for these
     # two sets. The 1,604,000 vector cases live in the `testrunner` crate, so
     # `cargo test -p z80` runs the hand-written tests and nothing else -- which is
@@ -1216,6 +1217,57 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
                 "CONTROL-initializer-field-order",
                 "        state_path: args.state.clone(),\n        shot_path: default_shot_path(&args.path),",
                 "        shot_path: default_shot_path(&args.path),\n        state_path: args.state.clone(),",
+                "SURVIVE",
+            ),
+        ],
+    ),
+    # The keyboard-layout boundary. `minifb::Key` names a hardware *position* after the
+    # letter US QWERTY prints on it -- the active layout is never consulted -- so P1's
+    # stick is mapped `M::W`/`M::A` to land on the keys an AZERTY keyboard labels Z and Q.
+    #
+    # This set exists because the correct code looks like a typo and the wrong code looks
+    # correct. Every mutant here is an edit a reader would make in good faith while
+    # "tidying", and each one silently moves P1's stick off the diamond on the keyboard
+    # this is actually played on. Nothing else in the project can see it: `frontend`'s 17
+    # `keys` tests never touch a keyboard, and `display`'s reachability test only asks
+    # that *some* key produce each variant.
+    "layout": (
+        "crates/sfemu/src/display.rs",
+        [
+            # The tidy-up: put P1's up key back on the US-QWERTY-named position. Moves it
+            # from the key labelled Z to the one labelled W.
+            (
+                "p1-up-follows-the-us-letter",
+                "        M::W => Key::Z,",
+                "        M::Z => Key::Z,",
+                "KILL",
+            ),
+            # The same for left: from the key labelled Q to the one labelled A.
+            (
+                "p1-left-follows-the-us-letter",
+                "        M::A => Key::Q,",
+                "        M::Q => Key::Q,",
+                "KILL",
+            ),
+            # "Support both layouts" -- map the QWERTY position *as well*. This is the
+            # subtlest of the three, because on an AZERTY keyboard it still works: the
+            # diamond is intact and W merely also presses up. What it destroys is the
+            # one-key-one-input property, and it is the edit most likely to be proposed,
+            # which is why the test asserts `M::Z => None` rather than only `M::W => Some`.
+            (
+                "both-layouts-press-p1-up",
+                "        M::W => Key::Z,",
+                "        M::W | M::Z => Key::Z,",
+                "KILL",
+            ),
+            # CONTROL: P1's six buttons sit in the same position on AZERTY and QWERTY, so
+            # reordering their arms changes nothing. The right control for this set: it is
+            # the edit in this exact neighbourhood that *is* safe, and it fails only if a
+            # test has started asserting match-arm order instead of behaviour.
+            (
+                "CONTROL-punch-arms-reordered",
+                "        M::I => Key::I,\n        M::O => Key::O,\n        M::P => Key::P,",
+                "        M::O => Key::O,\n        M::I => Key::I,\n        M::P => Key::P,",
                 "SURVIVE",
             ),
         ],

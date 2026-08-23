@@ -100,6 +100,10 @@ fn usage() -> String {
      Escape quits. Player 2's buttons need a numeric keypad. A frame count\n\
      is ignored with `--play`.\n\
      \n\
+     Player 1's stick is the AZERTY diamond: the keys labelled Z S Q D on a\n\
+     French keyboard. Those are physical positions, so on a US QWERTY board\n\
+     the same four keys read W S A D.\n\
+     \n\
      The ROM set is yours to supply: this program neither bundles nor\n\
      downloads one. Legal sources include Capcom Arcade Stadium, Capcom\n\
      Fighting Collection, or a board you own and dumped.\n"
@@ -1595,6 +1599,21 @@ mod tests {
         assert!(
             u.contains("numeric keypad"),
             "a laptop without a keypad cannot reach P2's buttons, and must be told"
+        );
+
+        // The layout caveat. "Z S Q D" above is true of an AZERTY keyboard and false of
+        // a QWERTY one, because the keys are bound to physical positions rather than to
+        // letters — `display::translate` maps P1's stick to `minifb`'s `W`/`S`/`A`/`D`,
+        // which are the positions AZERTY labels Z S Q D. Without this sentence the text
+        // is simply wrong for a QWERTY reader, who would press Z and S and get a crouch
+        // and nothing else.
+        assert!(
+            u.contains("AZERTY"),
+            "the stick is positional, so the text must say which layout it is naming"
+        );
+        assert!(
+            u.contains("W S A D"),
+            "and must name the QWERTY reading, since that is who the text misleads"
         );
     }
 

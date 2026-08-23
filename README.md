@@ -332,11 +332,17 @@ why the samples are converted rather than played as they are.
 ```
         Player 1                          Player 2
 
-          Z                                 ↑                7 8 9  punches
+          Z   (W on QWERTY)                 ↑                7 8 9  punches
         Q S D    I O P  punches           ← ↓ →              4 5 6  kicks
-                 J K L  kicks
-        stick                             stick               keypad
+        ^        J K L  kicks
+        (A)                               stick               keypad
+        stick
 ```
+
+The key names below are **AZERTY** labels. Keys are bound to physical positions, not
+to letters, so on a US QWERTY keyboard P1's stick reads `W` `S` `A` `D` — the same
+four keys in the same diamond, with different letters printed on them. See
+[Layouts](#layouts) below.
 
 | Key | Does |
 |---|---|
@@ -378,6 +384,34 @@ punch from also saving a state.
 
 The board's `Inputs` is the same either way, so a gamepad or netplay can drive
 either player later without touching this map.
+
+### Layouts
+
+`minifb::Key` names a **hardware position**, not a letter. On macOS it passes the raw
+`[event keyCode]` through a fixed table that names each position after the letter a US
+QWERTY keyboard prints there; the active layout is never consulted. So `minifb`'s `Q`
+means "position 0x0c", which types `q` on QWERTY and `a` on a French keyboard.
+
+P1's stick is mapped by position to keep the diamond shape, and it is set up for AZERTY
+— the two keys the layouts disagree about are up and left:
+
+| Board input | `minifb` name | AZERTY label | QWERTY label |
+|---|---|---|---|
+| P1 up | `W` | **Z** | W |
+| P1 left | `A` | **Q** | A |
+| P1 down | `S` | S | S |
+| P1 right | `D` | D | D |
+
+Everything else is layout-stable: `I` `O` `P` `J` `K` `L`, the number row, the keypad,
+the arrows and the function keys sit in the same place on both. So a QWERTY player uses
+WSAD for the stick and reads every other row of the table above as printed.
+
+This is why `crates/sfemu/src/display.rs` maps `M::W => Key::Z`, which looks like a
+typo and is not — `frontend::Key`'s variants carry the AZERTY label because that is
+what this README and the usage text tell the player to press.
+`display::tests::player_ones_stick_is_mapped_by_position` asserts both halves,
+including that `M::Z` and `M::Q` press *nothing*, because "supporting both layouts" by
+mapping all four would give one board input two keys and silently undo the fix.
 
 Save states go beside the ROM set — `sf2.zip` next to `sf2.sfs` — so two games
 never share one, and screenshots to `sf2.ppm` the same way. One state file, not a

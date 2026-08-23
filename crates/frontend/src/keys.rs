@@ -28,8 +28,15 @@
 //! the arrow keys, and the numeric keypad's `7`/`8`/`9` over `4`/`5`/`6`. Punches on
 //! top of kicks in both clusters, which is a six-button cabinet's own arrangement.
 //!
-//! Three consequences, all of them things a later reader would otherwise rediscover:
+//! Four consequences, all of them things a later reader would otherwise rediscover:
 //!
+//! - **The letters are AZERTY labels, and this module cannot see a layout.** A variant
+//!   named `Z` means "the key the player was told is Z" — on a French keyboard, the
+//!   position a US QWERTY board calls W. `sfemu`'s `display::translate` owns that,
+//!   because it is the only code that sees a keyboard: `minifb::Key` names a hardware
+//!   position after a US letter and never consults the active layout, so `M::W` is what
+//!   produces [`Key::Z`] here. Nothing in this file changes with the layout, which is
+//!   the point of the split — but it means the names here are labels, not evidence.
 //! - **P2 needs a numeric keypad.** A keyboard without one leaves P2's six buttons
 //!   unreachable while its stick still works, which is worse than nothing. `Inputs`
 //!   carries P2 either way, for a gamepad or netplay to fill in.
@@ -56,6 +63,11 @@ use machine::Inputs;
 /// [`Controls::update`] alone. Naming them `P1Up` would put the map in two places, and
 /// the two would then have to be changed together — this remap moved eleven of them
 /// and touched no variant name.
+///
+/// "A key called Z" means **the key the player reads as Z**, which is an AZERTY label:
+/// `sfemu`'s `display::translate` produces `Key::Z` from `minifb`'s `W`, since
+/// `minifb::Key` names hardware positions after US QWERTY letters. That indirection is
+/// deliberate and lives entirely at the display boundary; this enum is layout-blind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     /// P1 stick up.

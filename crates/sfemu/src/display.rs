@@ -119,13 +119,45 @@ impl Display for Window {
 ///
 /// `Escape` is mapped rather than handled here: the loop owns quitting, so a window
 /// closed by its own button and one closed by Escape take the same path.
+///
+/// # `minifb::Key` names a position, not a letter
+///
+/// This is the one fact that makes this function more than plumbing, and it is not
+/// documented anywhere in `minifb`. On macOS its `keyDown` handler passes
+/// `[event keyCode]` — a **hardware scancode** — through a fixed table that names each
+/// position after the letter a **US QWERTY** keyboard prints there. The active keyboard
+/// layout never enters into it. So `M::Q` does not mean "the key that types q"; it means
+/// "position 0x0c", which types `q` on QWERTY and **`a`** on AZERTY.
+///
+/// The consequence is that a map written by letter is correct on one layout and wrong on
+/// others, silently: the keys do something, just not what the docs say. Verified on this
+/// machine with Carbon's `UCKeyTranslate` against the `French - PC` layout — position
+/// 0x0c types `a`, and position 0x0d (`M::W`) types `z`.
+///
+/// P1's stick is therefore mapped **by position, to keep the diamond**, and the two
+/// AZERTY-shifted keys are the two that move:
+///
+/// | frontend key | this map | AZERTY label | QWERTY label |
+/// |---|---|---|---|
+/// | `Key::Z` (up)    | `M::W` | **Z** | W |
+/// | `Key::Q` (left)  | `M::A` | **Q** | A |
+/// | `Key::S` (down)  | `M::S` | S | S |
+/// | `Key::D` (right) | `M::D` | D | D |
+///
+/// `frontend::Key`'s variants are named for the **AZERTY** label, because that is the
+/// keyboard this is played on and `Z`/`S`/`Q`/`D` is what the README and the usage text
+/// tell the player to press. The mismatch between `Key::Z` and `M::W` is not a bug and
+/// must not be "tidied" — see `tests::player_ones_stick_is_mapped_by_position`.
 fn translate(k: minifb::Key) -> Option<Key> {
     use minifb::Key as M;
     Some(match k {
-        // Player 1's cluster.
-        M::Z => Key::Z,
+        // Player 1's cluster. The stick is by position (see above): `M::W`/`M::A` are
+        // the keys an AZERTY keyboard labels Z and Q, which is what the player is told
+        // to press. `M::Z`/`M::Q` — the keys labelled W and A here — are deliberately
+        // *not* mapped.
+        M::W => Key::Z,
         M::S => Key::S,
-        M::Q => Key::Q,
+        M::A => Key::Q,
         M::D => Key::D,
         M::I => Key::I,
         M::O => Key::O,
@@ -237,9 +269,9 @@ mod tests {
         use frontend::Key;
         use minifb::Key as M;
         let candidates = [
-            M::Z,
+            M::W,
             M::S,
-            M::Q,
+            M::A,
             M::D,
             M::I,
             M::O,
@@ -294,7 +326,7 @@ mod tests {
         }
         // And nothing is mapped that is not a `Key`: an unhandled key is `None`, not a
         // panic, because `minifb` reports keys this program has no opinion about.
-        assert_eq!(translate(M::W), None, "an unmapped letter is None");
+        assert_eq!(translate(M::Y), None, "an unmapped letter is None");
         assert_eq!(translate(M::Space), None, "and so is the space bar");
 
         // The number row and the keypad are different keys. P2's six buttons are on the
@@ -314,5 +346,72 @@ mod tests {
         );
         assert_eq!(translate(M::Key4), None, "the number row's 4 is nothing");
         assert_eq!(translate(M::NumPad1), None, "nor is the keypad's 1");
+    }
+
+    /// P1's stick is mapped by keyboard **position**, so the diamond survives AZERTY.
+    ///
+    /// `minifb::Key` names a hardware scancode after the letter US QWERTY prints on it —
+    /// the active layout is never consulted. So `M::Q` means "position 0x0c", which types
+    /// `q` on QWERTY and `a` on a French keyboard. Verified on this machine with Carbon's
+    /// `UCKeyTranslate` against `French - PC`: position 0x0c types `a`, 0x0d types `z`.
+    ///
+    /// This test exists because the correct map **looks like a typo**: `M::W => Key::Z`
+    /// reads as a mistake, and "fixing" it to `M::Z => Key::Z` would move P1's up key from
+    /// the one labelled Z to the one labelled W and break the diamond. Every other test in
+    /// this file would stay green — `every_frontend_key_can_be_produced_by_a_keypress` only
+    /// asks that *some* key produces each variant, and `frontend`'s tests never see a
+    /// keyboard at all. Nothing else in the project would notice.
+    ///
+    /// Both directions are asserted. Without the negative half, a map that produced
+    /// `Key::Z` from both `M::W` and `M::Z` would pass — and that is the specific shape a
+    /// well-meaning "let me also support QWERTY" edit takes. It cannot be supported here:
+    /// one physical key is one board input, and the positions that spell ZQSD on AZERTY
+    /// spell WASD on QWERTY. Which is right is a layout question this program cannot see.
+    #[test]
+    fn player_ones_stick_is_mapped_by_position() {
+        use super::translate;
+        use frontend::Key;
+        use minifb::Key as M;
+
+        // The two keys AZERTY shifts. `M::W` is the key labelled Z; `M::A` is labelled Q.
+        assert_eq!(
+            translate(M::W),
+            Some(Key::Z),
+            "P1 up is position 0x0d, the key an AZERTY keyboard labels Z"
+        );
+        assert_eq!(
+            translate(M::A),
+            Some(Key::Q),
+            "P1 left is position 0x00, the key an AZERTY keyboard labels Q"
+        );
+        // And the two US-QWERTY-named positions for those letters press nothing. These are
+        // the keys labelled W and A on this keyboard: outside the diamond, so mapping them
+        // would give one board input two keys and hide the bug above.
+        assert_eq!(
+            translate(M::Z),
+            None,
+            "position 0x06 is labelled W here and must press nothing"
+        );
+        assert_eq!(
+            translate(M::Q),
+            None,
+            "position 0x0c is labelled A here and must press nothing"
+        );
+        // The other two stick keys are unaffected: S and D sit in the same place on both
+        // layouts, which is why only two of the four move.
+        assert_eq!(translate(M::S), Some(Key::S), "S is S on both layouts");
+        assert_eq!(translate(M::D), Some(Key::D), "and D is D");
+        // P1's six buttons are also layout-stable: I O P J K L are identical on AZERTY
+        // and QWERTY, so they are mapped by name and position at once.
+        for (m, k) in [
+            (M::I, Key::I),
+            (M::O, Key::O),
+            (M::P, Key::P),
+            (M::J, Key::J),
+            (M::K, Key::K),
+            (M::L, Key::L),
+        ] {
+            assert_eq!(translate(m), Some(k), "{k:?} is in the same place on both");
+        }
     }
 }
