@@ -134,6 +134,27 @@ impl BankMapper {
         }
     }
 
+    /// Champion Edition's `mapper_S9263B` (`cps1_v.cpp:1284`).
+    ///
+    /// A different PAL from [`Self::stf29`] on a different B-board, with a
+    /// **byte-for-byte identical** range table and identical bank sizes. MAME
+    /// writes the two out separately because they are separate parts verified from
+    /// separate dumps; their equations happen to agree, and the pin assignments in
+    /// the two comments differ — `STF29`'s bank 0 is ROMs 1,5,8,12 where this
+    /// part's is ROMs 1,3 and 2,4.
+    ///
+    /// So this reuses `STF29_RANGES` rather than copying it. The copy would be six
+    /// more chances to mistype a bound, for no behavioural difference; what a
+    /// reader needs instead is a test asserting the tables really are equal, which
+    /// `tests::s9263b_and_stf29_have_the_same_table` is. If a future MAME revision
+    /// distinguishes them, that test fails and the ranges get split then.
+    pub const fn s9263b() -> Self {
+        Self {
+            bank_sizes: [0x8000, 0x8000, 0x8000, 0],
+            ranges: &STF29_RANGES,
+        }
+    }
+
     /// The ROM offset, in tiles of `kind`'s own size, for `code`.
     ///
     /// [`None`] means no range covers the code and nothing should be drawn.
@@ -321,5 +342,60 @@ mod tests {
             ranges: &AT3,
         };
         assert_eq!(m.map(GfxType::Scroll1, 0x0123), None);
+    }
+
+    /// `mapper_S9263B` and `mapper_STF29` describe the same mapping.
+    ///
+    /// [`BankMapper::s9263b`] shares `STF29_RANGES` by reference on the strength of
+    /// this, so the assertion is what licenses the sharing rather than a
+    /// restatement of it. The table is transcribed here from `cps1_v.cpp:1284-1301`
+    /// as literals and compared against **both** mappers: comparing the two
+    /// mappers to each other would pass trivially while they share a pointer, and
+    /// would keep passing if MAME's S9263B table changed under us.
+    #[test]
+    fn s9263b_and_stf29_have_the_same_table() {
+        let expected: [(GfxType, u32, u32, usize); 6] = [
+            (GfxType::Sprite, 0x0_0000, 0x0_7FFF, 0),
+            (GfxType::Sprite, 0x0_8000, 0x0_FFFF, 1),
+            (GfxType::Sprite, 0x1_0000, 0x1_1FFF, 2),
+            (GfxType::Scroll3, 0x0_2000, 0x0_3FFF, 2),
+            (GfxType::Scroll1, 0x0_4000, 0x0_4FFF, 2),
+            (GfxType::Scroll2, 0x0_5000, 0x0_7FFF, 2),
+        ];
+        for m in [BankMapper::s9263b(), BankMapper::stf29()] {
+            assert_eq!(m.bank_sizes, [0x8000, 0x8000, 0x8000, 0]);
+            assert_eq!(m.ranges.len(), 6);
+            for (r, &(kind, start, end, bank)) in m.ranges.iter().zip(expected.iter()) {
+                assert_eq!(
+                    *r,
+                    BankRange {
+                        kind,
+                        start,
+                        end,
+                        bank
+                    }
+                );
+            }
+        }
+        // And they agree on what they actually compute, over one code per range.
+        for (kind, code) in [
+            (GfxType::Sprite, 0x0100u32),
+            (GfxType::Sprite, 0x5000),
+            (GfxType::Sprite, 0x8800),
+            (GfxType::Scroll3, 0x0400),
+            (GfxType::Scroll1, 0x4800),
+            (GfxType::Scroll2, 0x3000),
+        ] {
+            assert_eq!(
+                BankMapper::s9263b().map(kind, code),
+                BankMapper::stf29().map(kind, code),
+                "{kind:?} code {code:#06x}"
+            );
+            assert!(
+                BankMapper::s9263b().map(kind, code).is_some(),
+                "{kind:?} code {code:#06x} must be inside a range, or the pair \
+                 above agrees only on None"
+            );
+        }
     }
 }

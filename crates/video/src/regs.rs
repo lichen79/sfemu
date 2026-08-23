@@ -170,6 +170,41 @@ impl VideoConfig {
             layer_enable_mask: [0x08, 0x14, 0x02],
         }
     }
+
+    /// `CPS_B_21_DEF` (`cps1_v.cpp:499`), the part on the `sf2ce` board.
+    ///
+    /// The four register indices are the **same** as [`Self::sf2`]'s — 0x26,
+    /// 0x28-0x2E, 0x30 — and the layer-enable bits are not. Stated that way round
+    /// because the coincidence is the trap: a CE board configured with
+    /// `VideoConfig::sf2()` addresses every register correctly and reads the wrong
+    /// bits out of the layer-control word, so the layers wink on and off rather
+    /// than the screen going black. That is subtler than the `cps_b_17` mix-up,
+    /// which produces nothing at all.
+    ///
+    /// MAME's five-element mask here is `{0x02, 0x04, 0x08, 0x30, 0x30}`. The two
+    /// trailing entries are the star layers and, unlike `CPS_B_11`'s, they are
+    /// **non-zero** — this part is shared with boards that have stars. `sf2ce`'s
+    /// `ROM_START` has no `stars` region, so the three fields this struct carries
+    /// are still the whole story for this board; a set that did have one would need
+    /// the field widened rather than these two values quietly dropped.
+    ///
+    /// ⚠️ `cpsb_value` is `-1` on this row: **CE has no ID register at all**, and
+    /// `machine::BoardConfig::sf2ce` carries that as `cpsb_addr: None`. What it
+    /// does have instead is the multiply-protection block, which is that struct's
+    /// business rather than this one's.
+    pub const fn cps_b_21_def() -> Self {
+        Self {
+            layer_control: 0x26 / 2,
+            priority: [
+                Some(0x28 / 2),
+                Some(0x2A / 2),
+                Some(0x2C / 2),
+                Some(0x2E / 2),
+            ],
+            palette_control: 0x30 / 2,
+            layer_enable_mask: [0x02, 0x04, 0x08],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +304,95 @@ mod tests {
             assert_ne!(reg & mask, 0, "{reg:#06x} enables scroll 2");
         }
         assert_eq!(0x008Bu16 & mask, 0, "with both bits clear it does not");
+    }
+
+    /// `CPS_B_21_DEF`'s row, as literals, against `cps1_v.cpp:499`.
+    #[test]
+    fn cps_b_21_defs_row_is_the_one_mame_records() {
+        let v = VideoConfig::cps_b_21_def();
+        assert_eq!(v.layer_control, 0x26 / 2);
+        assert_eq!(
+            v.priority,
+            [
+                Some(0x28 / 2),
+                Some(0x2A / 2),
+                Some(0x2C / 2),
+                Some(0x2E / 2)
+            ],
+        );
+        assert_eq!(v.palette_control, 0x30 / 2);
+        assert_eq!(
+            v.layer_enable_mask,
+            [0x02, 0x04, 0x08],
+            "the first three of {{0x02,0x04,0x08,0x30,0x30}}"
+        );
+    }
+
+    /// `CPS_B_21_DEF` agrees with `CPS_B_11` on every register **address** and on
+    /// no layer-enable bit.
+    ///
+    /// The inverse of `cps_b_17_shares_no_register_with_cps_b_11`, and the reason
+    /// this row needs its own test rather than reusing that shape: three of the
+    /// four fields here are *supposed* to be identical to `sf2`'s, so an
+    /// `assert_ne!(a, b)` on the whole struct is nearly the only difference a
+    /// wholesale copy would show. What separates the two chips is the mask alone,
+    /// and it separates them completely — no bit is shared, in either direction.
+    ///
+    /// A CE board wrongly given `VideoConfig::sf2()` therefore reads valid
+    /// registers and tests the wrong bits of the layer-control word: layers appear
+    /// and vanish with the value the game happens to write, instead of the black
+    /// screen a wrong `cps_b_17` produces. Harder to notice, so this is asserted.
+    #[test]
+    fn cps_b_21_def_shares_every_address_with_cps_b_11_and_no_enable_bit() {
+        let (a, b) = (VideoConfig::sf2(), VideoConfig::cps_b_21_def());
+        assert_eq!(a.layer_control, b.layer_control, "both 0x26");
+        assert_eq!(a.priority, b.priority, "both 0x28-0x2E, ascending");
+        assert_eq!(a.palette_control, b.palette_control, "both 0x30");
+        assert_ne!(
+            a.layer_enable_mask, b.layer_enable_mask,
+            "and this is the whole of the difference"
+        );
+        assert_ne!(a, b, "so the two rows are not interchangeable");
+
+        // No bit in common, layer by layer and in aggregate. Written per-layer as
+        // well as in aggregate because `[0x08,0x10,0x20]` versus
+        // `[0x02,0x04,0x08]` does share the value 0x08 — as scroll 1's bit on one
+        // board and scroll 3's on the other. That cross-layer collision is exactly
+        // the sort of mix-up an aggregate `&` would report as "disjoint".
+        for (i, (x, y)) in a
+            .layer_enable_mask
+            .iter()
+            .zip(b.layer_enable_mask.iter())
+            .enumerate()
+        {
+            assert_ne!(x, y, "layer {i} keeps its bit");
+            assert_eq!(x & y, 0, "layer {i}'s bits overlap");
+        }
+        let agg = |m: [u16; 3]| m.iter().fold(0u16, |acc, v| acc | v);
+        assert_eq!(agg(a.layer_enable_mask), 0x38, "0x08|0x10|0x20");
+        assert_eq!(agg(b.layer_enable_mask), 0x0E, "0x02|0x04|0x08");
+        assert_eq!(
+            agg(a.layer_enable_mask) & agg(b.layer_enable_mask),
+            0x08,
+            "the two rows do share the value 0x08 — as different layers' bits, \
+             which is why the per-layer loop above is the real assertion"
+        );
+    }
+
+    /// Each of `CPS_B_21_DEF`'s three enable bits is a single bit.
+    ///
+    /// Unlike `CPS_B_17`'s 0x14, so a reader who learned the `!= 0` rule from that
+    /// row does not have to wonder whether this one is ambiguous too. It is not:
+    /// three bits, three layers, one each.
+    #[test]
+    fn cps_b_21_defs_enable_bits_are_one_bit_each() {
+        for (i, m) in VideoConfig::cps_b_21_def()
+            .layer_enable_mask
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(m.count_ones(), 1, "layer {i}'s mask {m:#06x} is one bit");
+        }
     }
 
     /// `cps1_base` scales by 256, truncates to the boundary, and wraps into a
