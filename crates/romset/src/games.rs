@@ -279,8 +279,112 @@ pub static SF2EB: GameSpec = GameSpec {
     regions: SF2EB_REGIONS,
 };
 
+// ---------------------------------------------------------------------------
+// Street Fighter II: Champion Edition (World 920313) — MAME set `sf2ce`,
+// `src/mame/capcom/cps1.cpp:9074-9114`, read 2026-08-23.
+//
+// ⚠️ Names, offsets, lengths and CRCs only. No ROM data.
+//
+// Champion Edition is a **different game on the same board family**, not a
+// revision of `sf2`: every program and graphics file differs, it carries a
+// different CPS-B part and a different graphics bank mapper. `sf2eb` shares
+// three of `sf2`'s four regions; CE shares exactly one.
+// ---------------------------------------------------------------------------
+
+/// `ROM_LOAD16_WORD_SWAP`, which only Champion Edition uses here.
+const W16SW: LoadKind = LoadKind::Word16WordSwap;
+
+/// 68000 program: three 512 KB whole-word images, byte-swapped.
+///
+/// A different shape from every other set in this file. `sf2` and `sf2eb` are
+/// eight 128 KB files in `ROM_LOAD16_BYTE` pairs, where each file supplies one
+/// byte of every word; these three are complete 16-bit images at native width
+/// with the bytes of each word exchanged. 3 × 0x80000 = 1.5 MB at
+/// 0x000000-0x17FFFF; 0x180000-0x3FFFFF is unpopulated and reads as zero.
+///
+/// See [`LoadKind::Word16WordSwap`] for how the byte order was established —
+/// **not** from the macro's name, because both orderings produce a vector table
+/// that looks reasonable.
+#[rustfmt::skip]
+static SF2CE_MAINCPU: &[RomEntry] = &[
+    RomEntry { name: "s92e_23b.8f", offset: 0x00_0000, len: 0x8_0000, crc32: 0x0aaa_1a3a, load: W16SW },
+    RomEntry { name: "s92_22b.7f",  offset: 0x08_0000, len: 0x8_0000, crc32: 0x2bbe_15ed, load: W16SW },
+    RomEntry { name: "s92_21a.6f",  offset: 0x10_0000, len: 0x8_0000, crc32: 0x925a_7877, load: W16SW },
+];
+
+/// Graphics: twelve 512 KB files in three groups of four, as [`SF2_GFX`].
+///
+/// The same 64-bit strided layout and the same region size, and not one file in
+/// common — Champion Edition redrew the character art. ⚠️ The offset order
+/// within each group is `0/2/4/6` against **rising** file numbers here
+/// (`1m/3m/2m/4m`), where `SF2_GFX` interleaves them (`5m/7m/1m/3m`). Neither is
+/// a slip: the offset column is what the hardware sees, and MAME's file order is
+/// the board's socket order.
+#[rustfmt::skip]
+static SF2CE_GFX: &[RomEntry] = &[
+    RomEntry { name: "s92-1m.3a",   offset: 0x00_0000, len: 0x8_0000, crc32: 0x03b0_d852, load: W64 },
+    RomEntry { name: "s92-3m.5a",   offset: 0x00_0002, len: 0x8_0000, crc32: 0x8402_89ec, load: W64 },
+    RomEntry { name: "s92-2m.4a",   offset: 0x00_0004, len: 0x8_0000, crc32: 0xcdb5_f027, load: W64 },
+    RomEntry { name: "s92-4m.6a",   offset: 0x00_0006, len: 0x8_0000, crc32: 0xe279_9472, load: W64 },
+    RomEntry { name: "s92-5m.7a",   offset: 0x20_0000, len: 0x8_0000, crc32: 0xba8a_2761, load: W64 },
+    RomEntry { name: "s92-7m.9a",   offset: 0x20_0002, len: 0x8_0000, crc32: 0xe584_bfb5, load: W64 },
+    RomEntry { name: "s92-6m.8a",   offset: 0x20_0004, len: 0x8_0000, crc32: 0x21e3_f87d, load: W64 },
+    RomEntry { name: "s92-8m.10a",  offset: 0x20_0006, len: 0x8_0000, crc32: 0xbefc_47df, load: W64 },
+    RomEntry { name: "s92-10m.3c",  offset: 0x40_0000, len: 0x8_0000, crc32: 0x9606_87d5, load: W64 },
+    RomEntry { name: "s92-12m.5c",  offset: 0x40_0002, len: 0x8_0000, crc32: 0x978e_cd18, load: W64 },
+    RomEntry { name: "s92-11m.4c",  offset: 0x40_0004, len: 0x8_0000, crc32: 0xd6ec_9a0a, load: W64 },
+    RomEntry { name: "s92-13m.6c",  offset: 0x40_0006, len: 0x8_0000, crc32: 0xed2c_67f6, load: W64 },
+];
+
+/// Z80 program: one 64 KB file split across a 64 KB gap, as [`SF2_AUDIOCPU`].
+///
+/// A different file from `sf2_9.12a` and in a different socket, so it cannot be
+/// shared even though the shape is identical.
+#[rustfmt::skip]
+static SF2CE_AUDIOCPU: &[RomEntry] = &[
+    RomEntry { name: "s92_09.11a", offset: 0x0_0000, len: 0x1_0000, crc32: 0x08f6_b60e, load: AUDIO_SPLIT },
+];
+
+/// OKI MSM6295 samples — the **same two files** as [`SF2_OKI`], renamed.
+///
+/// `s92_18.11c`/`s92_19.12c` carry CRCs `7f162009`/`beade53f`, byte for byte
+/// `sf2_18.11c`/`sf2_19.12c`. Champion Edition reuses World Warrior's ADPCM
+/// samples unchanged; only the labels on the parts differ.
+///
+/// ⚠️ This is why the entries are duplicated rather than `SF2_OKI` reused: the
+/// **names** differ, and a name is what the loader looks for in the archive.
+/// A CE set contains no file called `sf2_18.11c`. Every other region shares
+/// nothing at all, so there is no near-miss risk in the duplication.
+#[rustfmt::skip]
+static SF2CE_OKI: &[RomEntry] = &[
+    RomEntry { name: "s92_18.11c", offset: 0x0_0000, len: 0x2_0000, crc32: 0x7f16_2009, load: BYTE },
+    RomEntry { name: "s92_19.12c", offset: 0x2_0000, len: 0x2_0000, crc32: 0xbead_e53f, load: BYTE },
+];
+
+/// `sf2ce`'s four regions — the same four tags and the same four sizes as
+/// [`SF2_REGIONS`], with its own files in all of them.
+#[rustfmt::skip]
+static SF2CE_REGIONS: &[RegionSpec] = &[
+    RegionSpec { name: "maincpu",  size: 0x40_0000, entries: SF2CE_MAINCPU  },
+    RegionSpec { name: "gfx",      size: 0x60_0000, entries: SF2CE_GFX      },
+    RegionSpec { name: "audiocpu", size: 0x01_8000, entries: SF2CE_AUDIOCPU },
+    RegionSpec { name: "oki",      size: 0x04_0000, entries: SF2CE_OKI      },
+];
+
+/// Street Fighter II: Champion Edition (World 920313), MAME set `sf2ce`.
+///
+/// CPS-1 hardware, so `board_for` maps it to `BoardKind::Cps1` with the other
+/// two — but **not** to the same registers. CE carries a `CPS_B_21_DEF` part
+/// where `sf2` has `CPS_B_11` and `sf2eb` has `CPS_B_17`, and a running machine
+/// under the wrong row draws nothing at all while every counter stays healthy.
+/// [`machine::config`](../../machine/config/index.html) owns that row.
+pub static SF2CE: GameSpec = GameSpec {
+    name: "sf2ce",
+    regions: SF2CE_REGIONS,
+};
+
 /// Every set this crate knows.
-pub static ALL: &[&GameSpec] = &[&SF2, &SF2EB, &SF1];
+pub static ALL: &[&GameSpec] = &[&SF2, &SF2EB, &SF2CE, &SF1];
 
 /// The set with this MAME name, if it is supported.
 pub fn by_name(name: &str) -> Option<&'static GameSpec> {
@@ -617,5 +721,191 @@ mod tests {
             assert_eq!(e.load, LoadKind::Byte);
         }
         assert_eq!(end_of(&r.entries[1]), 0x4_0000, "and fills the region");
+    }
+
+    // -----------------------------------------------------------------------
+    // Champion Edition. Every expected value below is a literal read off
+    // `cps1.cpp`'s `ROM_START( sf2ce )`, never computed from the table.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sf2ce_has_four_regions_with_the_expected_file_counts() {
+        assert_eq!(SF2CE.regions.len(), 4);
+        let names: Vec<&str> = SF2CE.regions.iter().map(|r| r.name).collect();
+        assert_eq!(names, vec!["maincpu", "gfx", "audiocpu", "oki"]);
+        let counts: Vec<usize> = SF2CE.regions.iter().map(|r| r.entries.len()).collect();
+        assert_eq!(
+            counts,
+            vec![3, 12, 1, 2],
+            "three program ROMs, not sf2's eight"
+        );
+        let sizes: Vec<usize> = SF2CE.regions.iter().map(|r| r.size).collect();
+        assert_eq!(sizes, vec![0x40_0000, 0x60_0000, 0x1_8000, 0x4_0000]);
+        assert_eq!(by_name("sf2ce").map(|g| g.name), Some("sf2ce"));
+    }
+
+    /// The program region is three whole-word images at 512 KB boundaries.
+    ///
+    /// The offsets are asserted as a literal vector rather than checked for even
+    /// parity: parity is `sf2`'s property, from files that supply one byte of each
+    /// word, and it is meaningless for this kind. A `Word16Byte` entry copied into
+    /// this table by mistake would satisfy a parity check at offset 0 and
+    /// byte-swap the whole program, so the `load` assertion below is the one that
+    /// matters.
+    #[test]
+    fn sf2ce_maincpu_is_three_word_swapped_images_filling_the_first_1_5_mb() {
+        let r = SF2CE.region("maincpu").unwrap();
+        let offsets: Vec<usize> = r.entries.iter().map(|e| e.offset).collect();
+        assert_eq!(offsets, vec![0x00_0000, 0x08_0000, 0x10_0000]);
+        for e in r.entries {
+            assert_eq!(e.len, 0x8_0000, "{} is a 512 KB file", e.name);
+            assert_eq!(
+                e.load,
+                LoadKind::Word16WordSwap,
+                "{} is ROM_LOAD16_WORD_SWAP, not an interleaved pair half",
+                e.name
+            );
+        }
+        let top = r.entries.iter().map(end_of).max().unwrap();
+        assert_eq!(top, 0x18_0000, "3 x 0x80000 laid end to end, no interleave");
+        assert!(
+            top < 0x40_0000,
+            "and the rest of CODE_SIZE reads as zero: {top:#x} of 0x400000"
+        );
+    }
+
+    /// CE's graphics have the same shape as `sf2`'s and share no file with them.
+    #[test]
+    fn sf2ce_gfx_strides_by_two_in_three_groups_and_fills_the_region() {
+        let r = SF2CE.region("gfx").unwrap();
+        assert_eq!(r.entries.len(), 12);
+        let bases: Vec<usize> = r.entries.chunks_exact(4).map(|g| g[0].offset).collect();
+        assert_eq!(bases, vec![0x00_0000, 0x20_0000, 0x40_0000]);
+        for group in r.entries.chunks_exact(4) {
+            for (i, e) in group.iter().enumerate() {
+                assert_eq!(e.offset, group[0].offset + 2 * i, "{}", e.name);
+                assert_eq!(e.len, 0x8_0000, "{} is a 512 KB file", e.name);
+                assert_eq!(e.load, LoadKind::Word64Word, "{}", e.name);
+            }
+        }
+        assert_eq!(
+            r.entries.iter().map(end_of).max().unwrap(),
+            0x60_0000,
+            "12 x 0x80000 fills the region exactly"
+        );
+    }
+
+    #[test]
+    fn sf2ce_audiocpu_and_oki_have_sf2s_shapes_with_ces_own_names() {
+        let e = &SF2CE.region("audiocpu").unwrap().entries[0];
+        assert_eq!(e.name, "s92_09.11a", "CE's Z80 ROM, in socket 11a");
+        assert_eq!(e.len, 0x1_0000);
+        assert_eq!(
+            e.load,
+            LoadKind::Continue {
+                split: 0x0_8000,
+                cont_at: 0x1_0000
+            }
+        );
+        assert_eq!(end_of(e), 0x1_8000, "and fills the region");
+
+        let r = SF2CE.region("oki").unwrap();
+        let offsets: Vec<usize> = r.entries.iter().map(|e| e.offset).collect();
+        assert_eq!(offsets, vec![0x0_0000, 0x2_0000]);
+        for e in r.entries {
+            assert_eq!(e.len, 0x2_0000);
+            assert_eq!(e.load, LoadKind::Byte);
+        }
+        assert_eq!(end_of(&r.entries[1]), 0x4_0000);
+    }
+
+    #[test]
+    fn every_sf2ce_entry_fits_inside_its_region() {
+        for r in SF2CE.regions {
+            for e in r.entries {
+                assert!(
+                    end_of(e) <= r.size,
+                    "{} ends at {:#x}, region {} is {:#x}",
+                    e.name,
+                    end_of(e),
+                    r.name,
+                    r.size
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_sf2ce_entries_share_a_name_or_a_crc() {
+        let mut names = std::collections::BTreeSet::new();
+        let mut crcs = std::collections::BTreeSet::new();
+        for r in SF2CE.regions {
+            for e in r.entries {
+                assert!(names.insert(e.name), "{} appears twice", e.name);
+                assert!(
+                    crcs.insert(e.crc32),
+                    "{} duplicates CRC {:08x}",
+                    e.name,
+                    e.crc32
+                );
+            }
+        }
+        assert_eq!(names.len(), 18, "3 + 12 + 1 + 2 distinct files");
+        assert_eq!(crcs.len(), 18);
+    }
+
+    /// CE shares its two ADPCM samples with `sf2` and nothing else.
+    ///
+    /// Both halves matter. The **two** pins the deliberate duplication in
+    /// [`SF2CE_OKI`]: if a later edit "deduplicated" it by pointing CE's `oki`
+    /// region at `SF2_OKI`, the names would revert to `sf2_18.11c`/`sf2_19.12c`
+    /// and every CE set on disk would fail to load — while this crate's own tests,
+    /// which never open a file, all stayed green. The **rest** of the assertion is
+    /// the claim that CE is a different game: a set that shared program or
+    /// graphics files would be a revision, and `identify` would have to choose
+    /// between them.
+    #[test]
+    fn sf2ce_shares_exactly_its_two_sample_files_with_sf2() {
+        let crcs = |g: &GameSpec, region: &str| -> Vec<u32> {
+            g.region(region)
+                .unwrap()
+                .entries
+                .iter()
+                .map(|e| e.crc32)
+                .collect()
+        };
+        assert_eq!(
+            crcs(&SF2CE, "oki"),
+            vec![0x7f16_2009, 0xbead_e53f],
+            "CE's samples are World Warrior's, relabelled"
+        );
+        assert_eq!(crcs(&SF2, "oki"), vec![0x7f16_2009, 0xbead_e53f]);
+        // ...under different names, which is why they are two separate tables.
+        let names = |g: &GameSpec, region: &str| -> Vec<&str> {
+            g.region(region)
+                .unwrap()
+                .entries
+                .iter()
+                .map(|e| e.name)
+                .collect()
+        };
+        assert_eq!(names(&SF2CE, "oki"), vec!["s92_18.11c", "s92_19.12c"]);
+        assert_eq!(names(&SF2, "oki"), vec!["sf2_18.11c", "sf2_19.12c"]);
+
+        // And nothing else is shared, in either direction.
+        for region in ["maincpu", "gfx", "audiocpu"] {
+            for ce in &crcs(&SF2CE, region) {
+                assert!(
+                    !crcs(&SF2, region).contains(ce),
+                    "CE's {region} shares CRC {ce:08x} with sf2 — CE is a different game"
+                );
+            }
+            for ce in &names(&SF2CE, region) {
+                assert!(
+                    !names(&SF2, region).contains(ce),
+                    "CE's {region} shares file `{ce}` with sf2"
+                );
+            }
+        }
     }
 }
