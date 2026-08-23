@@ -24,6 +24,20 @@ pub enum LoadKind {
     /// few steps rather than running visibly wrong for a while, which is the one
     /// mercy in this failure mode.
     Word16Byte,
+    /// `ROM_LOAD16_WORD_SWAP`: byte `i` lands at `offset + i`, but the two bytes
+    /// of every 16-bit word are exchanged — source `i` and `i+1` land at `i+1`
+    /// and `i` for even `i`.
+    ///
+    /// This is not [`Word16Byte`](LoadKind::Word16Byte) with one file: it is a
+    /// whole 16-bit image in one file, at native width, byte-swapped. Champion
+    /// Edition's three 512 KB program ROMs use it where World Warrior's eight
+    /// 128 KB ones use `ROM_LOAD16_BYTE` pairs.
+    ///
+    /// ⚠️ A wrong choice here is **not** self-announcing. Both orderings of CE's
+    /// first program ROM yield a vector table that looks reasonable — reset PC
+    /// 0x3602 unswapped, 0x0236 swapped — and only disassembly separates them.
+    /// `assemble.rs`'s test for this kind records the evidence.
+    Word16WordSwap,
     /// `ROM_LOAD64_WORD`: source word `i` (2 bytes) lands at `offset + 8*i`.
     Word64Word,
     /// `ROM_CONTINUE`: the first `split` bytes land at `offset`, the remainder at

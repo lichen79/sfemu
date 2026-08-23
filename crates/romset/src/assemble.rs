@@ -18,6 +18,9 @@ pub fn end_of(entry: &RomEntry) -> usize {
         // The final byte is at offset + 2*(len-1), so the exclusive end is one
         // past it.
         LoadKind::Word16Byte => entry.offset + 2 * entry.len.saturating_sub(1) + 1,
+        // No interleave: the image occupies its own length, and swapping bytes
+        // within it moves nothing across the span's edges.
+        LoadKind::Word16WordSwap => entry.offset + entry.len,
         LoadKind::Word64Word => {
             let words = entry.len / 2;
             entry.offset + 8 * words.saturating_sub(1) + 2
@@ -56,6 +59,18 @@ pub fn place(
         LoadKind::Word16Byte => {
             for (i, &b) in src.iter().enumerate() {
                 dest[entry.offset + 2 * i] = b;
+            }
+        }
+        // `chunks_exact` drops a trailing odd byte rather than panicking. Every
+        // real entry of this kind is a whole number of words — CE's three are
+        // 0x80000 each — and a spec that named an odd length would lose its last
+        // byte here rather than fail, which is why `load` checks the file's length
+        // against `entry.len` before this function ever sees it.
+        LoadKind::Word16WordSwap => {
+            for (i, pair) in src.chunks_exact(2).enumerate() {
+                let at = entry.offset + 2 * i;
+                dest[at] = pair[1];
+                dest[at + 1] = pair[0];
             }
         }
         LoadKind::Word64Word => {
@@ -143,6 +158,71 @@ mod tests {
         )
         .unwrap();
         assert_ne!(dest, other, "Byte and Word16Byte must be distinguishable");
+    }
+
+    /// `ROM_LOAD16_WORD_SWAP` swaps the two bytes of every 16-bit word.
+    ///
+    /// The order was established empirically rather than from MAME's macro name,
+    /// by disassembling Champion Edition's `s92e_23b.8f` both ways at the reset PC
+    /// its own vector table gives. As-is on disk the image decodes to garbage
+    /// (`moveq #-1,d1; dc.w $754E; bmi ...`); word-swapped it decodes to the same
+    /// boot sequence sf2eb runs, instruction for instruction —
+    /// `move.b #$80,$800030`, `move.b #$00,$800030`, `lea (pc),a4`, `bra`,
+    /// `move.b #$F0,$800181`, `move.w #$FFC0,$80010C`. That agreement across two
+    /// independently dumped revisions is the evidence; a byte order that merely
+    /// produces a plausible-looking vector table is not, because **both**
+    /// orderings do here (0x3602 as-is, 0x0236 swapped).
+    #[test]
+    fn word16_word_swap_exchanges_the_bytes_of_every_word() {
+        let mut dest = vec![0u8; 16];
+        place(
+            &mut dest,
+            &pat(0xA0, 8),
+            &entry(0, 8, LoadKind::Word16WordSwap),
+            "r",
+        )
+        .unwrap();
+        assert_eq!(
+            &dest[..8],
+            &[0xA1, 0xA0, 0xA3, 0xA2, 0xA5, 0xA4, 0xA7, 0xA6],
+            "each pair of source bytes lands reversed"
+        );
+        // Read back as the 68000 does: the first word of source 0xA0,0xA1 is the
+        // instruction word 0xA1A0, not 0xA0A1.
+        assert_eq!(u16::from_be_bytes([dest[0], dest[1]]), 0xA1A0);
+
+        // The discrimination the pattern exists for: a straight copy of the same
+        // source must not agree, or a swap that does nothing would pass.
+        let mut straight = vec![0u8; 16];
+        place(
+            &mut straight,
+            &pat(0xA0, 8),
+            &entry(0, 8, LoadKind::Byte),
+            "r",
+        )
+        .unwrap();
+        assert_ne!(
+            dest, straight,
+            "Word16WordSwap and Byte must be distinguishable"
+        );
+    }
+
+    /// The span is the file's own length — no interleave — and the swap is
+    /// confined to it.
+    #[test]
+    fn word16_word_swap_occupies_exactly_its_length_at_its_offset() {
+        let e = entry(4, 8, LoadKind::Word16WordSwap);
+        assert_eq!(end_of(&e), 12, "offset + len, like `Byte`");
+        assert!(place(&mut [0u8; 11], &pat(0xA0, 8), &e, "r").is_err());
+        let mut dest = vec![0u8; 16];
+        place(&mut dest, &pat(0xA0, 8), &e, "r").unwrap();
+        assert_eq!(
+            &dest[..4],
+            &[0, 0, 0, 0],
+            "nothing written below the offset"
+        );
+        assert_eq!(&dest[4..6], &[0xA1, 0xA0], "and the swap starts at it");
+        assert_eq!(&dest[12..], &[0, 0, 0, 0], "nothing written above the span");
     }
 
     #[test]
