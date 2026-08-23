@@ -1303,16 +1303,22 @@ mod tests {
         assert_eq!(b.read16(0x80_0146), 0x0012, "high word of 0x00123400");
     }
 
-    /// The two factor registers are not interchangeable in what they are read as.
+    /// Each factor register is also an ordinary read/write register.
     ///
-    /// Multiplication commutes, so no product can tell `factor1` from `factor2`, and
-    /// a row with the two swapped computes identical results forever. What separates
-    /// them is that each is also an **ordinary register**: a write to 0x800140 must
-    /// read back at 0x800140, and if the row put `result_lo` at a factor's offset
-    /// that read would answer with a product instead.
+    /// A write to 0x800140 reads back at 0x800140. That is what makes the pair
+    /// *ports* rather than a hidden device: only the two result offsets are
+    /// intercepted, so a row that put `result_lo` at a factor's offset would answer
+    /// this read with a product instead of the value written.
     ///
-    /// This is the assertion that a swap of `factor1`/`factor2` cannot pass — not
-    /// through the arithmetic, but through the register file.
+    /// ⚠️ This does **not** distinguish `factor1` from `factor2`. Nothing can:
+    /// multiplication commutes and both registers are read the same way, so
+    /// exchanging the two — in this function or in `sf2ce`'s row — is an exact
+    /// equivalence. Mutation confirmed the swap survives the whole suite. Recording
+    /// that here rather than leaving a later reader to discover it and assume the
+    /// tests are weak: they are as strong as the behaviour allows. What *is* caught
+    /// is a wrong pairing — reading one register twice, which squares it — and
+    /// `the_product_is_recomputed_on_each_read` fails on that mutant because its two
+    /// factors differ.
     #[test]
     fn the_factor_registers_stay_ordinary_read_write_registers() {
         let mut b = Board::new(&[], BoardConfig::sf2ce());
@@ -1380,6 +1386,43 @@ mod tests {
         b.write16(0x80_0142, 0xFFFF);
         assert_eq!(b.read16(0x80_0144), 0x0001, "low word of 0xFFFE0001");
         assert_eq!(b.read16(0x80_0146), 0xFFFE, "high word — not 0x0001 again");
+    }
+
+    /// A factor offset outside the CPS-B window indexes in range instead of panicking.
+    ///
+    /// `CPS_REGS` is 0x20 words, so a byte offset must be under 0x40 for `off >> 1`
+    /// to index the file — and every real row's is: `config.rs` asserts it for
+    /// `sf2ce`, and MAME's table has no row that violates it. So `& (CPS_REGS - 1)`
+    /// in [`Board::multiply_at`] is dead on every configuration this workspace ships,
+    /// and mutation confirmed that removing it fails no other test.
+    ///
+    /// It is not dead on every configuration that *compiles*. [`BoardConfig`]'s
+    /// fields are public, so a caller — a future MAME row transcribed with a slip, a
+    /// fuzz harness, a test — can hand the board an offset of 0x80. Unmasked, that is
+    /// `0x40` into a 32-word array: a panic, on a guest read of an address the guest
+    /// is entitled to read. The bus contract is that no guest address panics, and
+    /// this is the assertion that keeps the mask honest rather than a comment saying
+    /// it is probably needed.
+    ///
+    /// The row here puts the **factors** out of window and leaves `result_lo` inside
+    /// it, which is the only shape that reaches the indexing at all: a `result_lo` of
+    /// 0x80 is never compared equal to an `off` that is always under 0x40, so the
+    /// product would never be computed.
+    #[test]
+    fn an_out_of_window_factor_offset_wraps_rather_than_panicking() {
+        let mut cfg = BoardConfig::sf2ce();
+        cfg.multiply = Some(crate::config::MultiplyPorts {
+            factor1: 0x80,
+            factor2: 0x82,
+            result_lo: 0x04,
+            result_hi: 0x06,
+        });
+        let mut b = Board::new(&[], cfg);
+        // 0x80 >> 1 = 0x40, masked to word index 0; 0x82 >> 1 = 0x41, to index 1.
+        // Those are the registers at byte offsets 0x00 and 0x02.
+        b.write16(0x80_0140, 0x0003);
+        b.write16(0x80_0142, 0x0005);
+        assert_eq!(b.read16(0x80_0144), 0x000F, "wrapped, and did not panic");
     }
 
     /// The multiply behaviour comes from the config, not from the addresses.
