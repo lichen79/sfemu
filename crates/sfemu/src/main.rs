@@ -80,9 +80,10 @@ fn usage() -> String {
      The board is not guessed from the path: a set of files does not say\n\
      what hardware it came from.\n\
      \n\
-     The three CPS-1 sets are not interchangeable. They carry different\n\
-     CPS-B parts, and one run under another's registers boots, services\n\
-     every interrupt, and draws nothing at all.\n\
+     The three CPS-1 sets are not interchangeable: they carry different\n\
+     CPS-B parts, and each name selects both the files to expect and the\n\
+     registers to use. Naming the wrong one reports the file it could not\n\
+     find, so a mismatch is a load error rather than a bad picture.\n\
      \n\
      `--demo` runs a CPS-1 image this program generates itself — scrolling\n\
      tilemaps, a sprite on a path, a frame counter and FM music — and needs\n\
@@ -336,11 +337,21 @@ fn parse_args(args: Vec<String>) -> Result<Args, Fault> {
 /// the row a game needs is not derivable from its hardware being "CPS-1": `sf2`
 /// has `CPS_B_11` and `sf2eb` has `CPS_B_17`, which agree on no register at all.
 ///
-/// A wrong row here does not produce a crash or a garbled screen. The program
-/// reads the ID register, finds the wrong value, and branches to an idle loop —
-/// so the machine boots, runs, takes every interrupt, and draws nothing, with no
-/// unmapped access and no fault to report. That is why an unknown name is an
-/// error: there is no config that is safe to fall back to.
+/// A wrong row here does not produce a crash or a garbled screen, and the two
+/// measured failure modes are different from each other — which is the reason there
+/// is no safe fallback:
+///
+/// - `sf2eb` under `sf2`'s row reads the ID register, finds the wrong value, and
+///   branches to an idle loop. The machine boots, takes every interrupt, and draws
+///   nothing, with no unmapped access and no fault to report.
+/// - `sf2ce` under either other row **draws**. It never reads its ID register at all,
+///   so nothing fails a self-test; the row's layer-enable bits are simply wrong and
+///   the background layer goes missing. Measured at 1100 frames: identical interrupt
+///   and gfxram-write counts, 184 distinct pens against 123. A screen that looks like
+///   a working emulator is the worse of the two failures, and no counter sees it —
+///   `tests/boot.rs` compares the two rows' rendered output for exactly this reason.
+///
+/// That is why an unknown name is an error rather than a default.
 ///
 /// # Errors
 ///
@@ -2409,5 +2420,52 @@ mod tests {
             u.contains("not guessed from"),
             "and that the board is a stated choice: {u}"
         );
+    }
+
+    /// Every CPS-1 spec demands at least one `maincpu` file that no other CPS-1 spec
+    /// demands — which is what makes the usage text's claim true: naming the wrong
+    /// `--game` for a set reports a missing file rather than loading.
+    ///
+    /// That is a claim about the ROM specs, not about the prose, so it is asserted
+    /// here. It is deliberately **not** "the three sets have disjoint file names":
+    /// they do not. `sf2` and `sf2eb` both expect `sf2_29b.10e`, among others — they
+    /// are revisions of one game and share most of their program. Writing the
+    /// disjointness version of this test first is how that was found.
+    ///
+    /// The property that actually holds, and the one that matters, is the weaker one:
+    /// a unique file per spec means `romset::load` runs out of files in every
+    /// mismatched direction. Without it, a mismatched `--game` could load, run under
+    /// the wrong CPS-B row, and — for Champion Edition, which never checks its ID
+    /// register — draw a plausible screen with a layer missing.
+    #[test]
+    fn every_cps1_spec_demands_a_maincpu_file_no_other_does() {
+        let cps1 = ["sf2", "sf2eb", "sf2ce"];
+        let maincpu = |name: &str| -> Vec<&'static str> {
+            romset::games::by_name(name)
+                .expect("a documented name has a spec")
+                .region("maincpu")
+                .expect("a CPS-1 spec has a maincpu region")
+                .entries
+                .iter()
+                .map(|e| e.name)
+                .collect()
+        };
+        for a in cps1 {
+            let mine = maincpu(a);
+            assert!(!mine.is_empty(), "`{a}` must list its maincpu files");
+            let others: Vec<&str> = cps1
+                .iter()
+                .filter(|b| **b != a)
+                .flat_map(|b| maincpu(b))
+                .collect();
+            let unique: Vec<&&str> = mine.iter().filter(|n| !others.contains(n)).collect();
+            assert!(
+                !unique.is_empty(),
+                "every one of `{a}`'s {} maincpu files is also expected by another \
+                 CPS-1 spec, so a set of {a} files could satisfy that spec's load and \
+                 run under the wrong CPS-B row",
+                mine.len()
+            );
+        }
     }
 }
