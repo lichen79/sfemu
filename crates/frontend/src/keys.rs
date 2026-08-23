@@ -474,6 +474,56 @@ impl Controls {
 mod tests {
     use super::*;
 
+    /// Every game key, and the three ports it must produce: `(key, in0, in1, in2)`.
+    ///
+    /// Shared by the two tests that need it — the one that presses each key and the one
+    /// that checks the table covers every game key. A local array in the first would
+    /// leave the second unable to see it, which is exactly the bug the second test's doc
+    /// records: it asserted a count derived from `Key::ALL` and a deleted row went
+    /// unnoticed.
+    ///
+    /// The values are literals from `machine::inputs`' documented layout, computed by
+    /// hand: `IN1` bits 0-3 stick and 4-6 punches, P1 in the low byte and P2 in the
+    /// high; `IN2` bits 0-2 and 4-6 for the kicks; `IN0` for coins, starts and test.
+    /// A loop deriving them from the same fields the map sets would pass with every key
+    /// on the wrong button.
+    const GAME_KEY_PORTS: [(Key, u8, u16, u8, &str); 25] = [
+        // P1's stick, IN1 bits 0-3. ZSQD: Z above S, Q and D either side.
+        (Key::Z, 0xFF, 0xFFF7, 0xFF, "P1 up"),
+        (Key::S, 0xFF, 0xFFFB, 0xFF, "P1 down"),
+        (Key::Q, 0xFF, 0xFFFD, 0xFF, "P1 left"),
+        (Key::D, 0xFF, 0xFFFE, 0xFF, "P1 right"),
+        // P1's punches, IN1 bits 4-6, left to right on the top row.
+        (Key::I, 0xFF, 0xFFEF, 0xFF, "P1 jab"),
+        (Key::O, 0xFF, 0xFFDF, 0xFF, "P1 strong"),
+        (Key::P, 0xFF, 0xFFBF, 0xFF, "P1 fierce"),
+        // P1's kicks, IN2 bits 0-2, directly beneath. Note IN1 stays 0xFFFF: a kick is
+        // not a punch, and the two are read through different chips.
+        (Key::J, 0xFF, 0xFFFF, 0xFE, "P1 short"),
+        (Key::K, 0xFF, 0xFFFF, 0xFD, "P1 forward"),
+        (Key::L, 0xFF, 0xFFFF, 0xFB, "P1 roundhouse"),
+        // P2's stick, IN1's *high* byte — the same four bits, eight up.
+        (Key::Up, 0xFF, 0xF7FF, 0xFF, "P2 up"),
+        (Key::Down, 0xFF, 0xFBFF, 0xFF, "P2 down"),
+        (Key::Left, 0xFF, 0xFDFF, 0xFF, "P2 left"),
+        (Key::Right, 0xFF, 0xFEFF, 0xFF, "P2 right"),
+        // P2's punches, IN1 bits 12-14.
+        (Key::NumPad7, 0xFF, 0xEFFF, 0xFF, "P2 jab"),
+        (Key::NumPad8, 0xFF, 0xDFFF, 0xFF, "P2 strong"),
+        (Key::NumPad9, 0xFF, 0xBFFF, 0xFF, "P2 fierce"),
+        // P2's kicks, IN2 bits 4-6 — bit 3 is unwired, which is why they do not start
+        // at 3.
+        (Key::NumPad4, 0xFF, 0xFFFF, 0xEF, "P2 short"),
+        (Key::NumPad5, 0xFF, 0xFFFF, 0xDF, "P2 forward"),
+        (Key::NumPad6, 0xFF, 0xFFFF, 0xBF, "P2 roundhouse"),
+        // Coins and starts, IN0. MAME's convention: 5 and 6 coin, 1 and 2 start.
+        (Key::Num5, 0xFE, 0xFFFF, 0xFF, "coin 1"),
+        (Key::Num6, 0xFD, 0xFFFF, 0xFF, "coin 2"),
+        (Key::Num1, 0xEF, 0xFFFF, 0xFF, "start 1"),
+        (Key::Num2, 0xDF, 0xFFFF, 0xFF, "start 2"),
+        (Key::F2, 0xBF, 0xFFFF, 0xFF, "the test switch, IN0 bit 6"),
+    ];
+
     /// Nothing held is an idle board and no actions.
     #[test]
     fn nothing_held_is_an_idle_board() {
@@ -514,50 +564,17 @@ mod tests {
     /// beside it — `p2.right` for `p1.right`, `scripts/mutate.py`'s
     /// `a-key-reaches-player-two` — changes `in1`'s *high* byte, which a
     /// `0xFF__`-shaped literal catches and a `_ & 0xFF` comparison would not.
+    ///
+    /// The table lives at module scope as [`GAME_KEY_PORTS`] so
+    /// `the_port_bit_table_covers_every_game_key_and_only_those` can read it — see that
+    /// test for why it has to.
     #[test]
     fn each_game_key_clears_its_own_port_bit() {
         let one = |k: Key| {
             let mut c = Controls::new();
             c.update(KeySet::from_keys(&[k])).inputs
         };
-        // Every game key, with all three ports as literals. `expect` names which of
-        // the three is not idle, so a row reads as "this key, this port, this bit".
-        let cases: [(Key, u8, u16, u8, &str); 25] = [
-            // P1's stick, IN1 bits 0-3. ZSQD: Z above S, Q and D either side.
-            (Key::Z, 0xFF, 0xFFF7, 0xFF, "P1 up"),
-            (Key::S, 0xFF, 0xFFFB, 0xFF, "P1 down"),
-            (Key::Q, 0xFF, 0xFFFD, 0xFF, "P1 left"),
-            (Key::D, 0xFF, 0xFFFE, 0xFF, "P1 right"),
-            // P1's punches, IN1 bits 4-6, left to right on the top row.
-            (Key::I, 0xFF, 0xFFEF, 0xFF, "P1 jab"),
-            (Key::O, 0xFF, 0xFFDF, 0xFF, "P1 strong"),
-            (Key::P, 0xFF, 0xFFBF, 0xFF, "P1 fierce"),
-            // P1's kicks, IN2 bits 0-2, directly beneath. Note IN1 stays 0xFFFF: a
-            // kick is not a punch, and the two are different chips.
-            (Key::J, 0xFF, 0xFFFF, 0xFE, "P1 short"),
-            (Key::K, 0xFF, 0xFFFF, 0xFD, "P1 forward"),
-            (Key::L, 0xFF, 0xFFFF, 0xFB, "P1 roundhouse"),
-            // P2's stick, IN1's *high* byte — same four bits, eight up.
-            (Key::Up, 0xFF, 0xF7FF, 0xFF, "P2 up"),
-            (Key::Down, 0xFF, 0xFBFF, 0xFF, "P2 down"),
-            (Key::Left, 0xFF, 0xFDFF, 0xFF, "P2 left"),
-            (Key::Right, 0xFF, 0xFEFF, 0xFF, "P2 right"),
-            // P2's punches, IN1 bits 12-14.
-            (Key::NumPad7, 0xFF, 0xEFFF, 0xFF, "P2 jab"),
-            (Key::NumPad8, 0xFF, 0xDFFF, 0xFF, "P2 strong"),
-            (Key::NumPad9, 0xFF, 0xBFFF, 0xFF, "P2 fierce"),
-            // P2's kicks, IN2 bits 4-6 — bit 3 is unwired, which is why they do not
-            // start at 3.
-            (Key::NumPad4, 0xFF, 0xFFFF, 0xEF, "P2 short"),
-            (Key::NumPad5, 0xFF, 0xFFFF, 0xDF, "P2 forward"),
-            (Key::NumPad6, 0xFF, 0xFFFF, 0xBF, "P2 roundhouse"),
-            // Coins and starts, IN0. MAME's convention: 5 and 6 coin, 1 and 2 start.
-            (Key::Num5, 0xFE, 0xFFFF, 0xFF, "coin 1"),
-            (Key::Num6, 0xFD, 0xFFFF, 0xFF, "coin 2"),
-            (Key::Num1, 0xEF, 0xFFFF, 0xFF, "start 1"),
-            (Key::Num2, 0xDF, 0xFFFF, 0xFF, "start 2"),
-            (Key::F2, 0xBF, 0xFFFF, 0xFF, "the test switch, IN0 bit 6"),
-        ];
+        let cases = GAME_KEY_PORTS;
         for (k, in0, in1, in2, what) in cases {
             let i = one(k);
             assert_eq!(i.in0(), in0, "{k:?} ({what}): IN0");
@@ -581,13 +598,20 @@ mod tests {
         }
     }
 
-    /// The 25 rows above are every game key there is.
+    /// `GAME_KEY_PORTS` covers every game key, and nothing else.
     ///
-    /// Separate from the table so the count is asserted once, in a test whose failure
-    /// message is about coverage rather than about a port bit: a key added to the map
-    /// and not to the table is untested, and every assertion in the table still passes.
+    /// The table drives `each_game_key_clears_its_own_port_bit`, so a key missing from
+    /// it is a key with no port assertion at all — and every assertion that *is* there
+    /// still passes. This is the test that closes that: it reads the table's own keys
+    /// and compares them against `Key::ALL` minus the controls, in both directions.
+    ///
+    /// Probed, because the first version of this test did not work. It derived the game
+    /// keys from `Key::ALL` and asserted the *count* was 25, never reading the table —
+    /// so deleting `NumPad6`'s row and changing the length annotation to 24 left P2's
+    /// roundhouse kick untested with all 17 `keys` tests green. Comparing the two sets
+    /// is what makes the claim in the name true.
     #[test]
-    fn the_port_bit_table_covers_every_game_key() {
+    fn the_port_bit_table_covers_every_game_key_and_only_those() {
         let control = [
             Key::F3,
             Key::F5,
@@ -609,15 +633,35 @@ mod tests {
             Key::BracketRight,
             Key::Enter,
         ];
-        let game: Vec<Key> = Key::ALL
-            .iter()
-            .copied()
-            .filter(|k| !control.contains(k))
-            .collect();
+        let tabled: Vec<Key> = GAME_KEY_PORTS.iter().map(|r| r.0).collect();
+        // Every key that is not a control has a row.
+        for k in Key::ALL {
+            if control.contains(&k) {
+                assert!(
+                    !tabled.contains(&k),
+                    "{k:?} is a control and must not have a port row"
+                );
+            } else {
+                assert!(
+                    tabled.contains(&k),
+                    "{k:?} is a game key with no row in GAME_KEY_PORTS, so no port \
+                     assertion covers it"
+                );
+            }
+        }
+        // And the count, which catches a row for a key that is not in `Key::ALL` at all.
         assert_eq!(
-            game.len(),
+            tabled.len(),
+            Key::ALL.len() - control.len(),
+            "the table has {} rows for {} game keys",
+            tabled.len(),
+            Key::ALL.len() - control.len()
+        );
+        assert_eq!(
+            tabled.len(),
             25,
-            "the port-bit table has 25 rows; these are the keys it must cover: {game:?}"
+            "25 game keys: 20 player inputs, 4 coin and \
+                    start buttons, and the test switch"
         );
     }
 

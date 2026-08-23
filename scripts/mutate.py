@@ -716,6 +716,24 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
                 "            now.contains(Key::Num5),",
                 "KILL",
             ),
+            # A game key losing its port row -- the bug a hand probe found in the test
+            # that claims to prevent it. `the_port_bit_table_covers_every_game_key`
+            # derived its list from `Key::ALL` and asserted the *count* was 25, never
+            # reading the table, so deleting `NumPad6`'s row and editing the length
+            # annotation to 24 left P2's roundhouse kick with no port assertion at all
+            # and every `keys` test green.
+            #
+            # This is that bug as one replacement. `F3` is a control: it presses nothing,
+            # so all three ports read idle and its row's assertions pass, and the triple
+            # is unique so the pairwise check passes too. The *only* thing wrong is that
+            # `NumPad6` has no row and a control has one -- which is exactly and solely
+            # what the rewritten test compares. Expect one killer name, not two.
+            (
+                "a-game-key-loses-its-port-row",
+                '(Key::NumPad6, 0xFF, 0xFFFF, 0xBF, "P2 roundhouse"),',
+                '(Key::F3, 0xFF, 0xFFFF, 0xFF, "P2 roundhouse"),',
+                "KILL",
+            ),
             # Two keys sharing a bit.
             ("two-keys-share-a-bit", "Key::D => 3,", "Key::D => 1,", "KILL"),
             # The DIP switches, which idle() sets and this module must not touch.
