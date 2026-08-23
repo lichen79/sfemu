@@ -74,13 +74,15 @@ fn usage() -> String {
      \x20      sfemu --demo [frames] [--play] [--ppm <path>] [--state <path>]\n\
      \n\
      <name> is `sf2` (Street Fighter II on CPS-1, the default), `sf2eb`\n\
-     (the World 910214 revision of it) or `sf1` (Street Fighter, on its own\n\
-     1987 board). The board is not guessed from the path: a set of files\n\
-     does not say what hardware it came from.\n\
+     (the World 910214 revision of it), `sf2ce` (Champion Edition, 1992)\n\
+     or `sf1` (Street Fighter, on its own 1987 board).\n\
      \n\
-     The two SF2 revisions are not interchangeable. They carry different\n\
-     CPS-B parts, and a revision run under the other's registers boots,\n\
-     services every interrupt, and draws nothing at all.\n\
+     The board is not guessed from the path: a set of files does not say\n\
+     what hardware it came from.\n\
+     \n\
+     The three CPS-1 sets are not interchangeable. They carry different\n\
+     CPS-B parts, and one run under another's registers boots, services\n\
+     every interrupt, and draws nothing at all.\n\
      \n\
      `--demo` runs a CPS-1 image this program generates itself — scrolling\n\
      tilemaps, a sprite on a path, a frame counter and FM music — and needs\n\
@@ -190,10 +192,12 @@ fn default_state_path(rom: &str) -> PathBuf {
 /// here.
 fn board_for(game: &str) -> Option<machine::BoardKind> {
     match game {
-        // Both SF2 revisions are CPS-1 boards. They are *not* the same board:
-        // their CPS-B parts differ, which [`cps_b_config_for`] resolves. This
-        // enum names the bus and the video subsystem, which they do share.
-        "sf2" | "sf2eb" => Some(machine::BoardKind::Cps1),
+        // All three are CPS-1 boards; none of them is the *same* board. Their
+        // CPS-B parts differ, which [`cps_b_config_for`] resolves, and Champion
+        // Edition differs further still — a different game rather than a third
+        // revision, with its own program, its own graphics and its own B-board PAL.
+        // What this enum names is the bus and the video subsystem, which they share.
+        "sf2" | "sf2eb" | "sf2ce" => Some(machine::BoardKind::Cps1),
         "sf1" => Some(machine::BoardKind::Sf1),
         _ => None,
     }
@@ -1897,7 +1901,7 @@ mod tests {
         }
     }
 
-    /// The name selects the CPS-B row, and the two SF2 revisions get different ones.
+    /// The name selects the CPS-B row, and each CPS-1 set gets a different one.
     ///
     /// The check the guest performs is spelled out here rather than only in
     /// `machine`, because this is the function that chooses which value the guest
@@ -1905,15 +1909,34 @@ mod tests {
     /// `sf2`'s row it would read a plain CPS-B register instead and branch to an
     /// idle loop. Asserting the ID pair — not just that the two configs differ —
     /// is what ties this mapping to the reason it exists.
+    ///
+    /// Champion Edition is the case an ID-register comparison alone would miss: its
+    /// `cpsb_addr` is 0x32, the **same** as `sf2`'s. What separates its row is the
+    /// multiply protection its program uses eight times, so that is asserted here
+    /// too, along with the video half — where CE keeps `sf2`'s register addresses and
+    /// moves the enable bits, the inverse of the `sf2`/`sf2eb` difference.
     #[test]
-    fn the_game_name_selects_the_cps_b_row_and_the_two_sf2_revisions_differ() {
+    fn the_game_name_selects_the_cps_b_row_and_each_cps1_set_differs() {
         let a = cps_b_config_for("sf2").expect("sf2 has a row");
         let b = cps_b_config_for("sf2eb").expect("sf2eb has a row");
+        let c = cps_b_config_for("sf2ce").expect("sf2ce has a row");
         assert_eq!(a.cpsb_addr, Some(0x32), "CPS_B_11");
         assert_eq!(a.cpsb_value, 0x0401);
         assert_eq!(b.cpsb_addr, Some(0x08), "CPS_B_17");
         assert_eq!(b.cpsb_value, 0x0407);
         assert_ne!(a.video, b.video, "and the video registers move with it");
+
+        assert_eq!(c.cpsb_addr, Some(0x32), "CPS_B_21_DEF — sf2's address");
+        assert_eq!(c.cpsb_value, 0xFFFF, "but uint16_t(-1), not 0x0401");
+        assert_eq!(
+            c.multiply
+                .map(|m| (m.factor1, m.factor2, m.result_lo, m.result_hi)),
+            Some((0x00, 0x02, 0x04, 0x06)),
+            "the protection CE actually checks"
+        );
+        assert!(a.multiply.is_none(), "which sf2's board does not have");
+        assert!(b.multiply.is_none());
+        assert_ne!(a.video, c.video, "and CE's video row is its own");
     }
 
     /// A CPS-1 machine built for `sf2eb` answers the address its program reads.
@@ -1947,6 +1970,59 @@ mod tests {
             0x0401,
             "rev G answers its own ID address"
         );
+    }
+
+    /// A CPS-1 machine built for `sf2ce` answers a multiply read through its bus.
+    ///
+    /// The artifact, not the mapping. CE's protection is arithmetic, so the assertion
+    /// is a hand-computed product read back through the same `peek_word` the guest's
+    /// `move.w $800144,d0` goes through: 0x0123 × 0x0010 = 0x0000_1230, so the low
+    /// word is 0x1230 and the high word 0x0000.
+    ///
+    /// A second factor pair with a **non-zero high word**, because a product that
+    /// fits in 16 bits is answered identically by a `result_hi` that returns 0 for
+    /// everything: 0xFFFF × 0x0002 = 0x0001_FFFE.
+    ///
+    /// The `sf2`-built machine is read at the same addresses, which is what makes
+    /// this about the row rather than the address: there, 0x800144 is an ordinary
+    /// register holding whatever was put in it.
+    ///
+    /// The factors go into `board.cps_b` directly rather than through a bus write.
+    /// `write_lanes` is `pub(crate)` to `machine` — the guest writes through the CPU
+    /// — and the register file is the state a bus write would leave behind, which is
+    /// exactly what the read path multiplies. Word indices 0 and 1 are byte offsets
+    /// 0x00 and 0x02.
+    #[test]
+    fn a_machine_built_for_sf2ce_multiplies_where_its_program_reads() {
+        let set = a_synthetic_set(&[
+            ("maincpu", 0x11),
+            ("gfx", 0x22),
+            ("audiocpu", 0x33),
+            ("oki", 0x44),
+        ]);
+        let mut ce = build_cps1("sf2ce", &set).expect("every region is present");
+        let mut g = build_cps1("sf2", &set).expect("every region is present");
+
+        for m in [&mut ce, &mut g] {
+            m.board.cps_b[0] = 0x0123; // factor1, at 0x800140
+            m.board.cps_b[1] = 0x0010; // factor2, at 0x800142
+            m.board.cps_b[2] = 0xDEAD; // and something in result_lo's register
+        }
+        let at = |m: &machine::Cps1, a: u32| m.board.peek_word(a).expect("CPS-B decodes");
+        assert_eq!(at(&ce, 0x80_0144), 0x1230, "low word of 0x00001230");
+        assert_eq!(at(&ce, 0x80_0146), 0x0000, "high word of it");
+        assert_eq!(
+            at(&g, 0x80_0144),
+            0xDEAD,
+            "sf2's board has no multiplier, so 0x800144 is a plain register"
+        );
+
+        // A product whose high word is not zero: a `result_hi` that answered 0 for
+        // everything would satisfy the pair above.
+        ce.board.cps_b[0] = 0xFFFF;
+        ce.board.cps_b[1] = 0x0002;
+        assert_eq!(at(&ce, 0x80_0144), 0xFFFE, "low word of 0x0001FFFE");
+        assert_eq!(at(&ce, 0x80_0146), 0x0001, "and the high word is not 0");
     }
 
     /// The loop's board tag follows the selected game.
