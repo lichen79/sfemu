@@ -185,7 +185,8 @@ fn default_state_path(rom: &str) -> PathBuf {
 /// here.
 fn board_for(game: &str) -> Option<machine::BoardKind> {
     match game {
-        "sf2" => Some(machine::BoardKind::Cps1),
+        // Both SF2 revisions are the same CPS-1 hardware; only the program differs.
+        "sf2" | "sf2eb" => Some(machine::BoardKind::Cps1),
         "sf1" => Some(machine::BoardKind::Sf1),
         _ => None,
     }

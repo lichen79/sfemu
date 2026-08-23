@@ -36,6 +36,52 @@ impl Source {
             Self::Dir(d) => std::fs::read(d.join(name)).ok(),
         }
     }
+
+    /// Every file this source offers, by name.
+    fn names(&self) -> Vec<String> {
+        match self {
+            Self::Zip(a) => a.names(),
+            Self::Dir(d) => std::fs::read_dir(d)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.path().is_file())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect(),
+        }
+    }
+
+    /// The one file of length `len` whose CRC-32 is `crc32`, if exactly one is.
+    ///
+    /// The fallback for a set whose files are named by a different convention than
+    /// MAME's — WinKawaks-era sets call SF2's graphics `sf2_05.bin` where MAME
+    /// calls the same bytes `sf2-1m.3a`. Renaming by hand is the alternative, and
+    /// it is worse: a user who mis-renames two files gets a booting machine that
+    /// draws garbage.
+    ///
+    /// This is **not** a relaxation of verification. A name is a label anyone can
+    /// change; a CRC-32 is a statement about the bytes. Matching on the checksum
+    /// the spec already demands is strictly stronger than matching on the name and
+    /// then checking the checksum — the accepted file is the same file either way.
+    ///
+    /// `len` is checked first so a 512 KB file is never even hashed against a
+    /// 128 KB entry, and **ambiguity is refused**: if two files in one set have
+    /// the same length and CRC, this answers `None` rather than picking one, so
+    /// the caller reports the file as missing rather than silently choosing.
+    fn find_by_crc(&self, len: usize, crc32: u32) -> Option<Vec<u8>> {
+        let mut hit = None;
+        for n in self.names() {
+            let Some(data) = self.get(&n) else { continue };
+            if data.len() != len || crate::crc32::of(&data) != crc32 {
+                continue;
+            }
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some(data);
+        }
+        hit
+    }
 }
 
 /// Loads `spec` from `path`, which may be a zip archive or a directory of loose
@@ -54,6 +100,15 @@ impl Source {
 /// **no** "unknown CRC" exemption: an exemption is how verification stops
 /// verifying.
 ///
+/// # Names are a hint; the CRC is the identity
+///
+/// An entry not present under its MAME name is looked up by length and CRC-32
+/// instead ([`Source::find_by_crc`]), because ROM sets in the wild are named by
+/// several conventions for identical bytes. Every accepted file still satisfies
+/// the spec's length and checksum exactly — the fallback changes which file is
+/// *offered* to the check, never whether the check runs. A set with no file of
+/// the right bytes is still [`RomError::Missing`].
+///
 /// # Errors
 ///
 /// [`RomError::Missing`], [`RomError::WrongLength`], or [`RomError::Crc`] naming
@@ -70,10 +125,15 @@ pub fn load(spec: &GameSpec, path: &Path) -> Result<RomSet, RomError> {
     for region in spec.regions {
         let mut buf = vec![0u8; region.size];
         for entry in region.entries {
-            let data = src.get(entry.name).ok_or(RomError::Missing {
-                region: region.name,
-                name: entry.name,
-            })?;
+            // By name first, so a correctly named set never pays for a scan of the
+            // archive; by CRC only when the name is absent.
+            let data = src
+                .get(entry.name)
+                .or_else(|| src.find_by_crc(entry.len, entry.crc32))
+                .ok_or(RomError::Missing {
+                    region: region.name,
+                    name: entry.name,
+                })?;
             if data.len() != entry.len {
                 return Err(RomError::WrongLength {
                     name: entry.name,
@@ -255,6 +315,87 @@ mod tests {
             }
             other => panic!("a zero spec CRC must be enforced, not skipped: {other:?}"),
         }
+    }
+
+    /// A file under the wrong name is found by its CRC-32.
+    ///
+    /// The WinKawaks case: identical bytes, a different naming convention. The
+    /// assertion is on the assembled region and not merely on "it loaded", because
+    /// a fallback that found the *other* file of the same length would also load.
+    #[test]
+    fn a_file_under_a_foreign_name_is_found_by_its_crc() {
+        let (spec, even, odd) = spec_with_real_crcs(16);
+        let dir = write_dir("crc-rename", &[("sf2_05.bin", &even), ("sf2_06.bin", &odd)]);
+        let set = load(&spec, &dir).expect("the bytes are right, only the names differ");
+        assert_eq!(
+            &set.regions["maincpu"][..4],
+            &[0xA0, 0xB0, 0xA1, 0xB1],
+            "and each landed on its own byte lane, not merely somewhere"
+        );
+    }
+
+    /// A renamed file whose bytes are wrong is still missing.
+    ///
+    /// The property that keeps the fallback from being a relaxation: it searches
+    /// for the CRC the spec demands, so a corrupt file cannot be admitted by any
+    /// name. Without this the fallback would read as "accept whatever is there".
+    #[test]
+    fn a_renamed_file_with_the_wrong_bytes_is_not_accepted() {
+        let (spec, even, odd) = spec_with_real_crcs(16);
+        let mut bad = odd.clone();
+        bad[3] ^= 0x01;
+        let dir = write_dir("crc-rename-bad", &[("even.bin", &even), ("zzz.bin", &bad)]);
+        assert_eq!(
+            load(&spec, &dir).unwrap_err(),
+            RomError::Missing {
+                region: "maincpu",
+                name: "odd.bin"
+            },
+            "no file has odd.bin's checksum, so the set is short one ROM"
+        );
+    }
+
+    /// Two candidate files with the same bytes are refused, not guessed between.
+    ///
+    /// A merged set can hold the same ROM twice. Picking either would be correct
+    /// *here* — they are byte-identical — but "pick the first match" is a rule that
+    /// silently resolves genuine ambiguity too, and a loader that guesses is the
+    /// thing this crate's CRC checking exists to prevent. `None` sends the user a
+    /// missing-file error naming the ROM, which is actionable.
+    #[test]
+    fn two_files_with_the_same_crc_are_ambiguous_rather_than_guessed() {
+        let (spec, even, odd) = spec_with_real_crcs(16);
+        let dir = write_dir(
+            "crc-ambiguous",
+            &[("even.bin", &even), ("a.bin", &odd), ("b.bin", &odd)],
+        );
+        assert_eq!(
+            load(&spec, &dir).unwrap_err(),
+            RomError::Missing {
+                region: "maincpu",
+                name: "odd.bin"
+            }
+        );
+    }
+
+    /// The correct name wins over a CRC scan.
+    ///
+    /// Ordering matters for more than speed: with a file present under its proper
+    /// name, that file is the one loaded, so a set containing both a properly named
+    /// ROM and a stray duplicate is not thrown into the ambiguity case above.
+    #[test]
+    fn a_correctly_named_file_is_used_even_when_a_duplicate_exists() {
+        let (spec, even, odd) = spec_with_real_crcs(16);
+        let dir = write_dir(
+            "crc-name-first",
+            &[
+                ("even.bin", &even),
+                ("odd.bin", &odd),
+                ("odd-copy.bin", &odd),
+            ],
+        );
+        let set = load(&spec, &dir).expect("odd.bin is present under its own name");
+        assert_eq!(&set.regions["maincpu"][..4], &[0xA0, 0xB0, 0xA1, 0xB1]);
     }
 
     #[test]

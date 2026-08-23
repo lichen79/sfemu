@@ -234,8 +234,53 @@ pub static SF1: GameSpec = GameSpec {
     regions: SF1_REGIONS,
 };
 
+/// 68000 program for the 910214 revision, MAME set `sf2eb`.
+///
+/// The same eight-file shape as [`SF2_MAINCPU`] on the same board — only the
+/// program revision differs, which is why every other region is shared rather
+/// than copied. Two entries are byte-for-byte the ones rev G uses
+/// (`sf2_29b.10e`, `sf2_36b.10f`); the other six are this revision's.
+///
+/// Transcribed from `cps1.cpp:7199-7208`, read 2026-08-23.
+#[rustfmt::skip]
+static SF2EB_MAINCPU: &[RomEntry] = &[
+    RomEntry { name: "sf2e_30b.11e", offset: 0x0_0000, len: 0x2_0000, crc32: 0x57bd_7051, load: W16 },
+    RomEntry { name: "sf2e_37b.11f", offset: 0x0_0001, len: 0x2_0000, crc32: 0x6269_1cdd, load: W16 },
+    RomEntry { name: "sf2e_31b.12e", offset: 0x4_0000, len: 0x2_0000, crc32: 0xa673_143d, load: W16 },
+    RomEntry { name: "sf2e_38b.12f", offset: 0x4_0001, len: 0x2_0000, crc32: 0x4c2c_cef7, load: W16 },
+    RomEntry { name: "sf2_28b.9e",   offset: 0x8_0000, len: 0x2_0000, crc32: 0x4009_955e, load: W16 },
+    RomEntry { name: "sf2_35b.9f",   offset: 0x8_0001, len: 0x2_0000, crc32: 0x8c1f_3994, load: W16 },
+    RomEntry { name: "sf2_29b.10e",  offset: 0xc_0000, len: 0x2_0000, crc32: 0xbb4a_f315, load: W16 },
+    RomEntry { name: "sf2_36b.10f",  offset: 0xc_0001, len: 0x2_0000, crc32: 0xc02a_13eb, load: W16 },
+];
+
+/// `sf2eb`'s regions: its own program, and rev G's graphics, audio and samples.
+///
+/// The three shared statics are referenced rather than duplicated, which is the
+/// property that matters: MAME's own driver loads the identical files for both
+/// sets, so a copy here could drift from `SF2`'s and the symptom would be one
+/// revision rendering correctly while the other did not.
+#[rustfmt::skip]
+static SF2EB_REGIONS: &[RegionSpec] = &[
+    RegionSpec { name: "maincpu",  size: 0x40_0000, entries: SF2EB_MAINCPU },
+    RegionSpec { name: "gfx",      size: 0x60_0000, entries: SF2_GFX      },
+    RegionSpec { name: "audiocpu", size: 0x01_8000, entries: SF2_AUDIOCPU },
+    RegionSpec { name: "oki",      size: 0x04_0000, entries: SF2_OKI      },
+];
+
+/// Street Fighter II: The World Warrior (World 910214), MAME set `sf2eb`.
+///
+/// The same CPS-1 hardware as [`SF2`], so `board_for` maps both to
+/// `BoardKind::Cps1`. A separate spec and not a flag on `SF2`: a set is a list of
+/// files with checksums, and "the same game with six different files" is a
+/// different list.
+pub static SF2EB: GameSpec = GameSpec {
+    name: "sf2eb",
+    regions: SF2EB_REGIONS,
+};
+
 /// Every set this crate knows.
-pub static ALL: &[&GameSpec] = &[&SF2, &SF1];
+pub static ALL: &[&GameSpec] = &[&SF2, &SF2EB, &SF1];
 
 /// The set with this MAME name, if it is supported.
 pub fn by_name(name: &str) -> Option<&'static GameSpec> {
