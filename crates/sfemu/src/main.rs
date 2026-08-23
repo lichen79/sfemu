@@ -413,6 +413,19 @@ fn build_cps1(game: &str, set: &romset::RomSet) -> Result<machine::Cps1, Fault> 
         cps_b_config_for(game)?,
         machine::Timing::cps1_10mhz(),
     );
+    // A cabinet as it leaves the factory, not a board with every switch off.
+    //
+    // `Inputs::idle`'s all-ones `dsw` is the right default for `machine`'s own tests
+    // and the wrong one to run a game on: several CPS-1 DIP bits mean off when set,
+    // and Demo Sounds is one of them. A run from `idle()` is completely silent in
+    // attract mode — measured 0 non-zero samples out of 450,164 on Champion Edition,
+    // against 449,984 with the one bit cleared. That is correct behaviour for a board
+    // wired that way, and indistinguishable from a broken sound driver.
+    //
+    // Set here rather than in the play loop so the headless path gets it too: the two
+    // must not be differently-configured boards, or a `--ppm` frame and a windowed
+    // one stop being the same run.
+    m.board.inputs = machine::Inputs::sf2_factory();
     m.reset();
     Ok(m)
 }

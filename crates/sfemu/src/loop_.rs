@@ -170,6 +170,17 @@ pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &Loo
     // knows which. `cps1()` stays in `frontend` for its own tests.
     let mut pacer = FramePacer::new(m.frame_ns(), MAX_CATCH_UP);
     let mut controls = Controls::new();
+    // The DIP switches the machine was built with, carried into every frame's
+    // `Inputs`. Read from the machine rather than named here: `Controls::update`
+    // returns a whole `Inputs` that the loop assigns over the board's own, so
+    // whatever `main` configured at construction would be gone after one frame.
+    //
+    // Taken from the machine and not from a constant because the boards differ —
+    // `Sf1Inputs::from_shared` maps a different port block — so which switches are
+    // right is `main`'s decision, made once, per game.
+    if let Machine::Cps1(c) = &*m {
+        controls.set_dsw(c.board.inputs.dsw);
+    }
     let mut buf: Vec<u32> = Vec::new();
     let mut paused = false;
     let mut summary = Summary::default();

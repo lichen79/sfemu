@@ -295,12 +295,29 @@ pub struct Actions {
 pub struct Controls {
     /// Last frame's held keys, for the edge detection.
     was: KeySet,
+    /// The board's DIP switches, which no key moves.
+    ///
+    /// Held here because [`Controls::update`] returns a whole [`Inputs`] and the play
+    /// loop assigns it over the machine's own — so a setting made once at boot would
+    /// be overwritten on the very next frame. The switches are cabinet
+    /// configuration rather than controls, so they live beside the key state and are
+    /// copied into every frame's `Inputs`.
+    dsw: Option<[u8; 3]>,
 }
 
 impl Controls {
     /// A keyboard with nothing held.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets the board's DIP switches for every frame from here on.
+    ///
+    /// Without this, [`Controls::update`] builds from [`Inputs::idle`], whose
+    /// all-ones `dsw` means every switch *off* — including Demo Sounds, whose off
+    /// state is silence. See [`Inputs::sf2_factory`] for the measured figures.
+    pub fn set_dsw(&mut self, dsw: [u8; 3]) {
+        self.dsw = Some(dsw);
     }
 
     /// Reads this frame's held keys.
@@ -311,6 +328,9 @@ impl Controls {
         let edge = |k: Key| now.contains(k) && !self.was.contains(k);
 
         let mut inputs = Inputs::idle();
+        if let Some(dsw) = self.dsw {
+            inputs.dsw = dsw;
+        }
         inputs.p1.up = now.contains(Key::Up);
         inputs.p1.down = now.contains(Key::Down);
         inputs.p1.left = now.contains(Key::Left);
@@ -434,12 +454,12 @@ mod tests {
         assert_eq!(one(Key::F2).in0(), 0xBF, "the test switch, IN0 bit 6");
     }
 
-    /// The DIP switches read as every switch off, whatever is held.
+    /// No key moves a DIP switch, and with none set they stay at `idle()`'s value.
     ///
-    /// `Inputs::idle()` sets them to 0xFF and this module never touches them — but
-    /// building the struct field by field is exactly where a `Inputs::default()`
-    /// swapped for a derived one would turn every switch on, and the board would
-    /// then boot in a different configuration with no key involved.
+    /// `Inputs::idle()` sets them to 0xFF and no key path touches them — but building
+    /// the struct field by field is exactly where an `Inputs::default()` swapped for a
+    /// derived one would turn every switch on, and the board would then boot in a
+    /// different configuration with no key involved.
     #[test]
     fn the_dip_switches_are_never_touched() {
         for k in Key::ALL {
@@ -447,6 +467,54 @@ mod tests {
             let a = c.update(KeySet::from_keys(&[k]));
             assert_eq!(a.inputs.dsw, [0xFF; 3], "{k:?} moved a DIP switch");
         }
+    }
+
+    /// Switches set once survive every later frame, and no key disturbs them.
+    ///
+    /// This is the property the play loop needs and the reason `dsw` is held on
+    /// `Controls` at all. `update` returns a whole `Inputs` built from
+    /// `Inputs::idle()`, and the loop assigns it over the board's own — so a machine
+    /// configured at construction is back to all-switches-off one frame later. That
+    /// bug is silent: the board still boots, still plays, and is merely mute, on the
+    /// easiest difficulty.
+    ///
+    /// The multi-frame loop is the point. A single `update` would pass with an
+    /// implementation that applied the switches once and then forgot them.
+    #[test]
+    fn dip_switches_set_once_persist_across_frames() {
+        let mut c = Controls::new();
+        c.set_dsw([0xFF, 0xFC, 0x9F]);
+        for frame in 0..4 {
+            // A different key each frame, including none, so the carry-through is not
+            // resting on an idle keyboard.
+            let held = match frame {
+                0 => vec![],
+                1 => vec![Key::Down, Key::A],
+                2 => vec![Key::Num5],
+                _ => vec![Key::Z, Key::Right],
+            };
+            let a = c.update(KeySet::from_keys(&held));
+            assert_eq!(
+                a.inputs.dsw,
+                [0xFF, 0xFC, 0x9F],
+                "frame {frame} lost the DIP switches"
+            );
+            // Demo Sounds specifically, named rather than left inside the array
+            // comparison: this is the bit whose loss is audible and nothing else.
+            assert_eq!(a.inputs.dsw[2] & 0x20, 0x00, "frame {frame}: demo sounds");
+        }
+    }
+
+    /// `set_dsw` changes the switches and no control.
+    #[test]
+    fn set_dsw_presses_nothing() {
+        let mut c = Controls::new();
+        c.set_dsw([0x00, 0x00, 0x00]);
+        let a = c.update(KeySet::from_keys(&[]));
+        assert_eq!(a.inputs.dsw, [0x00; 3], "the switches went through");
+        assert_eq!(a.inputs.in0(), 0xFF, "no coin, start, service or test");
+        assert_eq!(a.inputs.in1(), 0xFFFF, "no stick or punch");
+        assert_eq!(a.inputs.in2(), 0xFF, "no kick");
     }
 
     /// Two keys at once clear two bits.

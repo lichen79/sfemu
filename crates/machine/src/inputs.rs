@@ -35,7 +35,9 @@ pub struct Inputs {
     /// Player 2's stick and buttons.
     pub p2: PlayerInput,
     /// DSWA, DSWB, DSWC. All-ones means every switch off, which is what
-    /// [`Inputs::idle`] gives.
+    /// [`Inputs::idle`] gives — and which is *not* a neutral board, because several
+    /// of these bits mean off when set. [`Inputs::sf2_factory`] has the defaults a
+    /// cabinet ships with and the reason it matters.
     pub dsw: [u8; 3],
 }
 
@@ -70,6 +72,17 @@ pub struct PlayerInput {
 
 impl Inputs {
     /// A board with nothing pressed and every DIP switch off.
+    ///
+    /// ⚠️ "Every switch off" is a statement about the *switches*, not about the
+    /// features they select. Several CPS-1 DIP bits mean **off when set**, so an
+    /// all-ones `dsw` is not a neutral board — most visibly Demo Sounds, which is
+    /// DSWC bit 0x20 and whose set state is *off*. A run from `idle()` plays no
+    /// attract music at all, which is correct hardware behaviour for a board wired
+    /// this way and reads exactly like a broken sound driver.
+    ///
+    /// Use [`Inputs::sf2_factory`] for a board configured the way a cabinet leaves
+    /// the factory. This stays as it is because it is what the port-level tests
+    /// want — a known constant with no game's opinion baked into it.
     pub const fn idle() -> Self {
         Self {
             coin1: false,
@@ -81,6 +94,34 @@ impl Inputs {
             p1: PlayerInput::none(),
             p2: PlayerInput::none(),
             dsw: [0xFF; 3],
+        }
+    }
+
+    /// [`Inputs::idle`] with SF2's DIP switches at their **factory** settings.
+    ///
+    /// MAME states each switch's default as the second argument to `PORT_DIPNAME`,
+    /// and for SF2's port block (`cps1.cpp:2053-2089`, which `sf2ce` and `sf2eb`
+    /// share — `cps1.cpp:15084` passes `sf2` as `sf2ce`'s input ports) those defaults
+    /// are **not** all-ones:
+    ///
+    /// - **DSWA `0xFF`.** Coin A and Coin B both 1C_1C (0x07, 0x38), "2 Coins to
+    ///   Start" off (0x40), bit 0x80 unused. All-ones here by coincidence, not
+    ///   because all-ones is the rule.
+    /// - **DSWB `0xFC`.** Difficulty is bits 0-2 and its default is **0x04**, "3
+    ///   (Normal)" — `CPS1_DIFFICULTY_1` at `cps1.cpp:806`. All-ones would be 0x07,
+    ///   "0 (Easiest)". Bits 3-7 are unused and default set.
+    /// - **DSWC `0x9F`.** Two bits default *clear*: Demo Sounds (0x20) and Allow
+    ///   Continue (0x40) are both **on**, and on is 0. Free Play, Freeze and Flip
+    ///   Screen are off (set), and Game Mode (0x80) is "Game" rather than "Test".
+    ///
+    /// The one that shows up immediately is Demo Sounds. Measured on a real
+    /// Champion Edition set over 240 frames after the music onset: with bit 0x20 set,
+    /// **0** non-zero samples out of 450,164; with it clear, 449,984 with a peak of
+    /// 16,124. Same driver, same ROM, one bit.
+    pub const fn sf2_factory() -> Self {
+        Self {
+            dsw: [0xFF, 0xFC, 0x9F],
+            ..Self::idle()
         }
     }
 
@@ -189,6 +230,65 @@ mod tests {
         assert_eq!(d.in0(), 0xFF);
         assert_eq!(d.in1(), 0xFFFF);
         assert_eq!(d.in2(), 0xFF);
+    }
+
+    /// `sf2_factory` is MAME's per-switch defaults, and differs from `idle` in the
+    /// two bytes where MAME's defaults are not all-ones.
+    ///
+    /// Every value here is transcribed from `PORT_DIPNAME`'s second argument in
+    /// `cps1.cpp:2053-2089` and `CPS1_DIFFICULTY_1` at `cps1.cpp:806`, per bit, rather
+    /// than asserted as three bytes — three bytes would pass with the right total and
+    /// the wrong switches, which is how a wrong difficulty or a Free Play board
+    /// reaches a user looking correct.
+    #[test]
+    fn sf2_factory_is_mames_per_switch_defaults() {
+        let f = Inputs::sf2_factory();
+
+        // DSWA: Coin A 1C_1C (0x07), Coin B 1C_1C (0x38), "2 Coins to Start" off
+        // (0x40), bit 0x80 unused and set. All-ones, but by transcription.
+        assert_eq!(f.dsw[0] & 0x07, 0x07, "Coin A is 1 coin, 1 credit");
+        assert_eq!(f.dsw[0] & 0x38, 0x38, "Coin B is 1 coin, 1 credit");
+        assert_eq!(f.dsw[0] & 0x40, 0x40, "2 Coins to Start is off");
+
+        // DSWB: difficulty defaults to 0x04, "3 (Normal)" — *not* 0x07, which is
+        // "0 (Easiest)". This is the bit an all-ones default gets wrong silently:
+        // the game plays, on the easiest setting a cabinet never ships with.
+        assert_eq!(f.dsw[1] & 0x07, 0x04, "difficulty is 3 (Normal)");
+        assert_eq!(f.dsw[1] & 0xF8, 0xF8, "DSWB's unused bits stay set");
+
+        // DSWC: the two bits whose default is *clear*, and both mean "on".
+        assert_eq!(
+            f.dsw[2] & 0x20,
+            0x00,
+            "Demo Sounds on — the silent-board bit"
+        );
+        assert_eq!(f.dsw[2] & 0x40, 0x00, "Allow Continue on");
+        assert_eq!(f.dsw[2] & 0x04, 0x04, "Free Play off");
+        assert_eq!(f.dsw[2] & 0x08, 0x08, "Freeze off");
+        assert_eq!(f.dsw[2] & 0x10, 0x10, "Flip Screen off");
+        assert_eq!(f.dsw[2] & 0x80, 0x80, "Game Mode is Game, not Test");
+
+        // And it is a different board from `idle()` in exactly the two bytes above.
+        // Without this, `sf2_factory` could be `idle` verbatim and every assertion
+        // that reads a *set* bit above would still pass.
+        let i = Inputs::idle();
+        assert_eq!(f.dsw[0], i.dsw[0], "DSWA agrees with idle");
+        assert_ne!(f.dsw[1], i.dsw[1], "DSWB does not: difficulty");
+        assert_ne!(f.dsw[2], i.dsw[2], "DSWC does not: demo sounds, continue");
+    }
+
+    /// `sf2_factory` changes the switches and nothing else.
+    ///
+    /// It is spelled as a `..Self::idle()` update, so a field added to `Inputs` is
+    /// picked up automatically — but a hand-written copy would be an easy edit later,
+    /// and a factory board with a coin held or the test switch down is a board that
+    /// boots into the service menu.
+    #[test]
+    fn sf2_factory_presses_no_control() {
+        let f = Inputs::sf2_factory();
+        assert_eq!(f.in0(), 0xFF, "no coin, start, service or test");
+        assert_eq!(f.in1(), 0xFFFF, "no stick or punch, either player");
+        assert_eq!(f.in2(), 0xFF, "no kick, either player");
     }
 
     /// Each `IN0` control clears exactly its own documented bit.
