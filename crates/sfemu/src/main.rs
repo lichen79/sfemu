@@ -73,9 +73,14 @@ fn usage() -> String {
      \x20      sfemu <path-to-rom-set> --play [--game <name>] [--state <path>]\n\
      \x20      sfemu --demo [frames] [--play] [--ppm <path>] [--state <path>]\n\
      \n\
-     <name> is `sf2` (Street Fighter II on CPS-1, the default) or `sf1`\n\
-     (Street Fighter, on its own 1987 board). The board is not guessed from\n\
-     the path: a set of files does not say what hardware it came from.\n\
+     <name> is `sf2` (Street Fighter II on CPS-1, the default), `sf2eb`\n\
+     (the World 910214 revision of it) or `sf1` (Street Fighter, on its own\n\
+     1987 board). The board is not guessed from the path: a set of files\n\
+     does not say what hardware it came from.\n\
+     \n\
+     The two SF2 revisions are not interchangeable. They carry different\n\
+     CPS-B parts, and a revision run under the other's registers boots,\n\
+     services every interrupt, and draws nothing at all.\n\
      \n\
      `--demo` runs a CPS-1 image this program generates itself — scrolling\n\
      tilemaps, a sprite on a path, a frame counter and FM music — and needs\n\
@@ -286,8 +291,15 @@ fn parse_args(args: Vec<String>) -> Result<Args, Fault> {
             // reached with an unknown name — there is no spec to hand it — and a user
             // who typed a name this program does not know needs the names it does.
             if board_for(&game).is_none() {
+                // The list is derived from `games::ALL`, not spelled out: a hardcoded
+                // one drifts the moment a spec is added, and the first symptom is a
+                // user being told their real game name is not a game.
+                // `each_game_name_selects_its_own_board_and_its_own_rom_spec` is what
+                // holds that table and `board_for` to the same set of names.
+                let names: Vec<&str> = romset::games::ALL.iter().map(|g| g.name).collect();
                 return Err(Fault::Failed(format!(
-                    "`{game}` is not a game this program knows: try `sf1` or `sf2`"
+                    "`{game}` is not a game this program knows: try {}",
+                    names.join(", ")
                 )));
             }
             Source::Set { path, game }
@@ -1835,8 +1847,17 @@ mod tests {
         match args(vec!["/some/set.zip", "--game", "sf3"]) {
             Err(Fault::Failed(m)) => {
                 assert!(m.contains("sf3"), "names what was asked for: {m}");
-                assert!(m.contains("sf1"), "and both names that exist: {m}");
-                assert!(m.contains("sf2"), "{m}");
+                // From `games::ALL`, not a list written here. A hardcoded `sf1`/`sf2`
+                // pair passes whatever the message actually says — `contains("sf2")`
+                // is satisfied by `sf2eb` alone — so it could not catch a name the
+                // program accepts and never mentions.
+                for spec in romset::games::ALL {
+                    assert!(
+                        m.contains(spec.name),
+                        "and `{}`, which would have worked: {m}",
+                        spec.name
+                    );
+                }
             }
             other => panic!("expected an error, got {:?}", other.is_ok()),
         }
@@ -2286,16 +2307,28 @@ mod tests {
         assert_eq!(bytes.len(), 258_063, "and a full CPS-1 frame behind it");
     }
 
-    /// The usage text names both games and says the board is not guessed.
+    /// The usage text names every game this program accepts, and says the board is
+    /// not guessed.
     ///
     /// `--game` with no usage line is an option nobody can find, and the sentence
     /// about not guessing is the spec's ruling stated where a user reads it.
+    ///
+    /// The names come from `games::ALL` rather than a list written here, so adding a
+    /// spec without documenting it fails. Spelling them out is what let `sf2eb` ship
+    /// accepted by `board_for` and absent from `--help`: a user holding that set had
+    /// no way to learn the name for it, and the default `sf2` boots it to a black
+    /// screen.
     #[test]
-    fn the_usage_text_names_both_games() {
+    fn the_usage_text_names_every_game_it_accepts() {
         let u = usage();
         assert!(u.contains("--game <name>"), "the option: {u}");
-        assert!(u.contains("`sf2`"), "and sf2: {u}");
-        assert!(u.contains("`sf1`"), "and sf1: {u}");
+        for spec in romset::games::ALL {
+            assert!(
+                u.contains(&format!("`{}`", spec.name)),
+                "`{}` is a name this program accepts but does not document: {u}",
+                spec.name
+            );
+        }
         assert!(
             u.contains("not guessed from"),
             "and that the board is a stated choice: {u}"
