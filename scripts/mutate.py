@@ -750,10 +750,17 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # is unique so the pairwise check passes too. The *only* thing wrong is that
             # `NumPad6` has no row and a control has one -- which is exactly and solely
             # what the rewritten test compares. Expect one killer name, not two.
+            #
+            # The literals track the row: `NumPad6` is P2's *fierce punch* since the
+            # keypad's rows were reversed, so it clears IN1's bit 14 and leaves IN2 idle.
+            # This pattern reported NO-OP on the first pass after that remap -- which is
+            # the harness working: a mutant anchored on a port value cannot survive its
+            # own subject being renumbered, and NO-OP says so instead of scoring a KILL
+            # nothing was measured for.
             (
                 "a-game-key-loses-its-port-row",
-                '(Key::NumPad6, 0xFF, 0xFFFF, 0xBF, "P2 roundhouse"),',
-                '(Key::F3, 0xFF, 0xFFFF, 0xFF, "P2 roundhouse"),',
+                '(Key::NumPad6, 0xFF, 0xBFFF, 0xFF, "P2 fierce"),',
+                '(Key::F3, 0xFF, 0xFFFF, 0xFF, "P2 fierce"),',
                 "KILL",
             ),
             # Two keys sharing a bit.

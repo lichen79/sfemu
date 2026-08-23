@@ -147,7 +147,7 @@ pub enum Key {
     F12,
     /// Pause / resume.
     ///
-    /// `F11` and not `P`, which is P1's fierce punch. The letter area belongs to the
+    /// `F11` and not `P`, which is P1's roundhouse kick. The letter area belongs to the
     /// players; `F11` was the one gap left in `F1`-`F12`.
     F11,
     /// Step one frame while paused.
