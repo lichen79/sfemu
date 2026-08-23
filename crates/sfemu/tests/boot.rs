@@ -203,6 +203,24 @@ fn sf2_boots_for_sixty_frames_without_wandering_off_the_map() {
 /// count tracks whichever attract-mode scene the frame lands in, and at 1800 frames
 /// the two rows happen to agree at 32 apiece — so a threshold on the absolute count
 /// would be vacuous at some frame counts and brittle at all of them.
+///
+/// # What mutation showed
+///
+/// Five mutants, all in the production row rather than here, since this test's job is
+/// to notice a degraded CE row:
+///
+/// - `sf2ce`'s `video` falls back to `sf2()`: 123/123. Killed by `b < a`.
+/// - `cps_b_21_def`'s `layer_enable_mask` replaced with `CPS_B_11`'s
+///   `{0x08,0x10,0x20}`: 123/123. Killed by `b < a`.
+/// - `layer_control` moved from 0x26 to 0x28: 123/123. Killed by `b < a`.
+/// - **One** wrong bit in the mask, `{0x02,0x04,0x20}`: **131/123**. `b < a` still
+///   holds, and only the ratio assertion fails — 1.06 against the 1.30 floor. This is
+///   the mutant that justifies having both, and it is the reason the floor is not 1.0.
+/// - The fourth `priority` entry dropped to `None`: **184/123, survives here.** That
+///   register does not change the pen set. It is killed by
+///   `video::regs`'s two table-row tests, which is where a transcribed literal
+///   belongs — recorded so a later reader does not add a pen assertion for it and
+///   find that no threshold can see it.
 #[test]
 #[ignore = "needs a user-supplied ROM set; set SFEMU_ROMS"]
 fn sf2ce_draws_its_attract_mode_and_only_under_its_own_cps_b_row() {
