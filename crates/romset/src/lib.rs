@@ -18,7 +18,7 @@ pub mod spec;
 pub mod zip;
 
 pub use games::SF2;
-pub use load::{load, RomSet};
+pub use load::{identify, load, RomSet};
 pub use spec::{GameSpec, LoadKind, RegionSpec, RomEntry};
 
 /// A host fault: our setup is wrong, not the guest's.
@@ -78,6 +78,17 @@ pub enum RomError {
         /// What is wrong with it.
         detail: String,
     },
+    /// [`load::identify`] found no supported game at the path.
+    Unknown {
+        /// Why the last spec tried did not load.
+        ///
+        /// Boxed because `RomError` would otherwise contain itself. Carried rather
+        /// than discarded because a user whose set is *nearly* one of ours is far
+        /// better served by the specific miss — a named missing file, a CRC that
+        /// says "wrong revision or a bad dump" — than by a bare "unrecognised",
+        /// which reads as a bug in this program rather than a fact about the files.
+        why: Box<RomError>,
+    },
 }
 
 impl core::fmt::Display for RomError {
@@ -109,6 +120,14 @@ impl core::fmt::Display for RomError {
                  {size:#x} — the spec table is wrong"
             ),
             Self::Zip { path, detail } => write!(f, "{path} is not a usable zip: {detail}"),
+            Self::Unknown { why } => {
+                let names: Vec<&str> = games::ALL.iter().map(|g| g.name).collect();
+                write!(
+                    f,
+                    "not a supported ROM set — tried {}. The closest miss: {why}",
+                    names.join(", ")
+                )
+            }
         }
     }
 }

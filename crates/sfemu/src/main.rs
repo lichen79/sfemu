@@ -323,15 +323,24 @@ fn parse_args(args: Vec<String>) -> Result<Args, Fault> {
 /// A wrong row here does not produce a crash or a garbled screen. The program
 /// reads the ID register, finds the wrong value, and branches to an idle loop —
 /// so the machine boots, runs, takes every interrupt, and draws nothing, with no
-/// unmapped access and no fault to report. That is why this is a `match` on the
-/// name and not a default: there is no config that is safe to fall back to.
-fn cps_b_config_for(game: &str) -> machine::BoardConfig {
-    match game {
-        "sf2eb" => machine::BoardConfig::sf2eb(),
-        // `sf2` and, by construction, any future revision added without a row of
-        // its own — which is the case the test below exists to make visible.
-        _ => machine::BoardConfig::sf2(),
-    }
+/// unmapped access and no fault to report. That is why an unknown name is an
+/// error: there is no config that is safe to fall back to.
+///
+/// # Errors
+///
+/// [`Fault::Failed`] if the name has no row.
+/// The table itself is [`machine::BoardConfig::for_game`], in the crate that owns
+/// the hardware facts; this is where the `None` becomes a message. A name reaching
+/// here without a row means [`board_for`] called it CPS-1 and `machine` has no
+/// registers for it, which is a gap in this workspace and not in the user's files.
+fn cps_b_config_for(game: &str) -> Result<machine::BoardConfig, Fault> {
+    machine::BoardConfig::for_game(game).ok_or_else(|| {
+        Fault::Failed(format!(
+            "internal: `{game}` is a CPS-1 game with no CPS-B configuration. \
+             Add its row to `machine::BoardConfig::for_game` — there is no \
+             default, because a wrong row boots and draws nothing."
+        ))
+    })
 }
 
 /// SF2 on CPS-1, from a loaded set.
@@ -374,7 +383,7 @@ fn build_cps1(game: &str, set: &romset::RomSet) -> Result<machine::Cps1, Fault> 
         gfx,
         audiocpu,
         okirom,
-        cps_b_config_for(game),
+        cps_b_config_for(game)?,
         machine::Timing::cps1_10mhz(),
     );
     m.reset();
@@ -1877,8 +1886,8 @@ mod tests {
     /// is what ties this mapping to the reason it exists.
     #[test]
     fn the_game_name_selects_the_cps_b_row_and_the_two_sf2_revisions_differ() {
-        let a = cps_b_config_for("sf2");
-        let b = cps_b_config_for("sf2eb");
+        let a = cps_b_config_for("sf2").expect("sf2 has a row");
+        let b = cps_b_config_for("sf2eb").expect("sf2eb has a row");
         assert_eq!(a.cpsb_addr, Some(0x32), "CPS_B_11");
         assert_eq!(a.cpsb_value, 0x0401);
         assert_eq!(b.cpsb_addr, Some(0x08), "CPS_B_17");

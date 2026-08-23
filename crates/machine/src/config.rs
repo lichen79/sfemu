@@ -82,6 +82,31 @@ impl BoardConfig {
         }
     }
 
+    /// The CPS-B row a MAME game name selects, or `None` for a name with no row.
+    ///
+    /// The name→row map lives here, in the crate that owns the hardware facts,
+    /// rather than in whichever caller happens to need it. Two callers need it —
+    /// the frontend that builds a machine from a user's set, and the gated tests
+    /// that run a real ROM — and a second copy of this table is a second thing to
+    /// be wrong, with the failure mode described on [`Self::sf2eb`]: a machine that
+    /// boots, runs, takes every interrupt, and draws nothing.
+    ///
+    /// `None` rather than a default. There is no row that is safe to fall back to:
+    /// the whole point of the ID register is that a board answers one address with
+    /// one value, so a guess is a guess about which game this is.
+    ///
+    /// A `&str` and not an enum, and no dependency on `romset`: this crate must not
+    /// gain one. The name is the same string `romset::games::by_name` resolves, and
+    /// `sfemu`'s tests are what hold the two tables to the same set of names.
+    #[must_use]
+    pub fn for_game(name: &str) -> Option<Self> {
+        match name {
+            "sf2" => Some(Self::sf2()),
+            "sf2eb" => Some(Self::sf2eb()),
+            _ => None,
+        }
+    }
+
     /// A board with no wired registers and no extra input port.
     ///
     /// Exists so a test can show that the wired-read behaviour comes from the
@@ -147,6 +172,32 @@ mod tests {
         // And the value survives the mask the program applies before comparing.
         assert_eq!(b.cpsb_value & 0xFC3F, 0x0407, "andi.w #$FC3F then cmpi.w");
         assert_ne!(a.cpsb_value & 0xFC3F, 0x0407, "which sf2's value does not");
+    }
+
+    /// `for_game` returns each row under its own name, and nothing under any other.
+    ///
+    /// The negative case is the load-bearing one: a `_ => Some(Self::sf2())` arm
+    /// would satisfy every positive assertion here and silently give a future
+    /// revision rev G's registers, which is exactly the bug this whole row exists
+    /// to fix. So an unknown name must be `None`, and `sf1` — a real game name, on
+    /// hardware that has no CPS-B at all — is the case most likely to be wrongly
+    /// admitted.
+    #[test]
+    fn for_game_maps_each_name_to_its_own_row_and_nothing_else() {
+        assert_eq!(
+            BoardConfig::for_game("sf2").map(|c| c.cpsb_addr),
+            Some(Some(0x32))
+        );
+        assert_eq!(
+            BoardConfig::for_game("sf2eb").map(|c| c.cpsb_addr),
+            Some(Some(0x08))
+        );
+        for name in ["sf1", "sf2ce", "sf3", "", "SF2"] {
+            assert!(
+                BoardConfig::for_game(name).is_none(),
+                "`{name}` has no CPS-B row and must not be given one"
+            );
+        }
     }
 
     /// Both SF2 rows use the same graphics mapper and the same kick-button port.

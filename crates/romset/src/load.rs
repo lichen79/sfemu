@@ -156,6 +156,50 @@ pub fn load(spec: &GameSpec, path: &Path) -> Result<RomSet, RomError> {
     Ok(RomSet { regions })
 }
 
+/// Which supported game a set at `path` is, and the set loaded.
+///
+/// [`load`] answers "does this path hold *that* game"; this answers "which game
+/// does this path hold". A caller who has a set and does not know its MAME name —
+/// a user running the emulator, a gated test that must work for whoever supplies
+/// the ROMs — needs the second question, and guessing from the file name is not
+/// an answer: `sf2.zip` in the wild routinely holds a different revision.
+///
+/// # Why this is trustworthy, and why it could not have been before
+///
+/// Every spec is tried in [`games::ALL`](crate::games::ALL) order and the first
+/// that loads wins. That is only sound because [`load`] verifies the CRC-32 of
+/// every entry: a spec that loads has been shown to match the bytes, so "the
+/// first that loads" cannot be a near-miss. Ordering therefore matters solely for
+/// speed, not for correctness — two specs cannot both load the same set unless
+/// they are byte-identical, in which case either answer is the same machine.
+///
+/// The revision distinction is exactly what this exists to get right. `sf2` and
+/// `sf2eb` share their graphics, audio and sample regions and differ only in the
+/// eight program ROMs, so a set is told apart from its near neighbour by 32 bits
+/// per program ROM and nothing else.
+///
+/// # Errors
+///
+/// [`RomError::Unknown`] if no spec loads. The error carries the last spec's
+/// failure, because a user whose set is *almost* one of these is far better served
+/// by "sf1's `sf-15.bin` is missing" than by "unknown set": the second sends them
+/// looking for a bug in this program.
+pub fn identify(path: &Path) -> Result<(&'static GameSpec, RomSet), RomError> {
+    let mut last = None;
+    for spec in crate::games::ALL {
+        match load(spec, path) {
+            Ok(set) => return Ok((spec, set)),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(RomError::Unknown {
+        // `expect`: `games::ALL` is a non-empty static, so the loop ran at least
+        // once and `last` is `Some`. A `games::ALL` emptied by an edit would be a
+        // workspace with no supported games at all, which every other test fails.
+        why: Box::new(last.expect("games::ALL is not empty")),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +252,62 @@ mod tests {
             even,
             odd,
         )
+    }
+
+    /// A directory that is not any supported set is refused, and the message names
+    /// what was tried and the closest miss.
+    ///
+    /// The message is asserted, not just the variant. "Unrecognised" alone sends a
+    /// user looking for a bug in this program; the specific miss — a named file
+    /// from a named region — sends them to look at their files, which is where the
+    /// problem is. So the wording is the behaviour here.
+    #[test]
+    fn a_directory_that_is_no_supported_game_is_refused_with_the_closest_miss() {
+        let dir = write_dir("identify-unknown", &[("nothing.bin", &[0u8; 16])]);
+        let e = identify(&dir).expect_err("16 zero bytes is not Street Fighter");
+        let msg = e.to_string();
+        assert!(matches!(e, RomError::Unknown { .. }), "{msg}");
+        for name in crate::games::ALL.iter().map(|g| g.name) {
+            assert!(msg.contains(name), "the message must name {name}: {msg}");
+        }
+        assert!(
+            msg.contains("is missing"),
+            "and carry the underlying miss: {msg}"
+        );
+    }
+
+    /// No two supported specs describe the same bytes, so "the first that loads"
+    /// is an identification and not a coin flip.
+    ///
+    /// This is the assumption [`identify`] rests on, and it is checked against the
+    /// spec tables rather than assumed: every pair of specs must differ in some
+    /// entry's CRC-32. Two specs that agreed on all of them would make `identify`
+    /// order-dependent — and the pair at risk is precisely `sf2` and `sf2eb`, which
+    /// share three of their four regions by *reference*.
+    #[test]
+    fn every_supported_spec_is_distinguishable_from_every_other() {
+        let crcs = |g: &crate::GameSpec| -> Vec<u32> {
+            let mut v: Vec<u32> = g
+                .regions
+                .iter()
+                .flat_map(|r| r.entries.iter().map(|e| e.crc32))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        let all = crate::games::ALL;
+        assert!(all.len() >= 2, "there is something to distinguish");
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(
+                    crcs(a),
+                    crcs(b),
+                    "`{}` and `{}` describe the same bytes",
+                    a.name,
+                    b.name
+                );
+            }
+        }
     }
 
     /// Each caller passes a distinct `tag` so no two tests share a directory.
