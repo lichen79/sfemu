@@ -1,5 +1,10 @@
 //! Does SF1's ADPCM board actually stream, and is the stereo mix audible?
 //!
+//! ⚠️ **Never executed against a ROM.** `sf1_boot.rs`'s module note lists the four
+//! premises that a real run of the CPS-1 gated tests falsified — `> 0` floors, 120
+//! frames from reset, attract-mode silence as a DIP setting, and a rising counter
+//! over a silent chip. This file carries all of them. Read that note first.
+//!
 //! # Why this is `#[ignore]`d when the rest of the project forbids it
 //!
 //! The sixth and last such test, for `sf1_boot.rs`'s reason, which is `boot.rs`'s.

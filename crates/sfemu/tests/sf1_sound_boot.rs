@@ -26,6 +26,12 @@
 //! a test that read it as a tick count would be wrong by a factor of two in the
 //! direction that makes everything look fine.
 //!
+//!
+//! ⚠️ **Never executed against a ROM.** `sf1_boot.rs`'s module note lists the four
+//! premises that a real run of the CPS-1 gated tests falsified — `> 0` floors, 120
+//! frames from reset, attract-mode silence as a DIP setting, and a rising counter
+//! over a silent chip. This file carries all of them. Read that note first.
+//!
 //! # Why the assertions are counters and not an audio hash
 //!
 //! `sound_boot.rs`'s reason, unchanged: `crates/ym2151` already checks the waveform

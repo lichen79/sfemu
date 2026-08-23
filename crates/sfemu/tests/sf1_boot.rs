@@ -23,6 +23,29 @@
 //! variable points at the wrong set is a `romset::load` error naming the file it
 //! could not find, which is loud.
 //!
+//! # ⚠️ These three have never been executed
+//!
+//! No SF1 set has been available to this project, so the three `sf1_*` gated tests
+//! have never run against a ROM — while the three CPS-1 ones now have. **That run
+//! falsified a premise in every one of them**, and these three still carry the same
+//! premises, so expect the first real SF1 run to fail and read the failures as
+//! findings about the tests before suspecting the drivers:
+//!
+//! - **`> 0` floors are usually on the wrong side of the gap.** `audio_boot.rs`'s
+//!   `oki_writes > 0` passed on a machine that initialised the chip and played
+//!   nothing: initialisation alone is 2 writes and playing is 91. Every `> 0` here
+//!   — `latch_reads`, `bank_writes`, `bank_fetches`, `nibbles` — is the same shape.
+//! - **120 frames from reset is before the music starts.** SF2's first non-zero
+//!   sample arrives at frame 916, after the self-test, the RAM clear, the logo and
+//!   the title screen. Both SF1 sound tests run 120 frames and assert on the result.
+//! - **Attract-mode silence may be a DIP switch, not a fault.** SF2's Demo Sounds is
+//!   DSWC bit 0x20 and the bit means *off*; `Inputs::idle` sets every switch off, so
+//!   the default configuration correctly plays nothing at all. Check SF1's
+//!   `INPUT_PORTS` for its equivalent before concluding the driver is silent.
+//! - **A counter that rises is not a chip that plays.** Measure, then set a floor
+//!   between the measured working figure and the measured broken one, and quote both
+//!   at the assertion — see `sound_boot.rs` and `audio_boot.rs` for the shape.
+//!
 //! # Why this is not `boot.rs` with two names changed
 //!
 //! `boot.rs`'s two video assertions are `cps_a_writes > 0` and `gfxram_writes > 0`,
