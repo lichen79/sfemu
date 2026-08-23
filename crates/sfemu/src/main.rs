@@ -185,7 +185,9 @@ fn default_state_path(rom: &str) -> PathBuf {
 /// here.
 fn board_for(game: &str) -> Option<machine::BoardKind> {
     match game {
-        // Both SF2 revisions are the same CPS-1 hardware; only the program differs.
+        // Both SF2 revisions are CPS-1 boards. They are *not* the same board:
+        // their CPS-B parts differ, which [`cps_b_config_for`] resolves. This
+        // enum names the bus and the video subsystem, which they do share.
         "sf2" | "sf2eb" => Some(machine::BoardKind::Cps1),
         "sf1" => Some(machine::BoardKind::Sf1),
         _ => None,
@@ -311,13 +313,37 @@ fn parse_args(args: Vec<String>) -> Result<Args, Fault> {
     })
 }
 
+/// The CPS-B configuration a CPS-1 game name selects.
+///
+/// A third consequence of the name, alongside the ROM spec and the board kind, and
+/// the one with the least forgiving failure mode. CPS-B is a family of parts, and
+/// the row a game needs is not derivable from its hardware being "CPS-1": `sf2`
+/// has `CPS_B_11` and `sf2eb` has `CPS_B_17`, which agree on no register at all.
+///
+/// A wrong row here does not produce a crash or a garbled screen. The program
+/// reads the ID register, finds the wrong value, and branches to an idle loop —
+/// so the machine boots, runs, takes every interrupt, and draws nothing, with no
+/// unmapped access and no fault to report. That is why this is a `match` on the
+/// name and not a default: there is no config that is safe to fall back to.
+fn cps_b_config_for(game: &str) -> machine::BoardConfig {
+    match game {
+        "sf2eb" => machine::BoardConfig::sf2eb(),
+        // `sf2` and, by construction, any future revision added without a row of
+        // its own — which is the case the test below exists to make visible.
+        _ => machine::BoardConfig::sf2(),
+    }
+}
+
 /// SF2 on CPS-1, from a loaded set.
 ///
 /// The four region lookups are `expect`-free and `ok_or_else`-loud for the reason
 /// each message states: every one of these regions is in `games::SF2`, so a `None`
 /// is a bug in `romset::games` rather than anything about the user's files, and
 /// defaulting to an empty region turns each into a different silent wrong answer.
-fn build_cps1(set: &romset::RomSet) -> Result<machine::Cps1, Fault> {
+///
+/// `game` selects the CPS-B row through [`cps_b_config_for`]; see there for why it
+/// cannot be hardcoded.
+fn build_cps1(game: &str, set: &romset::RomSet) -> Result<machine::Cps1, Fault> {
     let prog = set.region("maincpu").ok_or_else(|| {
         Fault::Failed("internal: the sf2 spec has no `maincpu` region".to_string())
     })?;
@@ -348,7 +374,7 @@ fn build_cps1(set: &romset::RomSet) -> Result<machine::Cps1, Fault> {
         gfx,
         audiocpu,
         okirom,
-        machine::BoardConfig::sf2(),
+        cps_b_config_for(game),
         machine::Timing::cps1_10mhz(),
     );
     m.reset();
@@ -409,7 +435,7 @@ fn build_sf1(set: &romset::RomSet) -> Result<machine::Sf1, Fault> {
 fn build_machine(game: &str, set: &romset::RomSet) -> Result<machine::Machine, Fault> {
     Ok(
         match board_for(game).expect("parse_args rejects a name with no board") {
-            machine::BoardKind::Cps1 => machine::Machine::Cps1(Box::new(build_cps1(set)?)),
+            machine::BoardKind::Cps1 => machine::Machine::Cps1(Box::new(build_cps1(game, set)?)),
             machine::BoardKind::Sf1 => machine::Machine::Sf1(Box::new(build_sf1(set)?)),
         },
     )
@@ -1825,11 +1851,72 @@ mod tests {
     #[test]
     fn each_game_name_selects_its_own_board_and_its_own_rom_spec() {
         assert_eq!(board_for("sf2"), Some(machine::BoardKind::Cps1));
+        assert_eq!(board_for("sf2eb"), Some(machine::BoardKind::Cps1));
         assert_eq!(board_for("sf1"), Some(machine::BoardKind::Sf1));
         assert_eq!(board_for("sf3"), None);
         // And the name that picks the board is the name that picks the files.
         assert_eq!(romset::games::by_name("sf2").map(|g| g.name), Some("sf2"));
+        assert_eq!(
+            romset::games::by_name("sf2eb").map(|g| g.name),
+            Some("sf2eb")
+        );
         assert_eq!(romset::games::by_name("sf1").map(|g| g.name), Some("sf1"));
+        // Every name with a board has a spec, and no name has one without the other.
+        for g in romset::games::ALL {
+            assert!(board_for(g.name).is_some(), "{} has no board", g.name);
+        }
+    }
+
+    /// The name selects the CPS-B row, and the two SF2 revisions get different ones.
+    ///
+    /// The check the guest performs is spelled out here rather than only in
+    /// `machine`, because this is the function that chooses which value the guest
+    /// will read: `sf2eb`'s program reads offset 0x08 and needs 0x0407, and under
+    /// `sf2`'s row it would read a plain CPS-B register instead and branch to an
+    /// idle loop. Asserting the ID pair — not just that the two configs differ —
+    /// is what ties this mapping to the reason it exists.
+    #[test]
+    fn the_game_name_selects_the_cps_b_row_and_the_two_sf2_revisions_differ() {
+        let a = cps_b_config_for("sf2");
+        let b = cps_b_config_for("sf2eb");
+        assert_eq!(a.cpsb_addr, Some(0x32), "CPS_B_11");
+        assert_eq!(a.cpsb_value, 0x0401);
+        assert_eq!(b.cpsb_addr, Some(0x08), "CPS_B_17");
+        assert_eq!(b.cpsb_value, 0x0407);
+        assert_ne!(a.video, b.video, "and the video registers move with it");
+    }
+
+    /// A CPS-1 machine built for `sf2eb` answers the address its program reads.
+    ///
+    /// The artifact, not the mapping: [`build_cps1`] is called with the name and the
+    /// resulting machine's bus is read at 0x800148, through `peek_word`, exactly as
+    /// the guest's `move.w $800148,d0` does. A `build_cps1` that took the config
+    /// from anywhere but its `game` argument fails here while the mapping test above
+    /// still passes.
+    #[test]
+    fn a_machine_built_for_sf2eb_answers_the_id_read_its_program_makes() {
+        // Synthetic regions: this needs a bus, not a game.
+        let set = a_synthetic_set(&[
+            ("maincpu", 0x11),
+            ("gfx", 0x22),
+            ("audiocpu", 0x33),
+            ("oki", 0x44),
+        ]);
+        let eb = build_cps1("sf2eb", &set).expect("every region is present");
+        let g = build_cps1("sf2", &set).expect("every region is present");
+
+        // `andi.w #$FC3F` then `cmpi.w #$0407`, at 0x0004c2.
+        let read = |m: &machine::Cps1| m.board.peek_word(0x80_0148).expect("CPS-B decodes");
+        assert_eq!(read(&eb) & 0xFC3F, 0x0407, "sf2eb's check passes");
+        assert_ne!(read(&g) & 0xFC3F, 0x0407, "and rev G's board fails it");
+
+        // The converse address, so this is about the row and not about 0x800148
+        // happening to hold 0x0407 on every board.
+        assert_eq!(
+            g.board.peek_word(0x80_0172).expect("CPS-B decodes"),
+            0x0401,
+            "rev G answers its own ID address"
+        );
     }
 
     /// The loop's board tag follows the selected game.

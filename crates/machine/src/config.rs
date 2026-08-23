@@ -52,6 +52,36 @@ impl BoardConfig {
         }
     }
 
+    /// Street Fighter II, MAME set `sf2eb` (World 910214).
+    ///
+    /// `cps1_v.cpp:1840` — `{"sf2eb", CPS_B_17, mapper_STF29, 0x36}`. Same
+    /// graphics mapper and same kick-button port as [`Self::sf2`]; a **different
+    /// CPS-B part**, which moves every register in the row.
+    ///
+    /// The ID register is the boot-critical one, and this set is the reason to be
+    /// precise about it rather than treating one SF2 revision as standing for all
+    /// of them. `sf2eb`'s program does this at 0x0004c2:
+    ///
+    /// ```text
+    /// move.w $800148,d0     ; the ID register — offset 0x08, not 0x32
+    /// andi.w #$FC3F,d0
+    /// cmpi.w #$0407,d0      ; 0x0407, not 0x0401
+    /// bne $6F0              ; and on a mismatch it parks in `bra $6FC` forever
+    /// ```
+    ///
+    /// Run under [`Self::sf2`] it takes that branch: the machine boots, services
+    /// every vblank, and draws nothing at all, because the failure path is an
+    /// idle loop rather than a crash.
+    pub const fn sf2eb() -> Self {
+        Self {
+            cpsb_addr: Some(0x08),
+            cpsb_value: 0x0407,
+            in2_addr: Some(0x36),
+            video: video::regs::VideoConfig::cps_b_17(),
+            mapper: video::bank::BankMapper::stf29(),
+        }
+    }
+
     /// A board with no wired registers and no extra input port.
     ///
     /// Exists so a test can show that the wired-read behaviour comes from the
@@ -84,6 +114,53 @@ mod tests {
         assert_eq!(c.cpsb_addr, Some(0x32), "CPS_B_11, cps1_v.cpp:491");
         assert_eq!(c.cpsb_value, 0x0401, "what the boot self-test expects");
         assert_eq!(c.in2_addr, Some(0x36), "cps1_v.cpp:1838, the kick buttons");
+    }
+
+    /// `sf2eb`'s row, from `cps1_v.cpp:1840` and `CPS_B_17` at `cps1_v.cpp:497`.
+    #[test]
+    fn sf2eb_matches_the_mame_table_row() {
+        let c = BoardConfig::sf2eb();
+        assert_eq!(c.cpsb_addr, Some(0x08), "CPS_B_17, cps1_v.cpp:497");
+        assert_eq!(c.cpsb_value, 0x0407, "what sf2eb's boot check demands");
+        assert_eq!(c.in2_addr, Some(0x36), "the same kick buttons as sf2");
+    }
+
+    /// The address and the value both differ from `sf2`'s, and the ID lands where
+    /// the program looks for it.
+    ///
+    /// The pair is what matters. Either field alone taken from the wrong row still
+    /// fails the guest's check — it reads one address and compares one value — so
+    /// asserting them together is what pins the row rather than a field of it.
+    /// The absolute address is spelled out because that is what the disassembly
+    /// shows, and a byte-versus-word slip in `cpsb_addr` would otherwise read as
+    /// plausible.
+    #[test]
+    fn sf2ebs_id_register_is_at_the_address_its_program_reads() {
+        let (a, b) = (BoardConfig::sf2(), BoardConfig::sf2eb());
+        assert_ne!(a.cpsb_addr, b.cpsb_addr, "a different CPS-B part");
+        assert_ne!(a.cpsb_value, b.cpsb_value);
+        assert_eq!(
+            0x80_0140 + u32::from(b.cpsb_addr.unwrap()),
+            0x80_0148,
+            "the address in `move.w $800148,d0` at 0x0004c2"
+        );
+        // And the value survives the mask the program applies before comparing.
+        assert_eq!(b.cpsb_value & 0xFC3F, 0x0407, "andi.w #$FC3F then cmpi.w");
+        assert_ne!(a.cpsb_value & 0xFC3F, 0x0407, "which sf2's value does not");
+    }
+
+    /// Both SF2 rows use the same graphics mapper and the same kick-button port.
+    ///
+    /// Stated as a test because it is the half of the difference that is *not*
+    /// there: a reader who sees two configs may reasonably assume the mapper moved
+    /// too, and a future third revision copied from the wrong one would be caught
+    /// by a mapper assertion only if some test says what the mapper should be.
+    #[test]
+    fn the_two_sf2_rows_share_the_mapper_and_the_kick_button_port() {
+        let (a, b) = (BoardConfig::sf2(), BoardConfig::sf2eb());
+        assert_eq!(a.in2_addr, b.in2_addr, "both mapper_STF29 rows end in 0x36");
+        assert_eq!(a.mapper.bank_sizes, b.mapper.bank_sizes);
+        assert_eq!(a.mapper.bank_sizes, [0x8000, 0x8000, 0x8000, 0]);
     }
 
     /// The video half of the row, also as literals.

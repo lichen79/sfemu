@@ -142,6 +142,34 @@ impl VideoConfig {
             layer_enable_mask: [0x08, 0x10, 0x20],
         }
     }
+
+    /// `CPS_B_17` (`cps1_v.cpp:497`), the chip on the `sf2eb` board.
+    ///
+    /// A different CPS-B part, not a variation on one: **every** register in the
+    /// row moves, and the priority group runs *downwards* — 0x12, 0x10, 0x0e,
+    /// 0x0c — where [`Self::sf2`]'s runs upwards. Two of the three layer-enable
+    /// bits differ too, and 0x14 is two bits (`0x10 | 0x04`) rather than one, so a
+    /// mask test must be `!= 0` and not an equality.
+    ///
+    /// MAME's line carries a comment worth preserving here, because it is the
+    /// evidence for the odd 0x14: the sf2-to-strider conversion needs 0x04 for the
+    /// second layer's enable on one level, that graphics layer is confirmed to
+    /// appear on the PCB, and the register at that moment is 0x8e — in which 0x10
+    /// is clear. So the bit that enables scroll 2 on this board is either of two,
+    /// and taking only 0x10 would lose a layer.
+    pub const fn cps_b_17() -> Self {
+        Self {
+            layer_control: 0x14 / 2,
+            priority: [
+                Some(0x12 / 2),
+                Some(0x10 / 2),
+                Some(0x0E / 2),
+                Some(0x0C / 2),
+            ],
+            palette_control: 0x0A / 2,
+            layer_enable_mask: [0x08, 0x14, 0x02],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +208,67 @@ mod tests {
         assert_eq!(OBJ_BASE, 0);
         assert_eq!(PALETTE_BASE, 5);
         assert_eq!(VIDEOCONTROL, 17);
+    }
+
+    /// `CPS_B_17`'s row, as literals, against `cps1_v.cpp:497`.
+    ///
+    /// Written out rather than derived, and every field asserted — including the
+    /// three that a reader might assume are shared with [`VideoConfig::sf2`]. None
+    /// of them are: this is a different chip, and the whole point of the row is
+    /// that no register keeps its place.
+    #[test]
+    fn cps_b_17s_row_is_the_one_mame_records() {
+        let v = VideoConfig::cps_b_17();
+        assert_eq!(v.layer_control, 0x14 / 2);
+        assert_eq!(
+            v.priority,
+            [
+                Some(0x12 / 2),
+                Some(0x10 / 2),
+                Some(0x0E / 2),
+                Some(0x0C / 2)
+            ],
+            "and it descends, where CPS_B_11's ascends"
+        );
+        assert_eq!(v.palette_control, 0x0A / 2);
+        assert_eq!(v.layer_enable_mask, [0x08, 0x14, 0x02]);
+    }
+
+    /// The two rows agree on nothing but the first layer-enable bit.
+    ///
+    /// This is the test that fails if `cps_b_17` is ever written as a copy of
+    /// `sf2` with one field edited, or if the two are collapsed into a shared
+    /// constant. Each of the four fields is compared, so a single accidental
+    /// carry-over is caught rather than only a wholesale duplicate.
+    #[test]
+    fn cps_b_17_shares_no_register_with_cps_b_11() {
+        let (a, b) = (VideoConfig::sf2(), VideoConfig::cps_b_17());
+        assert_ne!(a.layer_control, b.layer_control);
+        assert_ne!(a.priority, b.priority);
+        assert_ne!(a.palette_control, b.palette_control);
+        assert_ne!(a.layer_enable_mask, b.layer_enable_mask);
+        assert_ne!(a, b);
+
+        // Scroll 2's and scroll 3's bits move; scroll 1's genuinely does not, and
+        // saying so here keeps the assertion above honest about what it proves.
+        assert_eq!(a.layer_enable_mask[0], b.layer_enable_mask[0], "both 0x08");
+    }
+
+    /// `CPS_B_17` enables scroll 2 on **either** of two bits.
+    ///
+    /// 0x14 is `0x10 | 0x04`, so a layer-enable test must be `& mask != 0` rather
+    /// than `& mask == mask`. MAME's comment at `cps1_v.cpp:497` is the evidence:
+    /// on one Strider level the register reads 0x8e — 0x04 set, 0x10 clear — and
+    /// the layer is confirmed to appear on the PCB. An equality test would hide it.
+    #[test]
+    fn cps_b_17s_second_layer_enable_is_two_bits_either_of_which_enables_it() {
+        let mask = VideoConfig::cps_b_17().layer_enable_mask[1];
+        assert_eq!(mask, 0x14);
+        assert_eq!(mask.count_ones(), 2, "0x10 and 0x04");
+        for reg in [0x0004u16, 0x0010, 0x0014, 0x008E] {
+            assert_ne!(reg & mask, 0, "{reg:#06x} enables scroll 2");
+        }
+        assert_eq!(0x008Bu16 & mask, 0, "with both bits clear it does not");
     }
 
     /// `cps1_base` scales by 256, truncates to the boundary, and wraps into a
