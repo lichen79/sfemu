@@ -188,10 +188,11 @@ impl VideoConfig {
     /// are still the whole story for this board; a set that did have one would need
     /// the field widened rather than these two values quietly dropped.
     ///
-    /// ⚠️ `cpsb_value` is `-1` on this row: **CE has no ID register at all**, and
-    /// `machine::BoardConfig::sf2ce` carries that as `cpsb_addr: None`. What it
-    /// does have instead is the multiply-protection block, which is that struct's
-    /// business rather than this one's.
+    /// ⚠️ This row's `cpsb_value` is `-1`, which does **not** mean "no ID
+    /// register". `cpsb_addr` is still 0x32, and `cps1_cps_b_r` returns
+    /// `uint16_t(-1)` = 0xFFFF there. What is genuinely new on this part is the
+    /// multiply-protection block at 0x00-0x06; both live on
+    /// `machine::BoardConfig::sf2ce` rather than here.
     pub const fn cps_b_21_def() -> Self {
         Self {
             layer_control: 0x26 / 2,
