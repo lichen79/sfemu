@@ -90,10 +90,15 @@ fn usage() -> String {
      no files and no path. It is a homebrew demo and not any Capcom game.\n\
      \n\
      Without `--play`, runs a fixed number of frames and reports what the\n\
-     board saw. With `--play`, opens a window: arrow keys and ASDZXC for\n\
-     player one, 5 to insert a coin, 1 to start, P to pause, . to step,\n\
-     F3 to reset, F5 and F8 to save and load, F12 for a screenshot,\n\
-     Escape to quit. A frame count is ignored with `--play`.\n\
+     board saw. With `--play`, opens a window and both players can play:\n\
+     \n\
+     \x20 player 1: Z S Q D stick, I O P punches, J K L kicks\n\
+     \x20 player 2: arrow keys, keypad 7 8 9 punches, 4 5 6 kicks\n\
+     \n\
+     5 and 6 insert a coin, 1 and 2 start. F11 pauses, . steps a frame,\n\
+     F3 resets, F5 and F8 save and load, F12 takes a screenshot, and\n\
+     Escape quits. Player 2's buttons need a numeric keypad. A frame count\n\
+     is ignored with `--play`.\n\
      \n\
      The ROM set is yours to supply: this program neither bundles nor\n\
      downloads one. Legal sources include Capcom Arcade Stadium, Capcom\n\
@@ -1516,6 +1521,80 @@ mod tests {
         assert!(
             !u.contains("http"),
             "no URL of any kind belongs in this program"
+        );
+    }
+
+    /// The keys the usage text names are the keys the map actually presses.
+    ///
+    /// The usage text is the only place most people will read the controls, and it is
+    /// prose in a string literal — nothing about it is checked by the compiler. A remap
+    /// that changed `frontend::keys` and not this text leaves a program whose
+    /// documentation is wrong, which is worse than one with none.
+    ///
+    /// So each claim is asserted against `Controls` itself, by pressing the key and
+    /// reading the board's ports. The port values are literals from
+    /// `machine::inputs`' documented layout, the same ones
+    /// `frontend::keys`' own table uses; what is *new* here is the link from a
+    /// sentence in the usage string to that behaviour.
+    ///
+    /// Not every key: the six directions and twelve buttons are `frontend`'s to test.
+    /// The rows below are the ones the text makes a specific promise about — the two
+    /// clusters' corners, the coin and start buttons someone is looking this up to
+    /// find, and pause, which moved off `P` in this remap and is where a stale text
+    /// would show first.
+    #[test]
+    fn the_usage_text_names_the_keys_the_map_actually_presses() {
+        use frontend::{Controls, Key, KeySet};
+        let u = usage();
+        let press = |k: Key| {
+            let mut c = Controls::new();
+            c.update(KeySet::from_keys(&[k]))
+        };
+
+        // "player 1: Z S Q D stick, I O P punches, J K L kicks"
+        assert!(u.contains("player 1: Z S Q D stick, I O P punches, J K L kicks"));
+        assert_eq!(press(Key::Z).inputs.in1(), 0xFFF7, "Z is P1 up");
+        assert_eq!(press(Key::D).inputs.in1(), 0xFFFE, "D is P1 right");
+        assert_eq!(press(Key::I).inputs.in1(), 0xFFEF, "I is P1's jab");
+        assert_eq!(press(Key::L).inputs.in2(), 0xFB, "L is P1's roundhouse");
+
+        // "player 2: arrow keys, keypad 7 8 9 punches, 4 5 6 kicks"
+        assert!(u.contains("player 2: arrow keys, keypad 7 8 9 punches, 4 5 6 kicks"));
+        assert_eq!(press(Key::Up).inputs.in1(), 0xF7FF, "Up is P2 up");
+        assert_eq!(
+            press(Key::NumPad7).inputs.in1(),
+            0xEFFF,
+            "keypad 7 is P2's jab"
+        );
+        assert_eq!(
+            press(Key::NumPad4).inputs.in2(),
+            0xEF,
+            "keypad 4 is P2's short kick"
+        );
+
+        // "5 and 6 insert a coin, 1 and 2 start."
+        assert!(u.contains("5 and 6 insert a coin, 1 and 2 start"));
+        assert_eq!(press(Key::Num5).inputs.in0(), 0xFE, "5 is coin 1");
+        assert_eq!(press(Key::Num6).inputs.in0(), 0xFD, "6 is coin 2");
+        assert_eq!(press(Key::Num1).inputs.in0(), 0xEF, "1 is start 1");
+        assert_eq!(press(Key::Num2).inputs.in0(), 0xDF, "2 is start 2");
+
+        // "F11 pauses" — and `P` does not, because `P` is a punch now. The stale text
+        // this remap could have left behind said "P to pause", so both halves are
+        // asserted.
+        assert!(u.contains("F11 pauses"));
+        assert!(
+            !u.contains("P to pause"),
+            "`P` is player 1's fierce punch now"
+        );
+        assert!(press(Key::F11).pause_toggled, "F11 pauses");
+        assert!(!press(Key::P).pause_toggled, "and P does not");
+
+        // The keypad requirement, which is the one thing about this layout that can
+        // make it unusable on a given keyboard.
+        assert!(
+            u.contains("numeric keypad"),
+            "a laptop without a keypad cannot reach P2's buttons, and must be told"
         );
     }
 

@@ -632,8 +632,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             ),
             (
                 "pause-is-level-triggered",
-                "pause_toggled: edge(Key::P),",
-                "pause_toggled: now.contains(Key::P),",
+                "pause_toggled: edge(Key::F11),",
+                "pause_toggled: now.contains(Key::F11),",
                 "KILL",
             ),
             (
@@ -675,27 +675,49 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # The map itself.
             (
                 "kick-reads-a-punch-key",
-                "        inputs.p1.kick = [\n            now.contains(Key::Z),",
-                "        inputs.p1.kick = [\n            now.contains(Key::A),",
+                "        inputs.p1.kick = [\n            now.contains(Key::J),",
+                "        inputs.p1.kick = [\n            now.contains(Key::I),",
                 "KILL",
             ),
             (
                 "punch-key-order-swapped",
-                "            now.contains(Key::A),\n            now.contains(Key::S),",
-                "            now.contains(Key::S),\n            now.contains(Key::A),",
+                "            now.contains(Key::I),\n            now.contains(Key::O),",
+                "            now.contains(Key::O),\n            now.contains(Key::I),",
                 "KILL",
             ),
             ("coin-is-a-start-key", "inputs.coin1 = now.contains(Key::Num5);", "inputs.coin1 = now.contains(Key::Num1);", "KILL"),
-            ("stick-up-is-down", "inputs.p1.up = now.contains(Key::Up);", "inputs.p1.up = now.contains(Key::Down);", "KILL"),
-            # A P2 field written by a P1 key: the absence test must catch it.
+            ("stick-up-is-down", "inputs.p1.up = now.contains(Key::Z);", "inputs.p1.up = now.contains(Key::S);", "KILL"),
+            # A P1 key writing a P2 field. This was the mutant the old blanket
+            # "no key reaches P2" test caught; with both players mapped, what catches it
+            # is `each_game_key_clears_its_own_port_bit` asserting all three ports per
+            # key -- `p2.right` moves IN1's *high* byte, and D's row says 0xFFFE.
             (
-                "a-key-reaches-player-two",
-                "inputs.p1.right = now.contains(Key::Right);",
-                "inputs.p2.right = now.contains(Key::Right);",
+                "a-p1-key-reaches-player-two",
+                "inputs.p1.right = now.contains(Key::D);",
+                "inputs.p2.right = now.contains(Key::D);",
+                "KILL",
+            ),
+            # And the reverse, which only exists now that P2 is mapped: the two
+            # clusters' stick assignments are eight identical-looking lines, and a
+            # copy-paste that left `p1` on a P2 row gives one player two up keys and the
+            # other none.
+            (
+                "a-p2-key-reaches-player-one",
+                "inputs.p2.up = now.contains(Key::Up);",
+                "inputs.p1.up = now.contains(Key::Up);",
+                "KILL",
+            ),
+            # The number row and the keypad confused for each other: P2's forward kick
+            # reading the coin key. Plausible because `Num5` and `NumPad5` differ by
+            # three characters, and it makes inserting a coin throw a kick.
+            (
+                "the-keypad-is-the-number-row",
+                "            now.contains(Key::NumPad5),",
+                "            now.contains(Key::Num5),",
                 "KILL",
             ),
             # Two keys sharing a bit.
-            ("two-keys-share-a-bit", "Key::D => 6,", "Key::D => 5,", "KILL"),
+            ("two-keys-share-a-bit", "Key::D => 3,", "Key::D => 1,", "KILL"),
             # The DIP switches, which idle() sets and this module must not touch.
             (
                 "dip-switches-all-on",
@@ -715,11 +737,15 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # the failure mode a control exists to expose in the harness itself, and it
             # is why `--all` is run rather than one set at a time.
             #
-            # The denominator, written down this time: 34 keys hold bits 0-33, and
-            # `KeySet` is a `u64`, so everything from 34 up is free. 62 leaves room
+            # The denominator, written down this time: 44 keys hold bits 0-43, and
+            # `KeySet` is a `u64`, so everything from 44 up is free. 62 leaves room
             # above and below. This control will die again if a key is ever given bit
             # 62, and that death is the signal it exists for, not a mutant to
             # re-expect.
+            #
+            # It survived the P1/P2 remap without moving, which is the first time it has:
+            # player 2's ten keys took bits 34-43 rather than being interleaved with the
+            # existing ones, precisely so no bit that already had a key changed.
             ("CONTROL-escape-moves-to-another-free-bit", "Key::Escape => 21,", "Key::Escape => 62,", "SURVIVE"),
         ],
     ),

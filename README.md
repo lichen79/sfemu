@@ -329,16 +329,28 @@ that would not start. The device's own rate is printed beside the board's at sta
 because the interesting number is the pair: neither is the other's multiple, which is
 why the samples are converted rather than played as they are.
 
+```
+        Player 1                          Player 2
+
+          Z                                 ↑                7 8 9  punches
+        Q S D    I O P  punches           ← ↓ →              4 5 6  kicks
+                 J K L  kicks
+        stick                             stick               keypad
+```
+
 | Key | Does |
 |---|---|
-| Arrows | P1 stick |
-| `A` `S` `D` | P1 jab, strong, fierce |
-| `Z` `X` `C` | P1 short, forward, roundhouse |
+| `Z` `S` `Q` `D` | P1 stick — up, down, left, right |
+| `I` `O` `P` | P1 jab, strong, fierce |
+| `J` `K` `L` | P1 short, forward, roundhouse |
+| Arrows | P2 stick |
+| Keypad `7` `8` `9` | P2 jab, strong, fierce |
+| Keypad `4` `5` `6` | P2 short, forward, roundhouse |
 | `5` / `1` | Coin 1 / Start 1 |
 | `6` / `2` | Coin 2 / Start 2 |
 | `F2` | Test switch — hold it at boot for the service menu |
 | `F3` | Reset the machine |
-| `P` | Pause / resume |
+| `F11` | Pause / resume |
 | `.` | Step one frame while paused |
 | `F5` / `F8` | Save state / load state |
 | `F12` | Screenshot, as a binary PPM |
@@ -355,9 +367,17 @@ why the samples are converted rather than played as they are.
 | `Enter` | Act on the view — cycle its tile layout or layer, or toggle a layer |
 
 Punches sit on the top row and kicks directly under them, matching a real
-six-button cabinet. **Player 2 is not mapped**, deliberately: two players on one
-keyboard needs a second ten-key cluster and every arrangement of one is bad. The
-board's `Inputs` already carries P2, so a gamepad or netplay supplies it later.
+six-button cabinet, and each player has one half of the keyboard.
+
+Two things follow from that. **Player 2's buttons need a numeric keypad** — on a
+keyboard without one the arrow keys still move but the six attacks are unreachable,
+so P2 is a desktop arrangement. And **no letter key is a control any more**: pause
+moved off `P`, which is P1's fierce punch now, onto `F11`, the one gap that was left
+in `F1`–`F12`. Every control is a function or navigation key, which is what keeps a
+punch from also saving a state.
+
+The board's `Inputs` is the same either way, so a gamepad or netplay can drive
+either player later without touching this map.
 
 Save states go beside the ROM set — `sf2.zip` next to `sf2.sfs` — so two games
 never share one, and screenshots to `sf2.ppm` the same way. One state file, not a
@@ -502,8 +522,11 @@ your own ROM set, and look — and, for the last one, listen:
 2. **Does it run at the right speed?** The pacer is tested against a scripted
    clock, which proves the arithmetic and not the wall clock.
 3. **Do the controls respond?** The key map is tested against the board's
-   documented port bits, which proves `A` sets jab and not that `A` reaches the
-   game.
+   documented port bits, which proves `I` sets P1's jab and not that `I` reaches the
+   game. Two-player play is the same claim twice over, and adds one only a keyboard
+   can answer: whether your keyboard reports P1's cluster and P2's keypad **at the
+   same time**. Cheap membrane keyboards drop simultaneous keys in ways no test here
+   can see.
 4. **Is the debugger overlay legible on your display?** The font is 4×6 pixels,
    scaled by whatever the window is. A test can prove that no two of the 95 glyphs
    share a bitmap, that the sixteen hex digits are the bitmaps drawn here, that the

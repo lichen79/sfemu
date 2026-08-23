@@ -918,9 +918,9 @@ mod tests {
     #[test]
     fn pause_stops_the_frames_and_resume_starts_them() {
         let (o, _s, _p) = opts("pause");
-        let mut script = vec![Fake::held(&[Key::P])];
+        let mut script = vec![Fake::held(&[Key::F11])];
         script.extend(Fake::idle(2));
-        script.push(Fake::held(&[Key::P]));
+        script.push(Fake::held(&[Key::F11]));
         script.extend(Fake::idle(2));
         let mut d = Fake::new(script);
         let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
@@ -938,7 +938,7 @@ mod tests {
     #[test]
     fn a_step_runs_exactly_one_frame_while_paused() {
         let (o, _s, _p) = opts("step");
-        let mut script = vec![Fake::held(&[Key::P])];
+        let mut script = vec![Fake::held(&[Key::F11])];
         // Held for three ticks: one frame, because a step is an edge and not a
         // level. Then released and pressed again: a second edge, a second frame.
         script.extend(vec![Fake::held(&[Key::Period]); 3]);
@@ -953,7 +953,7 @@ mod tests {
     #[test]
     fn a_step_does_not_unpause() {
         let (o, _s, _p) = opts("step-pause");
-        let mut script = vec![Fake::held(&[Key::P]), Fake::held(&[Key::Period])];
+        let mut script = vec![Fake::held(&[Key::F11]), Fake::held(&[Key::Period])];
         script.extend(Fake::idle(3));
         let mut d = Fake::new(script);
         let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
@@ -1037,7 +1037,7 @@ mod tests {
     fn every_tick_presents_a_full_frame() {
         let (o, _s, _p) = opts("present");
         let mut script = Fake::idle(2);
-        script.push(Fake::held(&[Key::P]));
+        script.push(Fake::held(&[Key::F11]));
         script.extend(Fake::idle(3));
         let ticks = script.len();
         let mut d = Fake::new(script);
@@ -1063,7 +1063,7 @@ mod tests {
         let (o, _s, _p) = opts("paused-render");
         let mut m = machine_that_draws();
         // The very first tick pauses, so no frame runs inside the loop at all.
-        let mut d = Fake::new(vec![Fake::held(&[Key::P])]);
+        let mut d = Fake::new(vec![Fake::held(&[Key::F11])]);
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 0, "the premise: the loop ran no frames");
         let first = d.first.expect("a paused tick still presents");
@@ -1088,9 +1088,9 @@ mod tests {
         let (o, _s, _p) = opts("pause-debt");
         let mut d = Fake::new(vec![
             (KeySet::new(), FRAME_NS - 1),
-            Fake::held(&[Key::P]),
+            Fake::held(&[Key::F11]),
             Fake::held(&[]),
-            (KeySet::from_keys(&[Key::P]), 1),
+            (KeySet::from_keys(&[Key::F11]), 1),
         ]);
         let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert_eq!(
@@ -1140,7 +1140,7 @@ mod tests {
     #[test]
     fn the_title_reports_the_pause() {
         let (o, _s, _p) = opts("title-pause");
-        let mut script = vec![Fake::held(&[Key::P])];
+        let mut script = vec![Fake::held(&[Key::F11])];
         script.extend(Fake::idle(1));
         let mut d = Fake::new(script);
         run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
@@ -1510,11 +1510,11 @@ mod tests {
         let (o, _s, _p) = opts("inputs");
         let mut m = machine();
         let mut d = Fake::new(vec![
-            Fake::held(&[Key::P]),
-            Fake::held(&[Key::P, Key::Num5, Key::Down]),
+            Fake::held(&[Key::F11]),
+            Fake::held(&[Key::F11, Key::Num5, Key::S]),
         ]);
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
-        // P is held on both ticks, so there is no second edge and no unpause.
+        // F11 is held on both ticks, so there is no second edge and no unpause.
         assert_eq!(s.frames, 0, "the premise: no frame ran");
         assert!(
             cps1(&m).board.inputs.coin1,
@@ -1545,7 +1545,7 @@ mod tests {
         let (mut o, _s, _p) = opts("sf1-inputs");
         o.board = state_tag(machine::BoardKind::Sf1);
         let mut m = an_sf1_machine();
-        let mut d = Fake::new(vec![Fake::held(&[Key::Num5, Key::Num1, Key::Left])]);
+        let mut d = Fake::new(vec![Fake::held(&[Key::Num5, Key::Num1, Key::Q])]);
         run(&mut m, &mut d, &mut NullAudio::default(), &o);
 
         let i = &sf1(&m).board.inputs;
@@ -1825,12 +1825,12 @@ mod tests {
         // Paused throughout: what is under test is that `F4` moves the machine by an
         // *instruction*, and a running loop would move it by a frame at the same time.
         let script = vec![
-            Fake::held(&[Key::P]),
-            Fake::held(&[Key::P, Key::F4]),
+            Fake::held(&[Key::F11]),
+            Fake::held(&[Key::F11, Key::F4]),
             // Held for a second tick: one instruction per press, not per tick.
-            Fake::held(&[Key::P, Key::F4]),
-            Fake::held(&[Key::P]),
-            Fake::held(&[Key::P, Key::F4]),
+            Fake::held(&[Key::F11, Key::F4]),
+            Fake::held(&[Key::F11]),
+            Fake::held(&[Key::F11, Key::F4]),
         ];
         let mut d = Fake::new(script);
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
@@ -1925,9 +1925,9 @@ mod tests {
         let stopped = cps1(&m).total_cycles;
         assert!(stopped > 0, "the premise: the machine ran up to the stop");
 
-        // The same, but the third of those ticks presses `P`.
+        // The same, but the third of those ticks presses pause.
         cps1_mut(&mut m).restore(&start);
-        script[3] = Fake::held(&[Key::P]);
+        script[3] = Fake::held(&[Key::F11]);
         let mut d = Fake::new(script);
         run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert!(
@@ -2639,7 +2639,7 @@ mod tests {
     #[test]
     fn a_paused_tick_queues_nothing_and_reports_the_pause() {
         let (o, _s, _p) = opts("queue-paused");
-        let mut script = vec![Fake::held(&[Key::P])];
+        let mut script = vec![Fake::held(&[Key::F11])];
         script.extend(Fake::idle(2));
         let mut d = Fake::new(script);
         let mut a = FakeAudio::default();
@@ -2674,9 +2674,9 @@ mod tests {
     #[test]
     fn resuming_tells_the_sink_the_pause_is_over() {
         let (o, _s, _p) = opts("queue-resume");
-        let mut script = vec![Fake::held(&[Key::P])];
+        let mut script = vec![Fake::held(&[Key::F11])];
         script.extend(Fake::idle(1));
-        script.push(Fake::held(&[Key::P]));
+        script.push(Fake::held(&[Key::F11]));
         script.extend(Fake::idle(1));
         let mut d = Fake::new(script);
         let mut a = FakeAudio::default();

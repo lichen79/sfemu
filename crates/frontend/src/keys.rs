@@ -21,12 +21,26 @@
 //! it backwards costs: a board that "boots with every button held, which looks like
 //! a game bug rather than a bus bug and costs a day to find".
 //!
-//! # Player 2 is not mapped
+//! # Both players, on one keyboard
 //!
-//! Two players on one keyboard needs a second ten-key cluster and every honest
-//! option is bad. `Inputs` already carries P2 for a gamepad or netplay to fill in.
-//! `tests::no_key_presses_a_player_two_control` pins the absence, so a later map
-//! cannot half-add it.
+//! P1 has the left of the keyboard — `Z`/`S`/`Q`/`D` for the stick, `I`/`O`/`P` for
+//! the punches and `J`/`K`/`L` for the kicks directly under them. P2 has the right:
+//! the arrow keys, and the numeric keypad's `7`/`8`/`9` over `4`/`5`/`6`. Punches on
+//! top of kicks in both clusters, which is a six-button cabinet's own arrangement.
+//!
+//! Three consequences, all of them things a later reader would otherwise rediscover:
+//!
+//! - **P2 needs a numeric keypad.** A keyboard without one leaves P2's six buttons
+//!   unreachable while its stick still works, which is worse than nothing. `Inputs`
+//!   carries P2 either way, for a gamepad or netplay to fill in.
+//! - **No letter key is a control any more.** Pause moved off `P`, which is now P1's
+//!   fierce punch, onto `F11` — the one gap that was left in `F1`-`F12`. Every
+//!   control is now a function key or a navigation key, so a letter arriving at a
+//!   control is a bug with a shape.
+//! - **The two halves must not leak.** `tests::each_game_key_clears_its_own_port_bit`
+//!   asserts all three ports for every one of the 25 game keys, so a P1 key that also
+//!   moved P2 fails its own row; `tests::no_control_key_reaches_the_board` covers the
+//!   other direction over every remaining key.
 
 use machine::Inputs;
 
@@ -36,28 +50,54 @@ use machine::Inputs;
 /// `minifb::Key` here would make this module — the key map, the thing most worth
 /// testing — part of the display boundary. `sfemu`'s `display` module translates,
 /// in a total match with no decisions in it.
+///
+/// The variants are named after the **physical key**, not the button it presses:
+/// `Z` is a key called Z, and which of the twelve board inputs it is lives in
+/// [`Controls::update`] alone. Naming them `P1Up` would put the map in two places, and
+/// the two would then have to be changed together — this remap moved eleven of them
+/// and touched no variant name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     /// P1 stick up.
-    Up,
-    /// P1 stick down.
-    Down,
-    /// P1 stick left.
-    Left,
-    /// P1 stick right.
-    Right,
-    /// P1 jab.
-    A,
-    /// P1 strong.
-    S,
-    /// P1 fierce.
-    D,
-    /// P1 short kick.
     Z,
+    /// P1 stick down.
+    S,
+    /// P1 stick left.
+    Q,
+    /// P1 stick right.
+    D,
+    /// P1 jab.
+    I,
+    /// P1 strong.
+    O,
+    /// P1 fierce.
+    P,
+    /// P1 short kick.
+    J,
     /// P1 forward kick.
-    X,
+    K,
     /// P1 roundhouse kick.
-    C,
+    L,
+    /// P2 stick up.
+    Up,
+    /// P2 stick down.
+    Down,
+    /// P2 stick left.
+    Left,
+    /// P2 stick right.
+    Right,
+    /// P2 jab.
+    NumPad7,
+    /// P2 strong.
+    NumPad8,
+    /// P2 fierce.
+    NumPad9,
+    /// P2 short kick.
+    NumPad4,
+    /// P2 forward kick.
+    NumPad5,
+    /// P2 roundhouse kick.
+    NumPad6,
     /// Start 1.
     Num1,
     /// Start 2.
@@ -77,7 +117,10 @@ pub enum Key {
     /// Screenshot.
     F12,
     /// Pause / resume.
-    P,
+    ///
+    /// `F11` and not `P`, which is P1's fierce punch. The letter area belongs to the
+    /// players; `F11` was the one gap left in `F1`-`F12`.
+    F11,
     /// Step one frame while paused.
     Period,
     /// Quit.
@@ -114,17 +157,27 @@ impl Key {
     /// `tests::all_lists_every_key_exactly_once` fails if a variant is added and
     /// not listed here, which is what stops the tests that iterate this from
     /// quietly narrowing.
-    pub const ALL: [Key; 34] = [
+    pub const ALL: [Key; 44] = [
+        Key::Z,
+        Key::S,
+        Key::Q,
+        Key::D,
+        Key::I,
+        Key::O,
+        Key::P,
+        Key::J,
+        Key::K,
+        Key::L,
         Key::Up,
         Key::Down,
         Key::Left,
         Key::Right,
-        Key::A,
-        Key::S,
-        Key::D,
-        Key::Z,
-        Key::X,
-        Key::C,
+        Key::NumPad7,
+        Key::NumPad8,
+        Key::NumPad9,
+        Key::NumPad4,
+        Key::NumPad5,
+        Key::NumPad6,
         Key::Num1,
         Key::Num2,
         Key::Num5,
@@ -134,7 +187,7 @@ impl Key {
         Key::F5,
         Key::F8,
         Key::F12,
-        Key::P,
+        Key::F11,
         Key::Period,
         Key::Escape,
         Key::F1,
@@ -158,16 +211,16 @@ impl Key {
     /// remap every key. Written out, a reorder changes nothing.
     pub(crate) const fn bit(self) -> u32 {
         match self {
-            Key::Up => 0,
-            Key::Down => 1,
-            Key::Left => 2,
-            Key::Right => 3,
-            Key::A => 4,
-            Key::S => 5,
-            Key::D => 6,
-            Key::Z => 7,
-            Key::X => 8,
-            Key::C => 9,
+            Key::Z => 0,
+            Key::S => 1,
+            Key::Q => 2,
+            Key::D => 3,
+            Key::I => 4,
+            Key::O => 5,
+            Key::P => 6,
+            Key::J => 7,
+            Key::K => 8,
+            Key::L => 9,
             Key::Num1 => 10,
             Key::Num2 => 11,
             Key::Num5 => 12,
@@ -177,7 +230,7 @@ impl Key {
             Key::F5 => 16,
             Key::F8 => 17,
             Key::F12 => 18,
-            Key::P => 19,
+            Key::F11 => 19,
             Key::Period => 20,
             Key::Escape => 21,
             Key::F1 => 22,
@@ -192,6 +245,19 @@ impl Key {
             Key::BracketLeft => 31,
             Key::BracketRight => 32,
             Key::Enter => 33,
+            // Player 2's ten, added last so no existing key's bit moved. `KeySet` is a
+            // `u64` and this remap took it from 34 keys to 44 — bits 44 up are free, and
+            // `scripts/mutate.py`'s control mutant parks `Escape` on 62.
+            Key::Up => 34,
+            Key::Down => 35,
+            Key::Left => 36,
+            Key::Right => 37,
+            Key::NumPad7 => 38,
+            Key::NumPad8 => 39,
+            Key::NumPad9 => 40,
+            Key::NumPad4 => 41,
+            Key::NumPad5 => 42,
+            Key::NumPad6 => 43,
         }
     }
 }
@@ -201,11 +267,12 @@ impl Key {
 /// A bitmask rather than a `Vec`, so [`Controls`] can keep last frame's set by
 /// copy and the edge detection is one `&`.
 ///
-/// `u64` and not `u32`: 34 keys hold bits 0-33. It was a `u32` through E2's 29 keys,
+/// `u64` and not `u32`: 44 keys hold bits 0-43. It was a `u32` through E2's 29 keys,
 /// and the alternative to widening was overloading `PageUp`/`PageDown`/`Home` to
 /// mean something else while the graphics viewer is up — which would have reached 31
 /// keys, leaving exactly one free bit, and `scripts/mutate.py`'s control mutant needs
-/// a free bit to move `Escape` to. A `u64` is one field type and 30 bits to spare.
+/// a free bit to move `Escape` to. Mapping player 2 then added ten more, which a `u32`
+/// could not have held at all: 44 keys is 12 bits past its width.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KeySet {
     bits: u64,
@@ -331,19 +398,35 @@ impl Controls {
         if let Some(dsw) = self.dsw {
             inputs.dsw = dsw;
         }
-        inputs.p1.up = now.contains(Key::Up);
-        inputs.p1.down = now.contains(Key::Down);
-        inputs.p1.left = now.contains(Key::Left);
-        inputs.p1.right = now.contains(Key::Right);
+        // Player 1, the left of the keyboard: ZSQD stick, IOP punches, JKL kicks.
+        inputs.p1.up = now.contains(Key::Z);
+        inputs.p1.down = now.contains(Key::S);
+        inputs.p1.left = now.contains(Key::Q);
+        inputs.p1.right = now.contains(Key::D);
         inputs.p1.punch = [
-            now.contains(Key::A),
-            now.contains(Key::S),
-            now.contains(Key::D),
+            now.contains(Key::I),
+            now.contains(Key::O),
+            now.contains(Key::P),
         ];
         inputs.p1.kick = [
-            now.contains(Key::Z),
-            now.contains(Key::X),
-            now.contains(Key::C),
+            now.contains(Key::J),
+            now.contains(Key::K),
+            now.contains(Key::L),
+        ];
+        // Player 2, the right: arrow-key stick, keypad 789 punches over 456 kicks.
+        inputs.p2.up = now.contains(Key::Up);
+        inputs.p2.down = now.contains(Key::Down);
+        inputs.p2.left = now.contains(Key::Left);
+        inputs.p2.right = now.contains(Key::Right);
+        inputs.p2.punch = [
+            now.contains(Key::NumPad7),
+            now.contains(Key::NumPad8),
+            now.contains(Key::NumPad9),
+        ];
+        inputs.p2.kick = [
+            now.contains(Key::NumPad4),
+            now.contains(Key::NumPad5),
+            now.contains(Key::NumPad6),
         ];
         inputs.coin1 = now.contains(Key::Num5);
         inputs.coin2 = now.contains(Key::Num6);
@@ -356,7 +439,7 @@ impl Controls {
 
         let actions = Actions {
             inputs,
-            pause_toggled: edge(Key::P),
+            pause_toggled: edge(Key::F11),
             step: edge(Key::Period),
             reset: edge(Key::F3),
             save: edge(Key::F5),
@@ -421,37 +504,121 @@ mod tests {
     /// punches through the port block (`IN1`), so a frontend that put all six on
     /// one port would leave three buttons dead in-game while every test that looked
     /// only at "some bit changed" stayed green.
+    ///
+    /// # All three ports, every key
+    ///
+    /// Each key asserts `in0`, `in1` and `in2` — not only the port it belongs to.
+    /// That is what makes the two players' halves separable now that both are mapped:
+    /// the old `no_key_presses_a_player_two_control` could state "no key reaches P2"
+    /// as a blanket property, and cannot any more. A P1 key that also set the P2 field
+    /// beside it — `p2.right` for `p1.right`, `scripts/mutate.py`'s
+    /// `a-key-reaches-player-two` — changes `in1`'s *high* byte, which a
+    /// `0xFF__`-shaped literal catches and a `_ & 0xFF` comparison would not.
     #[test]
     fn each_game_key_clears_its_own_port_bit() {
         let one = |k: Key| {
             let mut c = Controls::new();
             c.update(KeySet::from_keys(&[k])).inputs
         };
+        // Every game key, with all three ports as literals. `expect` names which of
+        // the three is not idle, so a row reads as "this key, this port, this bit".
+        let cases: [(Key, u8, u16, u8, &str); 25] = [
+            // P1's stick, IN1 bits 0-3. ZSQD: Z above S, Q and D either side.
+            (Key::Z, 0xFF, 0xFFF7, 0xFF, "P1 up"),
+            (Key::S, 0xFF, 0xFFFB, 0xFF, "P1 down"),
+            (Key::Q, 0xFF, 0xFFFD, 0xFF, "P1 left"),
+            (Key::D, 0xFF, 0xFFFE, 0xFF, "P1 right"),
+            // P1's punches, IN1 bits 4-6, left to right on the top row.
+            (Key::I, 0xFF, 0xFFEF, 0xFF, "P1 jab"),
+            (Key::O, 0xFF, 0xFFDF, 0xFF, "P1 strong"),
+            (Key::P, 0xFF, 0xFFBF, 0xFF, "P1 fierce"),
+            // P1's kicks, IN2 bits 0-2, directly beneath. Note IN1 stays 0xFFFF: a
+            // kick is not a punch, and the two are different chips.
+            (Key::J, 0xFF, 0xFFFF, 0xFE, "P1 short"),
+            (Key::K, 0xFF, 0xFFFF, 0xFD, "P1 forward"),
+            (Key::L, 0xFF, 0xFFFF, 0xFB, "P1 roundhouse"),
+            // P2's stick, IN1's *high* byte — same four bits, eight up.
+            (Key::Up, 0xFF, 0xF7FF, 0xFF, "P2 up"),
+            (Key::Down, 0xFF, 0xFBFF, 0xFF, "P2 down"),
+            (Key::Left, 0xFF, 0xFDFF, 0xFF, "P2 left"),
+            (Key::Right, 0xFF, 0xFEFF, 0xFF, "P2 right"),
+            // P2's punches, IN1 bits 12-14.
+            (Key::NumPad7, 0xFF, 0xEFFF, 0xFF, "P2 jab"),
+            (Key::NumPad8, 0xFF, 0xDFFF, 0xFF, "P2 strong"),
+            (Key::NumPad9, 0xFF, 0xBFFF, 0xFF, "P2 fierce"),
+            // P2's kicks, IN2 bits 4-6 — bit 3 is unwired, which is why they do not
+            // start at 3.
+            (Key::NumPad4, 0xFF, 0xFFFF, 0xEF, "P2 short"),
+            (Key::NumPad5, 0xFF, 0xFFFF, 0xDF, "P2 forward"),
+            (Key::NumPad6, 0xFF, 0xFFFF, 0xBF, "P2 roundhouse"),
+            // Coins and starts, IN0. MAME's convention: 5 and 6 coin, 1 and 2 start.
+            (Key::Num5, 0xFE, 0xFFFF, 0xFF, "coin 1"),
+            (Key::Num6, 0xFD, 0xFFFF, 0xFF, "coin 2"),
+            (Key::Num1, 0xEF, 0xFFFF, 0xFF, "start 1"),
+            (Key::Num2, 0xDF, 0xFFFF, 0xFF, "start 2"),
+            (Key::F2, 0xBF, 0xFFFF, 0xFF, "the test switch, IN0 bit 6"),
+        ];
+        for (k, in0, in1, in2, what) in cases {
+            let i = one(k);
+            assert_eq!(i.in0(), in0, "{k:?} ({what}): IN0");
+            assert_eq!(i.in1(), in1, "{k:?} ({what}): IN1");
+            assert_eq!(i.in2(), in2, "{k:?} ({what}): IN2");
+        }
+        // No two rows claim the same key, and no two claim the same triple of ports —
+        // a copy-paste that gave two keys one row's values would otherwise pass every
+        // assertion above.
+        for (i, a) in cases.iter().enumerate() {
+            for b in &cases[i + 1..] {
+                assert_ne!(a.0, b.0, "{:?} appears twice", a.0);
+                assert_ne!(
+                    (a.1, a.2, a.3),
+                    (b.1, b.2, b.3),
+                    "{:?} and {:?} press the same thing",
+                    a.0,
+                    b.0
+                );
+            }
+        }
+    }
 
-        // The stick, IN1 bits 0-3.
-        assert_eq!(one(Key::Right).in1(), 0xFFFE);
-        assert_eq!(one(Key::Left).in1(), 0xFFFD);
-        assert_eq!(one(Key::Down).in1(), 0xFFFB);
-        assert_eq!(one(Key::Up).in1(), 0xFFF7);
-
-        // Punches, IN1 bits 4-6, left to right on the top row.
-        assert_eq!(one(Key::A).in1(), 0xFFEF, "jab");
-        assert_eq!(one(Key::S).in1(), 0xFFDF, "strong");
-        assert_eq!(one(Key::D).in1(), 0xFFBF, "fierce");
-        assert_eq!(one(Key::A).in2(), 0xFF, "a punch is not a kick");
-
-        // Kicks, IN2 bits 0-2, directly beneath.
-        assert_eq!(one(Key::Z).in2(), 0xFE, "short");
-        assert_eq!(one(Key::X).in2(), 0xFD, "forward");
-        assert_eq!(one(Key::C).in2(), 0xFB, "roundhouse");
-        assert_eq!(one(Key::Z).in1(), 0xFFFF, "a kick is not a punch");
-
-        // Coins and starts, IN0. MAME's convention: 5 and 6 coin, 1 and 2 start.
-        assert_eq!(one(Key::Num5).in0(), 0xFE, "coin 1");
-        assert_eq!(one(Key::Num6).in0(), 0xFD, "coin 2");
-        assert_eq!(one(Key::Num1).in0(), 0xEF, "start 1");
-        assert_eq!(one(Key::Num2).in0(), 0xDF, "start 2");
-        assert_eq!(one(Key::F2).in0(), 0xBF, "the test switch, IN0 bit 6");
+    /// The 25 rows above are every game key there is.
+    ///
+    /// Separate from the table so the count is asserted once, in a test whose failure
+    /// message is about coverage rather than about a port bit: a key added to the map
+    /// and not to the table is untested, and every assertion in the table still passes.
+    #[test]
+    fn the_port_bit_table_covers_every_game_key() {
+        let control = [
+            Key::F3,
+            Key::F5,
+            Key::F8,
+            Key::F12,
+            Key::F11,
+            Key::Period,
+            Key::Escape,
+            Key::F1,
+            Key::F4,
+            Key::F6,
+            Key::F7,
+            Key::PageUp,
+            Key::PageDown,
+            Key::Home,
+            Key::GfxToggled,
+            Key::GfxView,
+            Key::BracketLeft,
+            Key::BracketRight,
+            Key::Enter,
+        ];
+        let game: Vec<Key> = Key::ALL
+            .iter()
+            .copied()
+            .filter(|k| !control.contains(k))
+            .collect();
+        assert_eq!(
+            game.len(),
+            25,
+            "the port-bit table has 25 rows; these are the keys it must cover: {game:?}"
+        );
     }
 
     /// No key moves a DIP switch, and with none set they stay at `idle()`'s value.
@@ -489,9 +656,9 @@ mod tests {
             // resting on an idle keyboard.
             let held = match frame {
                 0 => vec![],
-                1 => vec![Key::Down, Key::A],
+                1 => vec![Key::S, Key::I],
                 2 => vec![Key::Num5],
-                _ => vec![Key::Z, Key::Right],
+                _ => vec![Key::J, Key::Right],
             };
             let a = c.update(KeySet::from_keys(&held));
             assert_eq!(
@@ -526,26 +693,95 @@ mod tests {
     #[test]
     fn several_keys_at_once_all_reach_the_board() {
         let mut c = Controls::new();
-        let a = c.update(KeySet::from_keys(&[Key::Down, Key::A, Key::Z]));
+        let a = c.update(KeySet::from_keys(&[Key::S, Key::I, Key::J]));
         assert_eq!(a.inputs.in1(), 0xFFEB, "down (bit 2) and jab (bit 4)");
         assert_eq!(a.inputs.in2(), 0xFE, "and the kick, on its own port");
     }
 
-    /// Player 2 is not mapped, deliberately.
+    /// Both players at once, on the same frame.
     ///
-    /// A default map cannot give P2 a second ten-key cluster on one keyboard, and a
-    /// mapping nobody uses is a mapping nobody notices is wrong. The board's P2
-    /// half must therefore read as idle no matter which key is held — which is what
-    /// this asserts, over every key there is.
+    /// The case the whole remap exists for, and one no single-key row can make: two
+    /// people playing. P1 holding down-back and a jab while P2 holds up-forward and a
+    /// roundhouse kick puts eight bits across three ports at once, and the values are
+    /// literals computed from `machine::inputs`' documented layout — P1 in `IN1`'s low
+    /// byte, P2 in its high, the kicks on `IN2` at bits 0-2 and 4-6.
+    ///
+    /// A map that dropped one player while the other was active — the natural mistake
+    /// being an `inputs.p2 = ...` assignment that overwrote rather than accumulated —
+    /// passes every one-key row above and fails here.
     #[test]
-    fn no_key_presses_a_player_two_control() {
-        for k in Key::ALL {
+    fn both_players_at_once_reach_their_own_halves() {
+        let mut c = Controls::new();
+        let a = c.update(KeySet::from_keys(&[
+            // P1: down (S) and left (Q), jab (I), roundhouse (L).
+            Key::S,
+            Key::Q,
+            Key::I,
+            Key::L,
+            // P2: up (Up) and right (Right), fierce (NumPad9), short (NumPad4).
+            Key::Up,
+            Key::Right,
+            Key::NumPad9,
+            Key::NumPad4,
+        ]));
+        // IN1 low byte: down is bit 2, left is bit 1, jab is bit 4 → 0xFF & !0x16 = 0xE9.
+        // IN1 high byte: up is bit 3, right is bit 0, fierce is bit 6 → !0x49 = 0xB6.
+        assert_eq!(a.inputs.in1(), 0xB6E9, "P2 in the high byte, P1 in the low");
+        // IN2: P1's roundhouse is bit 2, P2's short is bit 4 → !0x14 = 0xEB.
+        assert_eq!(a.inputs.in2(), 0xEB, "both players' kicks, one port");
+        assert_eq!(a.inputs.in0(), 0xFF, "and no coin or start was involved");
+    }
+
+    /// No control key touches the board.
+    ///
+    /// This replaces `no_key_presses_a_player_two_control`, which asserted that P2 was
+    /// idle no matter which key was held. That was true while P2 was unmapped and is
+    /// now false by design, so the property had to be re-stated rather than loosened:
+    /// what still holds in one blanket sweep is that a **control** — pause, step, save,
+    /// the debugger's seven, the graphics viewer's five — reaches no board input at
+    /// all. That is the direction with a real failure mode, because a control that also
+    /// pressed a button would be invisible: F5 saves *and* throws a fierce punch, and
+    /// the save still works.
+    ///
+    /// The other direction — a game key that reaches the wrong player — is
+    /// `each_game_key_clears_its_own_port_bit`, which asserts all three ports per key.
+    #[test]
+    fn no_control_key_reaches_the_board() {
+        // Every key that is not a game input. `F2` is not here: the test switch is a
+        // board input, level-triggered, and `the_test_switch_is_held_not_pressed` owns
+        // it.
+        let control = [
+            Key::F3,
+            Key::F5,
+            Key::F8,
+            Key::F12,
+            Key::F11,
+            Key::Period,
+            Key::Escape,
+            Key::F1,
+            Key::F4,
+            Key::F6,
+            Key::F7,
+            Key::PageUp,
+            Key::PageDown,
+            Key::Home,
+            Key::GfxToggled,
+            Key::GfxView,
+            Key::BracketLeft,
+            Key::BracketRight,
+            Key::Enter,
+        ];
+        assert_eq!(control.len(), 19, "add a new control here too");
+        for k in control {
             let mut c = Controls::new();
             let i = c.update(KeySet::from_keys(&[k])).inputs;
-            // P2's stick and punches are IN1's high byte; its kicks are IN2 bits
-            // 4-6 (bit 3 is unwired, which is why they do not start at 3).
-            assert_eq!(i.in1() >> 8, 0xFF, "{k:?} moved P2's stick or punches");
-            assert_eq!(i.in2() & 0x70, 0x70, "{k:?} pressed a P2 kick");
+            assert_eq!(
+                i.in0(),
+                0xFF,
+                "{k:?} reached a coin, start, service or test"
+            );
+            assert_eq!(i.in1(), 0xFFFF, "{k:?} reached a stick or a punch");
+            assert_eq!(i.in2(), 0xFF, "{k:?} reached a kick");
         }
     }
 
@@ -558,7 +794,7 @@ mod tests {
     #[test]
     fn control_keys_fire_once_per_press_and_game_keys_do_not() {
         let mut c = Controls::new();
-        let held = KeySet::from_keys(&[Key::Period, Key::Down]);
+        let held = KeySet::from_keys(&[Key::Period, Key::S]);
 
         let a = c.update(held);
         assert!(a.step, "the first frame of the press steps");
@@ -593,7 +829,7 @@ mod tests {
         /// type too complex, and it is: a table of key-and-accessor pairs.
         type Reader = fn(&Actions) -> bool;
         let cases: [(Key, Reader); 19] = [
-            (Key::P, |a| a.pause_toggled),
+            (Key::F11, |a| a.pause_toggled),
             (Key::Period, |a| a.step),
             (Key::F3, |a| a.reset),
             (Key::F5, |a| a.save),
@@ -617,16 +853,26 @@ mod tests {
         // table. Without this, adding a key and forgetting the row leaves the new
         // action untested and every assertion below still passes.
         let game = [
+            Key::Z,
+            Key::S,
+            Key::Q,
+            Key::D,
+            Key::I,
+            Key::O,
+            Key::P,
+            Key::J,
+            Key::K,
+            Key::L,
             Key::Up,
             Key::Down,
             Key::Left,
             Key::Right,
-            Key::A,
-            Key::S,
-            Key::D,
-            Key::Z,
-            Key::X,
-            Key::C,
+            Key::NumPad7,
+            Key::NumPad8,
+            Key::NumPad9,
+            Key::NumPad4,
+            Key::NumPad5,
+            Key::NumPad6,
             Key::Num1,
             Key::Num2,
             Key::Num5,
@@ -683,7 +929,7 @@ mod tests {
     #[test]
     fn two_control_keys_pressed_together_both_fire() {
         let mut c = Controls::new();
-        let a = c.update(KeySet::from_keys(&[Key::P, Key::F5]));
+        let a = c.update(KeySet::from_keys(&[Key::F11, Key::F5]));
         assert!(a.pause_toggled && a.save);
     }
 
@@ -695,7 +941,7 @@ mod tests {
     #[test]
     fn releasing_one_key_does_not_refire_another() {
         let mut c = Controls::new();
-        let a = c.update(KeySet::from_keys(&[Key::P, Key::F5]));
+        let a = c.update(KeySet::from_keys(&[Key::F11, Key::F5]));
         assert!(a.pause_toggled && a.save, "the premise");
         let a = c.update(KeySet::from_keys(&[Key::F5]));
         assert!(!a.save, "F5 was held throughout and must not fire again");
@@ -729,9 +975,9 @@ mod tests {
     /// Every key's bit fits the set, and the set is wide enough for the next one.
     ///
     /// `every_key_has_its_own_slot` proves the bits are distinct; it does not prove
-    /// they are *reachable*. `1u32 << 33` is a shift overflow — a debug-build panic
-    /// and a release-build wrap to bit 1, which would silently alias `GfxView` to
-    /// `Down`. So the width is asserted against the highest bit any key uses.
+    /// they are *reachable*. `1u32 << 43` is a shift overflow — a debug-build panic
+    /// and a release-build wrap to bit 11, which would silently alias P2's roundhouse
+    /// to start 2. So the width is asserted against the highest bit any key uses.
     #[test]
     fn every_key_fits_the_set_with_room_left() {
         let highest = Key::ALL.iter().map(|k| k.bit()).max().expect("29+ keys");
@@ -767,7 +1013,7 @@ mod tests {
     fn all_lists_every_key_exactly_once() {
         assert_eq!(
             Key::ALL.len(),
-            34,
+            44,
             "add new keys to ALL, and to this literal"
         );
         for (i, a) in Key::ALL.iter().enumerate() {

@@ -122,16 +122,30 @@ impl Display for Window {
 fn translate(k: minifb::Key) -> Option<Key> {
     use minifb::Key as M;
     Some(match k {
+        // Player 1's cluster.
+        M::Z => Key::Z,
+        M::S => Key::S,
+        M::Q => Key::Q,
+        M::D => Key::D,
+        M::I => Key::I,
+        M::O => Key::O,
+        M::P => Key::P,
+        M::J => Key::J,
+        M::K => Key::K,
+        M::L => Key::L,
+        // Player 2's. `NumPad4`-`NumPad9` and not `Key4`-`Key9`: the number row's 1, 2,
+        // 5 and 6 are the cabinet's start and coin buttons, and a keypad is a separate
+        // set of keycodes rather than an alias for them.
         M::Up => Key::Up,
         M::Down => Key::Down,
         M::Left => Key::Left,
         M::Right => Key::Right,
-        M::A => Key::A,
-        M::S => Key::S,
-        M::D => Key::D,
-        M::Z => Key::Z,
-        M::X => Key::X,
-        M::C => Key::C,
+        M::NumPad7 => Key::NumPad7,
+        M::NumPad8 => Key::NumPad8,
+        M::NumPad9 => Key::NumPad9,
+        M::NumPad4 => Key::NumPad4,
+        M::NumPad5 => Key::NumPad5,
+        M::NumPad6 => Key::NumPad6,
         M::Key1 => Key::Num1,
         M::Key2 => Key::Num2,
         M::Key5 => Key::Num5,
@@ -141,7 +155,7 @@ fn translate(k: minifb::Key) -> Option<Key> {
         M::F5 => Key::F5,
         M::F8 => Key::F8,
         M::F12 => Key::F12,
-        M::P => Key::P,
+        M::F11 => Key::F11,
         M::Period => Key::Period,
         M::Escape => Key::Escape,
         M::F1 => Key::F1,
@@ -223,16 +237,26 @@ mod tests {
         use frontend::Key;
         use minifb::Key as M;
         let candidates = [
+            M::Z,
+            M::S,
+            M::Q,
+            M::D,
+            M::I,
+            M::O,
+            M::P,
+            M::J,
+            M::K,
+            M::L,
             M::Up,
             M::Down,
             M::Left,
             M::Right,
-            M::A,
-            M::S,
-            M::D,
-            M::Z,
-            M::X,
-            M::C,
+            M::NumPad7,
+            M::NumPad8,
+            M::NumPad9,
+            M::NumPad4,
+            M::NumPad5,
+            M::NumPad6,
             M::Key1,
             M::Key2,
             M::Key5,
@@ -245,8 +269,8 @@ mod tests {
             M::F6,
             M::F7,
             M::F8,
+            M::F11,
             M::F12,
-            M::P,
             M::Period,
             M::Escape,
             M::PageUp,
@@ -270,11 +294,25 @@ mod tests {
         }
         // And nothing is mapped that is not a `Key`: an unhandled key is `None`, not a
         // panic, because `minifb` reports keys this program has no opinion about.
-        assert_eq!(translate(M::Q), None, "an unmapped key is None");
+        assert_eq!(translate(M::W), None, "an unmapped letter is None");
+        assert_eq!(translate(M::Space), None, "and so is the space bar");
+
+        // The number row and the keypad are different keys. P2's six buttons are on the
+        // keypad while 1, 2, 5 and 6 on the number row are the cabinet's start and coin
+        // buttons — a translation that treated `Key5` and `NumPad5` as the same thing
+        // would make inserting a coin throw P2's forward kick, and every assertion
+        // above would still pass.
         assert_eq!(
-            translate(M::F11),
-            None,
-            "including a neighbouring function key"
+            translate(M::Key5),
+            Some(Key::Num5),
+            "the number row's 5 is coin 1"
         );
+        assert_eq!(
+            translate(M::NumPad5),
+            Some(Key::NumPad5),
+            "the keypad's 5 is P2's forward kick"
+        );
+        assert_eq!(translate(M::Key4), None, "the number row's 4 is nothing");
+        assert_eq!(translate(M::NumPad1), None, "nor is the keypad's 1");
     }
 }
