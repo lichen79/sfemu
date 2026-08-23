@@ -676,14 +676,35 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # The map itself.
             (
                 "kick-reads-a-punch-key",
-                "        inputs.p1.kick = [\n            now.contains(Key::J),",
                 "        inputs.p1.kick = [\n            now.contains(Key::I),",
+                "        inputs.p1.kick = [\n            now.contains(Key::K),",
                 "KILL",
             ),
             (
                 "punch-key-order-swapped",
-                "            now.contains(Key::I),\n            now.contains(Key::O),",
-                "            now.contains(Key::O),\n            now.contains(Key::I),",
+                "            now.contains(Key::K),\n            now.contains(Key::L),",
+                "            now.contains(Key::L),\n            now.contains(Key::K),",
+                "KILL",
+            ),
+            # The two button rows traded wholesale -- the arrangement this project had
+            # until the remap, and the one a reader who knows a real cabinet would
+            # "restore". Every key still reaches a real button, all six ports stay
+            # distinct, and no key is duplicated or dropped: the only thing wrong is
+            # which row is which. `GAME_KEY_PORTS` says per key, and `main.rs`'s
+            # usage-text test presses both ends of both rows for exactly this.
+            (
+                "the-button-rows-are-swapped",
+                "        inputs.p1.punch = [\n            now.contains(Key::K),\n            now.contains(Key::L),\n            now.contains(Key::M),\n        ];\n        inputs.p1.kick = [\n            now.contains(Key::I),\n            now.contains(Key::O),\n            now.contains(Key::P),\n        ];",
+                "        inputs.p1.punch = [\n            now.contains(Key::I),\n            now.contains(Key::O),\n            now.contains(Key::P),\n        ];\n        inputs.p1.kick = [\n            now.contains(Key::K),\n            now.contains(Key::L),\n            now.contains(Key::M),\n        ];",
+                "KILL",
+            ),
+            # And the same trade on the keypad, which is the half a partial revert leaves
+            # behind: P1 fixed, P2 not. The two players would then disagree about which
+            # row punches, and every per-key port assertion for P1 still passes.
+            (
+                "the-keypad-rows-are-swapped",
+                "        inputs.p2.punch = [\n            now.contains(Key::NumPad4),\n            now.contains(Key::NumPad5),\n            now.contains(Key::NumPad6),\n        ];\n        inputs.p2.kick = [\n            now.contains(Key::NumPad7),\n            now.contains(Key::NumPad8),\n            now.contains(Key::NumPad9),\n        ];",
+                "        inputs.p2.punch = [\n            now.contains(Key::NumPad7),\n            now.contains(Key::NumPad8),\n            now.contains(Key::NumPad9),\n        ];\n        inputs.p2.kick = [\n            now.contains(Key::NumPad4),\n            now.contains(Key::NumPad5),\n            now.contains(Key::NumPad6),\n        ];",
                 "KILL",
             ),
             ("coin-is-a-start-key", "inputs.coin1 = now.contains(Key::Num5);", "inputs.coin1 = now.contains(Key::Num1);", "KILL"),
@@ -1260,10 +1281,33 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
                 "        M::W | M::Z => Key::Z,",
                 "KILL",
             ),
-            # CONTROL: P1's six buttons sit in the same position on AZERTY and QWERTY, so
-            # reordering their arms changes nothing. The right control for this set: it is
-            # the edit in this exact neighbourhood that *is* safe, and it fails only if a
-            # test has started asserting match-arm order instead of behaviour.
+            # The third trap, and the one with the worst symptom. AZERTY puts `M` on the
+            # home row at position 0x29, which `minifb` names `Semicolon` after the US
+            # letter printed there; `M::M` is 0x2e, the key labelled `,` here. So this
+            # mutant -- which is simply "the obvious spelling" -- moves P1's fierce punch
+            # off the home row onto the comma key. Nothing in `frontend` can see it, and
+            # `every_frontend_key_can_be_produced_by_a_keypress` still finds exactly one
+            # producer for `Key::M`; only the position assertion catches it.
+            (
+                "p1-fierce-follows-the-us-letter",
+                "        M::Semicolon => Key::M,",
+                "        M::M => Key::M,",
+                "KILL",
+            ),
+            # And the both-layouts variant of it, for the same reason as `M::W` above: on
+            # this keyboard the punch still works, and a second key merely also throws it.
+            (
+                "both-layouts-press-p1-fierce",
+                "        M::Semicolon => Key::M,",
+                "        M::Semicolon | M::M => Key::M,",
+                "KILL",
+            ),
+            # CONTROL: five of P1's six buttons sit in the same position on AZERTY and
+            # QWERTY -- `M` is the exception, which is what the two mutants above are
+            # about -- so reordering the layout-stable arms changes nothing. The right
+            # control for this set: it is the edit in this exact neighbourhood that *is*
+            # safe, and it fails only if a test has started asserting match-arm order
+            # instead of behaviour.
             (
                 "CONTROL-punch-arms-reordered",
                 "        M::I => Key::I,\n        M::O => Key::O,\n        M::P => Key::P,",

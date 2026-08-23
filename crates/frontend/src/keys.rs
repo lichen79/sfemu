@@ -23,12 +23,18 @@
 //!
 //! # Both players, on one keyboard
 //!
-//! P1 has the left of the keyboard — `Z`/`S`/`Q`/`D` for the stick, `I`/`O`/`P` for
-//! the punches and `J`/`K`/`L` for the kicks directly under them. P2 has the right:
-//! the arrow keys, and the numeric keypad's `7`/`8`/`9` over `4`/`5`/`6`. Punches on
-//! top of kicks in both clusters, which is a six-button cabinet's own arrangement.
+//! P1 has the left of the keyboard — `Z`/`S`/`Q`/`D` for the stick, `K`/`L`/`M` for
+//! the punches and `I`/`O`/`P` for the kicks directly above them. P2 has the right:
+//! the arrow keys, and the numeric keypad's `4`/`5`/`6` under `7`/`8`/`9`.
 //!
-//! Four consequences, all of them things a later reader would otherwise rediscover:
+//! **Punches below kicks, in both clusters — the reverse of a six-button cabinet.**
+//! That is deliberate and it was asked for: on an AZERTY keyboard `K L M` is a run of
+//! three on the home row, so the punches land under the resting fingers and the kicks
+//! go on the row above. The two clusters agree with each other, which is the property
+//! that matters once the arrangement is unconventional — a player who learns one half
+//! has learned the other.
+//!
+//! Five consequences, all of them things a later reader would otherwise rediscover:
 //!
 //! - **The letters are AZERTY labels, and this module cannot see a layout.** A variant
 //!   named `Z` means "the key the player was told is Z" — on a French keyboard, the
@@ -37,11 +43,17 @@
 //!   position after a US letter and never consults the active layout, so `M::W` is what
 //!   produces [`Key::Z`] here. Nothing in this file changes with the layout, which is
 //!   the point of the split — but it means the names here are labels, not evidence.
+//! - **[`Key::M`] is the sharpest case of that, and it is why the punches can be a
+//!   home-row run at all.** AZERTY moves `M` off the bottom row to the home row's right
+//!   end, right of `L`. That position is the one US QWERTY prints `;` on, so
+//!   `display::translate` produces this key from `minifb`'s `Semicolon` and *not* from
+//!   its `M`, which is the comma key here. On a QWERTY keyboard the third punch is
+//!   therefore the semicolon, not the letter M.
 //! - **P2 needs a numeric keypad.** A keyboard without one leaves P2's six buttons
 //!   unreachable while its stick still works, which is worse than nothing. `Inputs`
 //!   carries P2 either way, for a gamepad or netplay to fill in.
 //! - **No letter key is a control any more.** Pause moved off `P`, which is now P1's
-//!   fierce punch, onto `F11` — the one gap that was left in `F1`-`F12`. Every
+//!   roundhouse kick, onto `F11` — the one gap that was left in `F1`-`F12`. Every
 //!   control is now a function key or a navigation key, so a letter arriving at a
 //!   control is a bug with a shape.
 //! - **The two halves must not leak.** `tests::each_game_key_clears_its_own_port_bit`
@@ -78,18 +90,23 @@ pub enum Key {
     Q,
     /// P1 stick right.
     D,
-    /// P1 jab.
-    I,
-    /// P1 strong.
-    O,
-    /// P1 fierce.
-    P,
     /// P1 short kick.
-    J,
+    I,
     /// P1 forward kick.
-    K,
+    O,
     /// P1 roundhouse kick.
+    P,
+    /// P1 jab.
+    K,
+    /// P1 strong.
     L,
+    /// P1 fierce.
+    ///
+    /// The key **labelled M**, which on AZERTY is the home row's rightmost letter, next
+    /// to `L`. `display::translate` produces this from `minifb`'s `Semicolon` — position
+    /// 0x29 — and not from `M::M`, which is the comma key here. One more reason the
+    /// letters in this enum are labels rather than evidence.
+    M,
     /// P2 stick up.
     Up,
     /// P2 stick down.
@@ -98,17 +115,17 @@ pub enum Key {
     Left,
     /// P2 stick right.
     Right,
-    /// P2 jab.
-    NumPad7,
-    /// P2 strong.
-    NumPad8,
-    /// P2 fierce.
-    NumPad9,
     /// P2 short kick.
-    NumPad4,
+    NumPad7,
     /// P2 forward kick.
-    NumPad5,
+    NumPad8,
     /// P2 roundhouse kick.
+    NumPad9,
+    /// P2 jab.
+    NumPad4,
+    /// P2 strong.
+    NumPad5,
+    /// P2 fierce.
     NumPad6,
     /// Start 1.
     Num1,
@@ -177,9 +194,9 @@ impl Key {
         Key::I,
         Key::O,
         Key::P,
-        Key::J,
         Key::K,
         Key::L,
+        Key::M,
         Key::Up,
         Key::Down,
         Key::Left,
@@ -230,7 +247,10 @@ impl Key {
             Key::I => 4,
             Key::O => 5,
             Key::P => 6,
-            Key::J => 7,
+            // `M` takes the bit `J` had. Renaming a key is not a reason to move any
+            // other key's bit, and `scripts/mutate.py`'s control mutant is parked on 62
+            // on the strength of that.
+            Key::M => 7,
             Key::K => 8,
             Key::L => 9,
             Key::Num1 => 10,
@@ -410,35 +430,38 @@ impl Controls {
         if let Some(dsw) = self.dsw {
             inputs.dsw = dsw;
         }
-        // Player 1, the left of the keyboard: ZSQD stick, IOP punches, JKL kicks.
+        // Player 1, the left of the keyboard: ZSQD stick, KLM punches on the home row,
+        // IOP kicks on the row above. Punches under the resting fingers, which inverts a
+        // cabinet's own arrangement -- see the module docs.
         inputs.p1.up = now.contains(Key::Z);
         inputs.p1.down = now.contains(Key::S);
         inputs.p1.left = now.contains(Key::Q);
         inputs.p1.right = now.contains(Key::D);
         inputs.p1.punch = [
+            now.contains(Key::K),
+            now.contains(Key::L),
+            now.contains(Key::M),
+        ];
+        inputs.p1.kick = [
             now.contains(Key::I),
             now.contains(Key::O),
             now.contains(Key::P),
         ];
-        inputs.p1.kick = [
-            now.contains(Key::J),
-            now.contains(Key::K),
-            now.contains(Key::L),
-        ];
-        // Player 2, the right: arrow-key stick, keypad 789 punches over 456 kicks.
+        // Player 2, the right: arrow-key stick, keypad 456 punches under 789 kicks --
+        // mirroring P1's inversion, so the two halves agree about which row is which.
         inputs.p2.up = now.contains(Key::Up);
         inputs.p2.down = now.contains(Key::Down);
         inputs.p2.left = now.contains(Key::Left);
         inputs.p2.right = now.contains(Key::Right);
         inputs.p2.punch = [
-            now.contains(Key::NumPad7),
-            now.contains(Key::NumPad8),
-            now.contains(Key::NumPad9),
-        ];
-        inputs.p2.kick = [
             now.contains(Key::NumPad4),
             now.contains(Key::NumPad5),
             now.contains(Key::NumPad6),
+        ];
+        inputs.p2.kick = [
+            now.contains(Key::NumPad7),
+            now.contains(Key::NumPad8),
+            now.contains(Key::NumPad9),
         ];
         inputs.coin1 = now.contains(Key::Num5);
         inputs.coin2 = now.contains(Key::Num6);
@@ -505,29 +528,30 @@ mod tests {
         (Key::S, 0xFF, 0xFFFB, 0xFF, "P1 down"),
         (Key::Q, 0xFF, 0xFFFD, 0xFF, "P1 left"),
         (Key::D, 0xFF, 0xFFFE, 0xFF, "P1 right"),
-        // P1's punches, IN1 bits 4-6, left to right on the top row.
-        (Key::I, 0xFF, 0xFFEF, 0xFF, "P1 jab"),
-        (Key::O, 0xFF, 0xFFDF, 0xFF, "P1 strong"),
-        (Key::P, 0xFF, 0xFFBF, 0xFF, "P1 fierce"),
-        // P1's kicks, IN2 bits 0-2, directly beneath. Note IN1 stays 0xFFFF: a kick is
-        // not a punch, and the two are read through different chips.
-        (Key::J, 0xFF, 0xFFFF, 0xFE, "P1 short"),
-        (Key::K, 0xFF, 0xFFFF, 0xFD, "P1 forward"),
-        (Key::L, 0xFF, 0xFFFF, 0xFB, "P1 roundhouse"),
+        // P1's punches, IN1 bits 4-6 — KLM, the home row, left to right.
+        (Key::K, 0xFF, 0xFFEF, 0xFF, "P1 jab"),
+        (Key::L, 0xFF, 0xFFDF, 0xFF, "P1 strong"),
+        (Key::M, 0xFF, 0xFFBF, 0xFF, "P1 fierce"),
+        // P1's kicks, IN2 bits 0-2 — IOP, the row *above* the punches. Note IN1 stays
+        // 0xFFFF: a kick is not a punch, and the two are read through different chips.
+        (Key::I, 0xFF, 0xFFFF, 0xFE, "P1 short"),
+        (Key::O, 0xFF, 0xFFFF, 0xFD, "P1 forward"),
+        (Key::P, 0xFF, 0xFFFF, 0xFB, "P1 roundhouse"),
         // P2's stick, IN1's *high* byte — the same four bits, eight up.
         (Key::Up, 0xFF, 0xF7FF, 0xFF, "P2 up"),
         (Key::Down, 0xFF, 0xFBFF, 0xFF, "P2 down"),
         (Key::Left, 0xFF, 0xFDFF, 0xFF, "P2 left"),
         (Key::Right, 0xFF, 0xFEFF, 0xFF, "P2 right"),
-        // P2's punches, IN1 bits 12-14.
-        (Key::NumPad7, 0xFF, 0xEFFF, 0xFF, "P2 jab"),
-        (Key::NumPad8, 0xFF, 0xDFFF, 0xFF, "P2 strong"),
-        (Key::NumPad9, 0xFF, 0xBFFF, 0xFF, "P2 fierce"),
-        // P2's kicks, IN2 bits 4-6 — bit 3 is unwired, which is why they do not start
-        // at 3.
-        (Key::NumPad4, 0xFF, 0xFFFF, 0xEF, "P2 short"),
-        (Key::NumPad5, 0xFF, 0xFFFF, 0xDF, "P2 forward"),
-        (Key::NumPad6, 0xFF, 0xFFFF, 0xBF, "P2 roundhouse"),
+        // P2's punches, IN1 bits 12-14 — the keypad's *bottom* row, 456, mirroring P1's
+        // punches-under-kicks.
+        (Key::NumPad4, 0xFF, 0xEFFF, 0xFF, "P2 jab"),
+        (Key::NumPad5, 0xFF, 0xDFFF, 0xFF, "P2 strong"),
+        (Key::NumPad6, 0xFF, 0xBFFF, 0xFF, "P2 fierce"),
+        // P2's kicks, IN2 bits 4-6 — the keypad's 789, above. Bit 3 is unwired, which is
+        // why they do not start at 3.
+        (Key::NumPad7, 0xFF, 0xFFFF, 0xEF, "P2 short"),
+        (Key::NumPad8, 0xFF, 0xFFFF, 0xDF, "P2 forward"),
+        (Key::NumPad9, 0xFF, 0xFFFF, 0xBF, "P2 roundhouse"),
         // Coins and starts, IN0. MAME's convention: 5 and 6 coin, 1 and 2 start.
         (Key::Num5, 0xFE, 0xFFFF, 0xFF, "coin 1"),
         (Key::Num6, 0xFD, 0xFFFF, 0xFF, "coin 2"),
@@ -712,9 +736,9 @@ mod tests {
             // resting on an idle keyboard.
             let held = match frame {
                 0 => vec![],
-                1 => vec![Key::S, Key::I],
+                1 => vec![Key::S, Key::K],
                 2 => vec![Key::Num5],
-                _ => vec![Key::J, Key::Right],
+                _ => vec![Key::M, Key::Right],
             };
             let a = c.update(KeySet::from_keys(&held));
             assert_eq!(
@@ -749,7 +773,7 @@ mod tests {
     #[test]
     fn several_keys_at_once_all_reach_the_board() {
         let mut c = Controls::new();
-        let a = c.update(KeySet::from_keys(&[Key::S, Key::I, Key::J]));
+        let a = c.update(KeySet::from_keys(&[Key::S, Key::K, Key::I]));
         assert_eq!(a.inputs.in1(), 0xFFEB, "down (bit 2) and jab (bit 4)");
         assert_eq!(a.inputs.in2(), 0xFE, "and the kick, on its own port");
     }
@@ -769,16 +793,16 @@ mod tests {
     fn both_players_at_once_reach_their_own_halves() {
         let mut c = Controls::new();
         let a = c.update(KeySet::from_keys(&[
-            // P1: down (S) and left (Q), jab (I), roundhouse (L).
+            // P1: down (S) and left (Q), jab (K), roundhouse (P).
             Key::S,
             Key::Q,
-            Key::I,
-            Key::L,
-            // P2: up (Up) and right (Right), fierce (NumPad9), short (NumPad4).
+            Key::K,
+            Key::P,
+            // P2: up (Up) and right (Right), fierce (NumPad6), short (NumPad7).
             Key::Up,
             Key::Right,
-            Key::NumPad9,
-            Key::NumPad4,
+            Key::NumPad6,
+            Key::NumPad7,
         ]));
         // IN1 low byte: down is bit 2, left is bit 1, jab is bit 4 → 0xFF & !0x16 = 0xE9.
         // IN1 high byte: up is bit 3, right is bit 0, fierce is bit 6 → !0x49 = 0xB6.
@@ -916,9 +940,9 @@ mod tests {
             Key::I,
             Key::O,
             Key::P,
-            Key::J,
             Key::K,
             Key::L,
+            Key::M,
             Key::Up,
             Key::Down,
             Key::Left,

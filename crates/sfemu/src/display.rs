@@ -134,20 +134,26 @@ impl Display for Window {
 /// machine with Carbon's `UCKeyTranslate` against the `French - PC` layout — position
 /// 0x0c types `a`, and position 0x0d (`M::W`) types `z`.
 ///
-/// P1's stick is therefore mapped **by position, to keep the diamond**, and the two
-/// AZERTY-shifted keys are the two that move:
+/// P1's keys are therefore mapped **by position**, and three of them are places where
+/// AZERTY and QWERTY disagree:
 ///
 /// | frontend key | this map | AZERTY label | QWERTY label |
 /// |---|---|---|---|
-/// | `Key::Z` (up)    | `M::W` | **Z** | W |
-/// | `Key::Q` (left)  | `M::A` | **Q** | A |
-/// | `Key::S` (down)  | `M::S` | S | S |
-/// | `Key::D` (right) | `M::D` | D | D |
+/// | `Key::Z` (up)     | `M::W`         | **Z** | W |
+/// | `Key::Q` (left)   | `M::A`         | **Q** | A |
+/// | `Key::M` (fierce) | `M::Semicolon` | **M** | ; |
+/// | `Key::S` (down)   | `M::S` | S | S |
+/// | `Key::D` (right)  | `M::D` | D | D |
+///
+/// `Key::M` is the sharpest of the three, because AZERTY moves `M` off the bottom row
+/// entirely: it is the home row's last letter, right of `L`, at position 0x29. `minifb`
+/// calls that position `Semicolon`. Its own `M::M` is 0x2e, which types `,` here.
 ///
 /// `frontend::Key`'s variants are named for the **AZERTY** label, because that is the
-/// keyboard this is played on and `Z`/`S`/`Q`/`D` is what the README and the usage text
-/// tell the player to press. The mismatch between `Key::Z` and `M::W` is not a bug and
-/// must not be "tidied" — see `tests::player_ones_stick_is_mapped_by_position`.
+/// keyboard this is played on and `Z`/`S`/`Q`/`D` and `K`/`L`/`M` are what the README and
+/// the usage text tell the player to press. The mismatch between `Key::M` and
+/// `M::Semicolon` is not a bug and must not be "tidied" — see
+/// `tests::player_ones_keys_are_mapped_by_position`, which pins all three.
 fn translate(k: minifb::Key) -> Option<Key> {
     use minifb::Key as M;
     Some(match k {
@@ -162,9 +168,13 @@ fn translate(k: minifb::Key) -> Option<Key> {
         M::I => Key::I,
         M::O => Key::O,
         M::P => Key::P,
-        M::J => Key::J,
         M::K => Key::K,
         M::L => Key::L,
+        // The third punch, and the second position trap in this function. The key
+        // **labelled M** is position 0x29, which `minifb` names `Semicolon` after the US
+        // QWERTY letter there. `M::M` is position 0x2e — the key labelled `,` here — and
+        // mapping it would put P1's fierce punch one key past the end of the home row.
+        M::Semicolon => Key::M,
         // Player 2's. `NumPad4`-`NumPad9` and not `Key4`-`Key9`: the number row's 1, 2,
         // 5 and 6 are the cabinet's start and coin buttons, and a keypad is a separate
         // set of keycodes rather than an alias for them.
@@ -276,9 +286,9 @@ mod tests {
             M::I,
             M::O,
             M::P,
-            M::J,
             M::K,
             M::L,
+            M::Semicolon,
             M::Up,
             M::Down,
             M::Left,
@@ -368,7 +378,7 @@ mod tests {
     /// one physical key is one board input, and the positions that spell ZQSD on AZERTY
     /// spell WASD on QWERTY. Which is right is a layout question this program cannot see.
     #[test]
-    fn player_ones_stick_is_mapped_by_position() {
+    fn player_ones_keys_are_mapped_by_position() {
         use super::translate;
         use frontend::Key;
         use minifb::Key as M;
@@ -401,17 +411,31 @@ mod tests {
         // layouts, which is why only two of the four move.
         assert_eq!(translate(M::S), Some(Key::S), "S is S on both layouts");
         assert_eq!(translate(M::D), Some(Key::D), "and D is D");
-        // P1's six buttons are also layout-stable: I O P J K L are identical on AZERTY
-        // and QWERTY, so they are mapped by name and position at once.
+        // Five of P1's six buttons are layout-stable: I O P and K L are identical on
+        // AZERTY and QWERTY, so they are mapped by name and position at once.
         for (m, k) in [
             (M::I, Key::I),
             (M::O, Key::O),
             (M::P, Key::P),
-            (M::J, Key::J),
             (M::K, Key::K),
             (M::L, Key::L),
         ] {
             assert_eq!(translate(m), Some(k), "{k:?} is in the same place on both");
         }
+
+        // The sixth is the third trap, and the one that would be hardest to diagnose from
+        // the outside. AZERTY moves `M` off the bottom row to the home row's right end,
+        // position 0x29, which `minifb` names `Semicolon`. Verified with `UCKeyTranslate`:
+        // 0x29 types `m` on `French - PC`, and 0x2e — `M::M` — types `,`.
+        assert_eq!(
+            translate(M::Semicolon),
+            Some(Key::M),
+            "P1 fierce is position 0x29, the key an AZERTY keyboard labels M"
+        );
+        assert_eq!(
+            translate(M::M),
+            None,
+            "position 0x2e is labelled `,` here and must press nothing"
+        );
     }
 }

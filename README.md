@@ -332,26 +332,26 @@ why the samples are converted rather than played as they are.
 ```
         Player 1                          Player 2
 
-          Z   (W on QWERTY)                 ↑                7 8 9  punches
-        Q S D    I O P  punches           ← ↓ →              4 5 6  kicks
-        ^        J K L  kicks
-        (A)                               stick               keypad
-        stick
+          Z   (W on QWERTY)                 ↑                7 8 9  kicks
+        Q S D    I O P  kicks             ← ↓ →              4 5 6  punches
+        ^        K L M  punches
+        (A)      (last is `;`)            stick               keypad
+        stick     on QWERTY
 ```
 
 The key names below are **AZERTY** labels. Keys are bound to physical positions, not
 to letters, so on a US QWERTY keyboard P1's stick reads `W` `S` `A` `D` — the same
-four keys in the same diamond, with different letters printed on them. See
-[Layouts](#layouts) below.
+four keys in the same diamond, with different letters printed on them — and the third
+punch is the semicolon. See [Layouts](#layouts) below.
 
 | Key | Does |
 |---|---|
 | `Z` `S` `Q` `D` | P1 stick — up, down, left, right |
-| `I` `O` `P` | P1 jab, strong, fierce |
-| `J` `K` `L` | P1 short, forward, roundhouse |
+| `K` `L` `M` | P1 jab, strong, fierce |
+| `I` `O` `P` | P1 short, forward, roundhouse |
 | Arrows | P2 stick |
-| Keypad `7` `8` `9` | P2 jab, strong, fierce |
-| Keypad `4` `5` `6` | P2 short, forward, roundhouse |
+| Keypad `4` `5` `6` | P2 jab, strong, fierce |
+| Keypad `7` `8` `9` | P2 short, forward, roundhouse |
 | `5` / `1` | Coin 1 / Start 1 |
 | `6` / `2` | Coin 2 / Start 2 |
 | `F2` | Test switch — hold it at boot for the service menu |
@@ -372,15 +372,19 @@ four keys in the same diamond, with different letters printed on them. See
 | `[` / `]` | Move within the view |
 | `Enter` | Act on the view — cycle its tile layout or layer, or toggle a layer |
 
-Punches sit on the top row and kicks directly under them, matching a real
-six-button cabinet, and each player has one half of the keyboard.
+**Punches sit on the bottom row and kicks directly above them** — the reverse of a
+real six-button cabinet, deliberately. On an AZERTY keyboard `K` `L` `M` is a run of
+three on the home row, so putting the punches there puts them under the resting
+fingers and pushes the kicks up a row. Both clusters are arranged the same way, which
+is the property that matters once the arrangement is unconventional: learning one half
+teaches you the other. Each player has one half of the keyboard.
 
 Two things follow from that. **Player 2's buttons need a numeric keypad** — on a
 keyboard without one the arrow keys still move but the six attacks are unreachable,
 so P2 is a desktop arrangement. And **no letter key is a control any more**: pause
-moved off `P`, which is P1's fierce punch now, onto `F11`, the one gap that was left
-in `F1`–`F12`. Every control is a function or navigation key, which is what keeps a
-punch from also saving a state.
+moved off `P`, which is P1's roundhouse kick now, onto `F11`, the one gap that was
+left in `F1`–`F12`. Every control is a function or navigation key, which is what keeps
+a punch from also saving a state.
 
 The board's `Inputs` is the same either way, so a gamepad or netplay can drive
 either player later without touching this map.
@@ -392,26 +396,37 @@ either player later without touching this map.
 QWERTY keyboard prints there; the active layout is never consulted. So `minifb`'s `Q`
 means "position 0x0c", which types `q` on QWERTY and `a` on a French keyboard.
 
-P1's stick is mapped by position to keep the diamond shape, and it is set up for AZERTY
-— the two keys the layouts disagree about are up and left:
+P1's keys are mapped by position and set up for AZERTY. Three of them are places the
+layouts disagree about — up, left, and the third punch:
 
 | Board input | `minifb` name | AZERTY label | QWERTY label |
 |---|---|---|---|
 | P1 up | `W` | **Z** | W |
 | P1 left | `A` | **Q** | A |
+| P1 fierce | `Semicolon` | **M** | ; |
 | P1 down | `S` | S | S |
 | P1 right | `D` | D | D |
 
-Everything else is layout-stable: `I` `O` `P` `J` `K` `L`, the number row, the keypad,
-the arrows and the function keys sit in the same place on both. So a QWERTY player uses
-WSAD for the stick and reads every other row of the table above as printed.
+The third is the one worth stating twice, because AZERTY does not merely shift `M` — it
+moves it off the bottom row entirely, to the home row's right end next to `L`. That
+position is the one QWERTY prints `;` on, so `minifb` calls it `Semicolon`, and
+`minifb`'s own `M` is the key labelled `,` here. Mapping the punch by letter would put
+it one key past the end of the home row. Verified against the live layout with Carbon's
+`UCKeyTranslate` rather than reasoned about: on `French – PC`, position 0x29 types `m`
+and 0x2e types `,`.
 
-This is why `crates/sfemu/src/display.rs` maps `M::W => Key::Z`, which looks like a
-typo and is not — `frontend::Key`'s variants carry the AZERTY label because that is
-what this README and the usage text tell the player to press.
-`display::tests::player_ones_stick_is_mapped_by_position` asserts both halves,
-including that `M::Z` and `M::Q` press *nothing*, because "supporting both layouts" by
-mapping all four would give one board input two keys and silently undo the fix.
+Everything else is layout-stable: `I` `O` `P` `K` `L`, the number row, the keypad, the
+arrows and the function keys sit in the same place on both. So a QWERTY player uses
+WSAD for the stick, `K` `L` `;` for the punches, and reads every other row as printed.
+
+This is why `crates/sfemu/src/display.rs` maps `M::W => Key::Z` and
+`M::Semicolon => Key::M`, which look like typos and are not — `frontend::Key`'s
+variants carry the AZERTY label because that is what this README and the usage text
+tell the player to press.
+`display::tests::player_ones_keys_are_mapped_by_position` asserts both halves,
+including that `M::Z`, `M::Q` and `M::M` press *nothing*, because "supporting both
+layouts" by mapping the QWERTY positions as well would give one board input two keys
+and silently undo the fix.
 
 Save states go beside the ROM set — `sf2.zip` next to `sf2.sfs` — so two games
 never share one, and screenshots to `sf2.ppm` the same way. One state file, not a

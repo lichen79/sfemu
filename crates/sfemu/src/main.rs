@@ -92,17 +92,20 @@ fn usage() -> String {
      Without `--play`, runs a fixed number of frames and reports what the\n\
      board saw. With `--play`, opens a window and both players can play:\n\
      \n\
-     \x20 player 1: Z S Q D stick, I O P punches, J K L kicks\n\
-     \x20 player 2: arrow keys, keypad 7 8 9 punches, 4 5 6 kicks\n\
+     \x20 player 1: Z S Q D stick, K L M punches, I O P kicks\n\
+     \x20 player 2: arrow keys, keypad 4 5 6 punches, 7 8 9 kicks\n\
      \n\
      5 and 6 insert a coin, 1 and 2 start. F11 pauses, . steps a frame,\n\
      F3 resets, F5 and F8 save and load, F12 takes a screenshot, and\n\
      Escape quits. Player 2's buttons need a numeric keypad. A frame count\n\
      is ignored with `--play`.\n\
      \n\
-     Player 1's stick is the AZERTY diamond: the keys labelled Z S Q D on a\n\
-     French keyboard. Those are physical positions, so on a US QWERTY board\n\
-     the same four keys read W S A D.\n\
+     Player 1's keys are named for an AZERTY keyboard: the stick is the\n\
+     diamond labelled Z S Q D on a French board, and the punches are the\n\
+     home row's last three, K L M. Those are physical positions, so on a US\n\
+     QWERTY board the same four stick keys read W S A D and the third punch\n\
+     is the semicolon. The punches sit under the kicks, not over them — the\n\
+     reverse of a cabinet, because AZERTY's M is on the home row.\n\
      \n\
      The ROM set is yours to supply: this program neither bundles nor\n\
      downloads one. Legal sources include Capcom Arcade Stadium, Capcom\n\
@@ -1544,8 +1547,14 @@ mod tests {
     /// Not every key: the six directions and twelve buttons are `frontend`'s to test.
     /// The rows below are the ones the text makes a specific promise about — the two
     /// clusters' corners, the coin and start buttons someone is looking this up to
-    /// find, and pause, which moved off `P` in this remap and is where a stale text
-    /// would show first.
+    /// find, and pause, which moved off `P` in an earlier remap and is where a stale
+    /// text would show first.
+    ///
+    /// Two of the promises are about *which row is which*, and those are the ones a
+    /// remap breaks quietly. Both ends of each of P1's two button rows are pressed here,
+    /// because a text with "punches" and "kicks" transposed still names the right six
+    /// letters, and each key on its own still produces a valid port value — only the
+    /// pairing is wrong.
     #[test]
     fn the_usage_text_names_the_keys_the_map_actually_presses() {
         use frontend::{Controls, Key, KeySet};
@@ -1555,25 +1564,29 @@ mod tests {
             c.update(KeySet::from_keys(&[k]))
         };
 
-        // "player 1: Z S Q D stick, I O P punches, J K L kicks"
-        assert!(u.contains("player 1: Z S Q D stick, I O P punches, J K L kicks"));
+        // "player 1: Z S Q D stick, K L M punches, I O P kicks". Both rows are named,
+        // and both ends of each row pressed: a text that swapped the two words would
+        // otherwise pass on the corners alone.
+        assert!(u.contains("player 1: Z S Q D stick, K L M punches, I O P kicks"));
         assert_eq!(press(Key::Z).inputs.in1(), 0xFFF7, "Z is P1 up");
         assert_eq!(press(Key::D).inputs.in1(), 0xFFFE, "D is P1 right");
-        assert_eq!(press(Key::I).inputs.in1(), 0xFFEF, "I is P1's jab");
-        assert_eq!(press(Key::L).inputs.in2(), 0xFB, "L is P1's roundhouse");
+        assert_eq!(press(Key::K).inputs.in1(), 0xFFEF, "K is P1's jab");
+        assert_eq!(press(Key::M).inputs.in1(), 0xFFBF, "M is P1's fierce");
+        assert_eq!(press(Key::I).inputs.in2(), 0xFE, "I is P1's short kick");
+        assert_eq!(press(Key::P).inputs.in2(), 0xFB, "P is P1's roundhouse");
 
-        // "player 2: arrow keys, keypad 7 8 9 punches, 4 5 6 kicks"
-        assert!(u.contains("player 2: arrow keys, keypad 7 8 9 punches, 4 5 6 kicks"));
+        // "player 2: arrow keys, keypad 4 5 6 punches, 7 8 9 kicks"
+        assert!(u.contains("player 2: arrow keys, keypad 4 5 6 punches, 7 8 9 kicks"));
         assert_eq!(press(Key::Up).inputs.in1(), 0xF7FF, "Up is P2 up");
         assert_eq!(
-            press(Key::NumPad7).inputs.in1(),
+            press(Key::NumPad4).inputs.in1(),
             0xEFFF,
-            "keypad 7 is P2's jab"
+            "keypad 4 is P2's jab"
         );
         assert_eq!(
-            press(Key::NumPad4).inputs.in2(),
+            press(Key::NumPad7).inputs.in2(),
             0xEF,
-            "keypad 4 is P2's short kick"
+            "keypad 7 is P2's short kick"
         );
 
         // "5 and 6 insert a coin, 1 and 2 start."
@@ -1583,13 +1596,13 @@ mod tests {
         assert_eq!(press(Key::Num1).inputs.in0(), 0xEF, "1 is start 1");
         assert_eq!(press(Key::Num2).inputs.in0(), 0xDF, "2 is start 2");
 
-        // "F11 pauses" — and `P` does not, because `P` is a punch now. The stale text
+        // "F11 pauses" — and `P` does not, because `P` is a button now. The stale text
         // this remap could have left behind said "P to pause", so both halves are
         // asserted.
         assert!(u.contains("F11 pauses"));
         assert!(
             !u.contains("P to pause"),
-            "`P` is player 1's fierce punch now"
+            "`P` is player 1's roundhouse kick now"
         );
         assert!(press(Key::F11).pause_toggled, "F11 pauses");
         assert!(!press(Key::P).pause_toggled, "and P does not");
@@ -1614,6 +1627,21 @@ mod tests {
         assert!(
             u.contains("W S A D"),
             "and must name the QWERTY reading, since that is who the text misleads"
+        );
+        // The punches are positional too, and `M` is the sharper case: AZERTY puts it on
+        // the home row at the position QWERTY prints `;`, so a QWERTY reader told to
+        // press M would press the comma key and throw nothing. The text names the
+        // semicolon for exactly that reader.
+        assert!(
+            u.contains("semicolon"),
+            "P1's third punch is a position, and QWERTY prints `;` on it"
+        );
+        // And the row order, which reverses a real cabinet's. A player who assumes the
+        // usual arrangement holds a kick when they meant a punch, so it is stated rather
+        // than left to be discovered in a match.
+        assert!(
+            u.contains("punches sit under the kicks"),
+            "the rows are inverted on purpose and the text must say so"
         );
     }
 
