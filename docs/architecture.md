@@ -509,9 +509,12 @@ Recorded because an unrecorded open question becomes a wrong assumption.
 - **CE's CPU clock.** MAME runs `sf2ce` at `cps1_12MHz` (`cps1.cpp:15084`, read
   2026-08-23) while sfemu uses `Timing::cps1_10mhz()` for all three CPS-1 sets. If
   that is real, CE runs about 17% slow. Never investigated.
-- **Frame drops of 2–3%** across four windowed runs, on a 22× CPU margin. Never
-  investigated; the pacer counts them, so the number is real, but its cause is not
-  known.
+- **Frame drops, at a rate that varies by an order of magnitude between sessions.**
+  Four early windowed runs showed 2–3%; a 2026-08-24 session reported **3,246 of
+  18,656 frames, 17.4%**. Emulation cost is ruled out: 1,200 frames of `sf2eb`
+  headless took 1.08 s, i.e. 0.90 ms against a 16.768 ms budget (18.6×). Since a drop
+  needs a host tick exceeding `MAX_CATCH_UP` frames (67 ms), the cause is on the
+  window/present side. Never investigated.
 - **`scripts/mutate.py`'s patterns outside `keys`, `menu` and `layout` have not
   been audited** for drift against the current source. A pattern that no longer
   matches scores `NO-OP`, which is visible — but only in a full run.

@@ -10,13 +10,16 @@ cargo run -p sfemu --release -- /path/to/your/sf.zip --play --game sf1
 
 No ROM set? `cargo run -p sfemu --release -- --demo --play` needs no files at all.
 
-Two documents sit beside this one. **[docs/user-guide.md](docs/user-guide.md)** is
+Three documents sit beside this one. **[docs/user-guide.md](docs/user-guide.md)** is
 the practical one: building it, supplying your own set, every flag, every key, the
 key menu, save states, the debugger, the viewers, and a troubleshooting table.
 **[docs/architecture.md](docs/architecture.md)** is the structural one: the eleven
 crates, the dependency edges and why each exists, the display and audio boundaries,
 the frame and cycle model, the save-state format, and what a green suite does *not*
-establish.
+establish. **[docs/history.md](docs/history.md)** is how it was built: the order the
+sub-projects came in and why, the methods that earned their cost, and every false
+claim the process caught — including several of mine that were plausible enough to
+have been believed.
 
 Ten sub-projects are complete: the **68000 core** (A), the **bus and timing
 framework with a MAME ROM-set loader** (B), the **CPS-1 scanline renderer** (C),
@@ -616,11 +619,22 @@ three layers on, a full 256-record object table, opaque tiles, a 4 MB graphics R
 There is no `machine` or `video` benchmark in the tree to re-run it with. It is not
 a performance guarantee, and no optimisation work was done on the strength of it.
 
+A real game, freshly measured rather than quoted: 1,200 frames of `sf2eb` headless in
+1.08 s on the author's machine, 2026-08-24 — **0.90 ms per frame, an 18.6× margin**.
+Reproduce with `/usr/bin/time -p ./target/release/sfemu "$SFEMU_ROMS" 1200 --game
+sf2eb`.
+
 The pacer is what that margin buys: sleep-free and catch-up-bounded. A host tick
 that took longer than a frame owes the frames it missed, up to four; beyond that
 they are dropped and counted, because a machine that fell a second behind should
 resync rather than fast-forward through a second of the game. Pausing owes nothing
 — the clock is only read on a running tick.
+
+⚠️ **Dropped frames are real, unexplained, and vary by an order of magnitude.** Early
+windowed runs showed 2–3%; a 2026-08-24 session reported 3,246 of 18,656 frames —
+**17.4%**. The 18.6× headless margin rules out emulation cost, and a drop requires a
+host tick over 67 ms, so the cause is on the window/present side. Uninvestigated; see
+[docs/architecture.md](docs/architecture.md#open-questions).
 
 ### Eight things only you can check
 
@@ -753,6 +767,9 @@ docs/architecture.md the crates, the dependency edges and why each one exists,
 docs/user-guide.md   building it, supplying your own ROM set, every flag, every
                      key, the key menu, save states, the debugger, the viewers,
                      and a troubleshooting table.
+docs/history.md      how it was built: 330 commits over 20 days, the sub-project
+                     order and its reasons, the methods that paid off, and every
+                     false claim this process caught — including mine.
 docs/hardware/       what the vectors proved about the hardware, with evidence.
 docs/superpowers/    design specs and implementation plans.
 testdata/            gitignored; fetched vectors.

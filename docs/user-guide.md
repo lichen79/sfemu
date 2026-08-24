@@ -528,6 +528,14 @@ The frame budget is **16.768 ms** — CPS-1 runs at 8,000,000 / (512 × 262) =
 worst-case content, and quoted from the spec rather than freshly measured. It is not
 a performance guarantee.
 
+Emulation itself is comfortably inside the budget on a real game, measured rather
+than quoted — 1,200 frames of `sf2eb` headless in 1.08 s on the author's machine on
+2026-08-24, i.e. **0.90 ms per frame, an 18.6× margin**:
+
+```sh
+/usr/bin/time -p ./target/release/sfemu ~/roms/sf2eb 1200 --game sf2eb
+```
+
 The pacer is what that margin buys: sleep-free and catch-up-bounded. A host tick
 that took longer than a frame owes the frames it missed, **up to four**; beyond that
 they are dropped and counted, because a machine that fell a second behind should
@@ -535,15 +543,20 @@ resync rather than fast-forward through a second of the game. The title bar show
 the dropped count, and so does the report a session prints on the way out:
 
 ```
-frames        35812
-dropped       6
+frames        18656
+dropped       3246
 ```
 
 Pausing owes nothing — the clock is only read on a running tick, so a pause does not
 accumulate a debt that stampedes when you resume.
 
-⚠️ A known and uninvestigated observation: windowed runs have shown 2–3% dropped
-frames on a 22× CPU margin. The count is real; its cause is not known.
+⚠️ **Dropped frames are known, unexplained, and can be large.** That report above is
+a real 2026-08-24 windowed session: **3,246 of 18,656 frames, 17.4%**. Earlier runs
+showed 2–3%, so the rate varies a great deal between sessions. What is ruled out is
+emulation cost — at 0.90 ms per 16.768 ms frame, the board is not what misses the
+deadline. A drop requires a host tick longer than four frames (67 ms), so the cause
+is on the window/present side, and it has not been investigated. Play is unaffected
+in the sense that the game does not run slow; it resyncs.
 
 ---
 
