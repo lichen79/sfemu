@@ -100,6 +100,14 @@ fn usage() -> String {
      Escape quits. Player 2's buttons need a numeric keypad. A frame count\n\
      is ignored with `--play`.\n\
      \n\
+     Tab opens the key menu, which offers four button layouts — punches on\n\
+     the bottom row or on the top, named for an AZERTY or a QWERTY board —\n\
+     and a row that restores the default. Up and down move, Enter applies,\n\
+     Tab or Escape closes it. While it is open, the board sees nothing held.\n\
+     The choice is remembered beside the ROM set as a `.keys` file.\n\
+     The stick is not on the menu: its four keys are the same four physical\n\
+     positions on either layout.\n\
+     \n\
      Player 1's keys are named for an AZERTY keyboard: the stick is the\n\
      diamond labelled Z S Q D on a French board, and the punches are the\n\
      home row's last three, K L M. Those are physical positions, so on a US\n\
@@ -635,6 +643,7 @@ fn loop_opts(args: &Args) -> loop_::LoopOpts {
     loop_::LoopOpts {
         state_path: args.state.clone(),
         shot_path: default_shot_path(args.source.stem()),
+        keys_path: default_keys_path(args.source.stem()),
         board: loop_::state_tag(args.source.board()),
     }
 }
@@ -648,6 +657,19 @@ fn loop_opts(args: &Args) -> loop_::LoopOpts {
 fn default_shot_path(rom: &str) -> PathBuf {
     let mut p = PathBuf::from(rom);
     p.set_extension("ppm");
+    p
+}
+
+/// Where the key menu records its choice.
+///
+/// Beside the ROM set, like the state and the screenshot, and by the same rule: `sf2.zip`
+/// becomes `sf2.keys`. Per ROM set rather than one file for the program, which is the
+/// interesting half of the decision — it means a CE session and an SF2 session can want
+/// different arrangements, and it means this program still writes nothing outside the
+/// directory it was pointed at.
+fn default_keys_path(rom: &str) -> PathBuf {
+    let mut p = PathBuf::from(rom);
+    p.set_extension("keys");
     p
 }
 
@@ -1645,6 +1667,105 @@ mod tests {
         );
     }
 
+    /// The usage text's key-menu paragraph matches the menu that exists.
+    ///
+    /// Separate from the layout test above because the promises are of a different
+    /// kind: not "this letter presses that port bit" but "this key opens a menu with
+    /// this many rows, and the file it writes has this extension". Each sentence is
+    /// checked against the artifact it describes rather than against a second copy of
+    /// the same string — a text claiming five layouts would otherwise pass forever.
+    #[test]
+    fn the_usage_text_describes_the_key_menu_that_exists() {
+        use frontend::{Controls, Key, KeySet, MenuRow, Preset};
+        let u = usage();
+
+        // "Tab opens the key menu" — and Tab really is the key, which matters because
+        // every other candidate was taken: Escape quits, Enter acts on the graphics
+        // view, and all twelve function keys are mapped.
+        assert!(u.contains("Tab opens the key menu"));
+        let mut c = Controls::new();
+        assert!(
+            c.update(KeySet::from_keys(&[Key::Tab])).menu_toggled,
+            "Tab is what the text says opens it"
+        );
+
+        // "four button layouts" and "a row that restores the default" — the menu has
+        // five rows, four of which name a preset. Asserted against the tables rather
+        // than the prose, so growing the menu breaks this test rather than the text.
+        assert!(u.contains("four button layouts"));
+        assert_eq!(Preset::ALL.len(), 4, "the text says four");
+        assert!(u.contains("restores the default"));
+        assert_eq!(MenuRow::ALL.len(), 5, "the four, plus the restore row");
+
+        // "punches on the bottom row or on the top, named for an AZERTY or a QWERTY
+        // board" — that is the 2x2 the four presets are, and their own names say the
+        // same two words.
+        for p in Preset::ALL {
+            let n = p.name();
+            assert!(
+                n.contains("AZERTY") || n.contains("QWERTY"),
+                "the text promises the layouts are named by board: {n}"
+            );
+            assert!(
+                n.contains("punches low") || n.contains("punches high"),
+                "and by which row punches: {n}"
+            );
+        }
+
+        // "Up and down move, Enter applies, Tab or Escape closes it" — four claims,
+        // each of which is a flag the menu reads. Escape closing rather than quitting
+        // is the one a reader would not guess, since Escape quits at every other time.
+        let open = |k: Key| {
+            let mut c = Controls::new();
+            c.set_menu_open(true);
+            c.update(KeySet::from_keys(&[k]))
+        };
+        assert!(u.contains("Up and down move, Enter applies"));
+        assert!(open(Key::Up).menu_up, "up moves");
+        assert!(open(Key::Down).menu_down, "down moves");
+        assert!(open(Key::Enter).menu_apply, "Enter applies");
+        assert!(u.contains("Tab or Escape closes it"));
+        assert!(open(Key::Tab).menu_toggled, "Tab closes");
+        assert!(open(Key::Escape).menu_close, "and so does Escape");
+        assert!(
+            !open(Key::Escape).quit,
+            "which is the point: Escape must not quit while the menu is up"
+        );
+
+        // "while it is open the board sees nothing held" — the capture, and the reason
+        // it is stated: `Inputs` is level-triggered, so a stick held when the menu
+        // opened would otherwise stay held for as long as the menu was up.
+        assert!(u.contains("the board sees nothing held"));
+        let mut held = Controls::new();
+        held.set_menu_open(true);
+        let a = held.update(KeySet::from_keys(&[Key::D, Key::K]));
+        assert_eq!(a.inputs.in1(), 0xFFFF, "no direction and no punch");
+        assert_eq!(a.inputs.in2(), 0xFF, "and no kick");
+
+        // "remembered beside the ROM set as a `.keys` file" — the extension is the
+        // checkable half, and it is what `default_keys_path` produces.
+        assert!(u.contains("`.keys` file"));
+        assert_eq!(
+            default_keys_path("/a/b/sf2.zip").extension().unwrap(),
+            "keys"
+        );
+
+        // "The stick is not on the menu" — the discovery that shrank the menu from a
+        // 2x2 of sticks and buttons to a 2x2 of button rows: AZERTY's Z S Q D and
+        // QWERTY's W A S D are the same four positions, so no preset moves them.
+        assert!(u.contains("The stick is not on the menu"));
+        for p in Preset::ALL {
+            let mut c = Controls::new();
+            c.set_preset(p);
+            assert_eq!(
+                c.update(KeySet::from_keys(&[Key::Z])).inputs.in1(),
+                0xFFF7,
+                "{} moved P1 up off its key",
+                p.name()
+            );
+        }
+    }
+
     /// `--play` parses, with and without `--state`.
     #[test]
     fn the_play_flag_parses_with_and_without_a_state_path() {
@@ -1714,13 +1835,38 @@ mod tests {
             PathBuf::from("/a/b/sf2.ppm"),
             "and the screenshot lands beside it too"
         );
+        assert_eq!(
+            default_keys_path("/a/b/sf2.zip"),
+            PathBuf::from("/a/b/sf2.keys"),
+            "and so does the key menu's choice"
+        );
+        assert_eq!(
+            default_keys_path("/a/b.c/sf2"),
+            PathBuf::from("/a/b.c/sf2.keys"),
+            "by the same rule as the other two: no extension to replace, dotted directory"
+        );
+        // Three extensions, three distinct values, so no two of the paths can be
+        // confused for one another downstream.
+        assert_eq!(
+            [
+                default_state_path("/a/b/sf2.zip"),
+                default_shot_path("/a/b/sf2.zip"),
+                default_keys_path("/a/b/sf2.zip"),
+            ],
+            [
+                PathBuf::from("/a/b/sf2.sfs"),
+                PathBuf::from("/a/b/sf2.ppm"),
+                PathBuf::from("/a/b/sf2.keys"),
+            ]
+        );
     }
 
     /// The loop is handed the state path as the state path.
     ///
-    /// `LoopOpts` has two `PathBuf` fields, so swapping them compiles and the
-    /// symptom is F5 writing a save state over your screenshot. Distinct extensions
-    /// on purpose: with both derived from the same stem, a swap would be invisible.
+    /// `LoopOpts` has **three** `PathBuf` fields, so swapping any two compiles and the
+    /// symptom is F5 writing a save state over your screenshot — or the key menu writing
+    /// eighteen bytes of text over your save state. Distinct extensions on purpose: with
+    /// all three derived from the same stem, a swap would be invisible.
     #[test]
     fn the_loop_is_given_the_state_path_and_the_shot_path_the_right_way_round() {
         let args = Args {
@@ -1736,6 +1882,7 @@ mod tests {
         let o = loop_opts(&args);
         assert_eq!(o.state_path, PathBuf::from("/tmp/mine.sfs"));
         assert_eq!(o.shot_path, PathBuf::from("/a/b/sf2.ppm"));
+        assert_eq!(o.keys_path, PathBuf::from("/a/b/sf2.keys"));
 
         // The demo has no ROM set to sit beside, so both files come off its own
         // stem — and they still differ by extension, which is what makes a swap of
@@ -1750,6 +1897,7 @@ mod tests {
         let o = loop_opts(&demo);
         assert_eq!(o.state_path, PathBuf::from("sfemu-demo.sfs"));
         assert_eq!(o.shot_path, PathBuf::from("sfemu-demo.ppm"));
+        assert_eq!(o.keys_path, PathBuf::from("sfemu-demo.keys"));
     }
 
     /// `--state` without `--play` is an error naming both flags.

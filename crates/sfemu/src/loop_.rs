@@ -27,6 +27,7 @@ use crate::audio::Audio;
 use frontend::debug::Debugger;
 use frontend::gfx::GfxViewer;
 use frontend::keys::{Actions, Controls, KeySet};
+use frontend::menu::KeyMenu;
 use frontend::{pens_to_argb, pens_to_argb_sf1, FramePacer, MAX_CATCH_UP};
 use machine::Machine;
 use std::path::PathBuf;
@@ -66,6 +67,17 @@ pub struct LoopOpts {
     pub state_path: PathBuf,
     /// The screenshot file, for F12.
     pub shot_path: PathBuf,
+    /// The chosen key arrangement, for the `Tab` menu.
+    ///
+    /// A third same-typed path field, which is exactly why
+    /// `the_loop_is_given_the_state_path_and_the_shot_path_the_right_way_round` extends to
+    /// cover it: the symptom of a swap is the menu overwriting somebody's save state with
+    /// eighteen bytes of text.
+    ///
+    /// A missing or unreadable file is [`frontend::Preset::default`] and **not** an error,
+    /// on the same rule as a missing save state. Nobody has one of these on their first
+    /// run, and refusing to start over its absence would be absurd.
+    pub keys_path: PathBuf,
     /// The board tag this session's states carry, from [`state_tag`].
     ///
     /// # Why a field and not derived from the machine
@@ -187,10 +199,27 @@ pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &Loo
     let mut title = String::new();
     let mut dbg = Debugger::new();
     let mut gfx = GfxViewer::new();
+    let mut menu = KeyMenu::new();
+    // The arrangement from the last session, before the first frame. A missing file is
+    // the default and not a notice: nobody has one on their first run.
+    controls.set_preset(read_keys(o));
 
     while d.is_open() {
         let elapsed = d.elapsed_ns();
+        // Before `update`, so this frame's keys are read under this frame's capture. The
+        // menu's own state comes from the *previous* frame's actions, which is the
+        // one-frame lag `frontend::menu` documents — the board is live for the single
+        // frame on which `Tab` went down.
+        controls.set_menu_open(menu.open());
         let a: Actions = controls.update(d.held_keys());
+        // Before the quit check, and that ordering is load-bearing: `Escape` is the quit
+        // key, and `Controls::update` only withholds `quit` because it was told the menu
+        // was open. `menu.update` is what keeps that flag true, so a menu updated after
+        // this branch would let the next `Escape` end the session.
+        if let Some(p) = menu.update(&a, controls.preset()) {
+            controls.set_preset(p);
+            write_keys(o, p, &mut summary);
+        }
         if a.quit {
             break;
         }
@@ -345,6 +374,11 @@ pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &Loo
         // Over the debugger, not under it: both are opaque, and this one is the
         // whole screen while E2's are corners of it.
         gfx.draw(&mut buf, m);
+        // Last of the three, so it is over both. It is the only modal one — the board
+        // reads idle while it is up — so anything it hid would be something the player
+        // cannot act on anyway, and a key menu half-covered by a tile viewer is a menu
+        // you cannot read.
+        frontend::menu::draw(&mut buf, &menu, controls.preset());
         if let Err(e) = d.present(&buf) {
             note(&mut summary, format!("cannot present a frame: {e}"));
             break;
@@ -497,6 +531,40 @@ fn load(m: &mut Machine, o: &LoopOpts, s: &mut Summary) {
     }
 }
 
+/// The arrangement the last session chose, or the default.
+///
+/// Every failure is the default and **none** of them is a notice: an absent file is the
+/// normal first-run case, an unreadable one is not something the player can act on
+/// mid-game, and an unknown tag is what a file written by a future version looks like.
+/// A `Preset` cannot be half-applied — it is a `Copy` enum — so there is no partial state
+/// to fall into, which is what makes silence the right answer here where a failed *save*
+/// is a notice.
+///
+/// No notice also means no `&mut Summary`, which is what lets this run before the loop's
+/// first frame without threading one in.
+fn read_keys(o: &LoopOpts) -> frontend::Preset {
+    std::fs::read_to_string(&o.keys_path)
+        .ok()
+        .and_then(|s| frontend::Preset::from_tag(&s))
+        .unwrap_or_default()
+}
+
+/// Records the arrangement, or notes why it could not.
+///
+/// The tag and a newline, so the file is one line a person can read and edit — the whole
+/// reason [`frontend::Preset::tag`] is a string rather than a discriminant. `from_tag`
+/// trims, so the newline costs nothing on the way back.
+///
+/// A failure *is* a notice, unlike a failed read: the player asked for this, and a preset
+/// that quietly reverts on the next launch is a bug they would report as "the menu does
+/// not stick". The current session keeps the new preset either way.
+fn write_keys(o: &LoopOpts, p: frontend::Preset, s: &mut Summary) {
+    if let Err(e) = std::fs::write(&o.keys_path, format!("{}\n", p.tag())) {
+        note(s, format!("cannot write `{}`: {e}", o.keys_path.display()));
+    }
+}
+
+/// The last rendered frame, written where F12 says.
 fn screenshot(m: &Machine, o: &LoopOpts, s: &mut Summary) {
     // Two writers, not one: CPS-1's `ppm` asks `Video::rgb()` for a whole RGB buffer
     // and SF1's `ppm_sf1` asks `Sf1Video::rgb(pen)` per pen. Different shapes, because
@@ -885,23 +953,30 @@ mod tests {
     }
 
     /// Options writing into temp files named after the test.
-    fn opts(name: &str) -> (LoopOpts, TempPath, TempPath) {
+    ///
+    /// Three guards and not one, returned rather than kept here, because a `TempPath`
+    /// deletes on drop: a fixture that dropped them would delete the files the test is
+    /// about to write. Every caller binds all three even when it reads none, which is
+    /// what `_s`/`_p`/`_k` are.
+    fn opts(name: &str) -> (LoopOpts, TempPath, TempPath, TempPath) {
         let state = TempPath::new(&format!("{name}-state"));
         let shot = TempPath::new(&format!("{name}-shot"));
+        let keys = TempPath::new(&format!("{name}-keys"));
         let o = LoopOpts {
             state_path: state.0.clone(),
             shot_path: shot.0.clone(),
+            keys_path: keys.0.clone(),
             // Every fixture here builds a CPS-1 except `an_sf1_machine`, whose one test
             // overwrites this field. `run`'s assertion checks the pairing either way.
             board: state_tag(machine::BoardKind::Cps1),
         };
-        (o, state, shot)
+        (o, state, shot, keys)
     }
 
     /// One tick of one frame's time runs one frame.
     #[test]
     fn an_ordinary_tick_runs_one_frame() {
-        let (o, _s, _p) = opts("ordinary");
+        let (o, _s, _p, _k) = opts("ordinary");
         let mut m = machine();
         let mut d = Fake::new(Fake::idle(1));
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
@@ -917,7 +992,7 @@ mod tests {
     /// flag and keeps running frames.
     #[test]
     fn pause_stops_the_frames_and_resume_starts_them() {
-        let (o, _s, _p) = opts("pause");
+        let (o, _s, _p, _k) = opts("pause");
         let mut script = vec![Fake::held(&[Key::F11])];
         script.extend(Fake::idle(2));
         script.push(Fake::held(&[Key::F11]));
@@ -937,7 +1012,7 @@ mod tests {
     /// A step is exactly one frame, on the edge.
     #[test]
     fn a_step_runs_exactly_one_frame_while_paused() {
-        let (o, _s, _p) = opts("step");
+        let (o, _s, _p, _k) = opts("step");
         let mut script = vec![Fake::held(&[Key::F11])];
         // Held for three ticks: one frame, because a step is an edge and not a
         // level. Then released and pressed again: a second edge, a second frame.
@@ -952,7 +1027,7 @@ mod tests {
     /// A step does not unpause.
     #[test]
     fn a_step_does_not_unpause() {
-        let (o, _s, _p) = opts("step-pause");
+        let (o, _s, _p, _k) = opts("step-pause");
         let mut script = vec![Fake::held(&[Key::F11]), Fake::held(&[Key::Period])];
         script.extend(Fake::idle(3));
         let mut d = Fake::new(script);
@@ -967,7 +1042,7 @@ mod tests {
     /// The literals are hand-computed: 2e9 / 16_768_000 = 119 whole frames.
     #[test]
     fn a_stalled_host_runs_the_cap_and_not_the_debt() {
-        let (o, _s, _p) = opts("stall");
+        let (o, _s, _p, _k) = opts("stall");
         let mut d = Fake::new(vec![(KeySet::new(), 2_000_000_000)]);
         let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 4, "the catch-up cap");
@@ -977,7 +1052,7 @@ mod tests {
     /// F3 returns the machine to power-on.
     #[test]
     fn reset_returns_the_machine_to_power_on() {
-        let (o, _s, _p) = opts("reset");
+        let (o, _s, _p, _k) = opts("reset");
         let mut m = machine();
         // Recorded from *this* machine before it runs, rather than from a second one
         // built afterwards: a `Cps1` is 525 KB on the stack, and two live in one test
@@ -1016,7 +1091,7 @@ mod tests {
     /// Escape ends the loop before the script does.
     #[test]
     fn escape_ends_the_loop_early() {
-        let (o, _s, _p) = opts("escape");
+        let (o, _s, _p, _k) = opts("escape");
         let mut script = Fake::idle(10);
         script[3] = Fake::held(&[Key::Escape]);
         let mut d = Fake::new(script);
@@ -1035,7 +1110,7 @@ mod tests {
     /// practice, black. Pausing is not supposed to blank the screen.
     #[test]
     fn every_tick_presents_a_full_frame() {
-        let (o, _s, _p) = opts("present");
+        let (o, _s, _p, _k) = opts("present");
         let mut script = Fake::idle(2);
         script.push(Fake::held(&[Key::F11]));
         script.extend(Fake::idle(3));
@@ -1060,7 +1135,7 @@ mod tests {
     /// rendered frame and an unrendered one differ.
     #[test]
     fn a_paused_tick_presents_a_rendered_frame() {
-        let (o, _s, _p) = opts("paused-render");
+        let (o, _s, _p, _k) = opts("paused-render");
         let mut m = machine_that_draws();
         // The very first tick pauses, so no frame runs inside the loop at all.
         let mut d = Fake::new(vec![Fake::held(&[Key::F11])]);
@@ -1085,7 +1160,7 @@ mod tests {
     /// discarded by never calling `tick` while paused.
     #[test]
     fn unpausing_discards_the_debt_from_before_the_pause() {
-        let (o, _s, _p) = opts("pause-debt");
+        let (o, _s, _p, _k) = opts("pause-debt");
         let mut d = Fake::new(vec![
             (KeySet::new(), FRAME_NS - 1),
             Fake::held(&[Key::F11]),
@@ -1106,7 +1181,7 @@ mod tests {
     /// the pacer at all.
     #[test]
     fn the_remainder_completes_a_frame_when_nothing_is_paused() {
-        let (o, _s, _p) = opts("pace-remainder");
+        let (o, _s, _p, _k) = opts("pace-remainder");
         let mut d = Fake::new(vec![(KeySet::new(), FRAME_NS - 1), (KeySet::new(), 1)]);
         let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 1, "the two ticks are one frame between them");
@@ -1115,7 +1190,7 @@ mod tests {
     /// The title reports dropped frames — and only when there are some.
     #[test]
     fn the_title_reports_dropped_frames() {
-        let (o, _s, _p) = opts("title-drop");
+        let (o, _s, _p, _k) = opts("title-drop");
         let mut d = Fake::new(vec![(KeySet::new(), 2_000_000_000)]);
         run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert!(
@@ -1126,7 +1201,7 @@ mod tests {
 
         // And an ordinary run does not. A title that always mentioned drops would
         // be noise, and a test that only checked the stall case would pass for one.
-        let (o, _s, _p) = opts("title-quiet");
+        let (o, _s, _p, _k) = opts("title-quiet");
         let mut d = Fake::new(Fake::idle(4));
         run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert!(
@@ -1139,7 +1214,7 @@ mod tests {
     /// Pausing says so in the title.
     #[test]
     fn the_title_reports_the_pause() {
-        let (o, _s, _p) = opts("title-pause");
+        let (o, _s, _p, _k) = opts("title-pause");
         let mut script = vec![Fake::held(&[Key::F11])];
         script.extend(Fake::idle(1));
         let mut d = Fake::new(script);
@@ -1159,7 +1234,7 @@ mod tests {
     /// buffer and forgot to write it.
     #[test]
     fn a_save_and_load_round_trip_through_the_real_file() {
-        let (o, _s, _p) = opts("roundtrip");
+        let (o, _s, _p, _k) = opts("roundtrip");
         let mut m = machine();
 
         // Save on tick one, then run four frames.
@@ -1213,10 +1288,11 @@ mod tests {
             "sfemu-no-such-dir-{}/state.bin",
             std::process::id()
         ));
-        let (_o, _s, shot) = opts("save-fail");
+        let (_o, _s, shot, keys) = opts("save-fail");
         let o = LoopOpts {
             state_path: bad.clone(),
             shot_path: shot.0.clone(),
+            keys_path: keys.0.clone(),
             board: state_tag(machine::BoardKind::Cps1),
         };
         assert!(!bad.exists(), "the premise: the directory is really absent");
@@ -1244,7 +1320,7 @@ mod tests {
     /// A corrupt state file does not stop the loop.
     #[test]
     fn a_corrupt_state_file_does_not_stop_the_loop() {
-        let (o, _s, _p) = opts("corrupt");
+        let (o, _s, _p, _k) = opts("corrupt");
         std::fs::write(&o.state_path, b"this is not a save state").expect("temp dir is writable");
         let mut m = machine();
         let mut script = Fake::idle(2);
@@ -1268,7 +1344,7 @@ mod tests {
     /// A load that fails leaves the machine exactly as it was.
     #[test]
     fn a_failed_load_does_not_disturb_the_machine() {
-        let (o, _s, _p) = opts("load-fail");
+        let (o, _s, _p, _k) = opts("load-fail");
         // A valid state with one payload bit flipped: it passes the magic, version,
         // and board checks and fails the CRC, which is the closest a bad file gets
         // to being applied.
@@ -1306,7 +1382,7 @@ mod tests {
     /// `the_header_is_laid_out_as_documented` is what pins the offset to 8.
     #[test]
     fn a_saved_state_is_tagged_with_this_build_s_board() {
-        let (o, _s, _p) = opts("board-tag");
+        let (o, _s, _p, _k) = opts("board-tag");
         let mut d = Fake::new(vec![Fake::held(&[Key::F5])]);
         let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert!(s.notices.is_empty(), "{:?}", s.notices);
@@ -1331,7 +1407,7 @@ mod tests {
     /// `Sf1`'s codec rather than this loop's refusal.
     #[test]
     fn another_boards_state_is_refused_by_the_loop() {
-        let (o, _s, _p) = opts("board-refuse");
+        let (o, _s, _p, _k) = opts("board-refuse");
         let mut m = machine();
         m.run_frame();
         let mut bytes = frontend::encode(&cps1(&m).snapshot(), o.board);
@@ -1375,7 +1451,7 @@ mod tests {
     /// there both payloads are the same length.
     #[test]
     fn a_cps1_state_is_refused_by_an_sf1_loop() {
-        let (mut o, _s, _p) = opts("sf1-board-refuse");
+        let (mut o, _s, _p, _k) = opts("sf1-board-refuse");
         o.board = state_tag(machine::BoardKind::Sf1);
         let mut m = an_sf1_machine();
         m.run_frame();
@@ -1453,7 +1529,7 @@ mod tests {
     /// F12 writes a screenshot.
     #[test]
     fn a_screenshot_is_written_as_a_ppm() {
-        let (o, _s, shot) = opts("shot");
+        let (o, _s, shot, _k) = opts("shot");
         let mut d = Fake::new(vec![Fake::held(&[Key::F12])]);
         let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert!(s.notices.is_empty(), "{:?}", s.notices);
@@ -1473,7 +1549,7 @@ mod tests {
     /// interrupt through an odd SSP, which double bus faults on the frame push.
     #[test]
     fn a_halted_cpu_is_reported_in_the_title_and_does_not_stop_the_loop() {
-        let (o, _s, _p) = opts("halt");
+        let (o, _s, _p, _k) = opts("halt");
         let mut rom = vec![0u8; 0x2000];
         // An odd SSP. The reset vector fetch itself is fine; the first exception's
         // frame push is not, and `double_bus_fault` halts on an odd frame base.
@@ -1507,7 +1583,7 @@ mod tests {
     /// coin you inserted while paused.
     #[test]
     fn inputs_reach_the_board_on_a_tick_with_no_frames() {
-        let (o, _s, _p) = opts("inputs");
+        let (o, _s, _p, _k) = opts("inputs");
         let mut m = machine();
         let mut d = Fake::new(vec![
             Fake::held(&[Key::F11]),
@@ -1521,6 +1597,277 @@ mod tests {
             "the coin reached the board anyway"
         );
         assert_ne!(cps1(&m).board.inputs.in1(), 0xFFFF, "and so did the stick");
+    }
+
+    /// An open menu leaves the board seeing nothing held.
+    ///
+    /// The end-to-end form of the capture, and the only place it can be asserted: what
+    /// `frontend`'s own tests check is that `Controls::update` returns an idle `Inputs`
+    /// when it has been *told* the menu is open. Whether the loop tells it — and tells it
+    /// before reading the keys rather than after — is this loop's decision, and the
+    /// symptom of getting it wrong is a stick that still moves your fighter while you
+    /// are reading the menu.
+    ///
+    /// Asserted on `board.inputs` and not on an `Actions` field, because the board is
+    /// what a player sees. The stick and a punch together: the two ports are separate
+    /// assignments in `Controls::update`, so a capture that gated one and not the other
+    /// would pass on either key alone.
+    #[test]
+    fn an_open_menu_leaves_the_board_idle() {
+        let (o, _s, _p, _k) = opts("menu-idle");
+        let mut m = machine();
+        let mut d = Fake::new(vec![
+            // Live: the same keys, before the menu exists, so the assertion below is
+            // about the menu and not about keys that never worked.
+            Fake::held(&[Key::D, Key::K]),
+            Fake::held(&[Key::Tab]),
+            Fake::held(&[Key::D, Key::K]),
+        ]);
+        // Two runs of the same script would be needed to check the first tick, so the
+        // check is split: run one tick, look, then run the rest.
+        let mut first = Fake::new(vec![Fake::held(&[Key::D, Key::K])]);
+        run(&mut m, &mut first, &mut NullAudio::default(), &o);
+        assert_eq!(
+            cps1(&m).board.inputs.in1(),
+            0xFFEE,
+            "the premise: right at bit 0 and jab at bit 4, with no menu up"
+        );
+
+        let mut m = machine();
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        assert_eq!(d.presented.len(), 3, "the loop ran to the end");
+        assert!(s.notices.is_empty(), "{:?}", s.notices);
+        assert_eq!(
+            cps1(&m).board.inputs.in1(),
+            0xFFFF,
+            "neither the direction nor the punch reached the board"
+        );
+        assert_eq!(cps1(&m).board.inputs.in2(), 0xFF, "and no kick either");
+    }
+
+    /// `Escape` closes the menu instead of ending the session.
+    ///
+    /// `Escape` is the quit key, so this is the one collision that could end a player's
+    /// game by accident. Two claims, and both are needed: the loop kept running, *and*
+    /// the board is live again afterwards — a loop that swallowed `Escape` and left the
+    /// menu open would satisfy the first alone.
+    #[test]
+    fn escape_closes_the_menu_without_ending_the_loop() {
+        let (o, _s, _p, _k) = opts("menu-escape");
+        let mut m = machine();
+        let script = vec![
+            Fake::held(&[Key::Tab]),
+            Fake::held(&[]),
+            Fake::held(&[Key::Escape]),
+            Fake::held(&[]),
+            Fake::held(&[Key::D, Key::K]),
+        ];
+        let ticks = script.len();
+        let mut d = Fake::new(script);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        assert_eq!(
+            d.presented.len(),
+            ticks,
+            "Escape ended the loop instead of closing the menu"
+        );
+        assert!(s.notices.is_empty(), "{:?}", s.notices);
+        assert_eq!(
+            cps1(&m).board.inputs.in1(),
+            0xFFEE,
+            "and the board is live again: right at bit 0, jab at bit 4"
+        );
+    }
+
+    /// `Escape` still quits when the menu is shut.
+    ///
+    /// The mirror of the test above, and the reason it is separate: a loop that gated
+    /// `quit` unconditionally would pass that one and would have no way out but closing
+    /// the window.
+    #[test]
+    fn escape_still_quits_with_no_menu_open() {
+        let (o, _s, _p, _k) = opts("menu-escape-quits");
+        let mut d = Fake::new(vec![Fake::held(&[Key::Escape]), Fake::held(&[])]);
+        run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
+        assert_eq!(
+            d.presented.len(),
+            0,
+            "the loop broke before presenting anything"
+        );
+    }
+
+    /// Applying a preset remaps the buttons and records the choice.
+    ///
+    /// Down twice from the default reaches `QWERTY punches low`, whose jab is `J` — and
+    /// `J` is the sharp case: it presses nothing at all under either AZERTY preset,
+    /// because AZERTY's home-row run of three is `K L M`. So a loop that drew the menu
+    /// but never applied anything leaves `J` dead, and one that applied the wrong row
+    /// leaves it dead too.
+    ///
+    /// The file's contents are a literal, not `p.tag()`: a test that re-derived the tag
+    /// would pass for any tag at all, including the wrong preset's.
+    #[test]
+    fn applying_a_preset_remaps_the_buttons_and_records_the_choice() {
+        let (o, _s, _p, _k) = opts("menu-apply");
+        let mut m = machine();
+        let script = vec![
+            Fake::held(&[Key::Tab]),
+            Fake::held(&[]),
+            Fake::held(&[Key::Down]),
+            Fake::held(&[]),
+            Fake::held(&[Key::Down]),
+            Fake::held(&[]),
+            Fake::held(&[Key::Enter]),
+            Fake::held(&[Key::Tab]),
+            Fake::held(&[]),
+            Fake::held(&[Key::J]),
+        ];
+        let ticks = script.len();
+        let mut d = Fake::new(script);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        assert_eq!(d.presented.len(), ticks, "the loop ran to the end");
+        assert!(s.notices.is_empty(), "{:?}", s.notices);
+        assert_eq!(
+            cps1(&m).board.inputs.in1(),
+            0xFFEF,
+            "`J` is player 1's jab under the QWERTY preset"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&o.keys_path).expect("the menu wrote the file"),
+            "qwerty-punch-low\n"
+        );
+    }
+
+    /// The arrangement from the last session is in force before the first frame.
+    ///
+    /// Written by hand rather than by a previous run, so this test fails if `read_keys`
+    /// stops being called even while `write_keys` still works — the pair would otherwise
+    /// round-trip through each other's bug. No menu is opened here at all: the preset
+    /// must be live on the very first tick, which is why `read_keys` runs above the loop.
+    #[test]
+    fn the_recorded_arrangement_is_in_force_before_the_first_frame() {
+        let (o, _s, _p, _k) = opts("menu-read");
+        std::fs::write(&o.keys_path, "qwerty-punch-low\n").expect("temp dir is writable");
+        let mut m = machine();
+        let mut d = Fake::new(vec![Fake::held(&[Key::J])]);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        assert!(s.notices.is_empty(), "{:?}", s.notices);
+        assert_eq!(cps1(&m).board.inputs.in1(), 0xFFEF, "`J` is the jab");
+    }
+
+    /// A missing or unreadable `.keys` file is the default, silently.
+    ///
+    /// Three cases in one test because the claim is one claim — every failure is the
+    /// default and none is a notice — and the three differ only in how the read fails:
+    /// no file (everybody's first run), a tag no version of this program writes, and a
+    /// file that is not text at all. A notice here would greet a new player with an
+    /// error about a file they have never heard of.
+    ///
+    /// `M` is the probe rather than `J`: `M` is the default's fierce punch, so "the
+    /// default is in force" and "nothing is in force" give different answers. Under a
+    /// QWERTY preset `M` presses nothing, which is what a wrong fallback would show.
+    #[test]
+    fn a_missing_or_unreadable_keys_file_is_the_default_with_no_notice() {
+        // Absent.
+        let (o, _s, _p, _k) = opts("menu-absent");
+        assert!(!o.keys_path.exists(), "the premise: no file");
+        let mut m = machine();
+        let s = run(
+            &mut m,
+            &mut Fake::new(vec![Fake::held(&[Key::M])]),
+            &mut NullAudio::default(),
+            &o,
+        );
+        assert!(
+            s.notices.is_empty(),
+            "an absent file is not news: {:?}",
+            s.notices
+        );
+        assert_eq!(
+            cps1(&m).board.inputs.in1(),
+            0xFFBF,
+            "`M` is the default's fierce"
+        );
+
+        // An unknown tag, which is what a file from a future version looks like.
+        let (o, _s, _p, _k) = opts("menu-unknown");
+        std::fs::write(&o.keys_path, "dvorak-punches-sideways\n").expect("temp dir is writable");
+        let mut m = machine();
+        let s = run(
+            &mut m,
+            &mut Fake::new(vec![Fake::held(&[Key::M])]),
+            &mut NullAudio::default(),
+            &o,
+        );
+        assert!(s.notices.is_empty(), "{:?}", s.notices);
+        assert_eq!(cps1(&m).board.inputs.in1(), 0xFFBF);
+
+        // Not text. `read_to_string` fails rather than `from_tag` returning `None`, so
+        // this exercises the other of the two `ok()`/`and_then` arms.
+        let (o, _s, _p, _k) = opts("menu-binary");
+        std::fs::write(&o.keys_path, [0xFFu8, 0xFE, 0x00, 0x80]).expect("temp dir is writable");
+        let mut m = machine();
+        let s = run(
+            &mut m,
+            &mut Fake::new(vec![Fake::held(&[Key::M])]),
+            &mut NullAudio::default(),
+            &o,
+        );
+        assert!(s.notices.is_empty(), "{:?}", s.notices);
+        assert_eq!(cps1(&m).board.inputs.in1(), 0xFFBF);
+    }
+
+    /// A `.keys` file that cannot be written is one notice, and the session keeps the
+    /// preset anyway.
+    ///
+    /// The opposite rule from the read, and deliberately: the player asked for this, so
+    /// a preset that quietly reverts on the next launch is a bug they would report as
+    /// "the menu does not stick". Both halves are asserted — the notice, and that the
+    /// remap took effect regardless, since a failed write must not undo the choice.
+    ///
+    /// Applied twice, so a notice raised per apply would be two.
+    #[test]
+    fn a_failed_keys_write_is_one_notice_and_keeps_the_preset() {
+        let mut bad = std::env::temp_dir();
+        bad.push(format!("sfemu-no-such-dir-{}/sf2.keys", std::process::id()));
+        let (_o, state, shot, _k) = opts("menu-write-fail");
+        let o = LoopOpts {
+            state_path: state.0.clone(),
+            shot_path: shot.0.clone(),
+            keys_path: bad.clone(),
+            board: state_tag(machine::BoardKind::Cps1),
+        };
+        assert!(!bad.exists(), "the premise: the directory is really absent");
+
+        let mut m = machine();
+        let script = vec![
+            Fake::held(&[Key::Tab]),
+            Fake::held(&[]),
+            Fake::held(&[Key::Down]),
+            Fake::held(&[]),
+            Fake::held(&[Key::Down]),
+            Fake::held(&[]),
+            Fake::held(&[Key::Enter]),
+            Fake::held(&[]),
+            Fake::held(&[Key::Enter]),
+            Fake::held(&[Key::Tab]),
+            Fake::held(&[]),
+            Fake::held(&[Key::J]),
+        ];
+        let ticks = script.len();
+        let mut d = Fake::new(script);
+        let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
+        assert_eq!(d.presented.len(), ticks, "the loop ran to the end");
+        assert_eq!(s.notices.len(), 1, "one notice, not one per apply");
+        assert!(
+            s.notices[0].contains(&bad.display().to_string()),
+            "and it names the path: {}",
+            s.notices[0]
+        );
+        assert_eq!(
+            cps1(&m).board.inputs.in1(),
+            0xFFEF,
+            "the remap held despite the failed write"
+        );
     }
 
     /// On an SF1 the same held keys reach the board *through the conversion*.
@@ -1542,7 +1889,7 @@ mod tests {
     /// active-high line — see `machine::sf1::inputs`.
     #[test]
     fn sf1_inputs_reach_the_board_through_the_conversion() {
-        let (mut o, _s, _p) = opts("sf1-inputs");
+        let (mut o, _s, _p, _k) = opts("sf1-inputs");
         o.board = state_tag(machine::BoardKind::Sf1);
         let mut m = an_sf1_machine();
         let mut d = Fake::new(vec![Fake::held(&[Key::Num5, Key::Num1, Key::Q])]);
@@ -1568,7 +1915,7 @@ mod tests {
     /// (that is 3), so it draws.
     #[test]
     fn an_sf1_frame_reaches_the_window_through_sf1s_pen_conversion() {
-        let (mut o, _s, _p) = opts("sf1-pens");
+        let (mut o, _s, _p, _k) = opts("sf1-pens");
         o.board = state_tag(machine::BoardKind::Sf1);
         let mut m = an_sf1_machine_that_draws();
         let mut d = Fake::new(Fake::idle(2));
@@ -1604,7 +1951,7 @@ mod tests {
     /// that way first, the selection stopped at row 1 and the frame did not change.
     #[test]
     fn subtracting_an_sf1_layer_changes_the_presented_frame() {
-        let (mut o, _s, _p) = opts("sf1-mask-wired");
+        let (mut o, _s, _p, _k) = opts("sf1-mask-wired");
         o.board = state_tag(machine::BoardKind::Sf1);
 
         // Scoped, so the first machine is gone before the second is built.
@@ -1674,7 +2021,7 @@ mod tests {
     /// same number of frames, and require the machine to arrive at the same place.
     #[test]
     fn an_sf1_save_and_load_round_trip_through_the_real_file() {
-        let (mut o, _s, _p) = opts("sf1-roundtrip");
+        let (mut o, _s, _p, _k) = opts("sf1-roundtrip");
         o.board = state_tag(machine::BoardKind::Sf1);
         let mut m = an_sf1_machine();
 
@@ -1726,7 +2073,7 @@ mod tests {
     /// byte triple CPS-1's converter cannot produce from the same entry.
     #[test]
     fn f12_writes_an_sf1_screenshot() {
-        let (mut o, _s, _p) = opts("sf1-shot");
+        let (mut o, _s, _p, _k) = opts("sf1-shot");
         o.board = state_tag(machine::BoardKind::Sf1);
         let mut m = an_sf1_machine_that_draws();
         let mut d = Fake::new(vec![Fake::held(&[Key::F12]), Fake::held(&[])]);
@@ -1770,14 +2117,14 @@ mod tests {
         /// SF1's frame period in nanoseconds. See `machine`'s `SF1_FRAME_NS`.
         const SF1_NS: u64 = 16_666_667;
 
-        let (mut o, _s, _p) = opts("sf1-pace");
+        let (mut o, _s, _p, _k) = opts("sf1-pace");
         o.board = state_tag(machine::BoardKind::Sf1);
         let mut m = an_sf1_machine();
         let mut d = Fake::new(vec![(KeySet::new(), SF1_NS)]);
         let s = run(&mut m, &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 1, "SF1 owes a frame at its own period");
 
-        let (o2, _s2, _p2) = opts("cps1-pace");
+        let (o2, _s2, _p2, _k) = opts("cps1-pace");
         let mut m2 = machine();
         let mut d2 = Fake::new(vec![(KeySet::new(), SF1_NS)]);
         let s2 = run(&mut m2, &mut d2, &mut NullAudio::default(), &o2);
@@ -1803,7 +2150,7 @@ mod tests {
     #[should_panic(expected = "does not match the machine's board")]
     fn a_mismatched_board_tag_panics_in_debug() {
         // SF2's tag, an SF1 machine — the pairing that compiles, runs, and is wrong.
-        let (o, _s, _p) = opts("board-mismatch");
+        let (o, _s, _p, _k) = opts("board-mismatch");
         run(
             &mut an_sf1_machine(),
             &mut Fake::new(Fake::idle(1)),
@@ -1820,7 +2167,7 @@ mod tests {
     /// `step_instruction` equals itself.
     #[test]
     fn f4_steps_one_instruction() {
-        let (o, _s, _p) = opts("step-insn");
+        let (o, _s, _p, _k) = opts("step-insn");
         let mut m = machine();
         // Paused throughout: what is under test is that `F4` moves the machine by an
         // *instruction*, and a running loop would move it by a frame at the same time.
@@ -1859,7 +2206,7 @@ mod tests {
     /// follows comes back round to it.
     #[test]
     fn a_breakpoint_stops_the_loop_mid_frame() {
-        let (o, _s, _p) = opts("bp-midframe");
+        let (o, _s, _p, _k) = opts("bp-midframe");
         let mut m = machine_with_a_long_loop();
         assert_eq!(
             frontend::overlay::executing_pc(&m.cpu_view()),
@@ -1908,7 +2255,7 @@ mod tests {
     /// of the two. A loop that paused and could not resume would leave them equal.
     #[test]
     fn resuming_from_a_breakpoint_makes_progress() {
-        let (o, _s, _p) = opts("bp-resume");
+        let (o, _s, _p, _k) = opts("bp-resume");
         let mut m = machine_with_a_long_loop();
         // One machine, snapshotted and put back, rather than two: a `Cps1` is 525 KB on
         // the stack and two live in one test thread overflows it.
@@ -1962,7 +2309,7 @@ mod tests {
     /// had nothing to do with the claim.
     #[test]
     fn stepping_onto_a_breakpoint_and_resuming_makes_progress() {
-        let (o, _s, _p) = opts("step-onto-bp");
+        let (o, _s, _p, _k) = opts("step-onto-bp");
         let mut rom = vec![0u8; 0x2000];
         rom[0..8].copy_from_slice(&[0x00, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00]);
         rom[0x1000..0x1004].copy_from_slice(&[0x52, 0x40, 0x60, 0xFC]);
@@ -2016,7 +2363,7 @@ mod tests {
     /// the loop is supposed to pass.
     #[test]
     fn the_overlay_reaches_the_presented_buffer() {
-        let (o, _s, _p) = opts("overlay-shown");
+        let (o, _s, _p, _k) = opts("overlay-shown");
         let mut m = machine_that_draws();
         // Zero elapsed and one tick, so the machine does not move: the state it is in
         // afterwards is the state the overlay was drawn from.
@@ -2063,7 +2410,7 @@ mod tests {
     /// box over the game of everyone who never presses `F1`.
     #[test]
     fn the_overlay_off_presents_an_unmodified_frame() {
-        let (o, _s, _p) = opts("overlay-off");
+        let (o, _s, _p, _k) = opts("overlay-off");
         let mut m = machine_that_draws();
         let mut d = Fake::new(vec![(KeySet::new(), 0)]);
         run(&mut m, &mut d, &mut NullAudio::default(), &o);
@@ -2081,7 +2428,7 @@ mod tests {
     /// panel punched out of its top-left, which is where its own labels are.
     #[test]
     fn the_video_viewer_draws_over_the_debugger() {
-        let (o, _s, _p) = opts("viewer-over-debugger");
+        let (o, _s, _p, _k) = opts("viewer-over-debugger");
         // The pixel both halves read: the top-left corner of E2's register panel,
         // which the viewer's box covers. The corner itself and not a pixel inside it
         // — `overlay::PAD` is one pixel, so the first glyph of `D0 ...` starts at
@@ -2128,7 +2475,7 @@ mod tests {
     /// decision; this tests the wire.
     #[test]
     fn subtracting_a_layer_changes_the_presented_frame() {
-        let (o, _s, _p) = opts("mask-wired");
+        let (o, _s, _p, _k) = opts("mask-wired");
         // Scoped, so this machine is gone before the second is built: 525 KB each and
         // a test thread's stack is 2 MB.
         //
@@ -2197,7 +2544,7 @@ mod tests {
     /// leaves out the trace and the trace is where a stray acknowledge would show.
     #[test]
     fn looking_at_the_video_does_not_change_the_machine() {
-        let (o, _s, _p) = opts("looking");
+        let (o, _s, _p, _k) = opts("looking");
         let mut m = machine();
         // One machine, restored between the two runs — 525 KB on the stack means two
         // do not fit in a test thread.
@@ -2285,7 +2632,7 @@ mod tests {
     /// lengths would be comparing frame counts, not inertness.
     #[test]
     fn no_mask_combination_changes_the_machine() {
-        let (o, _s, _p) = opts("everymask");
+        let (o, _s, _p, _k) = opts("everymask");
         let mut m = machine();
         let start = cps1(&m).snapshot();
 
@@ -2393,7 +2740,7 @@ mod tests {
     /// the trace, and the trace is where a stray interrupt acknowledge would show.
     #[test]
     fn watching_the_machine_does_not_change_it() {
-        let (o, _s, _p) = opts("watching");
+        let (o, _s, _p, _k) = opts("watching");
         let mut m = machine();
         // One machine, put back between the two runs — 525 KB on the stack means two do
         // not fit in a test thread. `restore` leaves the trace alone deliberately, so
@@ -2457,7 +2804,7 @@ mod tests {
     /// without it, with every other test in this module green either way.
     #[test]
     fn the_stepping_path_reaches_the_same_machine_as_run_frame() {
-        let (o, _s, _p) = opts("stepping-path");
+        let (o, _s, _p, _k) = opts("stepping-path");
         let mut m = machine();
         let start = cps1(&m).snapshot();
         // `restore` deliberately leaves the trace alone — a reset or a load is part of
@@ -2522,7 +2869,7 @@ mod tests {
     /// A closed display runs nothing.
     #[test]
     fn a_display_that_never_opens_runs_nothing() {
-        let (o, _s, _p) = opts("closed");
+        let (o, _s, _p, _k) = opts("closed");
         let mut d = Fake::new(Vec::new());
         let mut a = FakeAudio::default();
         let s = run(&mut machine(), &mut d, &mut a, &o);
@@ -2603,7 +2950,7 @@ mod tests {
     /// is that count times [`machine::resample::CHANNELS`].
     #[test]
     fn each_frame_queues_its_samples_exactly_once() {
-        let (o, _s, _p) = opts("queue-once");
+        let (o, _s, _p, _k) = opts("queue-once");
         let mut m = machine();
         let mut d = Fake::new(Fake::idle(3));
         let mut a = FakeAudio::default();
@@ -2638,7 +2985,7 @@ mod tests {
     /// an underrun.
     #[test]
     fn a_paused_tick_queues_nothing_and_reports_the_pause() {
-        let (o, _s, _p) = opts("queue-paused");
+        let (o, _s, _p, _k) = opts("queue-paused");
         let mut script = vec![Fake::held(&[Key::F11])];
         script.extend(Fake::idle(2));
         let mut d = Fake::new(script);
@@ -2673,7 +3020,7 @@ mod tests {
     /// through a genuinely struggling host, which is the one thing it exists to say.
     #[test]
     fn resuming_tells_the_sink_the_pause_is_over() {
-        let (o, _s, _p) = opts("queue-resume");
+        let (o, _s, _p, _k) = opts("queue-resume");
         let mut script = vec![Fake::held(&[Key::F11])];
         script.extend(Fake::idle(1));
         script.push(Fake::held(&[Key::F11]));
@@ -2698,7 +3045,7 @@ mod tests {
     /// because sixty identical lines a second is how a message gets hidden inside itself.
     #[test]
     fn a_failed_queue_is_one_notice_and_does_not_stop_the_loop() {
-        let (o, _s, _p) = opts("queue-fails");
+        let (o, _s, _p, _k) = opts("queue-fails");
         let mut d = Fake::new(Fake::idle(4));
         let mut a = FakeAudio {
             fail: Some("the device went away".to_string()),
@@ -2723,7 +3070,7 @@ mod tests {
     /// silent game, a broken mix — with nothing on screen to choose between them.
     #[test]
     fn the_title_says_when_there_is_no_audio_device() {
-        let (o, _s, _p) = opts("title-no-audio");
+        let (o, _s, _p, _k) = opts("title-no-audio");
         let mut d = Fake::new(Fake::idle(2));
         let mut dead = FakeAudio {
             running: false,
@@ -2736,7 +3083,7 @@ mod tests {
             d.titles
         );
 
-        let (o2, _s2, _p2) = opts("title-has-audio");
+        let (o2, _s2, _p2, _k) = opts("title-has-audio");
         let mut d2 = Fake::new(Fake::idle(2));
         let mut live = FakeAudio::default();
         run(&mut machine(), &mut d2, &mut live, &o2);
@@ -2758,7 +3105,7 @@ mod tests {
     /// sink would pass the first half.
     #[test]
     fn the_rings_counters_reach_the_sound_panel() {
-        let (o, _s, _p) = opts("audio-stats");
+        let (o, _s, _p, _k) = opts("audio-stats");
         let mut m = machine();
         let mut d = Fake::new(Fake::idle(2));
         let mut a = FakeAudio {
@@ -2773,7 +3120,7 @@ mod tests {
         assert_eq!(t.audio_drops, 17, "drops is the first argument");
         assert_eq!(t.audio_underruns, 4, "and underruns the second");
 
-        let (o2, _s2, _p2) = opts("audio-stats-quiet");
+        let (o2, _s2, _p2, _k) = opts("audio-stats-quiet");
         let mut m2 = machine();
         let mut d2 = Fake::new(Fake::idle(2));
         run(&mut m2, &mut d2, &mut FakeAudio::default(), &o2);
@@ -2798,7 +3145,7 @@ mod tests {
     /// one pair.
     #[test]
     fn the_rings_counters_reach_an_sf1_machine() {
-        let (mut o, _s, _p) = opts("sf1-audio-stats");
+        let (mut o, _s, _p, _k) = opts("sf1-audio-stats");
         o.board = state_tag(machine::BoardKind::Sf1);
         let mut m = an_sf1_machine();
         let mut d = Fake::new(Fake::idle(2));
@@ -2813,7 +3160,7 @@ mod tests {
         assert_eq!(sf1(&m).audio_drops(), 17, "drops is the first argument");
         assert_eq!(sf1(&m).audio_underruns(), 4, "and underruns the second");
 
-        let (mut o2, _s2, _p2) = opts("sf1-audio-stats-quiet");
+        let (mut o2, _s2, _p2, _k) = opts("sf1-audio-stats-quiet");
         o2.board = state_tag(machine::BoardKind::Sf1);
         let mut m2 = an_sf1_machine();
         let mut d2 = Fake::new(Fake::idle(2));
@@ -2835,13 +3182,13 @@ mod tests {
     /// buffer full and diverge.
     #[test]
     fn a_failing_sink_reaches_the_same_machine_as_a_working_one() {
-        let (o, _s, _p) = opts("queue-same-a");
+        let (o, _s, _p, _k) = opts("queue-same-a");
         let mut working = machine();
         let mut d = Fake::new(Fake::idle(3));
         let mut a = FakeAudio::default();
         run(&mut working, &mut d, &mut a, &o);
 
-        let (o2, _s2, _p2) = opts("queue-same-b");
+        let (o2, _s2, _p2, _k) = opts("queue-same-b");
         let mut failing = machine();
         let mut d2 = Fake::new(Fake::idle(3));
         let mut a2 = FakeAudio {

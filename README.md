@@ -371,6 +371,7 @@ punch is the semicolon. See [Layouts](#layouts) below.
 | `F10` | Cycle the view: tiles, tilemap, palette, layers |
 | `[` / `]` | Move within the view |
 | `Enter` | Act on the view — cycle its tile layout or layer, or toggle a layer |
+| `Tab` | Key menu on / off — see [The key menu](#the-key-menu) |
 
 **Punches sit on the bottom row and kicks directly above them** — the reverse of a
 real six-button cabinet, deliberately. On an AZERTY keyboard `K` `L` `M` is a run of
@@ -427,6 +428,58 @@ tell the player to press.
 including that `M::Z`, `M::Q` and `M::M` press *nothing*, because "supporting both
 layouts" by mapping the QWERTY positions as well would give one board input two keys
 and silently undo the fix.
+
+### The key menu
+
+`Tab` opens it. Four button layouts and a row that puts the default back:
+
+```
+   KEYS
+ > AZERTY  punches low   (current)
+   AZERTY  punches high
+   QWERTY  punches low
+   QWERTY  punches high
+   restore defaults
+ P1  Z S Q D   K L M / I O P
+ P2  arrows    456 / 789
+ up/down move   Enter apply
+ Tab close      Esc cancel
+```
+
+Up and down move, `Enter` applies and leaves the menu up so you can see what
+changed, `Tab` or `Esc` closes it. The two summary rows preview the *highlighted*
+row's keys, not the active ones, so you can read a layout before choosing it. The
+choice is written beside the ROM set as `sf2.keys` — one line of text you can edit
+by hand — and is in force before the first frame of the next session. A missing,
+unreadable, or unrecognised file is the default and says nothing: a first run has no
+file, and a tag from a future version is not something a player can act on.
+
+**The menu captures the keyboard.** While it is up the board sees nothing held and
+every control but `Tab` is swallowed. Both halves are necessary. `Inputs` is
+level-triggered, so a stick held when the menu opened would stay held in the board's
+eyes for as long as the menu was up — the idle value has to be written, not merely
+withheld. And the three keys a menu wants most are all taken: `Esc` **quits**, `Enter`
+acts on the graphics view, and `F1` is the debugger overlay. `Tab` is the one key that
+was free and prints the same on both layouts, which is why it is the opener.
+
+`Esc` closing the menu rather than quitting is the whole point of the capture, and it
+only closes: pressed with no menu up, it still quits.
+
+**The stick is not on the menu**, and that is a discovery rather than an omission.
+AZERTY's `Z S Q D` and QWERTY's `W A S D` are the *same four physical keys*, so
+`minifb`'s position-naming means one map already reads correctly on both — only the
+printed letters differ. What the layouts really disagree about is the punch triple:
+AZERTY's home-row run of three is `K L M`, QWERTY's is `J K L`. So the four presets
+are two axes, not four: which row punches, and which triple.
+
+One consequence is visible in play: **which keys are live depends on the preset.**
+`J` presses nothing under either AZERTY preset, and `M` presses nothing under either
+QWERTY one. Both are mapped in `display.rs` unconditionally all the same, because the
+gate belongs in the preset table and not in the layer that translates keycodes.
+
+One rough edge, documented rather than fixed: the menu reads the *previous* frame's
+actions, so the board is live for the single frame on which `Tab` goes down. Fixing
+it would mean a second copy of the edge detection.
 
 Save states go beside the ROM set — `sf2.zip` next to `sf2.sfs` — so two games
 never share one, and screenshots to `sf2.ppm` the same way. One state file, not a

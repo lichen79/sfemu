@@ -170,6 +170,13 @@ fn translate(k: minifb::Key) -> Option<Key> {
         M::P => Key::P,
         M::K => Key::K,
         M::L => Key::L,
+        // Live only under a QWERTY preset, where the home row's run of three is `J K L`
+        // rather than AZERTY's `K L M`. Mapped unconditionally all the same: this
+        // function turns a scancode into a `frontend::Key` and knows nothing about
+        // presets — `frontend::keys` decides which keys a preset reads, and under an
+        // AZERTY one this key simply presses nothing. Position 0x26, the same letter on
+        // both layouts, so it is not one of the traps above.
+        M::J => Key::J,
         // The third punch, and the second position trap in this function. The key
         // **labelled M** is position 0x29, which `minifb` names `Semicolon` after the US
         // QWERTY letter there. `M::M` is position 0x2e — the key labelled `,` here — and
@@ -212,6 +219,11 @@ fn translate(k: minifb::Key) -> Option<Key> {
         M::LeftBracket => Key::BracketLeft,
         M::RightBracket => Key::BracketRight,
         M::Enter => Key::Enter,
+        // The key menu. `Tab` because there was nothing else: all twelve of `F1`-`F12`
+        // are mapped above, and the three keys a menu reaches for by instinct are taken
+        // — `Enter` acts on the graphics view, `F1` is the debugger overlay, and
+        // `Escape` quits. Position 0x30, and the same key on both layouts.
+        M::Tab => Key::Tab,
         _ => return None,
     })
 }
@@ -286,6 +298,7 @@ mod tests {
             M::I,
             M::O,
             M::P,
+            M::J,
             M::K,
             M::L,
             M::Semicolon,
@@ -323,6 +336,7 @@ mod tests {
             M::LeftBracket,
             M::RightBracket,
             M::Enter,
+            M::Tab,
         ];
         for want in Key::ALL {
             let n = candidates

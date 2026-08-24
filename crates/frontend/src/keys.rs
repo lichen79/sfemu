@@ -106,7 +106,19 @@ pub enum Key {
     /// to `L`. `display::translate` produces this from `minifb`'s `Semicolon` — position
     /// 0x29 — and not from `M::M`, which is the comma key here. One more reason the
     /// letters in this enum are labels rather than evidence.
+    ///
+    /// Live under the AZERTY presets and dead under the QWERTY ones, where [`Key::J`]
+    /// takes its place in the row. See [`Preset`].
     M,
+    /// P1's third button under a **QWERTY** preset, where the home row's run of three is
+    /// `J K L` rather than AZERTY's `K L M`.
+    ///
+    /// This variant existed, was deleted when the punches moved to `K L M`, and is back
+    /// for the presets: AZERTY moves `M` onto the home row and pushes `;` off it, so the
+    /// two layouts genuinely need different letters for the same three positions. Dead
+    /// under the AZERTY presets, exactly as [`Key::M`] is dead under the QWERTY ones —
+    /// one physical key, one board input, and which keys are live is preset-dependent.
+    J,
     /// P2 stick up.
     Up,
     /// P2 stick down.
@@ -178,6 +190,15 @@ pub enum Key {
     BracketRight,
     /// Act on the current graphics view.
     Enter,
+    /// Open or close the key menu.
+    ///
+    /// `Tab` because there was nothing else. All twelve of `F1`-`F12` are mapped, and the
+    /// three keys a menu would reach for by instinct are all taken and one of them is
+    /// dangerous: `Enter` acts on the graphics view, `F1` is the debugger overlay, and
+    /// `Escape` **quits**. `Tab` is position 0x30, unmapped until now, and prints the same
+    /// on AZERTY and QWERTY — so the one key that reaches the key menu is not itself a
+    /// layout question.
+    Tab,
 }
 
 impl Key {
@@ -186,7 +207,7 @@ impl Key {
     /// `tests::all_lists_every_key_exactly_once` fails if a variant is added and
     /// not listed here, which is what stops the tests that iterate this from
     /// quietly narrowing.
-    pub const ALL: [Key; 44] = [
+    pub const ALL: [Key; 46] = [
         Key::Z,
         Key::S,
         Key::Q,
@@ -197,6 +218,7 @@ impl Key {
         Key::K,
         Key::L,
         Key::M,
+        Key::J,
         Key::Up,
         Key::Down,
         Key::Left,
@@ -231,6 +253,7 @@ impl Key {
         Key::BracketLeft,
         Key::BracketRight,
         Key::Enter,
+        Key::Tab,
     ];
 
     /// This key's bit in a [`KeySet`].
@@ -290,7 +313,156 @@ impl Key {
             Key::NumPad4 => 41,
             Key::NumPad5 => 42,
             Key::NumPad6 => 43,
+            // The presets' two, appended for the same reason P2's ten were: an existing
+            // key's bit moving is a silent remap of every `KeySet` in flight. 46 keys, and
+            // bits 46 up stay free — `mutate.py`'s control mutant still has 62.
+            Key::J => 44,
+            Key::Tab => 45,
         }
+    }
+}
+
+/// A complete, verified arrangement of the twelve player buttons.
+///
+/// # Why presets and not per-key rebinding
+///
+/// "Press the key you want" cannot work in this program without a different `Key` type.
+/// This enum is layout-blind by construction — a variant is a *label*, and only
+/// `sfemu`'s `display::translate` knows which hardware position produces it — so a
+/// capture loop could only ever offer the positions the map already reaches. A player
+/// pressing the key their keyboard prints `W` on would get nothing, with no way to tell
+/// that from a bug. Shipping whole maps that have each been asserted against the board's
+/// ports avoids the question entirely.
+///
+/// # Only two axes, because the stick is not one
+///
+/// The obvious matrix is {AZERTY, QWERTY} × {punches low, punches high}, and its first
+/// axis is **half a fiction**: `Z S Q D` on AZERTY and `W A S D` on QWERTY are the *same
+/// four physical keys*. `minifb` names positions, so one map reads correctly on both and
+/// only the printed letters differ. A "QWERTY stick" preset would change nothing.
+///
+/// What genuinely varies is which row punches, and which three letters the rows use —
+/// `K L M` is AZERTY's home-row run of three, `J K L` is QWERTY's, because AZERTY moves
+/// `M` onto the home row and pushes `;` off it.
+///
+/// # Which keys are live depends on the preset
+///
+/// Under [`Preset::AzertyPunchLow`] and [`Preset::AzertyCabinet`], [`Key::J`] presses
+/// nothing. Under the two QWERTY presets, [`Key::M`] does. That is not an oversight — one
+/// physical key, one board input — but it means "this key does nothing" is a
+/// preset-dependent claim, which is why the tests assert it per preset rather than once.
+///
+/// The controls are **not** part of a preset. A preset that could move `Escape` could
+/// strand a player in a window they cannot close, so the function keys, coins and starts
+/// are fixed for every one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Preset {
+    /// AZERTY labels, punches on the home row **below** the kicks: `K L M` over `I O P`,
+    /// and the keypad's `4 5 6` punching under `7 8 9`.
+    ///
+    /// The default, and what was asked for. It inverts a six-button cabinet on purpose:
+    /// `K L M` is a run of three on the AZERTY home row, so the punches land under the
+    /// resting fingers.
+    #[default]
+    AzertyPunchLow,
+    /// AZERTY labels, punches **above** the kicks in a real cabinet's order: `I O P` over
+    /// `K L M`, keypad `7 8 9` over `4 5 6`.
+    AzertyCabinet,
+    /// QWERTY labels, punches below the kicks: `J K L` over `I O P`, keypad `4 5 6` under
+    /// `7 8 9`.
+    QwertyPunchLow,
+    /// QWERTY labels, punches above the kicks — the arrangement this project shipped
+    /// before the remap, on a US keyboard: `I O P` over `J K L`, keypad `7 8 9` over
+    /// `4 5 6`.
+    QwertyCabinet,
+}
+
+impl Preset {
+    /// Every preset, in the order the menu lists them.
+    pub const ALL: [Preset; 4] = [
+        Preset::AzertyPunchLow,
+        Preset::AzertyCabinet,
+        Preset::QwertyPunchLow,
+        Preset::QwertyCabinet,
+    ];
+
+    /// The name the menu shows.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Preset::AzertyPunchLow => "AZERTY  punches low",
+            Preset::AzertyCabinet => "AZERTY  punches high",
+            Preset::QwertyPunchLow => "QWERTY  punches low",
+            Preset::QwertyCabinet => "QWERTY  punches high",
+        }
+    }
+
+    /// The three keys this preset puts P1's punches on, jab first.
+    ///
+    /// Written out per preset rather than derived from a "letters" and a "row order"
+    /// field. Deriving them would make the four presets one expression with two
+    /// booleans, and a sign error in it would move all four at once — where a written
+    /// table can only ever be wrong about the row a reader is looking at.
+    pub const fn p1_punch(self) -> [Key; 3] {
+        match self {
+            Preset::AzertyPunchLow => [Key::K, Key::L, Key::M],
+            Preset::AzertyCabinet => [Key::I, Key::O, Key::P],
+            Preset::QwertyPunchLow => [Key::J, Key::K, Key::L],
+            Preset::QwertyCabinet => [Key::I, Key::O, Key::P],
+        }
+    }
+
+    /// The three keys this preset puts P1's kicks on, short first.
+    pub const fn p1_kick(self) -> [Key; 3] {
+        match self {
+            Preset::AzertyPunchLow => [Key::I, Key::O, Key::P],
+            Preset::AzertyCabinet => [Key::K, Key::L, Key::M],
+            Preset::QwertyPunchLow => [Key::I, Key::O, Key::P],
+            Preset::QwertyCabinet => [Key::J, Key::K, Key::L],
+        }
+    }
+
+    /// P2's punch row on the keypad, jab first.
+    pub const fn p2_punch(self) -> [Key; 3] {
+        match self {
+            Preset::AzertyPunchLow | Preset::QwertyPunchLow => {
+                [Key::NumPad4, Key::NumPad5, Key::NumPad6]
+            }
+            Preset::AzertyCabinet | Preset::QwertyCabinet => {
+                [Key::NumPad7, Key::NumPad8, Key::NumPad9]
+            }
+        }
+    }
+
+    /// P2's kick row on the keypad, short first.
+    pub const fn p2_kick(self) -> [Key; 3] {
+        match self {
+            Preset::AzertyPunchLow | Preset::QwertyPunchLow => {
+                [Key::NumPad7, Key::NumPad8, Key::NumPad9]
+            }
+            Preset::AzertyCabinet | Preset::QwertyCabinet => {
+                [Key::NumPad4, Key::NumPad5, Key::NumPad6]
+            }
+        }
+    }
+
+    /// The tag written to disk, and read back.
+    ///
+    /// A string and not the discriminant: a numbering is invisible in a config file and
+    /// silently renumbers if a preset is ever inserted rather than appended, which would
+    /// change what a saved file means without changing the file.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Preset::AzertyPunchLow => "azerty-punch-low",
+            Preset::AzertyCabinet => "azerty-cabinet",
+            Preset::QwertyPunchLow => "qwerty-punch-low",
+            Preset::QwertyCabinet => "qwerty-cabinet",
+        }
+    }
+
+    /// The preset a tag names, or `None` — an unknown tag is not an error to the caller,
+    /// which falls back to the default the way a missing save state does.
+    pub fn from_tag(s: &str) -> Option<Preset> {
+        Preset::ALL.into_iter().find(|p| p.tag() == s.trim())
     }
 }
 
@@ -299,12 +471,12 @@ impl Key {
 /// A bitmask rather than a `Vec`, so [`Controls`] can keep last frame's set by
 /// copy and the edge detection is one `&`.
 ///
-/// `u64` and not `u32`: 44 keys hold bits 0-43. It was a `u32` through E2's 29 keys,
+/// `u64` and not `u32`: 46 keys hold bits 0-45. It was a `u32` through E2's 29 keys,
 /// and the alternative to widening was overloading `PageUp`/`PageDown`/`Home` to
 /// mean something else while the graphics viewer is up — which would have reached 31
 /// keys, leaving exactly one free bit, and `scripts/mutate.py`'s control mutant needs
 /// a free bit to move `Escape` to. Mapping player 2 then added ten more, which a `u32`
-/// could not have held at all: 44 keys is 12 bits past its width.
+/// could not have held at all: 46 keys is 14 bits past its width.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KeySet {
     bits: u64,
@@ -387,6 +559,25 @@ pub struct Actions {
     pub gfx_forward: bool,
     /// Act on the current graphics view — cycle its tile kind or layer, or toggle.
     pub gfx_act: bool,
+    /// Open or close the key menu.
+    pub menu_toggled: bool,
+    /// Move the menu's selection towards the top.
+    ///
+    /// Only ever set while the menu is open, where it comes from the same `Up` that is
+    /// P2's stick the rest of the time. That overload is the whole reason the menu
+    /// captures the keyboard: two meanings for one key are safe exactly when only one of
+    /// them can be live at a time.
+    pub menu_up: bool,
+    /// Move the menu's selection towards the bottom.
+    pub menu_down: bool,
+    /// Apply the selected row.
+    pub menu_apply: bool,
+    /// Close the menu without applying.
+    ///
+    /// From `Escape`, which **quits** when the menu is shut. Keeping the two apart is the
+    /// single most load-bearing line in the capture: the instinctive way to back out of a
+    /// menu would otherwise end the session.
+    pub menu_close: bool,
 }
 
 /// The keyboard, frame to frame.
@@ -402,6 +593,18 @@ pub struct Controls {
     /// configuration rather than controls, so they live beside the key state and are
     /// copied into every frame's `Inputs`.
     dsw: Option<[u8; 3]>,
+    /// Which arrangement of the twelve player buttons is in force.
+    ///
+    /// Beside `dsw` and for the same reason: `update` returns a whole `Inputs` that the
+    /// play loop assigns over the machine's own, so anything that must outlive a single
+    /// frame lives here rather than being passed in.
+    preset: Preset,
+    /// Whether the key menu is open, in which case the board reads idle.
+    ///
+    /// Held here rather than taken as an argument because it gates the whole game-input
+    /// half of [`Controls::update`], and a caller that forgot to pass it would get a menu
+    /// you can play the game through.
+    menu_open: bool,
 }
 
 impl Controls {
@@ -419,6 +622,35 @@ impl Controls {
         self.dsw = Some(dsw);
     }
 
+    /// Which button arrangement is in force.
+    pub fn preset(&self) -> Preset {
+        self.preset
+    }
+
+    /// Switches the twelve player buttons to another arrangement.
+    ///
+    /// Takes effect on the next [`Controls::update`]. Nothing is retained from the old
+    /// preset: the keys held when this is called are read against the new map, which is
+    /// correct — a key that was a punch and is now a kick should be whatever it is now.
+    pub fn set_preset(&mut self, preset: Preset) {
+        self.preset = preset;
+    }
+
+    /// Tells the map whether the key menu is up.
+    ///
+    /// While it is, [`Controls::update`] reports an **idle board**: navigating a menu must
+    /// not throw punches. This matters more than it looks, because `Inputs` is
+    /// level-triggered — without the explicit idle, a stick held at the moment the menu
+    /// opened would stay held in the board's eyes for as long as the menu stayed up.
+    ///
+    /// The controls are gated too, and that is the other half of the capture: `Escape`
+    /// would otherwise **quit** and `Enter` would act on the graphics view, so the two
+    /// keys a menu needs most are the two that must not reach their old meanings. The
+    /// exception is `Tab`, which is what closes the menu again.
+    pub fn set_menu_open(&mut self, open: bool) {
+        self.menu_open = open;
+    }
+
     /// Reads this frame's held keys.
     pub fn update(&mut self, now: KeySet) -> Actions {
         // Pressed *this* frame: held now and not held before. Per key, so two
@@ -430,75 +662,94 @@ impl Controls {
         if let Some(dsw) = self.dsw {
             inputs.dsw = dsw;
         }
-        // Player 1, the left of the keyboard: ZSQD stick, KLM punches on the home row,
-        // IOP kicks on the row above. Punches under the resting fingers, which inverts a
-        // cabinet's own arrangement -- see the module docs.
-        inputs.p1.up = now.contains(Key::Z);
-        inputs.p1.down = now.contains(Key::S);
-        inputs.p1.left = now.contains(Key::Q);
-        inputs.p1.right = now.contains(Key::D);
-        inputs.p1.punch = [
-            now.contains(Key::K),
-            now.contains(Key::L),
-            now.contains(Key::M),
-        ];
-        inputs.p1.kick = [
-            now.contains(Key::I),
-            now.contains(Key::O),
-            now.contains(Key::P),
-        ];
-        // Player 2, the right: arrow-key stick, keypad 456 punches under 789 kicks --
-        // mirroring P1's inversion, so the two halves agree about which row is which.
-        inputs.p2.up = now.contains(Key::Up);
-        inputs.p2.down = now.contains(Key::Down);
-        inputs.p2.left = now.contains(Key::Left);
-        inputs.p2.right = now.contains(Key::Right);
-        inputs.p2.punch = [
-            now.contains(Key::NumPad4),
-            now.contains(Key::NumPad5),
-            now.contains(Key::NumPad6),
-        ];
-        inputs.p2.kick = [
-            now.contains(Key::NumPad7),
-            now.contains(Key::NumPad8),
-            now.contains(Key::NumPad9),
-        ];
-        inputs.coin1 = now.contains(Key::Num5);
-        inputs.coin2 = now.contains(Key::Num6);
-        inputs.start1 = now.contains(Key::Num1);
-        inputs.start2 = now.contains(Key::Num2);
-        // Level-triggered, unlike every other function key: the service menu is
-        // entered by *holding* the test switch, which is what the switch does on a
-        // real cabinet.
-        inputs.test = now.contains(Key::F2);
+        // The whole board half is skipped while the menu is up, leaving `Inputs::idle`.
+        // Not "the buttons are ignored" -- *idle*, which is a different claim: a stick
+        // held when the menu opened must stop being held, and `Inputs` is level-triggered,
+        // so only writing the idle value achieves that.
+        if !self.menu_open {
+            let p = self.preset;
+            // Player 1, the left of the keyboard. The stick is the same four physical keys
+            // on every preset -- AZERTY's ZSQD and QWERTY's WASD are one map, and only the
+            // printed letters differ -- so it is written here rather than in `Preset`.
+            inputs.p1.up = now.contains(Key::Z);
+            inputs.p1.down = now.contains(Key::S);
+            inputs.p1.left = now.contains(Key::Q);
+            inputs.p1.right = now.contains(Key::D);
+            // The six buttons are the preset's to name. `map` over the triple rather than
+            // three indexed reads: `[0]`, `[1]`, `[2]` written out is where a
+            // copy-paste puts the jab's key under the strong's finger.
+            inputs.p1.punch = p.p1_punch().map(|k| now.contains(k));
+            inputs.p1.kick = p.p1_kick().map(|k| now.contains(k));
+            // Player 2, the right: the arrow keys and the keypad, same shape.
+            inputs.p2.up = now.contains(Key::Up);
+            inputs.p2.down = now.contains(Key::Down);
+            inputs.p2.left = now.contains(Key::Left);
+            inputs.p2.right = now.contains(Key::Right);
+            inputs.p2.punch = p.p2_punch().map(|k| now.contains(k));
+            inputs.p2.kick = p.p2_kick().map(|k| now.contains(k));
+            inputs.coin1 = now.contains(Key::Num5);
+            inputs.coin2 = now.contains(Key::Num6);
+            inputs.start1 = now.contains(Key::Num1);
+            inputs.start2 = now.contains(Key::Num2);
+            // Level-triggered, unlike every other function key: the service menu is
+            // entered by *holding* the test switch, which is what the switch does on a
+            // real cabinet.
+            inputs.test = now.contains(Key::F2);
+        }
+
+        // While the menu is up it owns the keyboard, and `open` gates every control that
+        // would otherwise fire underneath it. Three of them are the reason this exists:
+        // `Escape` quits, `Enter` acts on the graphics view, and the arrows are P2's
+        // stick. All twelve of `F1`-`F12` are mapped, so there was no free key to give the
+        // menu instead -- capturing is not a shortcut here, it is the only option that
+        // does not overload a key with two live meanings.
+        //
+        // `Tab` itself is *not* gated: it is what closes the menu again.
+        let open = self.menu_open;
+        let ctl = |k: Key| !open && edge(k);
 
         let actions = Actions {
             inputs,
-            pause_toggled: edge(Key::F11),
-            step: edge(Key::Period),
-            reset: edge(Key::F3),
-            save: edge(Key::F5),
-            load: edge(Key::F8),
-            screenshot: edge(Key::F12),
-            quit: edge(Key::Escape),
-            overlay_toggled: edge(Key::F1),
-            step_instruction: edge(Key::F4),
-            focus_cycled: edge(Key::F6),
-            breakpoint_toggled: edge(Key::F7),
+            pause_toggled: ctl(Key::F11),
+            step: ctl(Key::Period),
+            reset: ctl(Key::F3),
+            save: ctl(Key::F5),
+            load: ctl(Key::F8),
+            screenshot: ctl(Key::F12),
+            // Gated like the rest, and this is the one that would cost a session: with the
+            // menu open, `Escape` closes it and quits nothing.
+            quit: ctl(Key::Escape),
+            overlay_toggled: ctl(Key::F1),
+            step_instruction: ctl(Key::F4),
+            focus_cycled: ctl(Key::F6),
+            breakpoint_toggled: ctl(Key::F7),
             // The scroll keys are edge-triggered like the rest, not repeating. A held
             // `PageDown` walking sixty pages a second is not a usable way to find an
             // address, and auto-repeat would need a timer — which would put a clock in
             // the one crate that deliberately has none.
-            scroll_up: edge(Key::PageUp),
-            scroll_down: edge(Key::PageDown),
-            follow_reset: edge(Key::Home),
+            scroll_up: ctl(Key::PageUp),
+            scroll_down: ctl(Key::PageDown),
+            follow_reset: ctl(Key::Home),
             // Edge-triggered, every one, for the reason written just above: a held
             // `]` walking sixty pages a second is not a way to find a tile.
-            gfx_toggled: edge(Key::GfxToggled),
-            gfx_view_cycled: edge(Key::GfxView),
-            gfx_back: edge(Key::BracketLeft),
-            gfx_forward: edge(Key::BracketRight),
-            gfx_act: edge(Key::Enter),
+            gfx_toggled: ctl(Key::GfxToggled),
+            gfx_view_cycled: ctl(Key::GfxView),
+            gfx_back: ctl(Key::BracketLeft),
+            gfx_forward: ctl(Key::BracketRight),
+            // The other half of the `Enter` collision: with the menu open this is false and
+            // `menu_apply` is true, so one keypress never means two things at once.
+            gfx_act: ctl(Key::Enter),
+            // Never gated -- this is the key that closes the menu again, and gating it
+            // would make the menu impossible to leave except by `Escape`.
+            menu_toggled: edge(Key::Tab),
+            // The mirror image of `ctl`: live only while the menu is open. `Up` and `Down`
+            // are P2's stick the rest of the time, and `Enter` and `Escape` are the two
+            // collisions above. Two meanings for one key are safe exactly when only one of
+            // them can be live at a time, which is what this pair of gates guarantees.
+            menu_up: open && edge(Key::Up),
+            menu_down: open && edge(Key::Down),
+            menu_apply: open && edge(Key::Enter),
+            menu_close: open && edge(Key::Escape),
         };
         self.was = now;
         actions
@@ -516,6 +767,10 @@ mod tests {
     /// leave the second unable to see it, which is exactly the bug the second test's doc
     /// records: it asserted a count derived from `Key::ALL` and a deleted row went
     /// unnoticed.
+    ///
+    /// The **default** preset only. [`Key::J`] is deliberately absent: it presses nothing
+    /// under an AZERTY preset, and [`PRESET_BUTTON_PORTS`] is where every preset's twelve
+    /// buttons are pinned.
     ///
     /// The values are literals from `machine::inputs`' documented layout, computed by
     /// hand: `IN1` bits 0-3 stick and 4-6 punches, P1 in the low byte and P2 in the
@@ -560,6 +815,234 @@ mod tests {
         (Key::F2, 0xBF, 0xFFFF, 0xFF, "the test switch, IN0 bit 6"),
     ];
 
+    /// The twelve player buttons under **every** preset: `(preset, key, in1, in2, what)`.
+    ///
+    /// [`GAME_KEY_PORTS`] covers the default preset only, which is not enough now that a
+    /// preset changes *which* port a button reaches — and, for two keys, whether it
+    /// reaches one at all. Forty-eight rows rather than a loop over
+    /// `Preset::p1_punch()`: a loop would read the same four tables the map reads, so
+    /// every preset could have its punches and kicks transposed and it would still pass.
+    ///
+    /// `in0` is not a column because no preset touches a coin, a start or the test
+    /// switch — the presets cover the twelve player buttons and nothing else. That is
+    /// asserted separately, by `no_preset_moves_a_coin_a_start_or_the_test_switch`.
+    #[allow(clippy::type_complexity)]
+    const PRESET_BUTTON_PORTS: [(Preset, Key, u16, u8, &str); 48] = [
+        // AZERTY, punches low — the default. Punches KLM on IN1 4-6, kicks IOP on IN2 0-2.
+        (Preset::AzertyPunchLow, Key::K, 0xFFEF, 0xFF, "P1 jab"),
+        (Preset::AzertyPunchLow, Key::L, 0xFFDF, 0xFF, "P1 strong"),
+        (Preset::AzertyPunchLow, Key::M, 0xFFBF, 0xFF, "P1 fierce"),
+        (Preset::AzertyPunchLow, Key::I, 0xFFFF, 0xFE, "P1 short"),
+        (Preset::AzertyPunchLow, Key::O, 0xFFFF, 0xFD, "P1 forward"),
+        (
+            Preset::AzertyPunchLow,
+            Key::P,
+            0xFFFF,
+            0xFB,
+            "P1 roundhouse",
+        ),
+        (Preset::AzertyPunchLow, Key::NumPad4, 0xEFFF, 0xFF, "P2 jab"),
+        (
+            Preset::AzertyPunchLow,
+            Key::NumPad5,
+            0xDFFF,
+            0xFF,
+            "P2 strong",
+        ),
+        (
+            Preset::AzertyPunchLow,
+            Key::NumPad6,
+            0xBFFF,
+            0xFF,
+            "P2 fierce",
+        ),
+        (
+            Preset::AzertyPunchLow,
+            Key::NumPad7,
+            0xFFFF,
+            0xEF,
+            "P2 short",
+        ),
+        (
+            Preset::AzertyPunchLow,
+            Key::NumPad8,
+            0xFFFF,
+            0xDF,
+            "P2 forward",
+        ),
+        (
+            Preset::AzertyPunchLow,
+            Key::NumPad9,
+            0xFFFF,
+            0xBF,
+            "P2 roundhouse",
+        ),
+        // AZERTY, a cabinet's order — the same six keys, the two rows traded.
+        (Preset::AzertyCabinet, Key::I, 0xFFEF, 0xFF, "P1 jab"),
+        (Preset::AzertyCabinet, Key::O, 0xFFDF, 0xFF, "P1 strong"),
+        (Preset::AzertyCabinet, Key::P, 0xFFBF, 0xFF, "P1 fierce"),
+        (Preset::AzertyCabinet, Key::K, 0xFFFF, 0xFE, "P1 short"),
+        (Preset::AzertyCabinet, Key::L, 0xFFFF, 0xFD, "P1 forward"),
+        (Preset::AzertyCabinet, Key::M, 0xFFFF, 0xFB, "P1 roundhouse"),
+        (Preset::AzertyCabinet, Key::NumPad7, 0xEFFF, 0xFF, "P2 jab"),
+        (
+            Preset::AzertyCabinet,
+            Key::NumPad8,
+            0xDFFF,
+            0xFF,
+            "P2 strong",
+        ),
+        (
+            Preset::AzertyCabinet,
+            Key::NumPad9,
+            0xBFFF,
+            0xFF,
+            "P2 fierce",
+        ),
+        (
+            Preset::AzertyCabinet,
+            Key::NumPad4,
+            0xFFFF,
+            0xEF,
+            "P2 short",
+        ),
+        (
+            Preset::AzertyCabinet,
+            Key::NumPad5,
+            0xFFFF,
+            0xDF,
+            "P2 forward",
+        ),
+        (
+            Preset::AzertyCabinet,
+            Key::NumPad6,
+            0xFFFF,
+            0xBF,
+            "P2 roundhouse",
+        ),
+        // QWERTY, punches low — `J K L`, the *US* home-row run, in place of `K L M`.
+        (Preset::QwertyPunchLow, Key::J, 0xFFEF, 0xFF, "P1 jab"),
+        (Preset::QwertyPunchLow, Key::K, 0xFFDF, 0xFF, "P1 strong"),
+        (Preset::QwertyPunchLow, Key::L, 0xFFBF, 0xFF, "P1 fierce"),
+        (Preset::QwertyPunchLow, Key::I, 0xFFFF, 0xFE, "P1 short"),
+        (Preset::QwertyPunchLow, Key::O, 0xFFFF, 0xFD, "P1 forward"),
+        (
+            Preset::QwertyPunchLow,
+            Key::P,
+            0xFFFF,
+            0xFB,
+            "P1 roundhouse",
+        ),
+        (Preset::QwertyPunchLow, Key::NumPad4, 0xEFFF, 0xFF, "P2 jab"),
+        (
+            Preset::QwertyPunchLow,
+            Key::NumPad5,
+            0xDFFF,
+            0xFF,
+            "P2 strong",
+        ),
+        (
+            Preset::QwertyPunchLow,
+            Key::NumPad6,
+            0xBFFF,
+            0xFF,
+            "P2 fierce",
+        ),
+        (
+            Preset::QwertyPunchLow,
+            Key::NumPad7,
+            0xFFFF,
+            0xEF,
+            "P2 short",
+        ),
+        (
+            Preset::QwertyPunchLow,
+            Key::NumPad8,
+            0xFFFF,
+            0xDF,
+            "P2 forward",
+        ),
+        (
+            Preset::QwertyPunchLow,
+            Key::NumPad9,
+            0xFFFF,
+            0xBF,
+            "P2 roundhouse",
+        ),
+        // QWERTY, a cabinet's order — what this project shipped on a US keyboard before
+        // the remap.
+        (Preset::QwertyCabinet, Key::I, 0xFFEF, 0xFF, "P1 jab"),
+        (Preset::QwertyCabinet, Key::O, 0xFFDF, 0xFF, "P1 strong"),
+        (Preset::QwertyCabinet, Key::P, 0xFFBF, 0xFF, "P1 fierce"),
+        (Preset::QwertyCabinet, Key::J, 0xFFFF, 0xFE, "P1 short"),
+        (Preset::QwertyCabinet, Key::K, 0xFFFF, 0xFD, "P1 forward"),
+        (Preset::QwertyCabinet, Key::L, 0xFFFF, 0xFB, "P1 roundhouse"),
+        (Preset::QwertyCabinet, Key::NumPad7, 0xEFFF, 0xFF, "P2 jab"),
+        (
+            Preset::QwertyCabinet,
+            Key::NumPad8,
+            0xDFFF,
+            0xFF,
+            "P2 strong",
+        ),
+        (
+            Preset::QwertyCabinet,
+            Key::NumPad9,
+            0xBFFF,
+            0xFF,
+            "P2 fierce",
+        ),
+        (
+            Preset::QwertyCabinet,
+            Key::NumPad4,
+            0xFFFF,
+            0xEF,
+            "P2 short",
+        ),
+        (
+            Preset::QwertyCabinet,
+            Key::NumPad5,
+            0xFFFF,
+            0xDF,
+            "P2 forward",
+        ),
+        (
+            Preset::QwertyCabinet,
+            Key::NumPad6,
+            0xFFFF,
+            0xBF,
+            "P2 roundhouse",
+        ),
+    ];
+
+    /// Every key that reaches no board input under any preset.
+    ///
+    /// Shared by the coverage test and `no_control_key_reaches_the_board`, which would
+    /// otherwise be two lists that have to be kept in step by hand — and were, until the
+    /// menu added a twentieth control to one of them.
+    const CONTROL_KEYS: [Key; 20] = [
+        Key::F3,
+        Key::F5,
+        Key::F8,
+        Key::F12,
+        Key::F11,
+        Key::Period,
+        Key::Escape,
+        Key::F1,
+        Key::F4,
+        Key::F6,
+        Key::F7,
+        Key::PageUp,
+        Key::PageDown,
+        Key::Home,
+        Key::GfxToggled,
+        Key::GfxView,
+        Key::BracketLeft,
+        Key::BracketRight,
+        Key::Enter,
+        Key::Tab,
+    ];
+
     /// Nothing held is an idle board and no actions.
     #[test]
     fn nothing_held_is_an_idle_board() {
@@ -575,6 +1058,8 @@ mod tests {
         assert!(!a.follow_reset);
         assert!(!a.gfx_toggled && !a.gfx_view_cycled && !a.gfx_act);
         assert!(!a.gfx_back && !a.gfx_forward);
+        assert!(!a.menu_toggled && !a.menu_up && !a.menu_down);
+        assert!(!a.menu_apply && !a.menu_close);
     }
 
     /// Each game key clears exactly its own port bit, with the expected values as
@@ -646,49 +1131,39 @@ mod tests {
     /// so deleting `NumPad6`'s row and changing the length annotation to 24 left P2's
     /// roundhouse kick untested with all 17 `keys` tests green. Comparing the two sets
     /// is what makes the claim in the name true.
+    ///
+    /// # Two tables, because liveness is preset-dependent
+    ///
+    /// A key is now covered if it appears in `GAME_KEY_PORTS` *or* in
+    /// [`PRESET_BUTTON_PORTS`]. `Key::J` is only in the second, because it presses nothing
+    /// under the default preset — and "presses nothing" is precisely the claim a missing
+    /// row makes silently. Requiring the union closes that: a key in neither table has no
+    /// port assertion under any preset.
     #[test]
     fn the_port_bit_table_covers_every_game_key_and_only_those() {
-        let control = [
-            Key::F3,
-            Key::F5,
-            Key::F8,
-            Key::F12,
-            Key::F11,
-            Key::Period,
-            Key::Escape,
-            Key::F1,
-            Key::F4,
-            Key::F6,
-            Key::F7,
-            Key::PageUp,
-            Key::PageDown,
-            Key::Home,
-            Key::GfxToggled,
-            Key::GfxView,
-            Key::BracketLeft,
-            Key::BracketRight,
-            Key::Enter,
-        ];
+        let control = CONTROL_KEYS;
         let tabled: Vec<Key> = GAME_KEY_PORTS.iter().map(|r| r.0).collect();
-        // Every key that is not a control has a row.
+        let preset_tabled: Vec<Key> = PRESET_BUTTON_PORTS.iter().map(|r| r.1).collect();
+        // Every key that is not a control has a row in one table or the other.
         for k in Key::ALL {
             if control.contains(&k) {
                 assert!(
-                    !tabled.contains(&k),
+                    !tabled.contains(&k) && !preset_tabled.contains(&k),
                     "{k:?} is a control and must not have a port row"
                 );
             } else {
                 assert!(
-                    tabled.contains(&k),
-                    "{k:?} is a game key with no row in GAME_KEY_PORTS, so no port \
-                     assertion covers it"
+                    tabled.contains(&k) || preset_tabled.contains(&k),
+                    "{k:?} is a game key with no row in GAME_KEY_PORTS or \
+                     PRESET_BUTTON_PORTS, so no port assertion covers it"
                 );
             }
         }
-        // And the count, which catches a row for a key that is not in `Key::ALL` at all.
+        // And the counts, which catch a row for a key that is not in `Key::ALL` at all.
+        // `J` is the one game key outside `GAME_KEY_PORTS`, hence the `- 1`.
         assert_eq!(
             tabled.len(),
-            Key::ALL.len() - control.len(),
+            Key::ALL.len() - control.len() - 1,
             "the table has {} rows for {} game keys",
             tabled.len(),
             Key::ALL.len() - control.len()
@@ -696,8 +1171,14 @@ mod tests {
         assert_eq!(
             tabled.len(),
             25,
-            "25 game keys: 20 player inputs, 4 coin and \
+            "25 game keys under the default preset: 20 player inputs, 4 coin and \
                     start buttons, and the test switch"
+        );
+        assert_eq!(
+            Key::ALL.len() - control.len(),
+            26,
+            "26 game keys across all presets: the 25 above plus J, which is live only \
+             under a QWERTY preset"
         );
     }
 
@@ -830,38 +1311,31 @@ mod tests {
         // Every key that is not a game input. `F2` is not here: the test switch is a
         // board input, level-triggered, and `the_test_switch_is_held_not_pressed` owns
         // it.
-        let control = [
-            Key::F3,
-            Key::F5,
-            Key::F8,
-            Key::F12,
-            Key::F11,
-            Key::Period,
-            Key::Escape,
-            Key::F1,
-            Key::F4,
-            Key::F6,
-            Key::F7,
-            Key::PageUp,
-            Key::PageDown,
-            Key::Home,
-            Key::GfxToggled,
-            Key::GfxView,
-            Key::BracketLeft,
-            Key::BracketRight,
-            Key::Enter,
-        ];
-        assert_eq!(control.len(), 19, "add a new control here too");
-        for k in control {
-            let mut c = Controls::new();
-            let i = c.update(KeySet::from_keys(&[k])).inputs;
-            assert_eq!(
-                i.in0(),
-                0xFF,
-                "{k:?} reached a coin, start, service or test"
-            );
-            assert_eq!(i.in1(), 0xFFFF, "{k:?} reached a stick or a punch");
-            assert_eq!(i.in2(), 0xFF, "{k:?} reached a kick");
+        assert_eq!(
+            CONTROL_KEYS.len(),
+            20,
+            "add a new control to CONTROL_KEYS too"
+        );
+        // Under **every** preset, not only the default: a preset that put a punch on
+        // `Tab` or `Enter` would make the menu unreachable, and the row order alone
+        // cannot show that.
+        for p in Preset::ALL {
+            for k in CONTROL_KEYS {
+                let mut c = Controls::new();
+                c.set_preset(p);
+                let i = c.update(KeySet::from_keys(&[k])).inputs;
+                assert_eq!(
+                    i.in0(),
+                    0xFF,
+                    "{k:?} reached a coin, start, service or test under {p:?}"
+                );
+                assert_eq!(
+                    i.in1(),
+                    0xFFFF,
+                    "{k:?} reached a stick or a punch under {p:?}"
+                );
+                assert_eq!(i.in2(), 0xFF, "{k:?} reached a kick under {p:?}");
+            }
         }
     }
 
@@ -895,20 +1369,25 @@ mod tests {
 
     /// Every control key is edge-triggered, not just the one above.
     ///
-    /// Checked as a table over all nineteen, because the natural implementation is one
+    /// Checked as a table over all twenty, because the natural implementation is one
     /// `edge` helper per action and the natural mistake is to forget it on one of
-    /// them — which then works exactly once out of nineteen, in whichever action the
+    /// them — which then works exactly once out of twenty, in whichever action the
     /// author tested by hand.
     ///
     /// The debugger's seven and the graphics viewer's five are in the same table as
     /// the original seven rather than tables of their own: they are the same kind of
     /// thing, and a separate table is a second place to forget to add a row.
+    ///
+    /// The menu's four navigation actions are *not* here, and cannot be: they only fire
+    /// while the menu is open, which `Controls::new()` is not.
+    /// `the_menus_navigation_is_edge_triggered_too` runs this same four-frame press
+    /// against an open menu.
     #[test]
     fn every_control_action_is_edge_triggered() {
         /// Reads one action's flag. Named because clippy calls the inline array
         /// type too complex, and it is: a table of key-and-accessor pairs.
         type Reader = fn(&Actions) -> bool;
-        let cases: [(Key, Reader); 19] = [
+        let cases: [(Key, Reader); 20] = [
             (Key::F11, |a| a.pause_toggled),
             (Key::Period, |a| a.step),
             (Key::F3, |a| a.reset),
@@ -928,6 +1407,7 @@ mod tests {
             (Key::BracketLeft, |a| a.gfx_back),
             (Key::BracketRight, |a| a.gfx_forward),
             (Key::Enter, |a| a.gfx_act),
+            (Key::Tab, |a| a.menu_toggled),
         ];
         // Every key that is not a game input and not the test switch must be in the
         // table. Without this, adding a key and forgetting the row leaves the new
@@ -940,6 +1420,7 @@ mod tests {
             Key::I,
             Key::O,
             Key::P,
+            Key::J,
             Key::K,
             Key::L,
             Key::M,
@@ -1093,13 +1574,427 @@ mod tests {
     fn all_lists_every_key_exactly_once() {
         assert_eq!(
             Key::ALL.len(),
-            44,
+            46,
             "add new keys to ALL, and to this literal"
         );
         for (i, a) in Key::ALL.iter().enumerate() {
             for b in &Key::ALL[i + 1..] {
                 assert_ne!(a, b, "{a:?} appears twice");
             }
+        }
+    }
+
+    /// Every preset puts each of the twelve player buttons on its own port bit.
+    ///
+    /// The literals are the point, as in `each_game_key_clears_its_own_port_bit`, and
+    /// more so here: the four presets differ only in *which* of two rows is the punch
+    /// row, so a table derived from `Preset::p1_punch()` would agree with a map that had
+    /// every preset's rows transposed. [`PRESET_BUTTON_PORTS`] is written out by hand
+    /// from `machine::inputs`' documented bits.
+    #[test]
+    fn every_preset_puts_the_twelve_buttons_on_their_own_ports() {
+        for (p, k, in1, in2, what) in PRESET_BUTTON_PORTS {
+            let mut c = Controls::new();
+            c.set_preset(p);
+            let i = c.update(KeySet::from_keys(&[k])).inputs;
+            assert_eq!(i.in1(), in1, "{p:?}: {k:?} ({what}): IN1");
+            assert_eq!(i.in2(), in2, "{p:?}: {k:?} ({what}): IN2");
+            assert_eq!(i.in0(), 0xFF, "{p:?}: {k:?} ({what}) reached IN0");
+        }
+        // Within one preset no two buttons press the same thing, and no key appears
+        // twice. A copy-paste that gave a preset's jab and strong one row's values
+        // would otherwise pass every assertion above.
+        for p in Preset::ALL {
+            let rows: Vec<_> = PRESET_BUTTON_PORTS.iter().filter(|r| r.0 == p).collect();
+            assert_eq!(rows.len(), 12, "{p:?} must have all twelve buttons");
+            for (i, a) in rows.iter().enumerate() {
+                for b in &rows[i + 1..] {
+                    assert_ne!(a.1, b.1, "{p:?}: {:?} appears twice", a.1);
+                    assert_ne!(
+                        (a.2, a.3),
+                        (b.2, b.3),
+                        "{p:?}: {:?} and {:?} press the same thing",
+                        a.1,
+                        b.1
+                    );
+                }
+            }
+        }
+    }
+
+    /// A key the active preset does not use presses **nothing**.
+    ///
+    /// This is the consequence of bringing `Key::J` back, and it is the one property of
+    /// the presets that is not a permutation: `J` is dead under the AZERTY presets and
+    /// `M` is dead under the QWERTY ones. One physical key, one board input — a preset
+    /// that left the old letter live as well would give P1 four punch keys for three
+    /// buttons, and `every_preset_puts_the_twelve_buttons_on_their_own_ports` would
+    /// still pass, because a spare key pressing a *duplicate* bit breaks none of its
+    /// assertions.
+    #[test]
+    fn a_key_the_preset_does_not_use_presses_nothing() {
+        let dead = [
+            (Preset::AzertyPunchLow, Key::J),
+            (Preset::AzertyCabinet, Key::J),
+            (Preset::QwertyPunchLow, Key::M),
+            (Preset::QwertyCabinet, Key::M),
+        ];
+        for (p, k) in dead {
+            let mut c = Controls::new();
+            c.set_preset(p);
+            let i = c.update(KeySet::from_keys(&[k])).inputs;
+            assert_eq!(i.in0(), 0xFF, "{p:?}: {k:?} is not in this preset");
+            assert_eq!(i.in1(), 0xFFFF, "{p:?}: {k:?} reached a stick or a punch");
+            assert_eq!(i.in2(), 0xFF, "{p:?}: {k:?} reached a kick");
+        }
+        // And the mirror: each of those keys *is* live under the other pair, so the
+        // assertions above are about the preset and not about a key that never works.
+        let live = [
+            (Preset::QwertyPunchLow, Key::J, 0xFFEFu16, 0xFFu8),
+            (Preset::QwertyCabinet, Key::J, 0xFFFF, 0xFE),
+            (Preset::AzertyPunchLow, Key::M, 0xFFBF, 0xFF),
+            (Preset::AzertyCabinet, Key::M, 0xFFFF, 0xFB),
+        ];
+        for (p, k, in1, in2) in live {
+            let mut c = Controls::new();
+            c.set_preset(p);
+            let i = c.update(KeySet::from_keys(&[k])).inputs;
+            assert_eq!(i.in1(), in1, "{p:?}: {k:?} must be live: IN1");
+            assert_eq!(i.in2(), in2, "{p:?}: {k:?} must be live: IN2");
+        }
+    }
+
+    /// No preset moves the sticks, the coins, the starts or the test switch.
+    ///
+    /// The presets cover the twelve player buttons and nothing else — deliberately. A
+    /// preset that moved a coin would be a surprise; a preset that moved `Escape` could
+    /// strand the player in a window they cannot close. Asserted with the same literals
+    /// [`GAME_KEY_PORTS`] uses, once per preset.
+    #[test]
+    fn no_preset_moves_a_stick_a_coin_a_start_or_the_test_switch() {
+        let fixed = [
+            (Key::Z, 0xFFu8, 0xFFF7u16, 0xFFu8, "P1 up"),
+            (Key::S, 0xFF, 0xFFFB, 0xFF, "P1 down"),
+            (Key::Q, 0xFF, 0xFFFD, 0xFF, "P1 left"),
+            (Key::D, 0xFF, 0xFFFE, 0xFF, "P1 right"),
+            (Key::Up, 0xFF, 0xF7FF, 0xFF, "P2 up"),
+            (Key::Down, 0xFF, 0xFBFF, 0xFF, "P2 down"),
+            (Key::Left, 0xFF, 0xFDFF, 0xFF, "P2 left"),
+            (Key::Right, 0xFF, 0xFEFF, 0xFF, "P2 right"),
+            (Key::Num5, 0xFE, 0xFFFF, 0xFF, "coin 1"),
+            (Key::Num6, 0xFD, 0xFFFF, 0xFF, "coin 2"),
+            (Key::Num1, 0xEF, 0xFFFF, 0xFF, "start 1"),
+            (Key::Num2, 0xDF, 0xFFFF, 0xFF, "start 2"),
+            (Key::F2, 0xBF, 0xFFFF, 0xFF, "the test switch"),
+        ];
+        for p in Preset::ALL {
+            for (k, in0, in1, in2, what) in fixed {
+                let mut c = Controls::new();
+                c.set_preset(p);
+                let i = c.update(KeySet::from_keys(&[k])).inputs;
+                assert_eq!(i.in0(), in0, "{p:?}: {k:?} ({what}): IN0");
+                assert_eq!(i.in1(), in1, "{p:?}: {k:?} ({what}): IN1");
+                assert_eq!(i.in2(), in2, "{p:?}: {k:?} ({what}): IN2");
+            }
+        }
+    }
+
+    /// The default preset is the one that was asked for, and `GAME_KEY_PORTS` describes it.
+    ///
+    /// Two claims in one, both worth pinning: a fresh `Controls` is
+    /// `AzertyPunchLow` — which is what makes `each_game_key_clears_its_own_port_bit`
+    /// meaningful, since it never calls `set_preset` — and the default is punches-low,
+    /// so nobody's keyboard changes under them when the menu ships.
+    #[test]
+    fn the_default_preset_is_azerty_punches_low() {
+        assert_eq!(Controls::new().preset(), Preset::AzertyPunchLow);
+        assert_eq!(Preset::default(), Preset::AzertyPunchLow);
+        assert_eq!(
+            Preset::ALL[0],
+            Preset::AzertyPunchLow,
+            "and it is listed first"
+        );
+        assert_eq!(
+            Preset::AzertyPunchLow.p1_punch(),
+            [Key::K, Key::L, Key::M],
+            "punches on the home row"
+        );
+    }
+
+    /// Switching preset takes effect on the next frame, for keys already held.
+    ///
+    /// The alternative — latching the map at the moment a key went down — would need
+    /// per-key state and would mean a key held across an apply kept its old meaning,
+    /// which nobody can see from the keyboard. Re-reading is the simpler rule *and* the
+    /// one a player can predict.
+    #[test]
+    fn switching_preset_rereads_the_keys_already_held() {
+        let mut c = Controls::new();
+        let held = KeySet::from_keys(&[Key::K]);
+        // AZERTY, punches low: `K` is the jab, IN1 bit 4.
+        assert_eq!(c.update(held).inputs.in1(), 0xFFEF, "K is P1's jab");
+        assert_eq!(c.update(held).inputs.in2(), 0xFF, "and not a kick");
+        // The same held key, a cabinet's order: `K` is now the short kick, IN2 bit 0.
+        c.set_preset(Preset::AzertyCabinet);
+        let i = c.update(held).inputs;
+        assert_eq!(i.in1(), 0xFFFF, "K is no longer a punch");
+        assert_eq!(i.in2(), 0xFE, "K is P1's short kick now");
+    }
+
+    /// Every preset's tag round-trips, and no two share one.
+    ///
+    /// The tags are what go to disk. A duplicate would make one preset unreachable on
+    /// reload and `from_tag` would silently return the other — the same file meaning a
+    /// different map, with nothing to see in the file.
+    #[test]
+    fn preset_tags_round_trip_and_are_distinct() {
+        for p in Preset::ALL {
+            assert_eq!(
+                Preset::from_tag(p.tag()),
+                Some(p),
+                "{p:?} does not round-trip"
+            );
+            // Whitespace is trimmed, because a file written with a trailing newline is
+            // the normal case and not a corrupt one.
+            assert_eq!(Preset::from_tag(&format!("{}\n", p.tag())), Some(p));
+        }
+        for (i, a) in Preset::ALL.iter().enumerate() {
+            for b in &Preset::ALL[i + 1..] {
+                assert_ne!(a.tag(), b.tag(), "{a:?} and {b:?} share a tag");
+                assert_ne!(a.name(), b.name(), "{a:?} and {b:?} share a name");
+            }
+        }
+        // The tags are literals, so a rename that changed what saved files mean fails
+        // here rather than silently resetting everyone to the default.
+        assert_eq!(Preset::AzertyPunchLow.tag(), "azerty-punch-low");
+        assert_eq!(Preset::AzertyCabinet.tag(), "azerty-cabinet");
+        assert_eq!(Preset::QwertyPunchLow.tag(), "qwerty-punch-low");
+        assert_eq!(Preset::QwertyCabinet.tag(), "qwerty-cabinet");
+        // An unknown tag is `None` and not a panic: a hand-edited or older file falls
+        // back to the default the way a missing save state does.
+        assert_eq!(Preset::from_tag(""), None);
+        assert_eq!(Preset::from_tag("azerty"), None);
+        assert_eq!(Preset::from_tag("AZERTY-PUNCH-LOW"), None);
+    }
+
+    /// An open menu is an **idle board**, not merely a board whose new presses are dropped.
+    ///
+    /// The distinction has a real failure mode, and it is the reason this is stated as
+    /// idle: `Inputs` is level-triggered, so a stick held at the moment the menu opened
+    /// stays held in the board's eyes until something writes the released value. A menu
+    /// that only ignored *fresh* presses would leave the player crouching, blocking or
+    /// walking left for as long as they read it.
+    #[test]
+    fn an_open_menu_is_an_idle_board() {
+        let mut c = Controls::new();
+        // Down-left and a fierce punch, all held before the menu opens.
+        let held = KeySet::from_keys(&[Key::S, Key::Q, Key::M, Key::NumPad8]);
+        let i = c.update(held).inputs;
+        assert_eq!(i.in1(), 0xFFB9, "held: P1 down, left and fierce");
+        assert_eq!(i.in2(), 0xDF, "and P2's forward kick");
+
+        // Open it without touching the keys. The same held set must now read released.
+        c.set_menu_open(true);
+        let i = c.update(held).inputs;
+        assert_eq!(i.in0(), 0xFF, "idle: IN0");
+        assert_eq!(i.in1(), 0xFFFF, "idle: the stick is no longer held");
+        assert_eq!(i.in2(), 0xFF, "idle: nor the kick");
+
+        // And a key pressed *while* it is open reaches nothing either.
+        let more = KeySet::from_keys(&[Key::S, Key::Q, Key::M, Key::NumPad8, Key::K]);
+        assert_eq!(
+            c.update(more).inputs.in1(),
+            0xFFFF,
+            "a fresh press is idle too"
+        );
+
+        // Closing it hands the board back, on the very next frame, with no fresh press
+        // needed — the keys never went up.
+        c.set_menu_open(false);
+        let i = c.update(held).inputs;
+        assert_eq!(i.in1(), 0xFFB9, "the board is live again");
+        assert_eq!(i.in2(), 0xDF);
+    }
+
+    /// The board reads idle under every preset while the menu is open.
+    ///
+    /// `an_open_menu_is_an_idle_board` presses one hand under the default. This presses
+    /// **every** key there is, under all four presets, because the gate is one `if` around
+    /// the whole game half and the mistake it is guarding against is a line left outside
+    /// it. A single field assigned before the gate would show up here and nowhere else.
+    #[test]
+    fn no_key_reaches_the_board_while_the_menu_is_open() {
+        for p in Preset::ALL {
+            for k in Key::ALL {
+                let mut c = Controls::new();
+                c.set_preset(p);
+                c.set_menu_open(true);
+                let i = c.update(KeySet::from_keys(&[k])).inputs;
+                assert_eq!(i.in0(), 0xFF, "{p:?}: {k:?} reached IN0 with the menu open");
+                assert_eq!(
+                    i.in1(),
+                    0xFFFF,
+                    "{p:?}: {k:?} reached IN1 with the menu open"
+                );
+                assert_eq!(i.in2(), 0xFF, "{p:?}: {k:?} reached IN2 with the menu open");
+            }
+        }
+        // Every key at once, which catches a gate that only holds for a lone press.
+        let mut c = Controls::new();
+        c.set_menu_open(true);
+        let i = c.update(KeySet::from_keys(&Key::ALL)).inputs;
+        assert_eq!(i.in0(), 0xFF, "all 46 keys at once: IN0");
+        assert_eq!(i.in1(), 0xFFFF, "all 46 keys at once: IN1");
+        assert_eq!(i.in2(), 0xFF, "all 46 keys at once: IN2");
+        // The DIP switches are cabinet configuration and are *not* part of the capture:
+        // an idle board still boots in the configuration it was given.
+        c.set_dsw([0x12, 0x34, 0x56]);
+        assert_eq!(
+            c.update(KeySet::new()).inputs.dsw,
+            [0x12, 0x34, 0x56],
+            "the switches survive an open menu"
+        );
+    }
+
+    /// `Escape` closes the menu instead of quitting.
+    ///
+    /// The single most load-bearing line in the capture. `Escape` is the instinctive way
+    /// to back out of a menu and it is also the key that ends the session, so a menu that
+    /// did not take it away would kill the emulator the first time anyone tried to cancel.
+    #[test]
+    fn escape_closes_the_menu_instead_of_quitting() {
+        let mut c = Controls::new();
+        let esc = KeySet::from_keys(&[Key::Escape]);
+
+        // Closed: `Escape` quits and there is no menu to close.
+        let a = c.update(esc);
+        assert!(a.quit, "with the menu shut, Escape quits");
+        assert!(!a.menu_close);
+
+        // Open: it closes the menu and quits nothing.
+        c.update(KeySet::new());
+        c.set_menu_open(true);
+        let a = c.update(esc);
+        assert!(!a.quit, "with the menu open, Escape must NOT quit");
+        assert!(a.menu_close, "it closes the menu");
+    }
+
+    /// While the menu is open, every control is swallowed except `Tab`.
+    ///
+    /// `Tab` is the exception by necessity: it is what closes the menu, so gating it would
+    /// make the menu impossible to leave except by `Escape`. Everything else must be
+    /// inert — a reset, a save, a load or a screenshot triggered from inside a key menu is
+    /// an action nobody asked for, and `Enter` in particular would apply a preset *and*
+    /// cycle a tile layout from one keypress.
+    #[test]
+    fn an_open_menu_swallows_every_control_but_tab() {
+        /// See `every_control_action_is_edge_triggered` for why this is named.
+        type Reader = fn(&Actions) -> bool;
+        let cases: [(Key, Reader, &str); 19] = [
+            (Key::F11, |a| a.pause_toggled, "pause"),
+            (Key::Period, |a| a.step, "step"),
+            (Key::F3, |a| a.reset, "reset"),
+            (Key::F5, |a| a.save, "save"),
+            (Key::F8, |a| a.load, "load"),
+            (Key::F12, |a| a.screenshot, "screenshot"),
+            (Key::Escape, |a| a.quit, "quit"),
+            (Key::F1, |a| a.overlay_toggled, "the debugger overlay"),
+            (Key::F4, |a| a.step_instruction, "an instruction step"),
+            (Key::F6, |a| a.focus_cycled, "the scroll focus"),
+            (Key::F7, |a| a.breakpoint_toggled, "a breakpoint"),
+            (Key::PageUp, |a| a.scroll_up, "a scroll"),
+            (Key::PageDown, |a| a.scroll_down, "a scroll"),
+            (Key::Home, |a| a.follow_reset, "the follow reset"),
+            (Key::GfxToggled, |a| a.gfx_toggled, "the graphics viewer"),
+            (Key::GfxView, |a| a.gfx_view_cycled, "the graphics view"),
+            (Key::BracketLeft, |a| a.gfx_back, "the graphics view"),
+            (Key::BracketRight, |a| a.gfx_forward, "the graphics view"),
+            (Key::Enter, |a| a.gfx_act, "the graphics view"),
+        ];
+        for (k, get, what) in cases {
+            let mut c = Controls::new();
+            c.set_menu_open(true);
+            let held = KeySet::from_keys(&[k]);
+            assert!(
+                !get(&c.update(held)),
+                "{k:?} reached {what} with the menu open"
+            );
+            // Not merely "not on the first frame": held, released and pressed again.
+            assert!(!get(&c.update(held)), "{k:?} still held");
+            c.update(KeySet::new());
+            assert!(!get(&c.update(held)), "{k:?} pressed again");
+            // And with the menu shut it works, so the assertions above are about the
+            // capture and not about a control that never fires.
+            c.set_menu_open(false);
+            c.update(KeySet::new());
+            assert!(get(&c.update(held)), "{k:?} must reach {what} once closed");
+        }
+        // `Tab` is the exception, and it fires with the menu both open and shut.
+        let tab = KeySet::from_keys(&[Key::Tab]);
+        for open in [false, true] {
+            let mut c = Controls::new();
+            c.set_menu_open(open);
+            assert!(
+                c.update(tab).menu_toggled,
+                "Tab must toggle the menu with it open={open}"
+            );
+        }
+    }
+
+    /// The menu's four navigation actions fire only while it is open.
+    ///
+    /// The mirror image of the test above, and the other half of what makes one key mean
+    /// two things safely: `Up` and `Down` are P2's stick, `Enter` acts on the graphics
+    /// view and `Escape` quits. If these fired with the menu shut, holding P2's up would
+    /// walk a selection in a menu nobody can see.
+    #[test]
+    fn the_menus_navigation_fires_only_while_it_is_open() {
+        /// See `every_control_action_is_edge_triggered` for why this is named.
+        type Reader = fn(&Actions) -> bool;
+        let cases: [(Key, Reader); 4] = [
+            (Key::Up, |a| a.menu_up),
+            (Key::Down, |a| a.menu_down),
+            (Key::Enter, |a| a.menu_apply),
+            (Key::Escape, |a| a.menu_close),
+        ];
+        for (k, get) in cases {
+            let mut c = Controls::new();
+            let held = KeySet::from_keys(&[k]);
+            assert!(!get(&c.update(held)), "{k:?} must not navigate a shut menu");
+            c.update(KeySet::new());
+            c.set_menu_open(true);
+            assert!(get(&c.update(held)), "{k:?} must navigate an open menu");
+        }
+    }
+
+    /// The menu's navigation is edge-triggered, like every other control.
+    ///
+    /// Held `Down` must not walk sixty rows a second past the end of a five-row list.
+    /// `every_control_action_is_edge_triggered` cannot cover these — they only fire with
+    /// the menu open — so this runs the same four-frame press against an open one.
+    #[test]
+    fn the_menus_navigation_is_edge_triggered_too() {
+        /// See `every_control_action_is_edge_triggered` for why this is named.
+        type Reader = fn(&Actions) -> bool;
+        let cases: [(Key, Reader); 5] = [
+            (Key::Tab, |a| a.menu_toggled),
+            (Key::Up, |a| a.menu_up),
+            (Key::Down, |a| a.menu_down),
+            (Key::Enter, |a| a.menu_apply),
+            (Key::Escape, |a| a.menu_close),
+        ];
+        for (k, get) in cases {
+            let mut c = Controls::new();
+            c.set_menu_open(true);
+            let held = KeySet::from_keys(&[k]);
+            assert!(get(&c.update(held)), "{k:?} must fire on the press");
+            assert!(!get(&c.update(held)), "{k:?} must not fire while held");
+            assert!(!get(&c.update(held)), "{k:?} still held");
+            c.update(KeySet::new());
+            assert!(
+                get(&c.update(held)),
+                "{k:?} must fire again after a release"
+            );
         }
     }
 }

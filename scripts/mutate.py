@@ -631,21 +631,26 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
                 "        let _ = now;\n        actions",
                 "KILL",
             ),
+            # ⚠️ The five control mutants below were written against `edge(Key::X)` and
+            # reported NO-OP after the key menu landed: every control now goes through
+            # `ctl`, which is `!open && edge(k)`. Re-anchored on `ctl`, which is also the
+            # sharper edit now -- `now.contains` drops both the edge *and* the menu
+            # capture, so a killer must exist for each independently.
             (
                 "pause-is-level-triggered",
-                "pause_toggled: edge(Key::F11),",
+                "pause_toggled: ctl(Key::F11),",
                 "pause_toggled: now.contains(Key::F11),",
                 "KILL",
             ),
             (
                 "step-is-level-triggered",
-                "step: edge(Key::Period),",
+                "step: ctl(Key::Period),",
                 "step: now.contains(Key::Period),",
                 "KILL",
             ),
             (
                 "save-is-level-triggered",
-                "save: edge(Key::F5),",
+                "save: ctl(Key::F5),",
                 "save: now.contains(Key::F5),",
                 "KILL",
             ),
@@ -657,13 +662,13 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # driven by the edge rather than by the level.
             (
                 "breakpoint-is-level-triggered",
-                "breakpoint_toggled: edge(Key::F7),",
+                "breakpoint_toggled: ctl(Key::F7),",
                 "breakpoint_toggled: now.contains(Key::F7),",
                 "KILL",
             ),
             (
                 "instruction-step-is-level-triggered",
-                "step_instruction: edge(Key::F4),",
+                "step_instruction: ctl(Key::F4),",
                 "step_instruction: now.contains(Key::F4),",
                 "KILL",
             ),
@@ -673,17 +678,23 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
                 "inputs.test = edge(Key::F2);",
                 "KILL",
             ),
-            # The map itself.
+            # The map itself. ⚠️ These four moved out of `Controls::update` and into
+            # `Preset` when the key menu landed: the six buttons are now read as
+            # `p.p1_punch().map(...)`, so a mutant anchored on
+            # `inputs.p1.kick = [now.contains(Key::I), ...]` reports NO-OP. Each one is
+            # re-anchored on the *default* preset's row, which is the arrangement the old
+            # pattern named -- and each is now a stronger claim, because the same edit is
+            # invisible to any test that only ever exercises one preset.
             (
                 "kick-reads-a-punch-key",
-                "        inputs.p1.kick = [\n            now.contains(Key::I),",
-                "        inputs.p1.kick = [\n            now.contains(Key::K),",
+                "            Preset::AzertyPunchLow => [Key::I, Key::O, Key::P],\n            Preset::AzertyCabinet => [Key::K, Key::L, Key::M],",
+                "            Preset::AzertyPunchLow => [Key::K, Key::L, Key::M],\n            Preset::AzertyCabinet => [Key::K, Key::L, Key::M],",
                 "KILL",
             ),
             (
                 "punch-key-order-swapped",
-                "            now.contains(Key::K),\n            now.contains(Key::L),",
-                "            now.contains(Key::L),\n            now.contains(Key::K),",
+                "            Preset::AzertyPunchLow => [Key::K, Key::L, Key::M],\n            Preset::AzertyCabinet => [Key::I, Key::O, Key::P],\n            Preset::QwertyPunchLow => [Key::J, Key::K, Key::L],",
+                "            Preset::AzertyPunchLow => [Key::L, Key::K, Key::M],\n            Preset::AzertyCabinet => [Key::I, Key::O, Key::P],\n            Preset::QwertyPunchLow => [Key::J, Key::K, Key::L],",
                 "KILL",
             ),
             # The two button rows traded wholesale -- the arrangement this project had
@@ -692,10 +703,14 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # distinct, and no key is duplicated or dropped: the only thing wrong is
             # which row is which. `GAME_KEY_PORTS` says per key, and `main.rs`'s
             # usage-text test presses both ends of both rows for exactly this.
+            # ⚠️ Re-anchored with the rest of the map: the rows are the preset's now, and
+            # the swap is a swap of the two `match` bodies. Which makes it the mutant this
+            # set most needs, because a preset table read by a loop over `Preset::ALL`
+            # agrees with itself no matter which row is which.
             (
                 "the-button-rows-are-swapped",
-                "        inputs.p1.punch = [\n            now.contains(Key::K),\n            now.contains(Key::L),\n            now.contains(Key::M),\n        ];\n        inputs.p1.kick = [\n            now.contains(Key::I),\n            now.contains(Key::O),\n            now.contains(Key::P),\n        ];",
-                "        inputs.p1.punch = [\n            now.contains(Key::I),\n            now.contains(Key::O),\n            now.contains(Key::P),\n        ];\n        inputs.p1.kick = [\n            now.contains(Key::K),\n            now.contains(Key::L),\n            now.contains(Key::M),\n        ];",
+                "    pub const fn p1_punch(self) -> [Key; 3] {\n        match self {\n            Preset::AzertyPunchLow => [Key::K, Key::L, Key::M],\n            Preset::AzertyCabinet => [Key::I, Key::O, Key::P],\n            Preset::QwertyPunchLow => [Key::J, Key::K, Key::L],\n            Preset::QwertyCabinet => [Key::I, Key::O, Key::P],",
+                "    pub const fn p1_punch(self) -> [Key; 3] {\n        match self {\n            Preset::AzertyPunchLow => [Key::I, Key::O, Key::P],\n            Preset::AzertyCabinet => [Key::K, Key::L, Key::M],\n            Preset::QwertyPunchLow => [Key::I, Key::O, Key::P],\n            Preset::QwertyCabinet => [Key::J, Key::K, Key::L],",
                 "KILL",
             ),
             # And the same trade on the keypad, which is the half a partial revert leaves
@@ -703,8 +718,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # row punches, and every per-key port assertion for P1 still passes.
             (
                 "the-keypad-rows-are-swapped",
-                "        inputs.p2.punch = [\n            now.contains(Key::NumPad4),\n            now.contains(Key::NumPad5),\n            now.contains(Key::NumPad6),\n        ];\n        inputs.p2.kick = [\n            now.contains(Key::NumPad7),\n            now.contains(Key::NumPad8),\n            now.contains(Key::NumPad9),\n        ];",
-                "        inputs.p2.punch = [\n            now.contains(Key::NumPad7),\n            now.contains(Key::NumPad8),\n            now.contains(Key::NumPad9),\n        ];\n        inputs.p2.kick = [\n            now.contains(Key::NumPad4),\n            now.contains(Key::NumPad5),\n            now.contains(Key::NumPad6),\n        ];",
+                "    pub const fn p2_punch(self) -> [Key; 3] {\n        match self {\n            Preset::AzertyPunchLow | Preset::QwertyPunchLow => {\n                [Key::NumPad4, Key::NumPad5, Key::NumPad6]\n            }\n            Preset::AzertyCabinet | Preset::QwertyCabinet => {\n                [Key::NumPad7, Key::NumPad8, Key::NumPad9]\n            }",
+                "    pub const fn p2_punch(self) -> [Key; 3] {\n        match self {\n            Preset::AzertyPunchLow | Preset::QwertyPunchLow => {\n                [Key::NumPad7, Key::NumPad8, Key::NumPad9]\n            }\n            Preset::AzertyCabinet | Preset::QwertyCabinet => {\n                [Key::NumPad4, Key::NumPad5, Key::NumPad6]\n            }",
                 "KILL",
             ),
             ("coin-is-a-start-key", "inputs.coin1 = now.contains(Key::Num5);", "inputs.coin1 = now.contains(Key::Num1);", "KILL"),
@@ -732,10 +747,14 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # The number row and the keypad confused for each other: P2's forward kick
             # reading the coin key. Plausible because `Num5` and `NumPad5` differ by
             # three characters, and it makes inserting a coin throw a kick.
+            # ⚠️ Re-anchored on the preset's punch row for the same reason as the rest.
+            # `Num5` and not `Num9`: there is no `Key::Num9` — only the four number-row
+            # keys the coins and starts need exist — and a mutant that does not compile
+            # scores as a KILL nothing was measured for.
             (
                 "the-keypad-is-the-number-row",
-                "            now.contains(Key::NumPad5),",
-                "            now.contains(Key::Num5),",
+                "            Preset::AzertyPunchLow | Preset::QwertyPunchLow => {\n                [Key::NumPad4, Key::NumPad5, Key::NumPad6]\n            }",
+                "            Preset::AzertyPunchLow | Preset::QwertyPunchLow => {\n                [Key::NumPad4, Key::Num5, Key::NumPad6]\n            }",
                 "KILL",
             ),
             # A game key losing its port row -- the bug a hand probe found in the test
@@ -794,6 +813,212 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # player 2's ten keys took bits 34-43 rather than being interleaved with the
             # existing ones, precisely so no bit that already had a key changed.
             ("CONTROL-escape-moves-to-another-free-bit", "Key::Escape => 21,", "Key::Escape => 62,", "SURVIVE"),
+            # --- The key menu's capture. ---
+            #
+            # The gate deleted: the board reads the keyboard while the menu is up, so your
+            # fighter walks as you scroll the rows. Nothing in the menu's own tests can see
+            # this -- they assert on rows and selections -- and nothing in the port table
+            # can either, since the ports are still correct for the keys held.
+            ("the-menu-does-not-capture-the-board", "        if !self.menu_open {", "        if true {", "KILL"),
+            # The subtler half of the same bug: the buttons are gated but the stick is not.
+            # A partial capture, which is what a hand-written `if` around only the block
+            # that was easy to indent looks like.
+            (
+                "the-menu-captures-the-buttons-but-not-the-stick",
+                "        if !self.menu_open {\n            let p = self.preset;",
+                "        inputs.p1.up = now.contains(Key::Z);\n        if !self.menu_open {\n            let p = self.preset;",
+                "KILL",
+            ),
+            # "Ignored" instead of *idle*: the board keeps whatever it had. This one needs
+            # `Inputs` to be understood as level-triggered to see at all -- a stick held
+            # when the menu opened stays held for as long as the menu is up -- and it is
+            # why the loop tests assert `board.inputs` rather than an `Actions` field.
+            #
+            # Expressed as the gate reading the *previous* frame's keys, which is the same
+            # symptom with a real cause: a capture written as "keep the last live value".
+            (
+                "an-open-menu-keeps-the-last-held-keys",
+                "        if !self.menu_open {\n            let p = self.preset;",
+                "        let now = if self.menu_open { self.was } else { now };\n        if !self.menu_open || true {\n            let p = self.preset;",
+                "KILL",
+            ),
+            # The control gate dropped, so `Escape` quits from inside the menu and `Enter`
+            # both applies a preset and acts on the graphics view. `ctl` becoming `edge` is
+            # the single edit that does it, and it is exactly what "the menu only needs to
+            # gate the board" would produce.
+            ("the-menu-does-not-capture-the-controls", "let ctl = |k: Key| !open && edge(k);", "let ctl = |k: Key| edge(k);", "KILL"),
+            # `Tab` gated like everything else, which is the one control that must not be:
+            # the menu would open and never close, and the only way out would be the window
+            # button. Note the mutant is *more* consistent-looking than the real code.
+            ("tab-is-gated-like-the-other-controls", "menu_toggled: edge(Key::Tab),", "menu_toggled: ctl(Key::Tab),", "KILL"),
+            # The navigation ungated, so the arrows both move the cursor and move P2's
+            # stick, and `Enter` applies a preset while the menu is shut. Survivable-looking
+            # because with the menu closed there is no cursor to move -- until you notice
+            # `menu_apply` firing on every `Enter` press in the graphics viewer.
+            ("the-menu-navigates-while-it-is-shut", "menu_apply: open && edge(Key::Enter),", "menu_apply: edge(Key::Enter),", "KILL"),
+            # A preset applied but never read: `set_preset` stores it and `update` keeps
+            # using the default. The menu still highlights the new row, and the `.keys` file
+            # still records it, so everything a test that only reads the menu's own state
+            # can see is right -- and no button has moved.
+            ("the-preset-is-stored-but-never-read", "            let p = self.preset;", "            let p = Preset::default();", "KILL"),
+            # A tag that round-trips through itself. Two presets sharing a tag means the
+            # file written for one loads as the other, and `from_tag`'s `find` returns the
+            # first match -- so `qwerty-cabinet` silently becomes `qwerty-punch-low`.
+            (
+                "two-presets-share-a-tag",
+                'Preset::QwertyCabinet => "qwerty-cabinet",',
+                'Preset::QwertyCabinet => "qwerty-punch-low",',
+                "KILL",
+            ),
+            # `from_tag` stops trimming, so the newline `write_keys` appends makes every
+            # saved file unreadable and every session opens on the default. The menu works
+            # perfectly within a session, which is what makes it a bug report of the form
+            # "it forgets".
+            ("from-tag-stops-trimming", "p.tag() == s.trim()", "p.tag() == s", "KILL"),
+            # CONTROL: the presets' *order* in `ALL` is the order the menu lists them, and
+            # nothing else depends on it -- `from_tag` searches, and no test asserts a row
+            # index against a literal. Swapping the two QWERTY rows changes which line of
+            # the menu they occupy and nothing about what any key does.
+            #
+            # It is the right control for this set because it looks like it must fail: it
+            # edits the same table three real mutants above edit. It fails only if a test
+            # has started asserting a row number instead of a row's content.
+            (
+                "CONTROL-the-two-qwerty-rows-trade-places",
+                "        Preset::QwertyPunchLow,\n        Preset::QwertyCabinet,\n    ];",
+                "        Preset::QwertyCabinet,\n        Preset::QwertyPunchLow,\n    ];",
+                "SURVIVE",
+            ),
+        ],
+    ),
+    # The key menu's state machine. Its characteristic bug is not a wrong pixel and not a
+    # wrong port -- it is a cursor that lands on the wrong row, or a frame on which two
+    # meanings of one key both fire. Five rows and five actions is a small machine, and
+    # every mutant below is an edit that leaves it looking entirely reasonable.
+    "menu": (
+        "crates/frontend/src/menu.rs",
+        [
+            # The trap this module was written around, and the reason `position` is not a
+            # `match`: `RestoreDefaults::preset()` *is* the default, so "the first row whose
+            # preset is `current`" opens the cursor on the restore row whenever the default
+            # is in force -- the most common case there is. The menu still works; it just
+            # points at a row that changes nothing, and the player's first `Enter` appears
+            # to do nothing at all.
+            (
+                "opening-lands-on-the-restore-row",
+                ".position(|r| *r == MenuRow::Use(current))",
+                ".position(|r| r.preset() == current)",
+                "KILL",
+            ),
+            # Opening does not move the cursor at all, so it stays wherever it was left.
+            # Harmless on the first open (`sel` starts at 0, which is the default's row) and
+            # wrong on every one after, which is why the test opens it twice.
+            (
+                "opening-does-not-move-the-cursor",
+                "            if self.open {\n                // Opening puts the cursor on the row that is in force.",
+                "            if false {\n                // Opening puts the cursor on the row that is in force.",
+                "KILL",
+            ),
+            # The toggle stops returning early, so the frame that opens the menu also reads
+            # that frame's navigation -- and `Tab`-with-`Enter` on one frame would open and
+            # immediately apply. It cannot happen from a keyboard often, and that is the
+            # point: a rule that holds only because a human is slow is not a rule.
+            (
+                "opening-also-reads-this-frames-navigation",
+                "            }\n            return None;\n        }\n        if !self.open {",
+                "            }\n        }\n        if !self.open {",
+                "KILL",
+            ),
+            # Close and apply on the same frame, resolved the other way: apply wins, so
+            # cancelling a row you did not want applies it. Both orders are one line apart
+            # and only one is safe.
+            (
+                "apply-beats-close-on-a-shared-frame",
+                "        if a.menu_close {\n            self.open = false;\n            return None;\n        }\n        if a.menu_up {",
+                "        if a.menu_apply {\n            return Some(self.selected().preset());\n        }\n        if a.menu_close {\n            self.open = false;\n            return None;\n        }\n        if a.menu_up {",
+                "KILL",
+            ),
+            # The second gate deleted. It is the one that looks redundant -- `Controls`
+            # already withholds every one of these actions while the menu is shut -- and
+            # deleting it makes this module's own tests rest on a guarantee made in another
+            # file, which is precisely what its comment says it exists to prevent.
+            (
+                "the-shut-menu-reads-actions-anyway",
+                "        if !self.open {\n            // Every action below is already gated",
+                "        if false {\n            // Every action below is already gated",
+                "KILL",
+            ),
+            # The cursor wraps instead of saturating: `Up` on the top row jumps to
+            # `restore defaults`. Five rows, so this is one keypress from "restore" every
+            # time a player overshoots upward.
+            ("the-cursor-wraps-at-the-top", "self.sel = self.sel.saturating_sub(1);", "self.sel = (self.sel + MenuRow::ALL.len() - 1) % MenuRow::ALL.len();", "KILL"),
+            # Off by one at the bottom, in the direction that is not a panic: the last row
+            # is unreachable. `restore defaults` would be visible and unselectable, and
+            # nothing crashes -- which is why the fencepost is written `.min(len - 1)` and
+            # asserted by walking the whole list.
+            ("the-last-row-is-unreachable", "self.sel = (self.sel + 1).min(MenuRow::ALL.len() - 1);", "self.sel = (self.sel + 1).min(MenuRow::ALL.len() - 2);", "KILL"),
+            # Apply closes the menu, which is the mockup's own reading of "Enter apply" and
+            # is still wrong: the confirmation a player needs is `(current)` moving to the
+            # row they chose, and a menu that vanishes shows them nothing.
+            (
+                "apply-closes-the-menu",
+                "        if a.menu_apply {\n            return Some(self.selected().preset());",
+                "        if a.menu_apply {\n            self.open = false;\n            return Some(self.selected().preset());",
+                "KILL",
+            ),
+            # The restore row applies the row above it instead of the default -- the shape a
+            # `RestoreDefaults => self.selected()` recursion or an off-by-one row lookup
+            # would take. Killed only because the restore row's preset is asserted as a
+            # literal rather than as "whatever the last row says".
+            (
+                "the-restore-row-applies-the-last-preset",
+                "            MenuRow::RestoreDefaults => Preset::default(),",
+                "            MenuRow::RestoreDefaults => Preset::QwertyCabinet,",
+                "KILL",
+            ),
+            # A summary row that previews the *active* preset rather than the highlighted
+            # one, so the keys shown never change as you scroll. This is the whole reason
+            # `draw` takes both `menu` and `current`, and the mutant makes one of them
+            # unused in the place it matters.
+            (
+                "the-summary-previews-the-active-row",
+                "    let p = menu.selected().preset();",
+                "    let p = current;",
+                "KILL",
+            ),
+            # A label that names the wrong keys: the QWERTY punch row shown as AZERTY's.
+            # `K L M` and `J K L` are both plausible home-row runs, and a player reading the
+            # menu has no way to tell which is true except by pressing.
+            (
+                "a-label-names-the-other-layouts-keys",
+                '        Preset::QwertyPunchLow => "J K L",',
+                '        Preset::QwertyPunchLow => "K L M",',
+                "KILL",
+            ),
+            # The stick label following the punch row's layout word rather than the board's,
+            # which reads correctly for two of the four presets.
+            (
+                "the-stick-label-follows-the-wrong-preset",
+                '        Preset::AzertyPunchLow | Preset::AzertyCabinet => "Z S Q D",',
+                '        Preset::AzertyPunchLow | Preset::QwertyPunchLow => "Z S Q D",',
+                "KILL",
+            ),
+            # A shut menu draws anyway, so the box sits over the game permanently. Obvious
+            # at a window and invisible to every test that only drives the state machine,
+            # which is why `a_shut_menu_draws_nothing` reads the buffer.
+            ("a-shut-menu-draws-anyway", "    if !menu.open {\n        return;\n    }", "    if false {\n        return;\n    }", "KILL"),
+            # The box one column narrower than its widest row. `draw_text` clips rather than
+            # panicking, so the symptom is a silently truncated row -- `(current)` losing its
+            # closing bracket -- and nothing fails unless a test measures the rows.
+            ("the-box-is-a-column-too-narrow", "pub const COLS: usize = 34;", "pub const COLS: usize = 32;", "KILL"),
+            # CONTROL: the box's *position* is centred for readability and nothing depends on
+            # the exact number -- no other panel overlaps it, since the whole point is that
+            # it is the only thing being read. Moving it two lines up stays on screen and
+            # changes nothing testable.
+            #
+            # It fails if a test has started asserting `MENU_Y` against a literal instead of
+            # asserting the box is on screen, or if a panel has grown into this space.
+            ("CONTROL-the-box-sits-two-lines-higher", "pub const MENU_Y: usize = (HEIGHT - (ROWS * LINE + 2 * PAD)) / 2;", "pub const MENU_Y: usize = (HEIGHT - (ROWS * LINE + 2 * PAD)) / 2 - 2 * LINE;", "SURVIVE"),
         ],
     ),
     "pixels": (

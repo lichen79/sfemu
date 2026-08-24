@@ -34,6 +34,7 @@ pub mod font;
 pub mod gfx;
 pub mod gfxpanels;
 pub mod keys;
+pub mod menu;
 pub mod overlay;
 pub mod pace;
 pub mod pixels;
@@ -41,7 +42,8 @@ pub mod sf1panels;
 pub mod sndpanel;
 pub mod state;
 
-pub use keys::{Actions, Controls, Key, KeySet};
+pub use keys::{Actions, Controls, Key, KeySet, Preset};
+pub use menu::{KeyMenu, MenuRow};
 pub use pace::{FramePacer, FRAME_NS, MAX_CATCH_UP};
 pub use pixels::{pens_to_argb, pens_to_argb_sf1};
 pub use state::{
