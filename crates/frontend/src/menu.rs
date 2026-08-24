@@ -135,10 +135,17 @@ impl KeyMenu {
         if a.menu_toggled {
             self.open = !self.open;
             if self.open {
-                // Opening puts the cursor on the row that is in force. `position` and not
-                // a match: `RestoreDefaults` also *has* a preset, and finding the first
-                // row whose preset is `current` would land on the restore row whenever
-                // the default is active — pointing the cursor at a row that does nothing.
+                // Opening puts the cursor on the row that is in force. Matched as
+                // `Use(current)` and not as "the first row whose `preset()` is `current`",
+                // because `RestoreDefaults` also *has* a preset — the default — and the
+                // looser test would find two rows whenever the default is in force.
+                //
+                // Today it would still pick the right one, since `position` returns the
+                // first match and `RestoreDefaults` is last in `ALL`. That is the whole
+                // difference: the loose form is correct only by the order of that array,
+                // and a menu that listed `restore defaults` first would open its cursor
+                // on a row that changes nothing, in the commonest case there is. The
+                // `menu` mutant set carries the loose form as a control and says so.
                 self.sel = MenuRow::ALL
                     .iter()
                     .position(|r| *r == MenuRow::Use(current))
@@ -879,8 +886,47 @@ mod tests {
         assert_eq!(p, Preset::QwertyPunchLow);
         assert_eq!(stick_label(p), "W A S D", "the preview follows the cursor");
         assert_eq!(punch_label(p), "J K L");
-        // Drawing with a *different* current preset must not change any of that: the
-        // `(current)` marker is the only thing `current` decides.
+        // And the drawn summary really follows the cursor. Read as *pixels*, over the two
+        // summary rows alone, because that is the only form in which the claim is testable
+        // at all: `stick_label(m.selected().preset())` above re-derives what `draw` does,
+        // so a `draw` that passed `current` to the labels instead would satisfy every
+        // assertion above it. A mutant doing exactly that survived this test until the
+        // band below was added — see the `menu` set.
+        //
+        // The two current presets differ *only* in which row is marked `(current)`, and
+        // that marker is on the choice rows, never in this band. So the band is identical
+        // between the two frames when the summary follows the cursor, and differs when it
+        // follows `current`. Both directions are asserted: a `draw` that drew no summary at
+        // all would make them identical too, which is what the third frame rules out.
+        let band = |current: Preset| {
+            let mut buf = vec![0u32; WIDTH * HEIGHT];
+            draw(&mut buf, &m, current);
+            // Rows 6 and 7 of the box — the title, five choices, then the two summaries.
+            let top = MENU_Y + PAD + 6 * LINE;
+            buf[top * WIDTH..(top + 2 * LINE) * WIDTH].to_vec()
+        };
+        assert_eq!(
+            band(Preset::AzertyPunchLow),
+            band(Preset::QwertyCabinet),
+            "the summary changed with `current`, so it is not previewing the cursor"
+        );
+        let mut moved = m;
+        moved.update(&act(|a| a.menu_up = true), Preset::AzertyPunchLow);
+        assert_eq!(moved.selected().preset(), Preset::AzertyCabinet);
+        let elsewhere = {
+            let mut buf = vec![0u32; WIDTH * HEIGHT];
+            draw(&mut buf, &moved, Preset::AzertyPunchLow);
+            let top = MENU_Y + PAD + 6 * LINE;
+            buf[top * WIDTH..(top + 2 * LINE) * WIDTH].to_vec()
+        };
+        assert_ne!(
+            band(Preset::AzertyPunchLow),
+            elsewhere,
+            "moving the cursor changed nothing, so no summary is drawn"
+        );
+
+        // Drawing with a *different* current preset does change the frame somewhere: the
+        // `(current)` marker moved, which is the only thing `current` decides.
         let mut buf = vec![0u32; WIDTH * HEIGHT];
         draw(&mut buf, &m, Preset::AzertyPunchLow);
         let mut other = vec![0u32; WIDTH * HEIGHT];

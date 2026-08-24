@@ -96,10 +96,17 @@ CRATES: dict[str, str | list[str]] = {
     "oki": ["oki", "machine", "testrunner", "sfemu", "frontend"],
 }
 
-# How long one mutant's test run may take before it is declared killed. The whole
-# workspace suite is under 3 s in this tree, so 120 is two orders of magnitude of
-# headroom -- generous enough that a slow cold build is never mistaken for a hang.
-MUTANT_TIMEOUT_S = 120
+# How long one mutant's test run may take before it is declared killed.
+#
+# ⚠️ Raised from 120. The premise behind that number was "the whole workspace suite is
+# under 3 s, so this is two orders of magnitude of headroom" -- which measured the wrong
+# thing: what a mutant costs is the *rebuild*, and `cargo test --workspace` on this tree
+# now takes over 70 s to compile before a test runs. `CONTROL-the-title-is-not-highlighted`
+# reported `KILL (hung)` at 120 s and then survived when run by hand, which is the failure
+# mode this constant can produce: a timeout scores as a kill, so an over-tight budget
+# manufactures kills for mutants nothing detected. 600 is generous against the build and
+# still an order of magnitude over any real hang, which is an infinite loop in a frame.
+MUTANT_TIMEOUT_S = 600
 
 # name -> (default file, [(mutant-name, old, new, expectation[, file[, extra]]), ...])
 #
@@ -898,17 +905,22 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
     "menu": (
         "crates/frontend/src/menu.rs",
         [
-            # The trap this module was written around, and the reason `position` is not a
-            # `match`: `RestoreDefaults::preset()` *is* the default, so "the first row whose
-            # preset is `current`" opens the cursor on the restore row whenever the default
-            # is in force -- the most common case there is. The menu still works; it just
-            # points at a row that changes nothing, and the player's first `Enter` appears
-            # to do nothing at all.
+            # CONTROL, and it was written expecting KILL. The claim was that matching a row
+            # by `preset()` rather than by `Use(current)` would open the cursor on
+            # `restore defaults` whenever the default is in force, since `RestoreDefaults`
+            # also *has* a preset. It survives, and the reason is worth the comment: two
+            # rows do match, but `position` returns the *first* and `RestoreDefaults` is
+            # last in `ALL`. The loose form is correct today by the order of that array
+            # alone.
+            #
+            # Kept as a control rather than deleted, because that is the honest reading:
+            # the edit is safe, and it becomes unsafe the day a row is inserted before the
+            # presets. It dies then, which is the signal it exists for.
             (
-                "opening-lands-on-the-restore-row",
+                "CONTROL-opening-matches-a-row-by-its-preset",
                 ".position(|r| *r == MenuRow::Use(current))",
                 ".position(|r| r.preset() == current)",
-                "KILL",
+                "SURVIVE",
             ),
             # Opening does not move the cursor at all, so it stays wherever it was left.
             # Harmless on the first open (`sel` starts at 0, which is the default's row) and
@@ -995,12 +1007,18 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
                 '        Preset::QwertyPunchLow => "K L M",',
                 "KILL",
             ),
-            # The stick label following the punch row's layout word rather than the board's,
-            # which reads correctly for two of the four presets.
+            # The stick label following which row punches rather than which board the keys
+            # are named for, which reads correctly for two of the four presets.
+            #
+            # ⚠️ Written first as a swap of the *left* halves of the two arms and reported
+            # NO-BUILD: that leaves `AzertyCabinet` and `QwertyPunchLow` unmatched, and a
+            # mutant that does not compile scores as a KILL nothing was measured for. Both
+            # arms are replaced together here, so the match stays exhaustive and the only
+            # thing wrong is which two presets say `Z S Q D`.
             (
                 "the-stick-label-follows-the-wrong-preset",
-                '        Preset::AzertyPunchLow | Preset::AzertyCabinet => "Z S Q D",',
-                '        Preset::AzertyPunchLow | Preset::QwertyPunchLow => "Z S Q D",',
+                '        Preset::AzertyPunchLow | Preset::AzertyCabinet => "Z S Q D",\n        Preset::QwertyPunchLow | Preset::QwertyCabinet => "W A S D",',
+                '        Preset::AzertyPunchLow | Preset::QwertyPunchLow => "Z S Q D",\n        Preset::AzertyCabinet | Preset::QwertyCabinet => "W A S D",',
                 "KILL",
             ),
             # A shut menu draws anyway, so the box sits over the game permanently. Obvious
@@ -1011,14 +1029,28 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # panicking, so the symptom is a silently truncated row -- `(current)` losing its
             # closing bracket -- and nothing fails unless a test measures the rows.
             ("the-box-is-a-column-too-narrow", "pub const COLS: usize = 34;", "pub const COLS: usize = 32;", "KILL"),
-            # CONTROL: the box's *position* is centred for readability and nothing depends on
-            # the exact number -- no other panel overlaps it, since the whole point is that
-            # it is the only thing being read. Moving it two lines up stays on screen and
-            # changes nothing testable.
+            # The box off centre by two lines. ⚠️ Written as a control -- "the exact position
+            # is arbitrary, nothing overlaps it" -- and it died, correctly. Centring is a
+            # stated property of this panel, not a coincidence of two numbers: it is the one
+            # modal panel, and `the_box_is_centred_and_on_screen` asserts
+            # `HEIGHT - (MENU_Y + h) <= MENU_Y` rather than only the literal. So the edit
+            # violates an asserted design property and KILL is the honest expectation.
             #
-            # It fails if a test has started asserting `MENU_Y` against a literal instead of
-            # asserting the box is on screen, or if a panel has grown into this space.
-            ("CONTROL-the-box-sits-two-lines-higher", "pub const MENU_Y: usize = (HEIGHT - (ROWS * LINE + 2 * PAD)) / 2;", "pub const MENU_Y: usize = (HEIGHT - (ROWS * LINE + 2 * PAD)) / 2 - 2 * LINE;", "SURVIVE"),
+            # Re-expected rather than deleted, because the death proves that centring
+            # assertion is not vacuous.
+            ("the-box-sits-two-lines-off-centre", "pub const MENU_Y: usize = (HEIGHT - (ROWS * LINE + 2 * PAD)) / 2;", "pub const MENU_Y: usize = (HEIGHT - (ROWS * LINE + 2 * PAD)) / 2 - 2 * LINE;", "KILL"),
+            # CONTROL: the title's colour. `HI` marks the row the cursor is on, and the title
+            # is drawn in it for emphasis only -- nothing distinguishes a row from a heading
+            # by colour, since the cursor's `"> "` does that. Dropping it to `FG` is a
+            # cosmetic difference no headless test can see: `an_open_menu_draws_inside_its_box_only`
+            # counts changed pixels against the box's whole area, so an opaque box of either
+            # colour passes, and the summary-band comparison never reaches the title row.
+            #
+            # The right control for this set: a *visible* edit -- it looks like it must fail
+            # -- that nothing can assert without a person at a window. It fails only if a
+            # test starts reading a specific pixel's colour, which would be the assertion to
+            # question rather than this edit.
+            ('CONTROL-the-title-is-not-highlighted', 'line(buf, "KEYS", HI);', 'line(buf, "KEYS", FG);', "SURVIVE"),
         ],
     ),
     "pixels": (
