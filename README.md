@@ -8,6 +8,16 @@ cargo run -p sfemu --release -- /path/to/your/sf2.zip --play
 cargo run -p sfemu --release -- /path/to/your/sf.zip --play --game sf1
 ```
 
+No ROM set? `cargo run -p sfemu --release -- --demo --play` needs no files at all.
+
+Two documents sit beside this one. **[docs/user-guide.md](docs/user-guide.md)** is
+the practical one: building it, supplying your own set, every flag, every key, the
+key menu, save states, the debugger, the viewers, and a troubleshooting table.
+**[docs/architecture.md](docs/architecture.md)** is the structural one: the eleven
+crates, the dependency edges and why each exists, the display and audio boundaries,
+the frame and cycle model, the save-state format, and what a green suite does *not*
+establish.
+
 Ten sub-projects are complete: the **68000 core** (A), the **bus and timing
 framework with a MAME ROM-set loader** (B), the **CPS-1 scanline renderer** (C),
 the **Z80 audio CPU** (D1), the **YM2151 FM chip and the sound board's wiring**
@@ -212,13 +222,13 @@ contain no game code — but they are still fetched at runtime rather than vendo
 If a vector file is missing, the harness fails loudly, naming the file and the
 command that fetches it. It does not skip, warn, or silently pass.
 
-**Six tests are the documented exception, and they are `#[ignore]`d for the reason
+**Seven tests are the documented exception, and they are `#[ignore]`d for the reason
 the rule itself gives.** "Fail loudly naming the command that fetches it" holds
 because the vector data *is* fetchable and there is a command to name. A ROM set is
-not, and there is no command we may put in a failure message. So `boot.rs`,
-`sound_boot.rs` and `audio_boot.rs` for SF2, and `sf1_boot.rs`,
-`sf1_sound_boot.rs` and `sf1_audio_boot.rs` for SF1 — the six tests that need real
-Capcom code — skip by default and read a path you supply:
+not, and there is no command we may put in a failure message. So `boot.rs` (two:
+SF2's boot and CE's attract mode), `sound_boot.rs` and `audio_boot.rs` for CPS-1,
+and `sf1_boot.rs`, `sf1_sound_boot.rs` and `sf1_audio_boot.rs` for SF1 — the seven
+tests that need real Capcom code — skip by default and read a path you supply:
 
 ```bash
 SFEMU_ROMS=/path/to/your/sf2.zip cargo test -p sfemu --test audio_boot -- --ignored
@@ -226,9 +236,9 @@ SFEMU_ROMS=/path/to/your/sf2.zip cargo test -p sfemu --test audio_boot -- --igno
 
 One variable, one panic message per test, no second escape hatch. `SFEMU_ROMS` is
 **not** how the binary is pointed at a ROM set — that is a positional argument; the
-variable exists only for these six. It holds **one** path and the two trios want
-different sets, so a user with both runs the suite twice with it pointing at each in
-turn — a second variable would be the second escape hatch this rule forbids by name,
+variable exists only for these seven. It holds **one** path and the CPS-1 four and
+the SF1 three want different sets, so a user with both runs the suite twice with it
+pointing at each in turn — a second variable would be the second escape hatch this rule forbids by name,
 and pointing it at the wrong set fails loudly with a `romset` error naming the file
 it could not find. What they add over the unconditional suites is
 narrow and specific: that SF2's own driver talks to the chips *where this code expects
@@ -280,7 +290,7 @@ cargo build -p oki --features serde
 # Throughput. Read the caveat below before quoting a number from it.
 cargo bench -p m68k
 
-# Mutation testing: 262 mutants, each an exact string replacement, each with a
+# Mutation testing: 299 mutants, each an exact string replacement, each with a
 # declared KILL or SURVIVE. Every set carries at least one control that must
 # survive — a pass where everything dies is more likely a broken harness than a
 # thorough suite. Commit first: it edits files in place.
@@ -732,10 +742,17 @@ crates/sfemu/        the binary. The only crate that names a windowing library o
                      an audio library, each in one file and nowhere else (a test
                      per boundary enforces it).
 crates/testrunner/   dev-only harness for the external vector suite.
-scripts/mutate.py    the mutation harness: 262 mutants over the above in 19 sets,
+scripts/mutate.py    the mutation harness: 299 mutants over the above in 21 sets,
                      each an exact string replacement with a declared
-                     expectation. 240 killed, 22 declared survivors (19 controls
-                     and 3 proven equivalents), 262/262 as expected.
+                     expectation. 273 killed, 26 declared survivors (23 controls
+                     and 3 proven equivalents), 299/299 as expected.
+docs/architecture.md the crates, the dependency edges and why each one exists,
+                     the display and audio boundaries, the frame and cycle model,
+                     the save-state format, and what a green suite does not
+                     establish.
+docs/user-guide.md   building it, supplying your own ROM set, every flag, every
+                     key, the key menu, save states, the debugger, the viewers,
+                     and a troubleshooting table.
 docs/hardware/       what the vectors proved about the hardware, with evidence.
 docs/superpowers/    design specs and implementation plans.
 testdata/            gitignored; fetched vectors.
