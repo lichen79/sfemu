@@ -21,6 +21,39 @@ pub const FRAME_NS: u64 = 16_768_000;
 /// that is better dropped than fast-forwarded: see [`FramePacer::tick`].
 pub const MAX_CATCH_UP: u32 = 4;
 
+/// How many buckets [`TickStats::owed`] has.
+///
+/// Indexed by whole frames owed, so buckets `0..=MAX_CATCH_UP` are ticks that were
+/// served in full and the last one is every tick that dropped something. Six for a
+/// cap of four; the constant is derived so a changed cap cannot leave a bucket the
+/// histogram has no room for.
+pub const OWED_BUCKETS: usize = MAX_CATCH_UP as usize + 2;
+
+/// The distribution of host tick lengths a run saw.
+///
+/// Dropped frames are the project's one open bug, and the counter that reports them
+/// cannot distinguish the two stories that produce the same total: a handful of
+/// multi-second stalls, or thousands of small ones just over the cap. 3,246 drops is
+/// one 54-second stall *or* 3,246 ticks of 84 ms, and those have different causes.
+/// So the shape is recorded, not only the sum.
+///
+/// It lives on the pacer because the pacer is already handed every tick length and
+/// reads no clock — see this module's header. Nothing here is machine state; it is an
+/// instrument, and `reset` deliberately does not clear it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TickStats {
+    /// Ticks by whole frames owed: index `n` for `n` frames, and the last index for
+    /// everything above the cap. See [`OWED_BUCKETS`].
+    pub owed: [u64; OWED_BUCKETS],
+    /// The longest single tick, in nanoseconds. A stall's *size*, which the buckets
+    /// deliberately do not carry: every tick past the cap lands in the same one.
+    pub worst_ns: u64,
+    /// Ticks that dropped at least one frame. The last bucket's count, kept as its
+    /// own field because it is the number a reader wants against [`FramePacer::dropped`]:
+    /// dropped/events is the mean stall length in frames.
+    pub drop_events: u64,
+}
+
 /// Converts host time into a count of emulated frames.
 ///
 /// Sleep-free and catch-up-bounded. The loop asks "how much time passed" and gets
@@ -35,6 +68,7 @@ pub struct FramePacer {
     owed_ns: u64,
     max_catch_up: u32,
     dropped: u64,
+    stats: TickStats,
 }
 
 impl Default for FramePacer {
@@ -60,6 +94,11 @@ impl FramePacer {
             owed_ns: 0,
             max_catch_up,
             dropped: 0,
+            stats: TickStats {
+                owed: [0; OWED_BUCKETS],
+                worst_ns: 0,
+                drop_events: 0,
+            },
         }
     }
 
@@ -77,6 +116,10 @@ impl FramePacer {
     /// window title reports: a dropped frame should be visible, not silent.
     pub fn tick(&mut self, elapsed_ns: u64) -> u32 {
         self.owed_ns = self.owed_ns.saturating_add(elapsed_ns);
+        // The tick's own length, not the accumulated debt: `worst_ns` answers "how long
+        // did the host go away for", and the remainder carried in from earlier ticks is
+        // not part of that.
+        self.stats.worst_ns = self.stats.worst_ns.max(elapsed_ns);
         // Neither constructor produces a zero period, and a zero would make this a
         // division by zero rather than a slow window — so it is worth one branch to
         // answer "no frames" instead of aborting the process.
@@ -87,6 +130,16 @@ impl FramePacer {
         self.owed_ns %= self.frame_ns;
         let served = u64::from(self.max_catch_up).min(owed);
         self.dropped += owed - served;
+        // Saturating into the last bucket: `owed` is unbounded (a suspended host owes
+        // billions of frames) and the buckets are a fixed array. Everything past the cap
+        // is one bucket by design — `worst_ns` is what carries the size.
+        let bucket = usize::try_from(owed)
+            .unwrap_or(usize::MAX)
+            .min(OWED_BUCKETS - 1);
+        self.stats.owed[bucket] += 1;
+        if owed > served {
+            self.stats.drop_events += 1;
+        }
         // The cap bounds `served` by `max_catch_up`, a `u32`, so this cannot lose
         // information.
         served as u32
@@ -97,11 +150,16 @@ impl FramePacer {
         self.dropped
     }
 
+    /// The distribution of tick lengths this pacer has seen. See [`TickStats`].
+    pub fn stats(&self) -> TickStats {
+        self.stats
+    }
+
     /// Forgets the outstanding debt, keeping the drop count.
     ///
     /// Called when resuming from a pause or a step: the wall-clock time spent
-    /// paused is not game time the machine owes. The drop count is a record of the
-    /// run rather than state of the pacer, so it survives.
+    /// paused is not game time the machine owes. The drop count and [`TickStats`] are
+    /// a record of the run rather than state of the pacer, so both survive.
     pub fn reset(&mut self) {
         self.owed_ns = 0;
     }
@@ -272,6 +330,101 @@ mod tests {
         assert_eq!(p.tick(1_000), 1, "one 1 µs frame");
         assert_eq!(p.tick(10_000), 2, "capped at 2, not 4");
         assert_eq!(p.dropped(), 8, "ten owed, two served");
+    }
+
+    /// The histogram separates the two runs a drop count cannot tell apart.
+    ///
+    /// This is the whole reason [`TickStats`] exists. 115 dropped frames is one 2-second
+    /// stall or 115 ticks of 84 ms, and `dropped()` returns 115 for both. The counts
+    /// below are the same in the two halves and every other number differs.
+    #[test]
+    fn one_long_stall_and_many_short_ones_drop_alike_and_look_different() {
+        // 2,000,000,000 / 16,768,000 = 119 owed, 4 served, 115 dropped — the figure
+        // `a_stalled_host_is_capped_and_the_refused_debt_is_dropped` pins.
+        let mut one = FramePacer::cps1();
+        one.tick(2_000_000_000);
+        assert_eq!(one.dropped(), 115, "the premise");
+        let s = one.stats();
+        assert_eq!(s.drop_events, 1, "one tick was late");
+        assert_eq!(s.worst_ns, 2_000_000_000);
+        assert_eq!(s.owed[OWED_BUCKETS - 1], 1, "and it is in the last bucket");
+        assert_eq!(s.owed[1], 0, "no tick owed exactly one frame");
+
+        // The same 115 drops as 115 separate five-frame ticks: each owes 5, serves 4,
+        // drops 1.
+        let mut many = FramePacer::cps1();
+        for _ in 0..115 {
+            assert_eq!(many.tick(FRAME_NS * 5), 4);
+        }
+        assert_eq!(many.dropped(), 115, "identical to the run above");
+
+        let m = many.stats();
+        assert_eq!(m.drop_events, 115, "115 late ticks, not one");
+        assert_eq!(m.worst_ns, FRAME_NS * 5, "and none of them was a long one");
+        assert_eq!(m.owed[OWED_BUCKETS - 1], 115);
+        // The pair a reader actually compares: mean frames lost per late tick is 115
+        // for the stall and 1 for the sputter.
+        assert_eq!(one.dropped() / one.stats().drop_events, 115);
+        assert_eq!(many.dropped() / many.stats().drop_events, 1);
+    }
+
+    /// Every tick lands in the bucket for the frames it owed, late or not.
+    ///
+    /// The buckets below the cap are the ones that say whether a host is keeping up at
+    /// all — a run whose ticks are mostly in bucket 1 is healthy, and one sitting in
+    /// bucket 4 is on the edge of dropping without having dropped anything yet. A
+    /// histogram that only counted late ticks could not show that, so the on-time
+    /// buckets are asserted here rather than left implied.
+    #[test]
+    fn the_buckets_count_on_time_ticks_too() {
+        let mut p = FramePacer::cps1();
+        assert_eq!(OWED_BUCKETS, 6, "MAX_CATCH_UP of 4, plus zero, plus over");
+        p.tick(0); // owes nothing
+        p.tick(FRAME_NS / 2); // still nothing: half a frame
+        p.tick(FRAME_NS / 2); // the two halves are one frame
+        p.tick(FRAME_NS * 3);
+        p.tick(FRAME_NS * 4); // exactly the cap, so not late
+        assert_eq!(p.dropped(), 0, "nothing above the cap yet");
+
+        let s = p.stats();
+        assert_eq!(
+            s.owed,
+            [2, 1, 0, 1, 1, 0],
+            "two zero-owed ticks, then 1, 3, 4"
+        );
+        assert_eq!(s.drop_events, 0, "and not one of them was late");
+        assert_eq!(s.worst_ns, FRAME_NS * 4);
+    }
+
+    /// A suspended host's owed count is astronomical and lands in the last bucket.
+    ///
+    /// `owed` is `u64` and the buckets are an array of six, so the index has to be
+    /// clamped. `u64::MAX` nanoseconds is what `Display::elapsed_ns` saturates to when
+    /// a machine was asleep, which makes this reachable rather than theoretical — and an
+    /// unclamped index would be a panic in the frame loop.
+    #[test]
+    fn a_suspended_host_does_not_index_past_the_buckets() {
+        let mut p = FramePacer::cps1();
+        assert_eq!(p.tick(u64::MAX), 4, "still capped");
+        let s = p.stats();
+        assert_eq!(s.owed[OWED_BUCKETS - 1], 1);
+        assert_eq!(s.worst_ns, u64::MAX);
+        assert_eq!(s.drop_events, 1);
+    }
+
+    /// `reset` keeps the histogram, for the reason it keeps the drop count.
+    #[test]
+    fn reset_keeps_the_tick_histogram() {
+        let mut p = FramePacer::cps1();
+        p.tick(FRAME_NS * 5);
+        assert_eq!(p.stats().drop_events, 1, "the premise");
+        p.reset();
+        assert_eq!(
+            p.stats().drop_events,
+            1,
+            "an instrument's record is not pacer state to clear"
+        );
+        assert_eq!(p.stats().worst_ns, FRAME_NS * 5);
     }
 
     /// A zero period answers "no frames" instead of dividing by zero.

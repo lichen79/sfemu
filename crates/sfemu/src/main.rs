@@ -712,8 +712,33 @@ fn default_keys_path(rom: &str) -> PathBuf {
 /// Short, and printed rather than discarded because a session that dropped frames or
 /// could not write a state should say so once at the end — the title bar said it at
 /// the time, and the title bar is gone.
+/// # Why the tick histogram is printed and not just the drop count
+///
+/// The drop count on its own has been actively misleading. Three sessions reported
+/// 2–3%, 17.4% and 4.7%, and nothing in the number says whether that is one long stall
+/// or thousands of short ones — the two have different causes and the same total. So
+/// the three lines below are printed whenever anything was dropped: how many ticks were
+/// late (`dropped / late` is the mean frames lost per stall), the longest single tick,
+/// and the whole distribution of frames owed per tick. `owed` reads left to right as
+/// buckets 0, 1, … up to the catch-up cap, then everything past it.
+///
+/// Printed only when something dropped: a clean session's histogram is a wall of digits
+/// saying "fine", and a report nobody reads is where the 17% hid.
 fn play_report(s: &loop_::Summary) -> String {
     let mut out = format!("frames        {}\ndropped       {}\n", s.frames, s.dropped);
+    if s.dropped > 0 {
+        let t = &s.ticks;
+        out.push_str(&format!("late ticks    {}\n", t.drop_events));
+        // Milliseconds, because a nanosecond figure for a 4-second stall is ten digits
+        // nobody reads as a duration. One decimal: the interesting range is 17 ms to
+        // several seconds and the cap is 67 ms.
+        out.push_str(&format!(
+            "worst tick    {:.1} ms\n",
+            t.worst_ns as f64 / 1_000_000.0
+        ));
+        let owed: Vec<String> = t.owed.iter().map(u64::to_string).collect();
+        out.push_str(&format!("owed/tick     {}\n", owed.join(" ")));
+    }
     for n in &s.notices {
         out.push_str(&format!("notice        {n}\n"));
     }
@@ -2078,6 +2103,7 @@ mod tests {
             frames: 3_600,
             dropped: 12,
             notices: vec!["cannot write `/x/y.sfs`: nope".to_string()],
+            ..Default::default()
         };
         let r = play_report(&s);
         assert!(r.contains("frames        3600"), "{r}");
@@ -2089,6 +2115,60 @@ mod tests {
         // A clean session says nothing extra.
         let clean = play_report(&loop_::Summary::default());
         assert!(!clean.contains("notice"), "{clean}");
+    }
+
+    /// A dropping session's report carries the shape of the drops, not only the count.
+    ///
+    /// The two summaries below have the **same** `dropped`, which is the point: the
+    /// report has to distinguish them, because the drop count did not and three
+    /// documents recorded a wrong figure behind it. The numbers are the ones
+    /// `frontend::pace`'s own test pins — 119 frames owed by a 2-second stall, 4 served,
+    /// 115 dropped.
+    #[test]
+    fn a_dropping_report_distinguishes_one_stall_from_many() {
+        let mut owed = [0u64; frontend::OWED_BUCKETS];
+        owed[frontend::OWED_BUCKETS - 1] = 1;
+        let stall = play_report(&loop_::Summary {
+            frames: 4,
+            dropped: 115,
+            ticks: frontend::TickStats {
+                owed,
+                worst_ns: 2_000_000_000,
+                drop_events: 1,
+            },
+            ..Default::default()
+        });
+        assert!(stall.contains("late ticks    1"), "{stall}");
+        assert!(stall.contains("worst tick    2000.0 ms"), "{stall}");
+        assert!(stall.contains("owed/tick     0 0 0 0 0 1"), "{stall}");
+
+        let mut owed = [0u64; frontend::OWED_BUCKETS];
+        owed[frontend::OWED_BUCKETS - 1] = 115;
+        let sputter = play_report(&loop_::Summary {
+            frames: 460,
+            dropped: 115,
+            ticks: frontend::TickStats {
+                owed,
+                // Five frames: 5 × 16,768,000 ns = 83.84 ms.
+                worst_ns: 83_840_000,
+                drop_events: 115,
+            },
+            ..Default::default()
+        });
+        assert!(sputter.contains("dropped       115"), "the same total");
+        assert!(sputter.contains("late ticks    115"), "{sputter}");
+        assert!(sputter.contains("worst tick    83.8 ms"), "{sputter}");
+
+        // A clean session prints none of the three lines. Without this the report would
+        // carry a histogram of zeros on every ordinary run, and the assertions above
+        // would pass on a `play_report` that ignored `dropped` entirely.
+        let clean = play_report(&loop_::Summary {
+            frames: 3_600,
+            ..Default::default()
+        });
+        assert!(!clean.contains("late ticks"), "{clean}");
+        assert!(!clean.contains("worst tick"), "{clean}");
+        assert!(!clean.contains("owed/tick"), "{clean}");
     }
 
     /// A CPU summary comes from the shared view, so one implementation serves both.

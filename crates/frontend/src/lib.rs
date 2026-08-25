@@ -44,7 +44,7 @@ pub mod state;
 
 pub use keys::{Actions, Controls, Key, KeySet, Preset};
 pub use menu::{KeyMenu, MenuRow};
-pub use pace::{FramePacer, FRAME_NS, MAX_CATCH_UP};
+pub use pace::{FramePacer, TickStats, FRAME_NS, MAX_CATCH_UP, OWED_BUCKETS};
 pub use pixels::{pens_to_argb, pens_to_argb_sf1};
 pub use state::{
     decode, decode_sf1, encode, encode_sf1, StateError, BOARD_SF1, BOARD_SF2, MAGIC, VERSION,

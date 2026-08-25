@@ -539,10 +539,27 @@ Recorded because an unrecorded open question becomes a wrong assumption.
 
 - **Frame drops, at a rate that varies by an order of magnitude between sessions.**
   Four early windowed runs showed 2–3%; a 2026-08-24 session reported **3,246 of
-  18,656 frames, 17.4%**. Emulation cost is ruled out: 1,200 frames of `sf2eb`
-  headless took 1.08 s, i.e. 0.90 ms against a 16.768 ms budget (18.6×). Since a drop
-  needs a host tick exceeding `MAX_CATCH_UP` frames (67 ms), the cause is on the
-  window/present side. Never investigated.
+  18,656 frames, 17.4%**; a third gave 786 of 16,783, 4.7%. Emulation cost is ruled out:
+  1,200 frames of `sf2eb` headless took 1.08 s, i.e. 0.90 ms against a 16.768 ms budget
+  (18.6×). Since a drop needs a host tick exceeding `MAX_CATCH_UP` frames (67 ms), the
+  cause is on the window/present side.
+
+  **Instrumented on 2026-08-25, not yet diagnosed.** `FramePacer` now keeps a
+  `TickStats` — a histogram of frames owed per tick, the count of late ticks, and the
+  longest single tick — and `play_report` prints all three when a session drops anything.
+  That is there because the drop *count* cannot distinguish the two candidate causes: 3,246
+  drops is one 54-second stall or 3,246 ticks of 84 ms, and those are different bugs. The
+  histogram was added to the pacer rather than to the loop because the pacer is already
+  handed every tick length and reads no clock, so it stayed testable.
+
+  What is still missing is a **reading**. The report prints on exit, and the figure has to
+  come from a windowed session a person closes; I cannot press the quit key or click the
+  window's close button from here. So the next step is one real session, then read
+  `late ticks`, `worst tick` and `owed/tick`. If `late ticks` is small and `worst tick` is
+  seconds, it is a stall — a window-server hitch, a device change, a laptop lid. If
+  `late ticks` is in the thousands and `worst tick` is near 84 ms, the loop is
+  systematically a little slower than the frame it owes, which is a different problem with
+  a different fix.
 - **`scripts/mutate.py`'s patterns outside `keys`, `menu` and `layout` have not
   been audited** for drift against the current source. A pattern that no longer
   matches scores `NO-OP`, which is visible — but only in a full run.

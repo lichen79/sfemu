@@ -558,11 +558,41 @@ accumulate a debt that stampedes when you resume.
 
 ⚠️ **Dropped frames are known, unexplained, and can be large.** That report above is
 a real 2026-08-24 windowed session: **3,246 of 18,656 frames, 17.4%**. Earlier runs
-showed 2–3%, so the rate varies a great deal between sessions. What is ruled out is
-emulation cost — at 0.90 ms per 16.768 ms frame, the board is not what misses the
-deadline. A drop requires a host tick longer than four frames (67 ms), so the cause
-is on the window/present side, and it has not been investigated. Play is unaffected
-in the sense that the game does not run slow; it resyncs.
+showed 2–3% and a later one 4.7%, so the rate varies a great deal between sessions.
+What is ruled out is emulation cost — at 0.90 ms per 16.768 ms frame, the board is not
+what misses the deadline. A drop requires a host tick longer than four frames (67 ms),
+so the cause is on the window/present side. Play is unaffected in the sense that the
+game does not run slow; it resyncs.
+
+**If your session drops frames, the report says more.** Three extra lines follow
+`dropped` whenever it is non-zero:
+
+```
+late ticks    812
+worst tick    412.3 ms
+owed/tick     96 10397 2140 189 41 812
+```
+
+- `late ticks` — how many single host ticks dropped anything. `dropped / late ticks` is
+  the mean number of frames lost per stall, and it is the number that matters: 3,246 lost
+  over 1 late tick is one long freeze, and over 3,246 late ticks it is a loop that is
+  persistently a fraction too slow. Different causes, and the old two-line report could
+  not tell them apart. Here it is 4.0 frames per stall.
+- `worst tick` — the longest single tick in the session. Anything over 67 ms dropped
+  something; 412 ms means the host went away for a quarter of a second.
+- `owed/tick` — the distribution: how many ticks owed 0 frames, then 1, 2, 3, 4, and then
+  the last column, every tick that owed more than the cap. A healthy session is almost
+  entirely in the second column. Weight in the fifth means the host is close to the edge
+  without having gone over it.
+
+The columns are a complete account of `frames`: each tick in column *n* rendered *n*
+frames, each of the 812 over-cap ticks rendered 4, and 10,397 + 4,280 + 567 + 164 +
+3,248 = 18,656.
+
+**Those three numbers are invented** — they show the format, not a measurement. No real
+reading exists yet, because the report prints on the way out: it takes a windowed session
+that a person closes with `Escape` or the close button. If you run one, that output is the
+whole diagnosis.
 
 ---
 

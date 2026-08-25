@@ -104,6 +104,14 @@ pub struct Summary {
     pub frames: u64,
     /// Frames the pacer refused to catch up on.
     pub dropped: u64,
+    /// The shape of the host's tick lengths, from the pacer.
+    ///
+    /// Carried out of the run because [`Self::dropped`] alone cannot say *what
+    /// happened*: 3,246 drops is one long stall or 3,246 short ones, and the fix for
+    /// those is not the same. This is the instrument the dropped-frame open question
+    /// needs, and it is the pacer's because the pacer is already given every tick
+    /// length and reads no clock.
+    pub ticks: frontend::TickStats,
     /// Things that went wrong without being fatal, each reported once.
     ///
     /// A failed save is not a reason to lose the session — the loop keeps running
@@ -389,6 +397,11 @@ pub fn run(m: &mut Machine, d: &mut impl Display, audio: &mut dyn Audio, o: &Loo
         }
 
         summary.dropped = pacer.dropped();
+        // Every iteration, like `dropped`, and for the same reason: a session ended by
+        // closing the window rather than by `Escape` leaves through `is_open`, and a
+        // figure only written after the loop would be the default on exactly the exit
+        // most people take.
+        summary.ticks = pacer.stats();
         let want = title_for(&summary, &m.cpu_view(), paused, audio.is_running());
         if want != title {
             d.set_title(&want);
@@ -1047,6 +1060,50 @@ mod tests {
         let s = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
         assert_eq!(s.frames, 4, "the catch-up cap");
         assert_eq!(s.dropped, 115, "119 owed less the 4 served");
+    }
+
+    /// The summary carries the *shape* of the drops out of the run, not just the count.
+    ///
+    /// The loop is where a dropped frame becomes observable, and for three sessions all
+    /// it made observable was a total: 2–3%, then 17.4%, then 4.7%, with nothing to say
+    /// which of two very different host behaviours produced them. So a run whose ticks
+    /// are all mildly late must be distinguishable here from one long stall, and the two
+    /// scripts below are built to have the **same** `dropped` on purpose.
+    ///
+    /// The `frames` counts differ, and that is the tell that these are two real runs of
+    /// the machine and not two hand-made structs: 4 frames against 460.
+    #[test]
+    fn the_summary_distinguishes_a_stall_from_a_run_of_late_ticks() {
+        let (o, _s, _p, _k) = opts("shape");
+
+        let mut d = Fake::new(vec![(KeySet::new(), 2_000_000_000)]);
+        let stall = run(&mut machine(), &mut d, &mut NullAudio::default(), &o);
+        assert_eq!(stall.dropped, 115, "the premise, from the test above");
+        assert_eq!(stall.ticks.drop_events, 1, "one tick was late");
+        assert_eq!(stall.ticks.worst_ns, 2_000_000_000);
+
+        // 115 ticks of five frames each: every one owes 5, serves 4, drops 1.
+        let (o2, _s2, _p2, _k2) = opts("shape2");
+        let mut d = Fake::new(vec![(KeySet::new(), FRAME_NS * 5); 115]);
+        let sputter = run(&mut machine(), &mut d, &mut NullAudio::default(), &o2);
+        assert_eq!(sputter.dropped, 115, "the identical total");
+        assert_eq!(sputter.frames, 460, "but 460 frames ran, not 4");
+        assert_eq!(sputter.ticks.drop_events, 115, "115 late ticks, not one");
+        assert_eq!(
+            sputter.ticks.worst_ns,
+            FRAME_NS * 5,
+            "and the worst tick was 84 ms, not two seconds"
+        );
+
+        // A clean run leaves the instrument reading zero drops while still counting the
+        // ticks it saw — otherwise `drop_events` being 0 above would prove nothing about
+        // whether the field is wired up at all.
+        let (o3, _s3, _p3, _k3) = opts("shape3");
+        let mut d = Fake::new(Fake::idle(10));
+        let clean = run(&mut machine(), &mut d, &mut NullAudio::default(), &o3);
+        assert_eq!(clean.dropped, 0);
+        assert_eq!(clean.ticks.drop_events, 0);
+        assert_eq!(clean.ticks.owed[1], 10, "ten ticks, each owing one frame");
     }
 
     /// F3 returns the machine to power-on.
