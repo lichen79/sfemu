@@ -102,6 +102,54 @@ pub fn mentions(library: &str, exempt: &[&str]) -> Mentions {
     found
 }
 
+/// Every crate root in the workspace, relative to `crates/`, sorted.
+///
+/// A *crate root* is a file the compiler starts a crate at: `src/lib.rs`, `src/main.rs`,
+/// and — the part that is easy to forget — every file under `src/bin/`, `tests/`,
+/// `benches/` and `examples/`. Each is its own crate, so an inner-attribute rule stated
+/// in `lib.rs` does not reach any of them.
+///
+/// This exists for one caller — `every_crate_root_in_the_workspace_forbids_unsafe_code`
+/// in `main.rs` — and lives here because the walk is the same walk: `crates/`, minus
+/// `target`.
+///
+/// # Panics
+///
+/// Panics if `crates/` cannot be read, for the reason [`mentions`] does.
+pub fn crate_roots() -> Vec<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/sfemu has two ancestors")
+        .join("crates");
+    assert!(root.is_dir(), "the crates directory must exist: {root:?}");
+
+    let mut roots = Vec::new();
+    walk(&root, &mut |path| {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.ends_with(".rs") {
+            return;
+        }
+        let rel = path.strip_prefix(&root).unwrap_or(path).to_path_buf();
+        // `<crate>/src/lib.rs` and `<crate>/src/main.rs` are roots; every other file
+        // under `src/` is a module of one, reached by `mod`.
+        let parent = rel
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str());
+        let is_root = match parent {
+            Some("src") => name == "lib.rs" || name == "main.rs",
+            Some("bin" | "tests" | "benches" | "examples") => true,
+            _ => false,
+        };
+        if is_root {
+            roots.push(rel);
+        }
+    });
+    roots.sort();
+    roots
+}
+
 /// Calls `f` for every file under `dir`, recursively.
 ///
 /// Skips `target` — a build directory holds vendored sources that would make these

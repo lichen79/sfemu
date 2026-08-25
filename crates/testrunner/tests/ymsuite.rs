@@ -6,6 +6,10 @@
 //! release-rate sensitivity, status variation, and CSM presence — so a regenerated
 //! suite that loses discriminating power fails loudly instead of passing vacuously.
 
+// An integration test is its own crate root, so the crate's `lib.rs` attribute
+// does not reach here.
+#![forbid(unsafe_code)]
+
 use testrunner::{ymfiles, ymfmt, ymrunner};
 
 /// Every case makes sound.

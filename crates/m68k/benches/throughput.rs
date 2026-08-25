@@ -30,6 +30,10 @@
 //! never leaves the vector. Read a green bench as evidence of liveness and of
 //! the mix, never as a performance guarantee.
 
+// A bench is its own crate root, so `lib.rs`'s attribute does not reach here — and a
+// benchmark is exactly where a reach for `unsafe` to shave a nanosecond would land.
+#![forbid(unsafe_code)]
+
 use m68k::{decode::Decoder, Bus, M68k};
 use std::collections::BTreeSet;
 use std::time::Instant;

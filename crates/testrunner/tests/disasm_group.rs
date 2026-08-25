@@ -13,6 +13,10 @@
 //! Missing testdata fails loudly:
 //! `cargo run -p testrunner --bin fetch`
 
+// An integration test is its own crate root, so the crate's `lib.rs` attribute
+// does not reach here.
+#![forbid(unsafe_code)]
+
 use m68k::disasm::disassemble;
 use testrunner::binfmt::parse_file;
 use testrunner::runner::testdata_dir;

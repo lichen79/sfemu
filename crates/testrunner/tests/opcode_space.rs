@@ -6,6 +6,10 @@
 //! `debug_assert!`s (notably the MOVE schedule's fetch-count assertion) are the
 //! point.
 
+// An integration test is its own crate root, so the crate's `lib.rs` attribute
+// does not reach here.
+#![forbid(unsafe_code)]
+
 use m68k::decode::Decoder;
 use m68k::{Bus, M68k};
 

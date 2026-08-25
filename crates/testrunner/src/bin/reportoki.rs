@@ -22,6 +22,9 @@
 //! went unnoticed. Both spellings are accepted here so neither habit silently
 //! runs nothing, and an unrecognised argument exits 2.
 
+// Each `bin` is its own crate root, so `lib.rs`'s attribute does not reach here.
+#![forbid(unsafe_code)]
+
 use testrunner::{okifiles, okifmt, okirunner};
 
 /// How many failing cases to name before the list stops being useful.

@@ -24,6 +24,9 @@
 //! most-missed clause: **the aborted access of an address error still counts as
 //! a bus access**, even though the core must never put it on the bus.
 
+// Each `bin` is its own crate root, so `lib.rs`'s attribute does not reach here.
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 use testrunner::runner::{run_group, testdata_dir};
 

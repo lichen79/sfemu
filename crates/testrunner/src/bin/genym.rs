@@ -29,6 +29,9 @@
 //!
 //! `/testdata` is gitignored: this writes 2.97 MB there and none of it is committed.
 
+// Each `bin` is its own crate root, so `lib.rs`'s attribute does not reach here.
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 use std::process::Command;
 use testrunner::{ymfiles, ymfm, ymfmt};

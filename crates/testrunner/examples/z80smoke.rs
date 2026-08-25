@@ -14,6 +14,9 @@
 //! No ROM is involved: these are MIT-licensed CPU vectors from SingleStepTests/z80,
 //! fetched by `fetchz80` into gitignored `testdata/`.
 
+// An example is its own crate root, so `lib.rs`'s attribute does not reach here.
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 
 /// The opcodes the core implements so far: as of Task 12, every file upstream ships

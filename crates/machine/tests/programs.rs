@@ -14,6 +14,10 @@
 //! Every encoding below was verified against `m68k::disasm` on 2026-08-07 and the
 //! disassembler's own rendering is quoted beside it. None was taken on trust.
 
+// An integration test is its own crate root, so the crate's `lib.rs` attribute
+// does not reach here.
+#![forbid(unsafe_code)]
+
 use machine::{BoardConfig, Cps1, Timing};
 
 /// Builds a ROM image: reset vector, an optional level-2 handler vector, the program

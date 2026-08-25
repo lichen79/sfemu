@@ -22,6 +22,9 @@
 //! No ROM is involved. The vectors are MIT-licensed CPU test data from
 //! SingleStepTests/z80; nothing here downloads game code.
 
+// Each `bin` is its own crate root, so `lib.rs`'s attribute does not reach here.
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 use std::process::Command;
 use testrunner::{z80files, z80fmt, z80json};

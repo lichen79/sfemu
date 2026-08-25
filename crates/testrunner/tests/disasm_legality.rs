@@ -20,6 +20,10 @@
 //! same setup as `opcode_space.rs::is_illegal`: vector 4 is redirected to a
 //! known address, and the PC after one step is checked.
 
+// An integration test is its own crate root, so the crate's `lib.rs` attribute
+// does not reach here.
+#![forbid(unsafe_code)]
+
 use m68k::decode::Decoder;
 use m68k::disasm::disassemble;
 use m68k::{Bus, M68k};

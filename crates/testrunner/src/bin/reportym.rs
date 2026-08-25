@@ -14,6 +14,9 @@
 //! which is how this sub-project's debugging is meant to be done — from the failure
 //! diff, not from a standalone harness.
 
+// Each `bin` is its own crate root, so `lib.rs`'s attribute does not reach here.
+#![forbid(unsafe_code)]
+
 use testrunner::{ymfiles, ymfmt, ymrunner};
 
 /// How many failing cases to name before the list stops being useful.

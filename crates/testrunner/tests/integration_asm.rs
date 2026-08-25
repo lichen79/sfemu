@@ -27,6 +27,10 @@
 //! is confirmed by execution, and three opcode words absent from the suite —
 //! `0x7000`, `0x203C`, `0x343C` — are sampling gaps, not bad encodings).
 
+// An integration test is its own crate root, so the crate's `lib.rs` attribute
+// does not reach here.
+#![forbid(unsafe_code)]
+
 use m68k::{decode::Decoder, Bus, M68k};
 
 struct Ram {

@@ -28,6 +28,10 @@
 //! a number nothing independent verifies, and it would change every time the
 //! scheduler's interleave moved by a T-state without anything being wrong.
 
+// An integration test is its own crate root, so the crate's `lib.rs` attribute
+// does not reach here.
+#![forbid(unsafe_code)]
+
 /// SF2's sound program initialises the chip and plays its attract-mode music.
 ///
 /// # Why the run is twenty seconds and not two

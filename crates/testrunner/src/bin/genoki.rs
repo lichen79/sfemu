@@ -30,6 +30,9 @@
 //! command script, the recorded nibbles — so a generator that stopped producing
 //! one cannot satisfy the check that it did.
 
+// Each `bin` is its own crate root, so `lib.rs`'s attribute does not reach here.
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use testrunner::{okifiles, okifmt};

@@ -198,7 +198,17 @@ have been believed.
 `docs/architecture.md`. Measured: **9 of 11**. `sfemu` and `testrunner` do not carry
 it — and `sfemu` is precisely where the two FFI-shaped dependencies (minifb, cpal)
 live, so it is the crate where the gap matters most. Caught by counting before
-publishing. The doc now names the nine and warns about the two.
+publishing.
+
+Fixed 2026-08-25 — and fixing it found the claim was wronger than the correction.
+"9 of 11" counts *directories*, but the attribute is per **crate root**, and a workspace
+has more of those than it has crates: each of the 8 files in `testrunner/src/bin/`, the
+15 integration tests under `tests/`, the bench and the example is its own crate root that
+`lib.rs`'s attribute does not reach. The real figure was **19 of 36**. All 36 carry it
+now, and `every_crate_root_in_the_workspace_forbids_unsafe_code` enumerates the roots and
+reads the attribute out of each, so the count cannot drift again — which is the part that
+was missing the first time: the original evidence for the claim was that no crate
+contained the word `unsafe`, a measurement rather than a rule.
 
 **"Two runs of the 2–3% dropped-frame figure."** Both new docs recorded 2–3% dropped
 frames as the known observation. The user's own session on 2026-08-24 reported
@@ -333,7 +343,10 @@ that does not exist.
   core with no interrupt support at all — the vectors do not cover it. That sentence is
   in the README and it is the honest limit of the validation.
 - **Eight things only a human can check** remain unchecked by me, by construction.
-- **`sfemu` and `testrunner` still lack `#![forbid(unsafe_code)]`.** Named, not fixed.
+- **The `#![forbid(unsafe_code)]` gap was named for a day before it was fixed.** It is
+  closed now, across all 36 crate roots and with a test behind it, but the version of
+  this page published on 2026-08-24 said "named, not fixed" — which is the right thing to
+  write down and still a gap that shipped.
 
 ---
 

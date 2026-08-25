@@ -62,6 +62,10 @@
 //! lines, and extracting all six means editing three tests nobody in CI can run.
 //! Each gated test stays readable end to end by the one person who can run it.
 
+// An integration test is its own crate root, so the crate's `lib.rs` attribute
+// does not reach here.
+#![forbid(unsafe_code)]
+
 /// SF1 boots, services its vblank, fills its palette and text layer, and stays
 /// inside the map for sixty frames.
 ///

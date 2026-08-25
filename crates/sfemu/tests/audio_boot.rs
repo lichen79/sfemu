@@ -32,6 +32,10 @@
 //! the driver talks to the chip at all: that the phrase table is where the code expects
 //! it, and that what reaches the mix is not silence.
 
+// An integration test is its own crate root, so the crate's `lib.rs` attribute
+// does not reach here.
+#![forbid(unsafe_code)]
+
 /// SF2's driver programs the OKI, and the mix carries audio.
 ///
 /// # What each assertion would catch

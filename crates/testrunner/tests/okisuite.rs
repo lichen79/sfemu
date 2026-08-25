@@ -21,6 +21,10 @@
 //! so a core whose table was wrong cannot make a premise about the data agree
 //! with it.
 
+// An integration test is its own crate root, so the crate's `lib.rs` attribute
+// does not reach here.
+#![forbid(unsafe_code)]
+
 use testrunner::okifiles;
 
 /// MAME's `s_index_shift`, indexed `nibble & 7`, from `okiadpcm.cpp`.

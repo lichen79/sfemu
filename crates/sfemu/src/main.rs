@@ -27,6 +27,14 @@
 //! bisect and a commit message can hold. `--ppm` writes the last frame out as a file,
 //! so a headless run still produces a picture to look at.
 
+// The nine library crates carry this; for a while this binary and `testrunner` did
+// not, which made "the workspace forbids unsafe" a claim about most of it. This is
+// the crate where it matters most: `minifb` and `cpal` are the workspace's only
+// FFI-shaped dependencies and they are reachable from here alone, so an `unsafe`
+// block written to work around one of them would land in this file rather than in
+// any of the crates that already forbade it.
+#![forbid(unsafe_code)]
+
 mod audio;
 #[cfg(test)]
 mod confine;
@@ -1576,6 +1584,81 @@ mod tests {
         assert!(
             !u.contains("http"),
             "no URL of any kind belongs in this program"
+        );
+    }
+
+    /// Every crate root in the workspace carries `#![forbid(unsafe_code)]`.
+    ///
+    /// The project claims the whole workspace forbids `unsafe`. For a while that claim
+    /// was true of nine crates out of eleven — and false of exactly the one where it
+    /// matters most, since `minifb` and `cpal` are the only FFI-shaped dependencies and
+    /// both are reachable from this binary alone. Nothing noticed, because the evidence
+    /// offered for the claim was that no crate contained the word `unsafe`: a property
+    /// about today's source, not a rule about tomorrow's.
+    ///
+    /// So the rule is asserted directly, and asserted at every place a crate *starts*.
+    /// An inner attribute applies to its own crate and no other, and a workspace has far
+    /// more crate roots than it has directories under `crates/`: each file in `src/bin/`,
+    /// `tests/`, `benches/` and `examples/` is a separate crate the attribute in `lib.rs`
+    /// does not reach. That is the gap this test was written to close — the 8 `testrunner`
+    /// bins, 15 integration tests, a bench and an example were all outside a rule the
+    /// documentation stated without qualification.
+    ///
+    /// The count is asserted too, and deliberately as a `>=` on a hand-written floor
+    /// rather than an equality: a new integration test must not fail this, but a walk
+    /// that stopped finding roots must. Without it, a `crate_roots` that returned an
+    /// empty vector — wrong root, a filter that matched nothing — would pass this test
+    /// while checking nothing at all, which is the exact failure mode `confine`'s own
+    /// tests exist to catch for the other scan.
+    #[test]
+    fn every_crate_root_in_the_workspace_forbids_unsafe_code() {
+        let roots = crate::confine::crate_roots();
+        assert!(
+            roots.len() >= 36,
+            "the walk must have found the workspace's crate roots; 36 existed when this \
+             was written, found {}: {roots:?}",
+            roots.len()
+        );
+
+        // The four shapes of root, each named by a file that exists, so a walk that
+        // silently dropped a whole category fails here rather than passing quietly.
+        for expected in [
+            "machine/src/lib.rs",
+            "sfemu/src/main.rs",
+            "testrunner/src/bin/report.rs",
+            "testrunner/tests/suite.rs",
+            "m68k/benches/throughput.rs",
+            "testrunner/examples/z80smoke.rs",
+        ] {
+            assert!(
+                roots.iter().any(|r| r.to_string_lossy() == expected),
+                "`{expected}` is a crate root and must be in the list: {roots:?}"
+            );
+        }
+        // And a module of a crate is *not* a root: `timing.rs` is reached by `mod`, so
+        // the attribute in `machine/src/lib.rs` already covers it and requiring one
+        // here would be noise. A predicate that matched every `.rs` file would make
+        // the assertion above vacuous.
+        assert!(
+            !roots.iter().any(|r| r.ends_with("machine/src/timing.rs")),
+            "a `mod` file is not a crate root: {roots:?}"
+        );
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/sfemu has two ancestors")
+            .join("crates");
+        let missing: Vec<_> = roots
+            .iter()
+            .filter(|r| {
+                let text = std::fs::read_to_string(root.join(r)).expect("a readable root");
+                !text.lines().any(|l| l.trim() == "#![forbid(unsafe_code)]")
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these crate roots do not forbid unsafe code: {missing:?}"
         );
     }
 

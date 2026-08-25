@@ -20,6 +20,10 @@
 //! Run with `--release`. 1,604,000 cases with a per-T-state bus trace is slow in a
 //! debug build.
 
+// An integration test is its own crate root, so the crate's `lib.rs` attribute
+// does not reach here.
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 use testrunner::z80files::{self, Page};
 use testrunner::z80runner;

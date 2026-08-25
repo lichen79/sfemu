@@ -419,13 +419,22 @@ distinct-address cap has silently made it a sample.
 These hold across the whole workspace. Each is a line someone has already tried to
 cross.
 
-- **`#![forbid(unsafe_code)]` in all nine library crates** — `m68k`, `z80`, `video`,
-  `ym2151`, `oki`, `machine`, `romset`, `frontend`, `testrom`. Not `deny`: `forbid`
-  cannot be locally overridden. ⚠️ The binary `sfemu` and the dev harness
-  `testrunner` do **not** carry the attribute, and nothing enforces its absence of
-  `unsafe` beyond the fact that (measured 2026-08-24) neither contains the word.
-  Adding it to both would close a real gap: `sfemu` is where the two FFI-shaped
-  dependencies live, which is exactly where an `unsafe` block would be tempting.
+- **`#![forbid(unsafe_code)]` in every crate root in the workspace** — all 36 of them
+  (measured 2026-08-25), not eleven: an inner attribute applies to its own crate and no
+  other, so each of the 8 files in `testrunner/src/bin/`, the 15 integration tests, the
+  bench and the example is a separate crate that `lib.rs` does not reach. Not `deny`:
+  `forbid` cannot be locally overridden.
+
+  This used to read "all nine library crates", with the binary `sfemu` and the dev
+  harness `testrunner` outside the rule — and the evidence offered was that neither
+  contained the word `unsafe`, which is a fact about the source that day rather than a
+  rule about the next commit. The gap mattered: `sfemu` holds both FFI-shaped
+  dependencies, so it is precisely where an `unsafe` block would be tempting. Closed
+  2026-08-25, and now enforced by
+  `every_crate_root_in_the_workspace_forbids_unsafe_code` in `crates/sfemu/src/main.rs`,
+  which enumerates the roots with `confine::crate_roots` and reads the attribute out of
+  each. It asserts a floor on the root count as well, so a walk that stopped finding
+  roots fails rather than passing with nothing to check.
 - **Never panic on a guest address.** Every index into guest memory is produced by
   masking or a nonzero remainder, never by a bounds-checked slice index on guest
   arithmetic. A mis-emulated jump produces wild addresses as a matter of course, and

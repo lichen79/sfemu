@@ -39,6 +39,10 @@
 //! nothing independent verifies, and it would move every time the scheduler's
 //! interleave shifted by a T-state without anything being wrong.
 
+// An integration test is its own crate root, so the crate's `lib.rs` attribute
+// does not reach here.
+#![forbid(unsafe_code)]
+
 /// SF1's FM driver initialises the chip and plays, over two seconds.
 ///
 /// # What each assertion would catch

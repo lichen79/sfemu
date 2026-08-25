@@ -7,6 +7,9 @@
 //! it used to say "132 MB" here and "~138 MB" there, describing identical bytes
 //! in two units without naming either.
 
+// Each `bin` is its own crate root, so `lib.rs`'s attribute does not reach here.
+#![forbid(unsafe_code)]
+
 use std::path::Path;
 use std::process::Command;
 

@@ -12,6 +12,11 @@
 //! No suite's data is committed — `testdata/` is gitignored, and a missing file
 //! fails loudly naming the fetch or generate command rather than skipping.
 
+// A dev-only harness, but the same rule as the crates it tests: nothing here
+// needs `unsafe`, and a vector runner reaching for it would be papering over a
+// disagreement with the chip rather than fixing one.
+#![forbid(unsafe_code)]
+
 pub mod binfmt;
 pub mod okifiles;
 pub mod okifmt;

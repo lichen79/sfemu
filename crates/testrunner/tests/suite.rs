@@ -3,6 +3,10 @@
 //! Groups are enabled as the core learns to execute them. Run with `--release`:
 //! 2500 cases per group is slow in a debug build.
 
+// An integration test is its own crate root, so the crate's `lib.rs` attribute
+// does not reach here.
+#![forbid(unsafe_code)]
+
 use testrunner::runner::{assert_group, group_name};
 
 /// Emits one `#[test]` per group plus `REGISTERED`, the list every group name is

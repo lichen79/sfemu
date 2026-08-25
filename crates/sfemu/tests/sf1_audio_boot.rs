@@ -37,6 +37,10 @@
 //! 32 KB of the wrong thing, which sounds like noise or like nothing, and every other
 //! counter in this file stays healthy through it.
 
+// An integration test is its own crate root, so the crate's `lib.rs` attribute
+// does not reach here.
+#![forbid(unsafe_code)]
+
 /// SF1's ADPCM driver streams from the banked ROM, and the stereo mix carries audio.
 ///
 /// # What each assertion would catch

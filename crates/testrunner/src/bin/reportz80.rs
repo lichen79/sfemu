@@ -19,6 +19,9 @@
 //! Run with `--release`: 1,604,000 cases with a per-T-state bus trace is slow in a
 //! debug build.
 
+// Each `bin` is its own crate root, so `lib.rs`'s attribute does not reach here.
+#![forbid(unsafe_code)]
+
 use testrunner::z80files;
 use testrunner::z80runner;
 

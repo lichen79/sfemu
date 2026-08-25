@@ -34,6 +34,10 @@
 //! never depend on `romset` — that would drag `miniz_oxide` and `std` into the
 //! path sub-project A kept clean. `sfemu` is the crate that already joins them.
 
+// An integration test is its own crate root, so the crate's `lib.rs` attribute
+// does not reach here.
+#![forbid(unsafe_code)]
+
 /// SF2 boots, services its vblank, programs the video hardware, and stays inside
 /// the map for sixty frames.
 ///
