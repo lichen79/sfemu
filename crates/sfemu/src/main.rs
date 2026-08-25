@@ -390,6 +390,30 @@ fn cps_b_config_for(game: &str) -> Result<machine::BoardConfig, Fault> {
     })
 }
 
+/// The CPU timing a game name selects.
+///
+/// A second lookup beside [`cps_b_config_for`] rather than a field on the same row,
+/// because the two answer different questions: the CPS-B row says which *registers*
+/// a board has, and this says how fast its 68000 runs. Champion Edition shares
+/// `sf2`'s CPS-B address and differs in its clock; `sf2eb` is the other way round.
+/// Neither fact predicts the other, so a single table would invite a row that gets
+/// one right and the other wrong.
+///
+/// # Errors
+///
+/// [`Fault::Failed`] if the name has no row. As with the CPS-B lookup there is no
+/// default: 10 MHz is right for both World Warrior sets and **wrong for CE**, which
+/// would run 17% slow — a failure that never looks like a failure.
+fn timing_for(game: &str) -> Result<machine::Timing, Fault> {
+    machine::Timing::for_game(game).ok_or_else(|| {
+        Fault::Failed(format!(
+            "internal: `{game}` has no CPU timing row. Add it to \
+             `machine::Timing::for_game` — there is no default, because a wrong \
+             clock runs the game at the wrong speed and never looks broken."
+        ))
+    })
+}
+
 /// SF2 on CPS-1, from a loaded set.
 ///
 /// The four region lookups are `expect`-free and `ok_or_else`-loud for the reason
@@ -431,7 +455,9 @@ fn build_cps1(game: &str, set: &romset::RomSet) -> Result<machine::Cps1, Fault> 
         audiocpu,
         okirom,
         cps_b_config_for(game)?,
-        machine::Timing::cps1_10mhz(),
+        // Not a constant: Champion Edition's 68000 is 12 MHz where both World
+        // Warrior sets are 10. See `timing_for`.
+        timing_for(game)?,
     );
     // A cabinet as it leaves the factory, not a board with every switch off.
     //
@@ -2196,6 +2222,66 @@ mod tests {
         // Every name with a board has a spec, and no name has one without the other.
         for g in romset::games::ALL {
             assert!(board_for(g.name).is_some(), "{} has no board", g.name);
+            // And a clock. A name that `board_for` admits but `Timing::for_game`
+            // does not is a `--game` the binary accepts and then fails to build,
+            // which is `timing_for`'s "internal:" message reaching a user.
+            assert!(
+                machine::Timing::for_game(g.name).is_some(),
+                "{} has no CPU timing row",
+                g.name
+            );
+        }
+    }
+
+    /// Champion Edition's 68000 is 12 MHz; both World Warrior sets are 10.
+    ///
+    /// `cps1.cpp:15084` gives `sf2ce` the `cps1_12MHz` machine config, while
+    /// `15024`–`15026` give `sf2`, `sf2ea` and `sf2eb` the 10 MHz one. Both clocks
+    /// are marked "verified on pcb" in MAME.
+    ///
+    /// Asserted here, in the binary that chooses, and not only in `machine`: this is
+    /// the function whose answer reaches a real board, and the bug it fixes ran CE
+    /// at 5/6 speed for a month with a fully green suite — no crash, no wrong pixel,
+    /// just a game that is slow and music that drifts. The cycle counts are the
+    /// assertion rather than the clock alone, because cycles-per-frame is what the
+    /// scheduler actually consumes.
+    #[test]
+    fn champion_edition_runs_at_twelve_megahertz_and_the_others_at_ten() {
+        let ce = timing_for("sf2ce").expect("sf2ce has a timing row");
+        let ww = timing_for("sf2").expect("sf2 has a timing row");
+        let eb = timing_for("sf2eb").expect("sf2eb has a timing row");
+
+        assert_eq!(ce.cpu_hz, 12_000_000, "cps1.cpp:15084 cps1_12MHz");
+        assert_eq!(ww.cpu_hz, 10_000_000, "cps1.cpp:15024 cps1_10MHz");
+        assert_eq!(eb.cpu_hz, 10_000_000, "cps1.cpp:15026 cps1_10MHz");
+
+        // What the difference buys, as literals: 768 × 262 against 640 × 262.
+        assert_eq!(ce.cycles_per_frame(), 201_216);
+        assert_eq!(ww.cycles_per_frame(), 167_680);
+        assert_eq!(eb.cycles_per_frame(), 167_680);
+
+        // The refresh rate is *not* what changed — 12 MHz is more cycles inside the
+        // same frame, not a faster frame. A fix that sped up the pacer instead would
+        // pass the clock assertions above and be wrong about the screen.
+        assert_eq!(
+            ce.lines_per_frame, ww.lines_per_frame,
+            "same 262-line raster"
+        );
+        assert_eq!(ce.vblank_line, ww.vblank_line, "same VBSTART");
+    }
+
+    /// An unknown name has no clock, and the message says where to add one.
+    #[test]
+    fn a_game_with_no_timing_row_is_an_internal_error_naming_the_table() {
+        match timing_for("sf2ee") {
+            Err(Fault::Failed(m)) => {
+                assert!(
+                    m.contains("machine::Timing::for_game"),
+                    "names the table: {m}"
+                );
+                assert!(m.contains("sf2ee"), "names the game: {m}");
+            }
+            other => panic!("expected an error, got {:?}", other.is_ok()),
         }
     }
 

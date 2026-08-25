@@ -698,7 +698,9 @@ it.
 
 `cargo bench -p m68k` measures a mixed workload — register ops, two memory
 accesses, a shift, and a taken branch — and reports simulated MHz. CPS-1 clocks
-its 68000 at 10 MHz; the core runs it at a **72x-82x margin** (719-820 MHz
+its 68000 at 10 MHz on the World Warrior boards (12 MHz on Champion Edition's, which
+makes the margin below 60x-68x rather than 72x-82x); the core runs it at a **72x-82x
+margin** (719-820 MHz
 simulated over nine runs on the author's machine, at 9.33 cycles per
 instruction). The spread is host load, and the low end is reproducibly the first
 run after a build — quote the range, not one sample. Of the three numbers the

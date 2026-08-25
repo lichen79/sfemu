@@ -214,12 +214,34 @@ CPS-1's number as the default pacer's period.
 
 ### `Timing` is `Copy` configuration
 
-| Field | CPS-1 (`cps1_10mhz`) | SF1 (`sf1_8mhz`) |
-|---|---|---|
-| `cpu_hz` | 10,000,000 | 8,000,000 |
-| `line_cycles` | `(640, 1)` | `(3125, 6)` |
-| `lines_per_frame` | 262 | 256 |
-| `vblank_line` | 240 (`CPS_VBSTART`, `cps1.cpp:394-396`) | 240 |
+| Field | CPS-1 (`cps1_10mhz`) | CPS-1 (`cps1_12mhz`) | SF1 (`sf1_8mhz`) |
+|---|---|---|---|
+| `cpu_hz` | 10,000,000 | 12,000,000 | 8,000,000 |
+| `line_cycles` | `(640, 1)` | `(768, 1)` | `(3125, 6)` |
+| `lines_per_frame` | 262 | 262 | 256 |
+| `vblank_line` | 240 (`CPS_VBSTART`, `cps1.cpp:394-396`) | 240 | 240 |
+
+**Two CPS-1 rows, because the board is not one clock.** MAME's `cps1_12MHz`
+(`cps1.cpp:3959-3964`) calls `cps1_10MHz` and then overrides exactly one thing —
+`m_maincpu->set_clock(XTAL(12'000'000))`, marked "verified on pcb". Champion Edition
+uses it (`cps1.cpp:15084`); **every** World Warrior set uses `cps1_10MHz` (all 26 in the
+block at `cps1.cpp:15024`). sfemu ran all three of its CPS-1 sets at 10 MHz until
+2026-08-25, which gave CE 5/6 of its cycles — 83.3% speed, and nothing about the picture
+or the sound says so.
+
+`machine::Timing::for_game(name)` selects the row, in the same shape as
+`BoardConfig::for_game`: `Option`, and **no default**, because 10 MHz is right for two of
+the three names and quietly wrong for the third. It is a *second* table rather than a
+field on the CPS-B row, because the two facts do not predict each other — `sf2ce` shares
+`sf2`'s `cpsb_addr` and differs in clock, and `sf2eb` is the reverse.
+
+**The refresh rate does not change.** The line rate comes from the pixel clock, not the
+CPU: `8_000_000 / 512 = 15,625` lines per second on both boards, so 12 MHz is more cycles
+inside the same 16.768 ms frame. `12_000_000 / 15_625 = 768` exactly — the denominator
+stays 1 — and the frame budget goes from 640×262 = 167,680 to 768×262 = 201,216, a ratio
+of exactly 6/5. `frame_ns()` is per-board and correctly untouched; a "fix" that sped up
+the pacer instead would have been wrong about the screen, which is why the tests assert
+`lines_per_frame` and `vblank_line` are unchanged.
 
 `line_cycles` is a ratio and not a count because SF1's is not an integer: 8 MHz
 over 15,360 lines per second is 3125/6, and rounding it to 520 or 521 is a 0.16%
@@ -506,9 +528,6 @@ here because they need a human at a window.
 
 Recorded because an unrecorded open question becomes a wrong assumption.
 
-- **CE's CPU clock.** MAME runs `sf2ce` at `cps1_12MHz` (`cps1.cpp:15084`, read
-  2026-08-23) while sfemu uses `Timing::cps1_10mhz()` for all three CPS-1 sets. If
-  that is real, CE runs about 17% slow. Never investigated.
 - **Frame drops, at a rate that varies by an order of magnitude between sessions.**
   Four early windowed runs showed 2–3%; a 2026-08-24 session reported **3,246 of
   18,656 frames, 17.4%**. Emulation cost is ruled out: 1,200 frames of `sf2eb`

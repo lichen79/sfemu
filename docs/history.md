@@ -321,11 +321,14 @@ that does not exist.
 
 ## What this process did not achieve
 
-- **Three open questions are recorded and uninvestigated**: CE's clock (MAME runs it
-  at 12 MHz, sfemu at 10 — about 17% slow if real), the dropped-frame cause, and drift
-  in `mutate.py`'s older patterns. They are written down in
+- **Two open questions are recorded and uninvestigated**: the dropped-frame cause and
+  drift in `mutate.py`'s older patterns. They are written down in
   [architecture.md](architecture.md#open-questions) because an unrecorded open question
-  becomes a wrong assumption.
+  becomes a wrong assumption. A third — CE's clock — was on that list until 2026-08-25,
+  when it turned out to be a real bug rather than a question: MAME's `cps1_12MHz`
+  overrides the 68000's clock and nothing else, so CE had been running at 83.3% speed.
+  Recording it is what made it fixable later; the honest note is that it sat there for
+  two days while nobody could see it, because a game running 17% slow looks like a game.
 - **A green suite is not a tested codebase.** All 1,604,000 Z80 cases would pass on a
   core with no interrupt support at all — the vectors do not cover it. That sentence is
   in the README and it is the honest limit of the validation.

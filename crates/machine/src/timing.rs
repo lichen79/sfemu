@@ -33,9 +33,18 @@ pub const VBSTART: u32 = 240;
 
 /// The 68000's clock: `XTAL(10'000'000)`, "verified on pcb", `cps1.cpp:3911`.
 ///
-/// Some later CPS-1 games run at 12 MHz (`cps1_12MHz`), which is why the cycle
-/// budget is a [`Timing`] field and not a constant.
+/// Some later CPS-1 games run at 12 MHz — see [`CPU_HZ_12M`] — which is why the
+/// cycle budget is a [`Timing`] field and not a constant.
 pub const CPU_HZ_10M: u32 = 10_000_000;
+
+/// The 68000's clock on the 12 MHz CPS-1 boards: `cps1.cpp:3963`,
+/// `m_maincpu->set_clock(XTAL(12'000'000))`, also "verified on pcb".
+///
+/// Champion Edition is one of them (`cps1.cpp:15084`, `cps1_12MHz`), while **every**
+/// World Warrior set — `sf2`, `sf2ea`, `sf2eb` and the rest — is 10 MHz. The two
+/// games sit on either side of this constant, which is the whole reason the clock
+/// cannot be a property of "CPS-1": see [`Timing::for_game`].
+pub const CPU_HZ_12M: u32 = 12_000_000;
 
 /// The sound board's crystal, `XTAL(3'579'545)` — the NTSC colour subcarrier.
 ///
@@ -298,6 +307,60 @@ impl Timing {
         }
     }
 
+    /// The 12 MHz CPS-1 configuration — Champion Edition's (`cps1.cpp:3959-3964`).
+    ///
+    /// Identical to [`Timing::cps1_10mhz`] but for the CPU clock: `cps1_12MHz`
+    /// calls `cps1_10MHz` and then overrides `set_clock`, so the screen, the sound
+    /// crystal and the raster geometry are all unchanged. Only the 68000 runs
+    /// faster, which means **only [`Timing::line_cycles`] moves**.
+    ///
+    /// # Why the division is still exact
+    ///
+    /// The line rate is a property of the pixel clock, not the CPU: 8 MHz / 512 is
+    /// 15,625 lines per second on both boards. So 12,000,000 / 15,625 = **768**
+    /// exactly, and the denominator stays 1. `cps1_line_cycles_are_768_at_12mhz`
+    /// pins it from the derivation, and the frame budget is 768 × 262 = 201,216
+    /// cycles against 10 MHz's 167,680 — 20% more work per frame for the same
+    /// 16.768 ms, which is what running CE at the wrong row cost.
+    pub const fn cps1_12mhz() -> Self {
+        Self {
+            cpu_hz: CPU_HZ_12M,
+            line_cycles: (768, 1),
+            lines_per_frame: VTOTAL,
+            vblank_line: VBSTART,
+        }
+    }
+
+    /// The timing a MAME game name selects, or `None` for a name with no row.
+    ///
+    /// The same shape, and the same argument, as
+    /// [`BoardConfig::for_game`](crate::BoardConfig::for_game): the name→hardware
+    /// map belongs in the crate that owns the hardware facts, and there is **no safe
+    /// default**. A clock guessed from the board kind is wrong for one of these two
+    /// games no matter which way it is guessed, because `sf2` and `sf2ce` are the
+    /// same board family at different crystals.
+    ///
+    /// The failure mode a default would give is the one this module's header warns
+    /// about, at 120 times the magnitude: not a crash, just a game running 17% slow
+    /// with music drifting against animation. Nothing looks broken.
+    ///
+    /// `sf1` is included so this function covers every name
+    /// [`board_for`](../../sfemu/fn.board_for.html) admits — the two tables are held
+    /// to the same set of names by a test in `sfemu`.
+    #[must_use]
+    pub fn for_game(name: &str) -> Option<Self> {
+        match name {
+            // Every World Warrior revision is `cps1_10MHz` — `cps1.cpp:15024-15026`
+            // for these two, and the same for all 26 sets in that block.
+            "sf2" | "sf2eb" => Some(Self::cps1_10mhz()),
+            // `cps1.cpp:15084`, `cps1_12MHz`. The one CPS-1 game here that is not
+            // 10 MHz, and the reason this table exists.
+            "sf2ce" => Some(Self::cps1_12mhz()),
+            "sf1" => Some(Self::sf1_8mhz()),
+            _ => None,
+        }
+    }
+
     /// The 8 MHz Street Fighter 1 configuration (`sf.cpp:751-771`).
     ///
     /// 8 MHz over [`sf1_line_rate`]'s 15,360 lines per second is **3125/6**,
@@ -407,6 +470,89 @@ mod tests {
         let mut acc = RationalAccumulator::new(640, 1);
         assert_eq!(acc.advance(), 640);
         assert_eq!(acc.remainder(), 0, "and never carries");
+    }
+
+    /// The 12 MHz board's 768, from the derivation and as a hand-written literal.
+    ///
+    /// 12,000,000 / 15,625 = 768. The line *rate* is unchanged from 10 MHz — it
+    /// comes from the pixel clock, `8_000_000 / 512` — so this is the same division
+    /// with a different numerator, and it is still exact.
+    #[test]
+    fn cps1_line_cycles_are_768_at_12mhz() {
+        let t = Timing::cps1_12mhz();
+        assert_eq!(t.cpu_hz, 12_000_000, "cps1.cpp:3963 XTAL(12'000'000)");
+        assert_eq!(t.line_cycles, (768, 1), "exact, so the denominator is 1");
+        // The derivation, against the literal above.
+        assert_eq!(
+            768,
+            CPU_HZ_12M / (PIXEL_CLOCK / HTOTAL),
+            "12_000_000 / 15_625"
+        );
+        assert_eq!(
+            0,
+            CPU_HZ_12M % (PIXEL_CLOCK / HTOTAL),
+            "with no remainder, which is why the denominator is 1"
+        );
+        let mut acc = RationalAccumulator::new(768, 1);
+        assert_eq!(acc.advance(), 768);
+        assert_eq!(acc.remainder(), 0, "and never carries");
+    }
+
+    /// The 12 MHz board differs from the 10 MHz one in the CPU clock and nothing else.
+    ///
+    /// `cps1_12MHz` calls `cps1_10MHz` and overrides only `set_clock`, so this is a
+    /// transcription of that structure: a future edit that changed the raster
+    /// geometry on one board and not the other would be a board MAME does not
+    /// describe.
+    #[test]
+    fn the_twelve_megahertz_board_differs_only_in_the_cpu_clock() {
+        let a = Timing::cps1_10mhz();
+        let b = Timing::cps1_12mhz();
+        assert_eq!(a.lines_per_frame, b.lines_per_frame, "same screen");
+        assert_eq!(a.vblank_line, b.vblank_line, "same VBSTART");
+        assert_ne!(a.cpu_hz, b.cpu_hz, "and only this moves");
+        assert_ne!(a.line_cycles, b.line_cycles, "with this as its consequence");
+    }
+
+    /// The frame budgets, as literals, and the 20% gap between them.
+    ///
+    /// 640 × 262 = 167,680 and 768 × 262 = 201,216. The ratio is exactly 6/5, so
+    /// running CE at the 10 MHz row gave it 5/6 of its cycles — the game runs at
+    /// 83.3% speed, which is the 17% this fixes.
+    #[test]
+    fn the_twelve_megahertz_frame_budget_is_a_fifth_larger() {
+        assert_eq!(Timing::cps1_10mhz().cycles_per_frame(), 167_680);
+        assert_eq!(Timing::cps1_12mhz().cycles_per_frame(), 201_216);
+        // 201,216 × 5 == 167,680 × 6, i.e. exactly 6/5, written so neither side is
+        // computed from the other's expression.
+        assert_eq!(201_216 * 5, 167_680 * 6, "exactly 6/5");
+    }
+
+    /// Every name has a row, each row is its own, and an unknown name has none.
+    ///
+    /// The negative cases are the load-bearing ones. A `_ => Some(cps1_10mhz())` arm
+    /// would satisfy every positive assertion here while reintroducing precisely the
+    /// bug this table fixes — and it is the arm most likely to be added, because
+    /// three of the four names do want that value.
+    #[test]
+    fn for_game_gives_each_name_its_own_clock_and_unknown_names_none() {
+        assert_eq!(Timing::for_game("sf2"), Some(Timing::cps1_10mhz()));
+        assert_eq!(Timing::for_game("sf2eb"), Some(Timing::cps1_10mhz()));
+        assert_eq!(Timing::for_game("sf2ce"), Some(Timing::cps1_12mhz()));
+        assert_eq!(Timing::for_game("sf1"), Some(Timing::sf1_8mhz()));
+        assert_eq!(
+            Timing::for_game("sf2ee"),
+            None,
+            "a real set with no row here"
+        );
+        assert_eq!(Timing::for_game(""), None);
+        assert_eq!(Timing::for_game("SF2CE"), None, "names are exact");
+        // The one that matters: CE is not the World Warrior clock.
+        assert_ne!(
+            Timing::for_game("sf2ce").map(|t| t.cpu_hz),
+            Timing::for_game("sf2").map(|t| t.cpu_hz),
+            "cps1.cpp:15084 is cps1_12MHz, 15024 is cps1_10MHz"
+        );
     }
 
     /// SF1's geometry: 384×224 visible at (64,16), 512×256 raster, vblank at 240.

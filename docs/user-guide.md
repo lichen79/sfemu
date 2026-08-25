@@ -74,7 +74,13 @@ machine it came out of, so nothing is inferred from the path or the archive's na
 | `sf1` | Street Fighter, on its own 1987 board | `sf` |
 
 **The three CPS-1 sets are not interchangeable.** Each carries a different CPS-B
-custom part, and `--game` selects both the file list and the register row. Naming
+custom part, and `--game` selects both the file list and the register row — and, since
+2026-08-25, the CPU clock: **Champion Edition's 68000 runs at 12 MHz where both World
+Warrior sets run at 10** (MAME's `cps1_12MHz`, `cps1.cpp:3963`, "verified on pcb"). The
+refresh rate is the same 59.637 Hz on both — the extra cycles fit inside the same frame —
+so a `--game sf2ce` run before that date played the whole game at 83.3% speed, which is
+not something the picture or the sound tells you. There is no default clock for the same
+reason there is no default register row. Naming
 the wrong one usually fails at load time with the name of the file it could not
 find — which is the good outcome, because it is a load error rather than a bad
 picture. The two measured bad outcomes, for reference:
