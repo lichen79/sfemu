@@ -770,6 +770,8 @@ docs/user-guide.md   building it, supplying your own ROM set, every flag, every
 docs/history.md      how it was built: 330 commits over 20 days, the sub-project
                      order and its reasons, the methods that paid off, and every
                      false claim this process caught — including mine.
+docs/blog/           a written-up account of the same, for a reader who does not
+                     have this repository open.
 docs/hardware/       what the vectors proved about the hardware, with evidence.
 docs/superpowers/    design specs and implementation plans.
 testdata/            gitignored; fetched vectors.
