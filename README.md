@@ -761,7 +761,11 @@ crates/testrunner/   dev-only harness for the external vector suite.
 scripts/mutate.py    the mutation harness: 299 mutants over the above in 21 sets,
                      each an exact string replacement with a declared
                      expectation. 273 killed, 26 declared survivors (23 controls
-                     and 3 proven equivalents), 299/299 as expected.
+                     and 3 proven equivalents), 299/299 as expected. Run it
+                     after any refactor: a pattern is a string, so a rename
+                     turns a mutant into a NO-OP or a NO-BUILD that still reads
+                     like a row of the table. 45 of the 299 measured nothing on
+                     2026-08-25 — 43 NO-OP, 2 NO-BUILD.
 docs/architecture.md the crates, the dependency edges and why each one exists,
                      the display and audio boundaries, the frame and cycle model,
                      the save-state format, and what a green suite does not

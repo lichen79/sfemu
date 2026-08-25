@@ -319,30 +319,38 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # The prefetch offset, which is the load-bearing arithmetic in this module.
             # `pc` itself, and the offset in the wrong direction: both show an address
             # that looks entirely reasonable.
+            #
+            # ⚠️ The signature is in the pattern, not just the body. Once
+            # `the_executing_pc_is_four_behind_the_views_pc` was written, the bare
+            # `v.cpu.pc.wrapping_sub(4)` occurs twice -- here and in that test's
+            # expectation -- and a two-match pattern is a NO-OP: it measures nothing
+            # while reading as a mutant. Anchoring on `fn executing_pc` also means the
+            # test keeps its own copy of the arithmetic when this one is mutated, which
+            # is what makes it a killer rather than a mirror.
             (
                 "pc-not-adjusted-for-prefetch",
-                "    m.cpu.pc.wrapping_sub(4)",
-                "    m.cpu.pc",
+                "pub fn executing_pc(v: &CpuView<'_>) -> u32 {\n    v.cpu.pc.wrapping_sub(4)\n}",
+                "pub fn executing_pc(v: &CpuView<'_>) -> u32 {\n    v.cpu.pc\n}",
                 "KILL",
             ),
             (
                 "prefetch-offset-added",
-                "    m.cpu.pc.wrapping_sub(4)",
-                "    m.cpu.pc.wrapping_add(4)",
+                "pub fn executing_pc(v: &CpuView<'_>) -> u32 {\n    v.cpu.pc.wrapping_sub(4)\n}",
+                "pub fn executing_pc(v: &CpuView<'_>) -> u32 {\n    v.cpu.pc.wrapping_add(4)\n}",
                 "KILL",
             ),
             (
                 "prefetch-offset-one-word",
-                "    m.cpu.pc.wrapping_sub(4)",
-                "    m.cpu.pc.wrapping_sub(2)",
+                "pub fn executing_pc(v: &CpuView<'_>) -> u32 {\n    v.cpu.pc.wrapping_sub(4)\n}",
+                "pub fn executing_pc(v: &CpuView<'_>) -> u32 {\n    v.cpu.pc.wrapping_sub(2)\n}",
                 "KILL",
             ),
             # A7 from the shadow rather than the active pointer. Wrong precisely when
             # you are inside an exception handler, which is when you are reading it.
             (
                 "a7-read-from-the-shadow",
-                'let line = format!("D{i} {:08X} A{i} {:08X}", m.cpu.d[i], m.cpu.a[i]);',
-                'let line = format!("D{i} {:08X} A{i} {:08X}", m.cpu.d[i], if i == 7 { m.cpu.ssp } else { m.cpu.a[i] });',
+                'let line = format!("D{i} {:08X} A{i} {:08X}", v.cpu.d[i], v.cpu.a[i]);',
+                'let line = format!("D{i} {:08X} A{i} {:08X}", v.cpu.d[i], if i == 7 { v.cpu.ssp } else { v.cpu.a[i] });',
                 "KILL",
             ),
             # The two register labels swapped, values left where they were: the panel
@@ -351,8 +359,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # which is why `read_text` reads the whole row.
             (
                 "the-register-labels-are-swapped",
-                'let line = format!("D{i} {:08X} A{i} {:08X}", m.cpu.d[i], m.cpu.a[i]);',
-                'let line = format!("A{i} {:08X} D{i} {:08X}", m.cpu.d[i], m.cpu.a[i]);',
+                'let line = format!("D{i} {:08X} A{i} {:08X}", v.cpu.d[i], v.cpu.a[i]);',
+                'let line = format!("A{i} {:08X} D{i} {:08X}", v.cpu.d[i], v.cpu.a[i]);',
                 "KILL",
             ),
             # The listing advancing by a constant rather than by the instruction's
@@ -413,30 +421,34 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # effects, not a caller from reaching for something else. `read16` needs
             # `&mut`, which `draw` does not have, so the reachable form is a *panel*
             # that stops using `peek_word`'s honest `None`.
+            #
+            # The panel now reads through an injected `peek` closure rather than calling
+            # `m.peek_word` itself, so the mutation moved with it. The claim did not: it
+            # is still "the dump answers for an address nothing decoded".
             (
                 "the-dump-invents-a-value-for-a-gap",
-                "            match m.peek_word(a) {",
-                "            match m.peek_word(a).or(Some(0)) {",
+                "            match peek(a) {",
+                "            match peek(a).or(Some(0)) {",
                 "KILL",
             ),
             # The status line: HALT and STOP are different machines, and confusing them
             # sends you to the wrong question entirely.
             (
                 "halted-and-stopped-confused",
-                '    let run = if m.cpu.halted {\n        "HALT"\n    } else if m.cpu.stopped {\n        "STOP"',
-                '    let run = if m.cpu.halted {\n        "STOP"\n    } else if m.cpu.stopped {\n        "HALT"',
+                '    let run = if v.cpu.halted {\n        "HALT"\n    } else if v.cpu.stopped {\n        "STOP"',
+                '    let run = if v.cpu.halted {\n        "STOP"\n    } else if v.cpu.stopped {\n        "HALT"',
                 "KILL",
             ),
             (
                 "a-halted-cpu-looks-like-it-is-running",
-                "    let run = if m.cpu.halted {",
+                "    let run = if v.cpu.halted {",
                 "    let run = if false {",
                 "KILL",
             ),
             (
                 "flags-read-inverted",
-                "    let f = |bit: u16, c: char| if m.cpu.sr & bit != 0 { c } else { '-' };",
-                "    let f = |bit: u16, c: char| if m.cpu.sr & bit == 0 { c } else { '-' };",
+                "    let f = |bit: u16, c: char| if v.cpu.sr & bit != 0 { c } else { '-' };",
+                "    let f = |bit: u16, c: char| if v.cpu.sr & bit == 0 { c } else { '-' };",
                 "KILL",
             ),
             (
@@ -463,8 +475,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # black out the game when switched off.
             (
                 "panels-draw-even-when-disabled",
-                "    if p.regs {\n        draw_regs(buf, m);\n    }",
-                "    draw_regs(buf, m);",
+                "    if p.regs {\n        draw_regs(buf, v);\n    }",
+                "    draw_regs(buf, v);",
                 "KILL",
             ),
             # CONTROL: the background colour. Nothing pins it and nothing should -- the
@@ -494,8 +506,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # middle of it.
             (
                 "a-breakpoint-is-compared-against-the-pc",
-                "self.stopped_at != Some(m.total_cycles) && self.breakpoints.contains(&executing_pc(m))",
-                "self.stopped_at != Some(m.total_cycles) && self.breakpoints.contains(&m.cpu.pc)",
+                "self.stopped_at != Some(v.total_cycles) && self.breakpoints.contains(&executing_pc(v))",
+                "self.stopped_at != Some(v.total_cycles) && self.breakpoints.contains(&v.cpu.pc)",
                 "KILL",
             ),
             # The same error one step earlier: `F7` marking the PC rather than the
@@ -504,8 +516,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # instructions from where you asked.
             (
                 "f7-marks-the-pc-not-the-instruction",
-                "            let at = executing_pc(m);",
-                "            let at = m.cpu.pc;",
+                "            let at = executing_pc(v);",
+                "            let at = v.cpu.pc;",
                 "KILL",
             ),
             # The suppression that never expires: once a breakpoint has fired, it never
@@ -513,8 +525,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # you get exactly one stop and then the debugger silently does nothing.
             (
                 "the-suppression-never-expires",
-                "self.stopped_at != Some(m.total_cycles) && self.breakpoints.contains(&executing_pc(m))",
-                "self.stopped_at.is_none() && self.breakpoints.contains(&executing_pc(m))",
+                "self.stopped_at != Some(v.total_cycles) && self.breakpoints.contains(&executing_pc(v))",
+                "self.stopped_at.is_none() && self.breakpoints.contains(&executing_pc(v))",
                 "KILL",
             ),
             # The suppression recorded as an address rather than as this stop's cycle
@@ -523,16 +535,16 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # forever: set it and you can never get past it.
             (
                 "note-stopped-records-the-address",
-                "        self.stopped_at = Some(m.total_cycles);",
-                "        self.stopped_at = Some(u64::from(executing_pc(m)));",
+                "        self.stopped_at = Some(v.total_cycles);",
+                "        self.stopped_at = Some(u64::from(executing_pc(v)));",
                 "KILL",
             ),
             # The focus not reaching the scroll. Both panels move together, which reads
             # as `F6` being broken rather than as the scroll being wrong.
             (
                 "the-focus-does-not-affect-which-panel-scrolls",
-                "    fn scroll(&mut self, m: &Cps1, forward: bool) {\n        match self.focus {",
-                "    fn scroll(&mut self, m: &Cps1, forward: bool) {\n        match Focus::Disasm {",
+                "    fn scroll(&mut self, v: &CpuView<'_>, forward: bool) {\n        match self.focus {",
+                "    fn scroll(&mut self, v: &CpuView<'_>, forward: bool) {\n        match Focus::Disasm {",
                 "KILL",
             ),
             (
@@ -546,7 +558,7 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # the reset vector, nowhere near what you were reading.
             (
                 "the-first-scroll-starts-from-zero",
-                "                let from = self.disasm_at.unwrap_or_else(|| executing_pc(m));",
+                "                let from = self.disasm_at.unwrap_or_else(|| executing_pc(v));",
                 "                let from = self.disasm_at.unwrap_or(0);",
                 "KILL",
             ),
@@ -555,15 +567,15 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             (
                 "home-sets-the-current-pc-rather-than-following",
                 "                Focus::Disasm => self.disasm_at = None,",
-                "                Focus::Disasm => self.disasm_at = Some(executing_pc(m)),",
+                "                Focus::Disasm => self.disasm_at = Some(executing_pc(v)),",
                 "KILL",
             ),
             # `Home` on the dump reading the shadow stack pointer: a plausible address,
             # wrong exactly inside an exception handler, which is where you press it.
             (
                 "home-sends-the-dump-to-the-shadow-pointer",
-                "                Focus::Mem => self.mem_at = m.cpu.a[7],",
-                "                Focus::Mem => self.mem_at = m.cpu.ssp,",
+                "                Focus::Mem => self.mem_at = v.cpu.a[7],",
+                "                Focus::Mem => self.mem_at = v.cpu.ssp,",
                 "KILL",
             ),
             # A toggle that clears the list instead of removing one entry: every other
@@ -1056,29 +1068,40 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
     "pixels": (
         "crates/frontend/src/pixels.rs",
         [
+            # ⚠️ Every pattern in this set is anchored on a line the CPS-1 converter does
+            # not share with SF1's. When `argb_sf1`/`pens_to_argb_sf1` arrived, the shift
+            # expression, `out.clear();` and the `extend` all began matching twice, and a
+            # two-match pattern is a NO-OP: it measures nothing while reading as a
+            # mutant. The claims are unchanged -- `entry_to_rgb` names CPS-1's converter,
+            # `let pal = v.palette();` its palette read, and `argb(` its per-pixel call.
             (
                 "red-and-blue-swapped",
-                "    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)\n}",
-                "    (u32::from(b) << 16) | (u32::from(g) << 8) | u32::from(r)\n}",
+                "    let [r, g, b] = entry_to_rgb(entry);\n    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)\n}",
+                "    let [r, g, b] = entry_to_rgb(entry);\n    (u32::from(b) << 16) | (u32::from(g) << 8) | u32::from(r)\n}",
                 "KILL",
             ),
             (
                 "red-in-the-alpha-byte",
-                "    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)\n}",
-                "    (u32::from(r) << 24) | (u32::from(g) << 8) | u32::from(b)\n}",
+                "    let [r, g, b] = entry_to_rgb(entry);\n    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)\n}",
+                "    let [r, g, b] = entry_to_rgb(entry);\n    (u32::from(r) << 24) | (u32::from(g) << 8) | u32::from(b)\n}",
                 "KILL",
             ),
             (
                 "green-not-shifted",
-                "    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)\n}",
-                "    (u32::from(r) << 16) | u32::from(g) | u32::from(b)\n}",
+                "    let [r, g, b] = entry_to_rgb(entry);\n    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)\n}",
+                "    let [r, g, b] = entry_to_rgb(entry);\n    (u32::from(r) << 16) | u32::from(g) | u32::from(b)\n}",
                 "KILL",
             ),
-            ("buffer-never-cleared", "    out.clear();\n", "", "KILL"),
+            (
+                "buffer-never-cleared",
+                "    let pal = v.palette();\n    out.clear();\n",
+                "    let pal = v.palette();\n",
+                "KILL",
+            ),
             (
                 "only-part-of-the-frame-converted",
-                "out.extend(v.fb.pens.iter().map",
-                "out.extend(v.fb.pens.iter().take(1000).map",
+                "out.extend(v.fb.pens.iter().map(|&pen| argb(",
+                "out.extend(v.fb.pens.iter().take(1000).map(|&pen| argb(",
                 "KILL",
             ),
             (
@@ -1276,6 +1299,15 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
     "state": (
         "crates/frontend/src/state.rs",
         [
+            # ⚠️ The payload mutants below carry a neighbouring line they do not need to
+            # make their point. They need it to be *unambiguous*: `encode_sf1` writes a
+            # 68000 and a set of controls with the same field names as `encode`, so
+            # `w.i64(s.carry);` and `w.bool(s.vblank_pending);` each match twice now, and
+            # a two-match pattern is a NO-OP that measures nothing. Each extra line is
+            # one CPS-1 only has -- the sprite latch, a `u16` coin control, the `test`
+            # input, the `// Memory.` block -- and it is carried unchanged into the
+            # replacement, so the mutant is still the single edit its name describes.
+            #
             # The five refusals, each defeated in turn. A codec that accepts
             # everything is the failure mode a user only discovers when a state
             # loads as garbage.
@@ -1315,8 +1347,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # `snapshot` carries them; this proves the *bytes* do.
             (
                 "carry-omitted-from-the-payload",
-                "    w.i64(s.carry);",
-                "    w.i64(0);",
+                "    w.i64(s.carry);\n    w.words(s.obj.words());",
+                "    w.i64(0);\n    w.words(s.obj.words());",
                 "KILL",
             ),
             (
@@ -1327,8 +1359,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             ),
             (
                 "vblank-pending-omitted-from-the-payload",
-                "    w.bool(s.vblank_pending);",
-                "    w.bool(false);",
+                "    w.u16(s.coin_ctrl);\n    w.bool(s.vblank_pending);",
+                "    w.u16(s.coin_ctrl);\n    w.bool(false);",
                 "KILL",
             ),
             # Two adjacent same-width fields written in the other order. A
@@ -1336,14 +1368,14 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # which is why `every_field_survives_the_round_trip` exists.
             (
                 "two-adjacent-fields-swapped",
-                "    w.bool(s.inputs.start1);\n    w.bool(s.inputs.start2);",
-                "    w.bool(s.inputs.start2);\n    w.bool(s.inputs.start1);",
+                "    w.bool(s.inputs.start1);\n    w.bool(s.inputs.start2);\n    w.bool(s.inputs.test);",
+                "    w.bool(s.inputs.start2);\n    w.bool(s.inputs.start1);\n    w.bool(s.inputs.test);",
                 "KILL",
             ),
             (
                 "cpu-flag-bytes-swapped",
-                "    w.bool(s.cpu.halted);\n    w.bool(s.cpu.stopped);",
-                "    w.bool(s.cpu.stopped);\n    w.bool(s.cpu.halted);",
+                "    w.bool(s.cpu.halted);\n    w.bool(s.cpu.stopped);\n    w.u8(s.cpu.pending_irq);\n    w.bool(s.cpu.in_exception);\n    w.bool(s.cpu.trace_pending);\n\n    // Memory.",
+                "    w.bool(s.cpu.stopped);\n    w.bool(s.cpu.halted);\n    w.u8(s.cpu.pending_irq);\n    w.bool(s.cpu.in_exception);\n    w.bool(s.cpu.trace_pending);\n\n    // Memory.",
                 "KILL",
             ),
             # The forward polynomial instead of the reflected one: a CRC that is
@@ -1403,14 +1435,14 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # mutant that reports SURVIVE for being a no-op.
             (
                 "render-only-when-frames-ran",
-                "        m.render();\n        pens_to_argb(&m.video, &mut buf);",
-                "        pens_to_argb(&m.video, &mut buf);",
+                "        m.render();\n        // Two converters and not one generic",
+                "        // Two converters and not one generic",
                 "KILL",
             ),
             (
                 "inputs-never-reach-the-board",
-                "        m.board.inputs = a.inputs;",
-                "        let _ = a.inputs;",
+                "            Machine::Cps1(c) => c.board.inputs = a.inputs,",
+                "            Machine::Cps1(_) => { let _ = a.inputs; }",
                 "KILL",
             ),
             (
@@ -1430,8 +1462,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # one nor the running one.
             (
                 "a-refused-load-is-still-applied",
-                "        Err(e) => note(s, format!(\"cannot load `{}`: {e}\", o.state_path.display())),",
-                "        Err(_) => m.reset(),",
+                "        Machine::Cps1(c) => match frontend::decode(&bytes, o.board) {\n            Ok(state) => c.restore(&state),\n            Err(e) => note(s, format!(\"cannot load `{}`: {e}\", o.state_path.display())),",
+                "        Machine::Cps1(c) => match frontend::decode(&bytes, o.board) {\n            Ok(state) => c.restore(&state),\n            Err(_) => c.reset(),",
                 "KILL",
             ),
             (
@@ -1447,8 +1479,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # `a_saved_state_is_tagged_with_this_build_s_board` was written.
             (
                 "states-tagged-for-another-board",
-                "const BOARD: u32 = frontend::BOARD_SF2;",
-                "const BOARD: u32 = 0x5346_3100;",
+                "        machine::BoardKind::Cps1 => frontend::BOARD_SF2,",
+                "        machine::BoardKind::Cps1 => 0x5346_3100,",
                 "KILL",
             ),
             # The overlay drawn before the pen conversion rather than after. Written
@@ -1464,8 +1496,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # gone. Killed by `the_overlay_reaches_the_presented_buffer`.
             (
                 "overlay-drawn-before-the-pen-conversion",
-                "        pens_to_argb(&m.video, &mut buf);\n        // After the conversion, never before: the overlay's pixels are already\n        // `0x00RRGGBB`, while `m.video`'s are CPS-1 pens. Drawn into the pen buffer\n        // they would be run through the palette and come out as whatever colours\n        // those indices happen to name.\n        dbg.draw(&mut buf, m);",
-                "        buf.resize(machine::video::WIDTH * machine::video::HEIGHT, 0);\n        dbg.draw(&mut buf, m);\n        pens_to_argb(&m.video, &mut buf);",
+                "        match &*m {\n            Machine::Cps1(c) => pens_to_argb(&c.video, &mut buf),\n            Machine::Sf1(f) => pens_to_argb_sf1(&f.video, &mut buf),\n        }\n        // After the conversion, never before: the overlay's pixels are already\n        // `0x00RRGGBB`, while the video's are pens. Drawn into the pen buffer they\n        // would be run through the palette and come out as whatever colours those\n        // indices happen to name.\n        dbg.draw(&mut buf, &m.cpu_view(), &|a| m.peek_word(a), m);",
+                "        buf.resize(machine::video::WIDTH * machine::video::HEIGHT, 0);\n        dbg.draw(&mut buf, &m.cpu_view(), &|a| m.peek_word(a), m);\n        match &*m {\n            Machine::Cps1(c) => pens_to_argb(&c.video, &mut buf),\n            Machine::Sf1(f) => pens_to_argb_sf1(&f.video, &mut buf),\n        }",
                 "KILL",
             ),
             # CONTROL: the title's exact wording. Nothing pins the phrasing, and
@@ -1489,8 +1521,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # over your screenshot and F12 a screenshot over your save.
             (
                 "state-and-shot-paths-swapped",
-                "        state_path: args.state.clone(),\n        shot_path: default_shot_path(&args.path),",
-                "        state_path: default_shot_path(&args.path),\n        shot_path: args.state.clone(),",
+                "        state_path: args.state.clone(),\n        shot_path: default_shot_path(args.source.stem()),",
+                "        state_path: default_shot_path(args.source.stem()),\n        shot_path: args.state.clone(),",
                 "KILL",
             ),
             # CONTROL: the same two fields, written in the other order. A struct
@@ -1500,8 +1532,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # above must not.
             (
                 "CONTROL-initializer-field-order",
-                "        state_path: args.state.clone(),\n        shot_path: default_shot_path(&args.path),",
-                "        shot_path: default_shot_path(&args.path),\n        state_path: args.state.clone(),",
+                "        state_path: args.state.clone(),\n        shot_path: default_shot_path(args.source.stem()),",
+                "        shot_path: default_shot_path(args.source.stem()),\n        state_path: args.state.clone(),",
                 "SURVIVE",
             ),
         ],
@@ -1592,8 +1624,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # pattern is a NO-OP rather than a result.
             (
                 "enter-always-acts-on-the-tile-view",
-                "    fn act(&mut self) {\n        match self.state.view {",
-                "    fn act(&mut self) {\n        match View::Tiles {",
+                "    fn act(&mut self, m: &Machine) {\n        match m {\n            Machine::Cps1(_) => match self.view {",
+                "    fn act(&mut self, m: &Machine) {\n        match m {\n            Machine::Cps1(_) => match View::Tiles {",
                 "KILL",
             ),
             # The guard genuinely removed, not disabled: a hidden viewer that cycles
@@ -1611,21 +1643,21 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             (
                 "toggling-the-viewer-clears-the-mask",
                 "        if a.gfx_toggled {\n            self.on = !self.on;\n        }",
-                "        if a.gfx_toggled {\n            self.on = !self.on;\n            self.state.mask = LayerMask::all();\n        }",
+                "        if a.gfx_toggled {\n            self.on = !self.on;\n            self.cps1.mask = LayerMask::all();\n        }",
                 "KILL",
             ),
             (
                 "the-cursor-keeps-following-after-a-move",
-                "                self.state.map_at = Some((c, r));",
-                "                self.state.map_at = None;",
+                "                    self.cps1.map_at = Some((col, r));",
+                "                    self.cps1.map_at = None;",
                 "KILL",
             ),
             # The reset dropped from the layer arm, anchored on its comment so the
             # pattern does not also match the assignment in `step`.
             (
                 "a-new-layer-keeps-the-old-cursor",
-                "                // old one means nothing. Back to following the beam.\n                self.state.map_at = None;",
-                "                // old one means nothing. Back to following the beam.",
+                "                    self.cps1.layer = next_layer(self.cps1.layer);\n                    self.cps1.map_at = None;",
+                "                    self.cps1.layer = next_layer(self.cps1.layer);",
                 "KILL",
             ),
             ("the-viewer-starts-shown", "            on: false,", "            on: true,", "KILL"),
@@ -1651,8 +1683,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             ),
             (
                 "the-row-selection-sticks-at-the-top",
-                "                    (self.state.row + ROWS - 1) % ROWS",
-                "                    self.state.row.saturating_sub(1)",
+                "                        (self.cps1.row + ROWS - 1) % ROWS",
+                "                        self.cps1.row.saturating_sub(1)",
                 "KILL",
             ),
             # Two rows sharing a layer: the table that is right in three places and
@@ -1684,8 +1716,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # value at all.
             (
                 "CONTROL-initial-state-field-order",
-                "                map_at: None,\n                row: 0,",
-                "                row: 0,\n                map_at: None,",
+                "                map_at: None,\n                row: 0,\n                mask: LayerMask::all(),",
+                "                row: 0,\n                map_at: None,\n                mask: LayerMask::all(),",
                 "SURVIVE",
             ),
         ],
@@ -2926,8 +2958,8 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             # a DC excursion the device filters out.
             (
                 "ringholdzero",
-                "*slot = self.last;",
-                "*slot = 0;",
+                "                slot.copy_from_slice(&self.last);",
+                "                slot.fill(0);",
                 "KILL",
                 "crates/machine/src/resample.rs",
             ),
@@ -2936,7 +2968,7 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             (
                 "ringpaused",
                 """            } else if paused {
-                *slot = 0;
+                slot.fill(0);
             } else {
 """,
                 "            } else {\n",
@@ -2945,12 +2977,16 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
             ),
             # --- The panel and the save state (`frontend`) ---
             # The sound panel's header one row short of what it draws.
+            #
+            # ⚠️ The panel moved out of `overlay.rs` into `sndpanel.rs` when SF1 got its
+            # own, and `SND_HEAD_ROWS` was renamed `CPS1_HEAD_ROWS` at the same value.
+            # Both this mutant and `overlaystats` followed it. Neither claim changed.
             (
                 "sndheadrows",
-                "const SND_HEAD_ROWS: usize = 11;",
-                "const SND_HEAD_ROWS: usize = 10;",
+                "pub const CPS1_HEAD_ROWS: usize = 11;",
+                "pub const CPS1_HEAD_ROWS: usize = 10;",
                 "KILL",
-                "crates/frontend/src/overlay.rs",
+                "crates/frontend/src/sndpanel.rs",
             ),
             # The CLP/DRP/UND row deleted, so the panel cannot answer "why does it sound
             # wrong" and 11 rows no longer describes what is drawn.
@@ -2970,14 +3006,14 @@ SETS: dict[str, tuple[str, list[tuple[str, ...]]]] = {
 """,
                 "",
                 "KILL",
-                "crates/frontend/src/overlay.rs",
+                "crates/frontend/src/sndpanel.rs",
             ),
             # The save-state version left behind after the payload grew, so an old state
             # loads into a struct that no longer matches it.
             (
                 "stateversion",
+                "pub const VERSION: u8 = 4;",
                 "pub const VERSION: u8 = 3;",
-                "pub const VERSION: u8 = 2;",
                 "KILL",
                 "crates/frontend/src/state.rs",
             ),

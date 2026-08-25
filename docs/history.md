@@ -223,6 +223,23 @@ Actual: **299 in 21, 273 killed**. Caught by executing `scripts/mutate.py` and c
 rather than reading the prose. The drift was the key menu — `keys` went 21→31 and
 `menu` was new at 16.
 
+**"299 mutants, 273 killed" — the count was right and the claim was still false.**
+Fixed 2026-08-25. Counting the rows in `SETS` is not the same as checking they still
+match the source, and **43 of the 299 (14%) matched zero or two times**, which the
+harness scores `NO-OP`: nothing applied, nothing measured, and a row in the table that
+reads exactly like a kill. Two causes. A rename — `draw`'s `m: &Machine` became
+`v: &CpuView`, `SND_HEAD_ROWS` moved to `sndpanel::CPS1_HEAD_ROWS`, `*slot = x` became
+`slot.fill(x)` when the audio ring went stereo. And **a second board**: SF1 gave
+`pixels.rs`, `state.rs`, `gfx.rs` and `loop_.rs` a parallel path with the same field
+names, so patterns that had been unique started matching *twice* — the `NO-OP` nobody
+looks for, because the code the pattern names is still sitting right there. Every one
+is repaired, and re-running the six affected sets found two more that the audit could
+not see: mutants whose `old` matched but whose *replacement* still said `m.`, so they
+had been reporting `NO-BUILD` — the verdict that exists to catch exactly that, and
+which nobody had read either. The check is one command, `--all`, and its own docstring
+says why it must be that: "a set that has started reporting NO-OP because the code it
+mutates was reworded is invisible when you only run the set you are working on."
+
 **"Six tests are the documented exception."** Actual: **seven**. `boot.rs` had gained
 CE's attract-mode test after that sentence was written, so the prose describing the
 one-variable ROM-gating rule failed to name a test the rule covered.

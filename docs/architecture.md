@@ -484,6 +484,29 @@ measures the *core*; it says nothing about the hand-written tests.
 - **A no-op is a distinct verdict.** A pattern that matches zero or several times
   is reported as `NO-OP`, not as a kill — a mutant that never applied is not a
   mutant that was caught.
+- **Patterns rot, and the rot is silent.** ⚠️ A pattern is a string, so any rewording
+  of the code it names turns it into a `NO-OP` — and a `NO-OP` looks like a row in a
+  table, not like a hole. On 2026-08-25 an audit of all 299 patterns found **43 of
+  them (14%) matching zero or two times**, so the documented "273 killed, 299/299 as
+  expected" had not been true of the tree for some time. Two causes, both from later
+  sub-projects: a rename (`draw`'s `m: &Machine` became `v: &CpuView`, `SND_HEAD_ROWS`
+  became `sndpanel::CPS1_HEAD_ROWS`, `*slot = x` became `slot.fill(x)` when the ring
+  went stereo), and **a second board**. SF1's arrival gave `pixels.rs`, `state.rs`,
+  `gfx.rs` and `loop_.rs` a parallel path with the same field names, so patterns that
+  had been unique started matching twice — the `NO-OP` case nobody expects, because
+  the code the pattern names is still right there. Every one is repaired and every
+  repaired mutant re-run; the fix for the ambiguous ones is an anchor only the CPS-1
+  path has. **Run `--all` after any refactor**, which is what its docstring says and
+  what nobody did.
+- **Auditing the patterns is not enough — the replacements rot too.** ⚠️ The audit above
+  reads each mutant's `old` string, and re-running the six repaired sets found two more
+  it could not see: `debug/home-sets-the-current-pc-rather-than-following` and
+  `gfx/toggling-the-viewer-clears-the-mask`, whose patterns matched but whose *new* text
+  still said `executing_pc(m)` and `self.state.mask`. Both had been reporting
+  `NO-BUILD` — nothing measured — and both were repaired and confirmed killed. There is
+  no static check for this: a replacement introduces code that is *supposed* to be
+  absent from the file, so only an actual run can tell a deliberate new expression from
+  a stale one. Which is the argument for running the sets rather than auditing them.
 - **A timeout scores as a kill**, so `MUTANT_TIMEOUT_S` has to exceed a full
   rebuild. It is 600 s: the tree takes over 70 s to compile, and at 120 s the
   harness was scoring rebuilds as kills.
