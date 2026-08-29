@@ -2371,6 +2371,15 @@ mod tests {
         assert!(stall.contains("late ticks    1"), "{stall}");
         assert!(stall.contains("worst tick    2000.0 ms"), "{stall}");
         assert!(stall.contains("owed/tick     0 0 0 0 0 1"), "{stall}");
+        // 4 frames over 1 tick × 16.768 ms = 67.1 ms, and *not* the 2,000 ms the tick
+        // really took: the mean is built from frames served, so it under-reports by
+        // exactly the dropped frames. That is documented rather than fixed — see
+        // `play_report` — and this literal is what holds the documentation honest. A
+        // mean that folded `dropped` back in would print 1,996.4 ms here.
+        assert!(
+            stall.contains("mean tick     67.1 ms"),
+            "the mean counts frames served, not frames owed: {stall}"
+        );
 
         let mut owed = [0u64; frontend::OWED_BUCKETS];
         owed[frontend::OWED_BUCKETS - 1] = 115;
