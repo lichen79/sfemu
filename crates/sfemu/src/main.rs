@@ -1802,6 +1802,93 @@ mod tests {
         }
     }
 
+    /// Every local image the README references exists, and the demo poster is one.
+    ///
+    /// The README is the project's front page on a public repository, and a broken
+    /// image there is invisible from inside the repository: `cargo test` does not read
+    /// markdown, and the author's own checkout renders it from disk whether or not the
+    /// file was ever committed. `docs/sfemu-poster.png` is the specific trap — it sits
+    /// beside three `docs/*.mp4` files that `.gitignore` deliberately excludes, so one
+    /// careless `/docs/*` broadening of that rule turns the front page's only picture
+    /// into a broken-image icon for everyone but the author.
+    ///
+    /// Scoped to *local* paths on purpose. The release-asset URLs the README also names
+    /// cannot be checked here: this workspace's rule is that no test touches the
+    /// network, and a test that did would fail on a plane rather than on a mistake.
+    ///
+    /// The poster is asserted by name as well as by scan, because a scan alone passes
+    /// on a README that stopped mentioning the demo at all.
+    #[test]
+    fn every_local_image_the_readme_references_exists() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/sfemu has two ancestors")
+            .to_path_buf();
+        let readme = std::fs::read_to_string(root.join("README.md")).expect("a readable README");
+
+        // `![alt](path)` and `[![alt](path)](href)` both put the image path in the
+        // first parenthesised group after a `]`. Only `docs/`-relative ones are local.
+        let mut found = Vec::new();
+        for (i, _) in readme.match_indices("](docs/") {
+            let from = i + 2;
+            let len = readme[from..]
+                .find(')')
+                .expect("a markdown link's parenthesis closes");
+            let path = &readme[from..from + len];
+            if path.ends_with(".png") || path.ends_with(".jpg") || path.ends_with(".gif") {
+                found.push(path.to_owned());
+            }
+        }
+
+        assert!(
+            found.iter().any(|p| p == "docs/sfemu-poster.png"),
+            "the README must show the demo poster; found these local images: {found:?}"
+        );
+        for path in &found {
+            let on_disk = root.join(path);
+            assert!(
+                on_disk.is_file(),
+                "the README references `{path}`, which is not a file: {on_disk:?}"
+            );
+        }
+    }
+
+    /// The recordings stay out of git, and the poster stays in.
+    ///
+    /// Two published cuts of the demo are 30 MB of H.264 against 7.3 MB of tracked
+    /// source, and a blob that size is in every clone forever — `git rm` later does not
+    /// remove it from history. They live in a GitHub release instead. The poster is the
+    /// deliberate exception at 126 KB, because the README needs it inline.
+    ///
+    /// This asserts the *rule*, not today's directory: a `.gitignore` that lost its
+    /// `/docs/*.mp4` line would let the next `git add -A` commit whichever recording
+    /// happens to be sitting there, and nothing else in the suite would notice.
+    #[test]
+    fn the_gitignore_excludes_recordings_but_not_the_poster() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/sfemu has two ancestors")
+            .to_path_buf();
+        let ignore =
+            std::fs::read_to_string(root.join(".gitignore")).expect("a readable .gitignore");
+
+        assert!(
+            ignore.lines().any(|l| l.trim() == "/docs/*.mp4"),
+            "`.gitignore` must exclude the recordings: a 30 MB blob cannot be taken \
+             back out of history"
+        );
+        // And must not exclude the whole directory, which would take the poster and
+        // all four prose documents with it.
+        for too_broad in ["/docs", "/docs/", "/docs/*", "docs/"] {
+            assert!(
+                !ignore.lines().any(|l| l.trim() == too_broad),
+                "`{too_broad}` would ignore the poster and the docs as well"
+            );
+        }
+    }
+
     /// The keys the usage text names are the keys the map actually presses.
     ///
     /// The usage text is the only place most people will read the controls, and it is

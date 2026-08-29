@@ -10,6 +10,27 @@ cargo run -p sfemu --release -- /path/to/your/sf.zip --play --game sf1
 
 No ROM set? `cargo run -p sfemu --release -- --demo --play` needs no files at all.
 
+## It runs
+
+[![Street Fighter II running on sfemu — Ryu against Dhalsim, CPS-1 hardware emulated in Rust](docs/sfemu-poster.png)](https://github.com/lichen79/sfemu/releases/download/v0.1.0/sfemu-github.mp4)
+
+**▶ [Watch the 56-second demo, with sound](https://github.com/lichen79/sfemu/releases/download/v0.1.0/sfemu-github.mp4)** — Street Fighter II, World 910214
+revision, on the emulated CPS-1 board. Player select, a round against Dhalsim,
+and the FM and ADPCM chips audible throughout.
+
+The clip is a release asset rather than an embedded `<video>`, and the image
+above is a poster frame that links to it. That is not a stylistic choice: GitHub's
+markdown sanitizer strips `<video>` from a committed README — verified against the
+`/markdown` API, which returns an empty `<p>` for it — and it renders video only
+for files uploaded through its own comment box. Hosting the file in
+[the v0.1.0 release](https://github.com/lichen79/sfemu/releases/tag/v0.1.0) also
+keeps 30 MB of H.264 out of a repository whose tracked source is 7.3 MB.
+
+A second cut of the same session,
+[`sfemu-linkedin.mp4`](https://github.com/lichen79/sfemu/releases/download/v0.1.0/sfemu-linkedin.mp4),
+is a 1080×1350 portrait card with captions burned in, for feeds that autoplay
+muted in a vertical column.
+
 Three documents sit beside this one. **[docs/user-guide.md](docs/user-guide.md)** is
 the practical one: building it, supplying your own set, every flag, every key, the
 key menu, save states, the debugger, the viewers, and a troubleshooting table.

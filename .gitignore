@@ -5,3 +5,8 @@ Cargo.lock
 /.worktrees
 /.superpowers
 __pycache__/
+# Screen recordings and the cuts made from them. They live in a GitHub release,
+# not in git: the two published cuts are 30 MB against 7.3 MB of tracked source,
+# and a binary that large is in every clone forever. `docs/sfemu-poster.png` is
+# committed on purpose — it is 126 KB and the README needs it inline.
+/docs/*.mp4
