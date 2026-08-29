@@ -12,19 +12,29 @@ No ROM set? `cargo run -p sfemu --release -- --demo --play` needs no files at al
 
 ## It runs
 
-[![Street Fighter II running on sfemu — Ryu against Dhalsim, CPS-1 hardware emulated in Rust](docs/sfemu-poster.png)](https://github.com/lichen79/sfemu/releases/download/v0.1.0/sfemu-github.mp4)
+![Street Fighter II running on sfemu — Ryu against Dhalsim, CPS-1 hardware emulated in Rust](docs/sfemu-demo.gif)
 
-**▶ [Watch the 56-second demo, with sound](https://github.com/lichen79/sfemu/releases/download/v0.1.0/sfemu-github.mp4)** — Street Fighter II, World 910214
-revision, on the emulated CPS-1 board. Player select, a round against Dhalsim,
-and the FM and ADPCM chips audible throughout.
+Six seconds of the real thing, at native 384×224. Street Fighter II, World 910214
+revision, on the emulated CPS-1 board.
 
-The clip is a release asset rather than an embedded `<video>`, and the image
-above is a poster frame that links to it. That is not a stylistic choice: GitHub's
-markdown sanitizer strips `<video>` from a committed README — verified against the
-`/markdown` API, which returns an empty `<p>` for it — and it renders video only
-for files uploaded through its own comment box. Hosting the file in
+**▶ [Watch the full 56 seconds, with sound](https://github.com/lichen79/sfemu/releases/download/v0.1.0/sfemu-github.mp4)** — player select,
+a full round against Dhalsim, and the YM2151 FM and OKI ADPCM chips audible
+throughout. A GIF cannot carry audio, and this emulator's harder half is the sound.
+
+The moving image above is a GIF and the clip with sound is a release asset,
+because a committed README cannot embed a video on GitHub. That is measured, not
+assumed: a `<video>` tag, a `<video><source>` pair, and `![](…mp4)` were each
+committed to a branch and fetched back through all three renderers — the
+`/markdown` API, the `contents` API's HTML media type, and the live repository
+page. Every one returns zero `<video>` elements; the image syntax survives as an
+`<img>` pointing at an mp4, which is a broken image rather than a player. GitHub
+does render an inline player, but only for URLs on its `user-attachments` host,
+and those are minted by dragging a file into the web UI — the upload endpoint
+rejects a personal access token, so nothing in this repository can produce one.
+[`scripts/readme-video.md`](scripts/readme-video.md) is the two-minute manual
+procedure if you want the player. Keeping the H.264 in
 [the v0.1.0 release](https://github.com/lichen79/sfemu/releases/tag/v0.1.0) also
-keeps 30 MB of H.264 out of a repository whose tracked source is 7.3 MB.
+keeps 30 MB out of a repository whose tracked source is 7.3 MB; the GIF costs 1.7 MB.
 
 A second cut of the same session,
 [`sfemu-linkedin.mp4`](https://github.com/lichen79/sfemu/releases/download/v0.1.0/sfemu-linkedin.mp4),

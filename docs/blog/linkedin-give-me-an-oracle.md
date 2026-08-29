@@ -89,9 +89,11 @@ them.
 One more, found while writing this post: the caption burned into the demo video said
 "1,880 tests" when the suite reported 1,882. A published claim about the repository that
 nothing in the repository checked. There's a test for it now — and adding that test took
-the count to 1,884, so the first literal I wrote was already stale by one.
+the count to 1,884, so the first literal I wrote was already stale by one. Then two more
+tests took it to 1,886 and the guard didn't notice — it compares two hand-written numbers,
+so a drift that misses both reads as agreement.
 
-The emulator runs. 1,884 tests, no unsafe code, 299 mutants each with a declared verdict.
+The emulator runs. 1,886 tests, no unsafe code, 299 mutants each with a declared verdict.
 Both sound chips verified sample-for-sample. MIT, and it ships no ROMs — you supply a set
 you own.
 

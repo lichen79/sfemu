@@ -91,7 +91,11 @@ def bottom_band():
         # `crates/sfemu/src/main.rs`: this line is a claim about the repository burned
         # into a published video, and it had already drifted once (it said 1,880 at
         # 1,882). Changing the count means re-rendering and re-uploading the cut.
-        "Written in Rust. 1,884 tests. No unsafe code.",
+        # Drifted a second time at 1,884, when two tests guarding the README's demo GIF
+        # took the suite to 1,886 — the guarding test compares two literals, so it saw
+        # nothing. Re-read the real total from `cargo test --workspace` before trusting
+        # this line.
+        "Written in Rust. 1,886 tests. No unsafe code.",
         ImageFont.truetype(str(REGULAR), 35),
         WHITE,
     )

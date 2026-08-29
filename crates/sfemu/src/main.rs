@@ -1830,21 +1830,21 @@ mod tests {
         }
     }
 
-    /// Every local image the README references exists, and the demo poster is one.
+    /// Every local image the README references exists, and the demo GIF is one.
     ///
     /// The README is the project's front page on a public repository, and a broken
     /// image there is invisible from inside the repository: `cargo test` does not read
     /// markdown, and the author's own checkout renders it from disk whether or not the
-    /// file was ever committed. `docs/sfemu-poster.png` is the specific trap — it sits
+    /// file was ever committed. `docs/sfemu-demo.gif` is the specific trap — it sits
     /// beside three `docs/*.mp4` files that `.gitignore` deliberately excludes, so one
-    /// careless `/docs/*` broadening of that rule turns the front page's only picture
-    /// into a broken-image icon for everyone but the author.
+    /// careless `/docs/*` broadening of that rule turns the front page's only moving
+    /// picture into a broken-image icon for everyone but the author.
     ///
     /// Scoped to *local* paths on purpose. The release-asset URLs the README also names
     /// cannot be checked here: this workspace's rule is that no test touches the
     /// network, and a test that did would fail on a plane rather than on a mistake.
     ///
-    /// The poster is asserted by name as well as by scan, because a scan alone passes
+    /// The GIF is asserted by name as well as by scan, because a scan alone passes
     /// on a README that stopped mentioning the demo at all.
     #[test]
     fn every_local_image_the_readme_references_exists() {
@@ -1870,8 +1870,8 @@ mod tests {
         }
 
         assert!(
-            found.iter().any(|p| p == "docs/sfemu-poster.png"),
-            "the README must show the demo poster; found these local images: {found:?}"
+            found.iter().any(|p| p == "docs/sfemu-demo.gif"),
+            "the README must show the demo GIF; found these local images: {found:?}"
         );
         for path in &found {
             let on_disk = root.join(path);
@@ -1882,18 +1882,126 @@ mod tests {
         }
     }
 
-    /// The recordings stay out of git, and the poster stays in.
+    /// The demo GIF animates, loops forever, and is the board's native resolution.
+    ///
+    /// Four ways to break the front page while leaving a file that `is_file()` and every
+    /// image viewer accepts, which is all the scan above proves:
+    ///
+    ///   * a single-frame GIF — a still, silently, where a demo was promised;
+    ///   * a GIF89a without the `NETSCAPE2.0` application block, which plays once and
+    ///     then sits on its last frame for every visitor who arrives after it finishes;
+    ///   * the same block with a non-zero loop count, which is the same failure delayed;
+    ///   * a rescale off 384×224, which is what CPS-1 actually outputs. At other sizes
+    ///     the browser resamples and the pixel art goes soft — the one property this
+    ///     project's video is supposed to demonstrate.
+    ///
+    /// Read from the bytes rather than through an image crate: the GIF89a header and the
+    /// loop extension are fixed-offset and self-describing, and this binary's dependency
+    /// list is not worth widening to assert three fields.
+    #[test]
+    fn the_demo_gif_loops_at_the_boards_native_resolution() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/sfemu has two ancestors")
+            .to_path_buf();
+        let gif = std::fs::read(root.join("docs/sfemu-demo.gif")).expect("a readable demo GIF");
+
+        // GIF89a, not GIF87a: the loop extension this test requires is a GIF89a feature
+        // and an 87a file cannot carry one.
+        assert_eq!(&gif[..6], b"GIF89a", "the demo must be a GIF89a");
+
+        // Logical screen size, little-endian, at bytes 6..10 of the header.
+        let width = u16::from(gif[6]) | u16::from(gif[7]) << 8;
+        let height = u16::from(gif[8]) | u16::from(gif[9]) << 8;
+        assert_eq!(
+            (width, height),
+            (384, 224),
+            "CPS-1 outputs 384x224 and the GIF must not resample it"
+        );
+
+        // `\x21\xff\x0bNETSCAPE2.0` then a 3-byte sub-block: `\x03\x01` and a
+        // little-endian loop count, where 0 means forever.
+        let at = gif
+            .windows(11)
+            .position(|w| w == b"NETSCAPE2.0")
+            .expect("a NETSCAPE2.0 application block, or the GIF plays once and stops");
+        let loops = u16::from(gif[at + 14]) | u16::from(gif[at + 15]) << 8;
+        assert_eq!(loops, 0, "the loop count must be 0 (forever), not {loops}");
+
+        // Every frame after the first is introduced by a graphic control extension,
+        // `\x21\xf9\x04`. One of those means a still image with a delay on it.
+        let frames = gif.windows(3).filter(|w| *w == b"\x21\xf9\x04").count();
+        assert!(frames > 24, "a demo needs more than {frames} frames");
+    }
+
+    /// The README's video procedure is documented, and says why it cannot be automated.
+    ///
+    /// GitHub renders an inline player only for `user-attachments` URLs, and those are
+    /// minted by a browser upload — `POST /upload/policies/assets` answers a personal
+    /// access token with an error page. So the one form that plays with sound is the one
+    /// form no script here can produce, and that asymmetry is the whole reason the README
+    /// shows a silent GIF. A reader who does not know it will read the GIF as a choice
+    /// and try `<video>`, which three separate renderers strip.
+    ///
+    /// This asserts the pointer and the reason, not the prose: a README that quietly
+    /// stopped linking the procedure, or a procedure that stopped naming the host it
+    /// depends on, both leave the next person to rediscover the measurement.
+    #[test]
+    fn the_readme_video_procedure_matches_the_readme() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/sfemu has two ancestors")
+            .to_path_buf();
+        let readme = std::fs::read_to_string(root.join("README.md")).expect("a readable README");
+        let procedure = std::fs::read_to_string(root.join("scripts/readme-video.md"))
+            .expect("a readable video procedure");
+
+        assert!(
+            readme.contains("scripts/readme-video.md"),
+            "the README must link the procedure that gets a real player"
+        );
+        // The host is the load-bearing fact. Everything else in that file is steps.
+        assert!(
+            procedure.contains("user-attachments"),
+            "the procedure must name the host GitHub renders a player for"
+        );
+        // And the reason it is manual, so nobody spends an afternoon looking for the API.
+        assert!(
+            procedure.contains("/upload/policies/assets"),
+            "the procedure must name the endpoint that refuses a token"
+        );
+        // No *live* `<video>` element: GitHub strips it, measured against three
+        // renderers, and someone reading the GIF as a stylistic choice is the likeliest
+        // way it comes back. The README discusses the tag in backticks, which is the
+        // point of the section, so a bare `contains("<video")` would fire on the
+        // explanation rather than on the mistake — hence the backtick test. That
+        // distinction is exactly why this assertion earns its comment: a naive version
+        // of it fails on the very prose that documents the finding.
+        for (i, _) in readme.match_indices("<video") {
+            let quoted = i > 0 && readme.as_bytes()[i - 1] == b'`';
+            assert!(
+                quoted,
+                "an unquoted `<video>` at byte {i}: GitHub strips it — see \
+                 scripts/readme-video.md"
+            );
+        }
+    }
+
+    /// The recordings stay out of git, and the demo GIF stays in.
     ///
     /// Two published cuts of the demo are 30 MB of H.264 against 7.3 MB of tracked
     /// source, and a blob that size is in every clone forever — `git rm` later does not
-    /// remove it from history. They live in a GitHub release instead. The poster is the
-    /// deliberate exception at 126 KB, because the README needs it inline.
+    /// remove it from history. They live in a GitHub release instead. The GIF is the
+    /// deliberate exception at 1.7 MB, because it is the only moving image a README can
+    /// actually play: GitHub strips `<video>`, so the alternative is a still.
     ///
     /// This asserts the *rule*, not today's directory: a `.gitignore` that lost its
     /// `/docs/*.mp4` line would let the next `git add -A` commit whichever recording
     /// happens to be sitting there, and nothing else in the suite would notice.
     #[test]
-    fn the_gitignore_excludes_recordings_but_not_the_poster() {
+    fn the_gitignore_excludes_recordings_but_not_the_demo_gif() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
@@ -1907,12 +2015,19 @@ mod tests {
             "`.gitignore` must exclude the recordings: a 30 MB blob cannot be taken \
              back out of history"
         );
-        // And must not exclude the whole directory, which would take the poster and
+        // And must not exclude the whole directory, which would take the demo GIF and
         // all four prose documents with it.
         for too_broad in ["/docs", "/docs/", "/docs/*", "docs/"] {
             assert!(
                 !ignore.lines().any(|l| l.trim() == too_broad),
-                "`{too_broad}` would ignore the poster and the docs as well"
+                "`{too_broad}` would ignore the demo GIF and the docs as well"
+            );
+        }
+        // The GIF is the exception the mp4 rule needs, so no pattern may swallow it.
+        for swallows in ["/docs/*.gif", "docs/*.gif", "*.gif"] {
+            assert!(
+                !ignore.lines().any(|l| l.trim() == swallows),
+                "`{swallows}` would ignore the README's only moving image"
             );
         }
     }
@@ -1937,13 +2052,23 @@ mod tests {
     /// 1,884, so the literal below had to be written *after* the assertion existed —
     /// the first value I wrote was already stale by one, which is the whole hazard in
     /// miniature. Any future test added anywhere in the workspace moves this number,
-    /// including a test added to guard some other published claim.
+    /// including a test added to guard some other published claim. That happened
+    /// immediately: the two tests guarding the README's demo GIF took it to 1,886, and
+    /// this assertion did **not** fail — because both literals it compares are
+    /// hand-maintained, so a drift that misses both reads as agreement.
+    ///
+    /// That is this test's structural limit, and it is worth stating plainly rather
+    /// than trusting: it detects a *half-done* edit, not a stale pair. Only running the
+    /// suite and reading the total detects the pair, and no test can do that from
+    /// inside the suite it would have to count. So the honest scope is narrow — it
+    /// stops the caption and the repository's own record of the caption from diverging,
+    /// and nothing more.
     #[test]
     fn the_video_caption_states_the_current_test_count() {
         /// `cargo test --workspace`, summed over every `test result:` line, on
         /// 2026-08-29 — with this test included in the total. A literal because
         /// nothing can compute it.
-        const WORKSPACE_TESTS: &str = "1,884";
+        const WORKSPACE_TESTS: &str = "1,886";
 
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1963,7 +2088,13 @@ mod tests {
         );
         // And no *other* four-digit test count, which is what a half-done edit leaves:
         // a corrected line plus a stale one somewhere else in the bands.
-        for stale in ["1,880 tests", "1,881 tests", "1,882 tests", "1,883 tests"] {
+        for stale in [
+            "1,880 tests",
+            "1,881 tests",
+            "1,882 tests",
+            "1,883 tests",
+            "1,884 tests",
+        ] {
             assert!(
                 !script.contains(stale),
                 "a stale count is still in the caption: `{stale}`"

@@ -314,6 +314,23 @@ load-bearing — I had reasoned about which of two causes they would distinguish
 figures I had made up. When the real reading arrived on 2026-08-29 it was **neither of
 the two cases I had framed**, and it condemned the instrument itself. See below.
 
+**A platform limit measured through one door.** The README explained that the demo was a
+release-asset link rather than an embedded video "because GitHub's markdown sanitizer
+strips `<video>` — verified against the `/markdown` API". The conclusion was right; the
+verification was one renderer out of three, and I had published it as settled. Asked to
+put the video in the README, the honest move was to doubt my own sentence: I committed
+each candidate form to a throwaway branch and read it back through the `/markdown` API,
+the `contents` API's HTML media type, and the live repository page. All three strip
+`<video>`. But the same probes turned up what a single-door check had hidden — GitHub
+*does* render an inline player, keyed on its `user-attachments` host, injected
+client-side where no `curl` can see it; and `POST /upload/policies/assets` refuses a
+personal access token, so that URL is mintable only by hand. The published claim was
+true and incomplete in the way that matters: it named the thing that fails and not the
+thing that works. The README now shows a GIF, which needs no human, and
+[`scripts/readme-video.md`](../scripts/readme-video.md) carries the table and the manual
+procedure. **Confirming a claim through the same instrument that produced it is not
+verification** — and "the sanitizer strips it" was, until re-tested, exactly that.
+
 **A tidy property that was false.** I asserted two ROM sets have disjoint file names.
 They do not. The weaker true claim was sufficient for the test's purpose.
 
@@ -327,6 +344,13 @@ Read as a group, these are not random errors. Almost all are the same failure:
 The wrong CPS-B row, the `forbid(unsafe_code)` count, the drop rate, the mutant totals,
 the disjoint file names, the DIP-switch story — in each case a plausible mechanism
 substituted for a measurement, and the prose gave no hint of the difference.
+
+Two are a sharper variant, where a measurement *was* taken and still misled. The gated
+histogram was read through an instrument whose trigger was the symptom it existed to look
+past. The `<video>` sanitizer was read through one renderer of three, and the reading was
+correct — which is what made it stick, because a false claim invites a re-check and a true
+one does not. A measurement establishes what its instrument can see. The question that
+catches this class is not "did I verify it?" but "what would this check fail to notice?"
 
 Three defenses worked, and they are the transferable part of this project:
 
