@@ -17,6 +17,10 @@ members = [
 [workspace.package]
 edition = "2021"
 rust-version = "1.93"
+# Stated here and inherited by every crate, so a new crate is licensed by
+# default rather than by remembering. `LICENSE` at the workspace root is the
+# text; this is the SPDX identifier a machine reads.
+license = "MIT"
 
 [profile.release]
 opt-level = 3

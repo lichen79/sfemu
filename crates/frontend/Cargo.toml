@@ -3,6 +3,7 @@ name = "frontend"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "Frame pacing, controls, and save states — everything a frontend decides, with no window"
 

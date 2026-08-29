@@ -5635,7 +5635,7 @@ The cost: `testrunner` reads a 266 MB suite off disk for every mutant in the set
 - [ ] **Step 4: Run every set, not just this one**
 
 ```bash
-cd /Users/macini/Documents/dev/sfemu
+cd <repo-root>
 nohup python3 scripts/mutate.py --all > /tmp/mutate-oki.log 2>&1 &
 ```
 

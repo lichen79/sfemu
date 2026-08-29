@@ -891,4 +891,42 @@ serialization. Honouring that from the start makes both nearly free.
 
 ## License
 
-Not yet chosen. The `m68k` core contains no third-party code.
+**MIT** — see [`LICENSE`](LICENSE). Every crate inherits it from
+`[workspace.package]`, so a crate added later is licensed by default rather than
+by remembering.
+
+### Third-party attribution
+
+MIT covers the code in this repository. It does not cover what that code was read
+from, and the honest statement is narrower than "no third-party code":
+
+- **`m68k`, `z80`, `video`, `frontend` contain no third-party code.** The two CPU
+  cores were written against published vector suites and the manual; the video
+  crate's arithmetic was derived from hardware behaviour and checked against a
+  framebuffer. Where a table there could not be proofread it is *derived* in a
+  test, not copied.
+- **`oki` is a transcription, and says so in its own module docs.** `chip.rs`
+  restates `okim6295.cpp`'s command protocol and volume table; `adpcm.rs`
+  restates `okiadpcm.cpp`'s step table and accumulator. Both are
+  **BSD-3-Clause** — © Mirko Buffoni and Aaron Giles, and © Andrew Gardner and
+  Aaron Giles respectively. `machine/src/sf1/msm5205.rs` likewise restates
+  `msm5205.cpp` (BSD-3-Clause, © Aaron Giles).
+- **`machine`'s memory maps, register layouts and DIP-switch defaults are
+  transcribed from MAME's Capcom drivers** — `cps1.cpp` and `cps1_v.cpp`
+  (BSD-3-Clause, © Paul Leaman) and `sf.cpp` (BSD-3-Clause, © Olivier Galibert).
+  Every such value carries a file-and-line citation at its definition, which is
+  where the attribution actually lives.
+- **`ym2151`'s tables came from ymfm** (BSD-3-Clause, © 2021 Aaron Giles), the FM
+  implementation MAME uses, for the reason `tables.rs` gives: 768 hand-copied
+  numbers cannot be proofread, so they were generated and then checked against an
+  independent derivation.
+
+BSD-3-Clause permits this and asks for the notice to travel with the work, which
+is what the list above and the per-file citations are for. **No MAME or ymfm
+source file is vendored in this repository** — `testrunner` fetches them at
+generate time into a scratch directory and compiles against them, so what is
+committed here is Rust that was written by reading them, plus the citations
+saying where to look.
+
+And separately from any of that: **no ROM, no game data, and no Capcom code** —
+see [This project ships no ROMs, and never will](#this-project-ships-no-roms-and-never-will).

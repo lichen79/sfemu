@@ -3,6 +3,7 @@ name = "ym2151"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "Yamaha YM2151 (OPM) FM sound chip core"
 
 # Zero runtime dependencies, like `m68k` and `z80`. `serde` is optional and off

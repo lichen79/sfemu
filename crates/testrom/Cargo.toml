@@ -3,6 +3,7 @@ name = "testrom"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "A homebrew CPS-1 demo ROM this workspace generates from nothing"
 
 # No dependencies, and specifically not `machine`, `video` or `romset`: this crate

@@ -1687,6 +1687,121 @@ mod tests {
         );
     }
 
+    /// Every crate in the workspace is licensed, by inheriting one statement.
+    ///
+    /// The repository is public and MIT. A crate with no `license` field is a crate
+    /// nobody may legally reuse, and the failure is silent in the direction that
+    /// matters: `cargo build` does not care, `cargo test` does not care, and the
+    /// README goes on saying the workspace is MIT. Only someone reading the manifest
+    /// finds out, and by then the code is published.
+    ///
+    /// Asserted as inheritance rather than as a value. `license.workspace = true` is
+    /// checked here and the root manifest's `license = "MIT"` separately below, which
+    /// is what makes this a rule about *new* crates: a crate added later with its own
+    /// `license = "MIT"` typed in would satisfy a value check and still be a second
+    /// place for the licence to drift when it changes.
+    ///
+    /// The floor is a `>=` for [`crate::confine::crate_roots`]' reason — a new crate
+    /// must not fail this, but a walk that found nothing must.
+    #[test]
+    fn every_crate_inherits_the_workspace_license() {
+        let manifests = crate::confine::crate_manifests();
+        assert!(
+            manifests.len() >= 11,
+            "the walk must have found the workspace's members; 11 existed when this was \
+             written, found {}: {manifests:?}",
+            manifests.len()
+        );
+        // Named so a walk that silently stopped descending fails here.
+        for expected in ["m68k/Cargo.toml", "sfemu/Cargo.toml", "video/Cargo.toml"] {
+            assert!(
+                manifests.iter().any(|m| m.to_string_lossy() == expected),
+                "`{expected}` is a member manifest and must be in the list: {manifests:?}"
+            );
+        }
+
+        let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/sfemu has two ancestors")
+            .join("crates");
+        let unlicensed: Vec<_> = manifests
+            .iter()
+            .filter(|m| {
+                let text = std::fs::read_to_string(crates.join(m)).expect("a readable manifest");
+                !text.lines().any(|l| l.trim() == "license.workspace = true")
+            })
+            .collect();
+        assert!(
+            unlicensed.is_empty(),
+            "these crates do not inherit the workspace license: {unlicensed:?}"
+        );
+
+        // And the one place the licence is actually stated. Without this the check
+        // above would pass on a workspace that inherits nothing.
+        let root = crates
+            .parent()
+            .expect("crates has a parent")
+            .join("Cargo.toml");
+        let text = std::fs::read_to_string(&root).expect("a readable root manifest");
+        assert!(
+            text.lines().any(|l| l.trim() == r#"license = "MIT""#),
+            "the workspace manifest must state the licence every crate inherits: {root:?}"
+        );
+    }
+
+    /// `LICENSE` holds the MIT text, with a copyright line naming someone.
+    ///
+    /// A `license = "MIT"` field with no `LICENSE` file is a claim with nothing behind
+    /// it: MIT's own terms require the notice to be distributed with the software, and
+    /// GitHub reads the file rather than the manifest. Both halves are asserted because
+    /// the file could exist and be empty, or hold the terms with the copyright line
+    /// still saying `[year] [fullname]` — which is what a template does, and which
+    /// grants nothing to anyone.
+    #[test]
+    fn the_license_file_holds_the_mit_text_and_a_real_copyright_line() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/sfemu has two ancestors")
+            .join("LICENSE");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("the workspace must carry its licence text at {path:?}: {e}")
+        });
+
+        assert!(
+            text.starts_with("MIT License\n"),
+            "the MIT heading is first"
+        );
+        // The two clauses that make it MIT rather than a paraphrase.
+        assert!(
+            text.contains("Permission is hereby granted, free of charge"),
+            "the grant must be present verbatim"
+        );
+        assert!(
+            text.contains(
+                "The above copyright notice and this permission notice shall be included in all"
+            ),
+            "the notice-retention clause must be present verbatim"
+        );
+        assert!(
+            text.contains(r#"THE SOFTWARE IS PROVIDED "AS IS""#),
+            "the warranty disclaimer must be present verbatim"
+        );
+
+        // A real holder and year, not a template's placeholders.
+        assert!(
+            text.contains("Copyright (c) 2026 Li CHEN"),
+            "the copyright line must name a holder and a year: {path:?}"
+        );
+        for placeholder in ["[year]", "[fullname]", "<year>", "<name of author>"] {
+            assert!(
+                !text.contains(placeholder),
+                "`{placeholder}` is a template placeholder, not a licence"
+            );
+        }
+    }
+
     /// The keys the usage text names are the keys the map actually presses.
     ///
     /// The usage text is the only place most people will read the controls, and it is

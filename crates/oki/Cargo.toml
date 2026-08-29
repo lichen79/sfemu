@@ -3,6 +3,7 @@ name = "oki"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "OKI MSM6295 ADPCM sound chip"
 
 # Zero runtime dependencies, like `m68k`, `z80` and `ym2151`, and it must stay that

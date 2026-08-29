@@ -150,6 +150,43 @@ pub fn crate_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// Every crate manifest in the workspace, relative to `crates/`, sorted.
+///
+/// One caller — `every_crate_inherits_the_workspace_license` in `main.rs` — and it
+/// lives here for the same reason [`crate_roots`] does: it is the same walk of
+/// `crates/`, minus `target`.
+///
+/// A manifest is `<crate>/Cargo.toml` and nothing else. The depth check matters: a
+/// `Cargo.toml` two levels down would belong to something that is not a workspace
+/// member, and counting it would make the caller's floor pass on files no member
+/// owns.
+///
+/// # Panics
+///
+/// Panics if `crates/` cannot be read, for the reason [`mentions`] does.
+pub fn crate_manifests() -> Vec<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/sfemu has two ancestors")
+        .join("crates");
+    assert!(root.is_dir(), "the crates directory must exist: {root:?}");
+
+    let mut found = Vec::new();
+    walk(&root, &mut |path| {
+        if path.file_name().and_then(|n| n.to_str()) != Some("Cargo.toml") {
+            return;
+        }
+        let rel = path.strip_prefix(&root).unwrap_or(path).to_path_buf();
+        // `<crate>/Cargo.toml` is two components; anything deeper is not a member's.
+        if rel.components().count() == 2 {
+            found.push(rel);
+        }
+    });
+    found.sort();
+    found
+}
+
 /// Calls `f` for every file under `dir`, recursively.
 ///
 /// Skips `target` — a build directory holds vendored sources that would make these
