@@ -549,50 +549,81 @@ resync rather than fast-forward through a second of the game. The title bar show
 the dropped count, and so does the report a session prints on the way out:
 
 ```
-frames        18656
-dropped       3246
+frames        5899
+dropped       100
+late ticks    69
+worst tick    367.5 ms
+mean tick     48.7 ms
+owed/tick     2 210 433 721 596 69
 ```
 
 Pausing owes nothing — the clock is only read on a running tick, so a pause does not
 accumulate a debt that stampedes when you resume.
 
-⚠️ **Dropped frames are known, unexplained, and can be large.** That report above is
-a real 2026-08-24 windowed session: **3,246 of 18,656 frames, 17.4%**. Earlier runs
-showed 2–3% and a later one 4.7%, so the rate varies a great deal between sessions.
-What is ruled out is emulation cost — at 0.90 ms per 16.768 ms frame, the board is not
-what misses the deadline. A drop requires a host tick longer than four frames (67 ms),
-so the cause is on the window/present side. Play is unaffected in the sense that the
-game does not run slow; it resyncs.
-
-**If your session drops frames, the report says more.** Three extra lines follow
-`dropped` whenever it is non-zero:
-
-```
-late ticks    812
-worst tick    412.3 ms
-owed/tick     96 10397 2140 189 41 812
-```
+What the lines mean:
 
 - `late ticks` — how many single host ticks dropped anything. `dropped / late ticks` is
-  the mean number of frames lost per stall, and it is the number that matters: 3,246 lost
-  over 1 late tick is one long freeze, and over 3,246 late ticks it is a loop that is
+  the mean number of frames lost per stall, and it is the number that matters: 100 lost
+  over 1 late tick is one long freeze, and over 69 late ticks it is a loop that is
   persistently a fraction too slow. Different causes, and the old two-line report could
-  not tell them apart. Here it is 4.0 frames per stall.
-- `worst tick` — the longest single tick in the session. Anything over 67 ms dropped
-  something; 412 ms means the host went away for a quarter of a second.
+  not tell them apart. Here it is **1.45 frames per stall** — the second reading.
+- `worst tick` — the longest single tick in the session, and the tick's own length rather
+  than the debt carried into it. Anything over five frames (83.8 ms) dropped something.
+- `mean tick` — `frames / ticks × 16.768 ms`, which is the figure that reads as a rate:
+  48.7 ms is "the loop ran at about 20 Hz". It is computed from the two counts rather
+  than from a clock, which is why it is a slight *under*-estimate on a session that
+  dropped: `frames` is what the ticks served, not what they owed. Here the true figure
+  is 49.5 ms — add the dropped frames back and divide again if you want it exact.
 - `owed/tick` — the distribution: how many ticks owed 0 frames, then 1, 2, 3, 4, and then
-  the last column, every tick that owed more than the cap. A healthy session is almost
-  entirely in the second column. Weight in the fifth means the host is close to the edge
-  without having gone over it.
+  the last column, every tick that owed more than the cap.
 
-The columns are a complete account of `frames`: each tick in column *n* rendered *n*
-frames, each of the 812 over-cap ticks rendered 4, and 10,397 + 4,280 + 567 + 164 +
-3,248 = 18,656.
+These lines print when **any** tick owed more than one frame — not only when frames were
+dropped. That distinction is the 2026-08-29 reading's doing: a host that is equally slow
+but steady at four frames a tick drops nothing at all, and the old `dropped > 0` gate
+would have reported `dropped 0` and stopped, certifying the bug.
 
-**Those three numbers are invented** — they show the format, not a measurement. No real
-reading exists yet, because the report prints on the way out: it takes a windowed session
-that a person closes with `Escape` or the close button. If you run one, that output is the
-whole diagnosis.
+The columns are a complete account of `frames`: each tick in column *n* served *n*
+frames and each of the 69 over-cap ticks served 4, so
+0 + 210 + 866 + 2,163 + 2,384 + 276 = **5,899**, the reported figure.
+
+### What the measured session shows
+
+That block is a real reading, from the 2026-08-29 windowed session of `sf2eb` that
+`docs/sfemu.mp4` records — the log and the recording are the same run, three seconds
+apart. It is the first one taken; the report prints only on the way out, so it needs a
+windowed session a person closes.
+
+⚠️ **Dropped frames are real but small here, and the interesting number is not the
+drop rate.** 100 of 5,899 is **1.7%**. Two figures matter more:
+
+- **The loop runs at about 20 Hz, not 59.6.** 2,031 ticks served 5,999 owed frames,
+  which is 100.6 s of wall clock: a **mean host tick of 49.5 ms**, or 2.95 frame
+  budgets. Two-thirds of the ticks are in the 2-, 3- and 4-frame columns. The pacer's
+  catch-up is doing its job — the game runs at the right speed because each slow tick
+  serves the frames it owes — but it is being asked to, constantly, rather than in
+  bursts.
+- **The drops are many small overruns, not one freeze.** 1.45 frames per late tick,
+  and 33% of ticks already sitting at the cap. A tick has to exceed 83.8 ms to drop
+  anything, and the 69 that did averaged 91 ms. `worst tick 367.5 ms` is the outlier,
+  not the pattern.
+
+The window titlebar in the recording pins down *when*: 73 drops before the recording
+started, 23 during its 56 seconds, 4 after. So they accrue throughout rather than at
+one event.
+
+**Emulation cost is ruled out, on the path the window actually uses.** The 0.90 ms
+figure above is `run_frame`, but a windowed tick runs each frame through
+`run_frame_to_breakpoint`, one instruction at a time with a breakpoint check on each.
+Measured against each other on `sf2eb` on 2026-08-29 — 600 frames of each after 300
+frames of warm-up — **0.230 ms/frame stepping against 0.232 ms/frame tight, 0.99×**,
+over 14,550 instructions per frame. So the per-instruction path costs nothing
+measurable, and emulation is about 5% of a 49.5 ms tick either way.
+
+That leaves `minifb`'s `update_with_buffer` and `set_target_fps(60)`, which is the one
+thing between the loop and the glass and the one thing no test in this project can
+reach. The next step, if someone takes it, is to time `present` from inside
+`display.rs` — accepting that the measurement lives on the untestable side of the
+display boundary.
 
 ---
 

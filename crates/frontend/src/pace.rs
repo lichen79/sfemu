@@ -37,6 +37,13 @@ pub const OWED_BUCKETS: usize = MAX_CATCH_UP as usize + 2;
 /// one 54-second stall *or* 3,246 ticks of 84 ms, and those have different causes.
 /// So the shape is recorded, not only the sum.
 ///
+/// The shape turned out to answer a question neither story asked. Read on 2026-08-29:
+/// `2 210 433 721 596 69` over 2,031 ticks, a mean tick of 49.5 ms against this
+/// module's 16.768 ms frame. The loop was running at ~20 Hz with only 1.7% dropped,
+/// because catch-up serves up to four frames and most ticks stayed under the
+/// five-frame threshold. `dropped` was measuring the tail of this distribution; the
+/// distribution was the bug. See `docs/architecture.md`'s open questions.
+///
 /// It lives on the pacer because the pacer is already handed every tick length and
 /// reads no clock — see this module's header. Nothing here is machine state; it is an
 /// instrument, and `reset` deliberately does not clear it.

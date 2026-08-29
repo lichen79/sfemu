@@ -575,14 +575,39 @@ Recorded because an unrecorded open question becomes a wrong assumption.
   histogram was added to the pacer rather than to the loop because the pacer is already
   handed every tick length and reads no clock, so it stayed testable.
 
-  What is still missing is a **reading**. The report prints on exit, and the figure has to
-  come from a windowed session a person closes; I cannot press the quit key or click the
-  window's close button from here. So the next step is one real session, then read
-  `late ticks`, `worst tick` and `owed/tick`. If `late ticks` is small and `worst tick` is
-  seconds, it is a stall — a window-server hitch, a device change, a laptop lid. If
-  `late ticks` is in the thousands and `worst tick` is near 84 ms, the loop is
-  systematically a little slower than the frame it owes, which is a different problem with
-  a different fix.
+  **Read on 2026-08-29, and the answer is neither branch of the question above.** One
+  windowed `sf2eb` session — the one `docs/sfemu.mp4` records — reported:
+
+  ```
+  frames 5899 · dropped 100 · late ticks 69 · worst tick 367.5 ms
+  owed/tick 2 210 433 721 596 69
+  ```
+
+  The prediction was a dichotomy: few late ticks with a multi-second `worst tick` meant a
+  stall, thousands of late ticks near 84 ms meant a loop systematically a little slow.
+  This is 69 late ticks with a `worst tick` of 367 ms, which is neither. The histogram is
+  what says why, and it is the number the drop count could never have shown:
+
+  **the loop ticks at about 20 Hz, not 59.6.** 2,031 ticks served 5,999 owed frames — 100.6
+  s of wall clock, a mean host tick of **49.5 ms**, 2.95 frame budgets. Two-thirds of ticks
+  sit in the 2-, 3- and 4-frame columns and 33% are already at the cap. So the loop *is*
+  systematically slow, badly so, and the drop rate stayed at 1.7% only because catch-up
+  absorbs it: a tick must exceed five frames (83.8 ms) before it loses anything, and the
+  69 that did averaged 91 ms. The drop count was measuring the tail of the distribution
+  while the distribution itself was the finding.
+
+  Emulation is ruled out on the path the window actually uses, not just on `run_frame`. A
+  windowed tick runs each frame through `run_frame_to_breakpoint`, one instruction at a
+  time with a breakpoint check on each; measured against `run_frame` on `sf2eb` on
+  2026-08-29, 600 frames of each after 300 of warm-up, it costs **0.230 ms/frame against
+  0.232, i.e. 0.99×** over 14,550 instructions per frame. Emulation is ~5% of a 49.5 ms
+  tick either way.
+
+  What is left is `minifb`: `update_with_buffer` and the `set_target_fps(60)` sleep, the
+  only thing between the loop and the glass. That is also the one place this architecture
+  cannot instrument from a test — see the display boundary above — so the next step is to
+  time `present` inside `display.rs` and accept the measurement lives on the untestable
+  side. Still open, but open on one named suspect rather than on "the window/present side".
 - **`scripts/mutate.py`'s patterns outside `keys`, `menu` and `layout` have not
   been audited** for drift against the current source. A pattern that no longer
   matches scores `NO-OP`, which is visible — but only in a full run.

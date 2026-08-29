@@ -651,10 +651,15 @@ they are dropped and counted, because a machine that fell a second behind should
 resync rather than fast-forward through a second of the game. Pausing owes nothing
 — the clock is only read on a running tick.
 
-⚠️ **Dropped frames are real, unexplained, and vary by an order of magnitude.** Early
-windowed runs showed 2–3%; a 2026-08-24 session reported 3,246 of 18,656 frames —
-**17.4%**. The 18.6× headless margin rules out emulation cost, and a drop requires a
-host tick over 67 ms, so the cause is on the window/present side. Uninvestigated; see
+⚠️ **The host loop ticks at about 20 Hz, and the drop count was the wrong thing to
+watch.** The pacer's per-tick histogram, read on 2026-08-29 from the session
+`docs/sfemu.mp4` records: 2,031 ticks served 5,999 owed frames over 100.6 s — a mean
+host tick of **49.5 ms** against a 16.768 ms frame, with two-thirds of ticks owing 2 to
+4 frames. Only 1.7% were actually dropped, because catch-up serves up to four and a
+tick must exceed 83.8 ms to lose anything; earlier sessions' 2–17% drop rates were the
+tail of that distribution rather than the problem. Emulation is ~5% of a tick, on the
+per-instruction path the window really uses (0.99× the tight loop, measured). The
+remaining suspect is `minifb`'s present. See
 [docs/architecture.md](docs/architecture.md#open-questions).
 
 ### Eight things only you can check

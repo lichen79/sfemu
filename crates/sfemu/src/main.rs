@@ -717,16 +717,32 @@ fn default_keys_path(rom: &str) -> PathBuf {
 /// The drop count on its own has been actively misleading. Three sessions reported
 /// 2–3%, 17.4% and 4.7%, and nothing in the number says whether that is one long stall
 /// or thousands of short ones — the two have different causes and the same total. So
-/// the three lines below are printed whenever anything was dropped: how many ticks were
-/// late (`dropped / late` is the mean frames lost per stall), the longest single tick,
-/// and the whole distribution of frames owed per tick. `owed` reads left to right as
-/// buckets 0, 1, … up to the catch-up cap, then everything past it.
+/// the lines below carry the shape: how many ticks were late (`dropped / late` is the
+/// mean frames lost per stall), the longest single tick, the mean tick, and the whole
+/// distribution of frames owed per tick. `owed` reads left to right as buckets 0, 1, …
+/// up to the catch-up cap, then everything past it.
 ///
-/// Printed only when something dropped: a clean session's histogram is a wall of digits
-/// saying "fine", and a report nobody reads is where the 17% hid.
+/// # Why the gate is "fell behind" and not "dropped something"
+///
+/// It was `dropped > 0`, and that hid the finding it was added to expose. The
+/// 2026-08-29 reading was a loop ticking at ~20 Hz — a mean tick of 49.5 ms against a
+/// 16.768 ms frame, two-thirds of ticks owing 2 to 4 frames — and it only printed a
+/// histogram at all because 69 of 2,031 ticks happened to cross the 83.8 ms drop
+/// threshold. A host that was equally slow but *steady* at four frames a tick drops
+/// nothing: catch-up serves the whole debt, `dropped` stays 0, and the report says
+/// `frames`, `dropped 0`, and nothing else. Which is a report that certifies the bug.
+///
+/// So the condition is any tick that owed more than one frame. That is still silent on
+/// a session keeping up — where the histogram is a wall of digits saying "fine", and a
+/// report nobody reads is where the 17% hid — but it can no longer be silent about a
+/// loop running at a third of the frame rate.
 fn play_report(s: &loop_::Summary) -> String {
     let mut out = format!("frames        {}\ndropped       {}\n", s.frames, s.dropped);
-    if s.dropped > 0 {
+    // Buckets 2 and up: bucket 1 is a tick that owed exactly its frame, which is a
+    // healthy tick, and bucket 0 is a tick faster than a frame, which is healthier
+    // still. Summed rather than read from `drop_events`, which counts only the tail.
+    let behind: u64 = s.ticks.owed[2..].iter().sum();
+    if behind > 0 {
         let t = &s.ticks;
         out.push_str(&format!("late ticks    {}\n", t.drop_events));
         // Milliseconds, because a nanosecond figure for a 4-second stall is ten digits
@@ -736,6 +752,18 @@ fn play_report(s: &loop_::Summary) -> String {
             "worst tick    {:.1} ms\n",
             t.worst_ns as f64 / 1_000_000.0
         ));
+        // The mean, which is what reads as a rate: 49.5 ms is "the loop ran at 20 Hz",
+        // and no single figure in the histogram says that. Frames over ticks times the
+        // frame period, so it needs no clock — the same reason the histogram lives on
+        // the pacer. `frames` is what the ticks *served*, so a session that dropped
+        // frames has a mean slightly below its true tick length; the alternative is
+        // for the pacer to keep a total elapsed, which is a second clock-shaped field
+        // for a figure a reader can already correct with `dropped`.
+        let ticks: u64 = t.owed.iter().sum();
+        if ticks > 0 {
+            let mean_ms = s.frames as f64 / ticks as f64 * frontend::FRAME_NS as f64 / 1e6;
+            out.push_str(&format!("mean tick     {mean_ms:.1} ms\n"));
+        }
         let owed: Vec<String> = t.owed.iter().map(u64::to_string).collect();
         out.push_str(&format!("owed/tick     {}\n", owed.join(" ")));
     }
@@ -2371,6 +2399,61 @@ mod tests {
         assert!(!clean.contains("late ticks"), "{clean}");
         assert!(!clean.contains("worst tick"), "{clean}");
         assert!(!clean.contains("owed/tick"), "{clean}");
+    }
+
+    /// A session that is behind but never past the cap still prints the histogram.
+    ///
+    /// This is the case the 2026-08-29 reading found, and the case gating on
+    /// `dropped > 0` cannot report. A host tick of three frames owes three, catch-up
+    /// serves all three, and nothing is dropped — so the loop runs at a third of the
+    /// frame rate with a report that says `dropped 0` and stops there. The measured
+    /// session only printed its histogram because 69 of 2,031 ticks happened to cross
+    /// 83.8 ms; had they all stayed at four frames it would have looked perfect.
+    ///
+    /// The numbers below are that session's, rounded to whole ticks: 2,031 ticks of
+    /// which 1,819 owed two or more, and a mean of 49.5 ms.
+    #[test]
+    fn a_report_names_a_slow_loop_that_dropped_nothing() {
+        // 212 ticks at one frame, then 433 + 721 + 596 owing 2, 3 and 4 — the measured
+        // distribution with the 69 over-cap ticks folded into bucket 4, so `dropped` is
+        // legitimately zero.
+        let owed = [0, 212, 433, 721, 665, 0];
+        let slow = play_report(&loop_::Summary {
+            frames: 5_999,
+            dropped: 0,
+            ticks: frontend::TickStats {
+                owed,
+                worst_ns: 67_000_000,
+                drop_events: 0,
+            },
+            ..Default::default()
+        });
+        assert!(slow.contains("dropped       0"), "nothing was lost: {slow}");
+        assert!(
+            slow.contains("owed/tick     0 212 433 721 665 0"),
+            "the distribution is the finding, so it must print: {slow}"
+        );
+        // 5,999 frames over 2,031 ticks is 2.954 frames a tick, and 2.954 × 16.768 ms
+        // = 49.5 ms. A literal, computed by hand from the two counts above.
+        assert!(
+            slow.contains("mean tick     49.5 ms"),
+            "and the mean is the number that reads as 20 Hz: {slow}"
+        );
+
+        // A session keeping up prints none of it, however many ticks it ran: this is
+        // what stops the rule above from being "always print".
+        let quick = play_report(&loop_::Summary {
+            frames: 3_600,
+            dropped: 0,
+            ticks: frontend::TickStats {
+                owed: [40, 3_600, 0, 0, 0, 0],
+                worst_ns: 20_000_000,
+                drop_events: 0,
+            },
+            ..Default::default()
+        });
+        assert!(!quick.contains("owed/tick"), "{quick}");
+        assert!(!quick.contains("mean tick"), "{quick}");
     }
 
     /// A CPU summary comes from the shared view, so one implementation serves both.

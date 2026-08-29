@@ -111,6 +111,11 @@ pub struct Summary {
     /// those is not the same. This is the instrument the dropped-frame open question
     /// needs, and it is the pacer's because the pacer is already given every tick
     /// length and reads no clock.
+    ///
+    /// It earned its keep on 2026-08-29: the histogram said the loop was ticking at
+    /// ~20 Hz — mean 49.5 ms against a 16.768 ms frame — with `dropped` at 1.7%,
+    /// because catch-up absorbed nearly all of it. No drop count could have shown
+    /// that, and a steadier host equally slow would have shown a drop count of zero.
     pub ticks: frontend::TickStats,
     /// Things that went wrong without being fatal, each reported once.
     ///
