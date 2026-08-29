@@ -1917,6 +1917,60 @@ mod tests {
         }
     }
 
+    /// The burned-in video caption states this suite's own test count.
+    ///
+    /// `scripts/caption.py` renders text into a published video, where it cannot be
+    /// corrected without a re-encode and a re-upload. It said "1,880 tests" three
+    /// commits after the total reached 1,882 — a claim about the repository that
+    /// nothing in the repository checked, which is exactly the failure the project's
+    /// history section is about.
+    ///
+    /// So the count is asserted here, against the number this binary's own suite
+    /// reports. It cannot be derived — a test cannot count the workspace's tests
+    /// without running them — so it is a literal in both places, and this is the
+    /// assertion that makes the two disagree loudly rather than silently. When the
+    /// total changes: update `WORKSPACE_TESTS`, update the caption, re-render, and
+    /// re-upload. That the caption is expensive to change is the point; it is
+    /// published.
+    ///
+    /// ⚠️ **This test counts itself.** Adding it took the workspace from 1,883 to
+    /// 1,884, so the literal below had to be written *after* the assertion existed —
+    /// the first value I wrote was already stale by one, which is the whole hazard in
+    /// miniature. Any future test added anywhere in the workspace moves this number,
+    /// including a test added to guard some other published claim.
+    #[test]
+    fn the_video_caption_states_the_current_test_count() {
+        /// `cargo test --workspace`, summed over every `test result:` line, on
+        /// 2026-08-29 — with this test included in the total. A literal because
+        /// nothing can compute it.
+        const WORKSPACE_TESTS: &str = "1,884";
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/sfemu has two ancestors")
+            .to_path_buf();
+        let script = std::fs::read_to_string(root.join("scripts/caption.py"))
+            .expect("a readable caption script");
+
+        // The whole sentence, not just the number: `contains("1,883")` would pass on a
+        // script that had moved the figure into some other claim.
+        let claim = format!("Written in Rust. {WORKSPACE_TESTS} tests. No unsafe code.");
+        assert!(
+            script.contains(&claim),
+            "the caption must say `{claim}` — re-render and re-upload the LinkedIn cut \
+             if the count moved"
+        );
+        // And no *other* four-digit test count, which is what a half-done edit leaves:
+        // a corrected line plus a stale one somewhere else in the bands.
+        for stale in ["1,880 tests", "1,881 tests", "1,882 tests", "1,883 tests"] {
+            assert!(
+                !script.contains(stale),
+                "a stale count is still in the caption: `{stale}`"
+            );
+        }
+    }
+
     /// The keys the usage text names are the keys the map actually presses.
     ///
     /// The usage text is the only place most people will read the controls, and it is

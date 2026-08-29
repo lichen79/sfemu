@@ -87,7 +87,11 @@ def bottom_band():
     y = centred(
         d,
         y + 40,
-        "Written in Rust. 1,880 tests. No unsafe code.",
+        # Asserted by `the_video_caption_states_the_current_test_count` in
+        # `crates/sfemu/src/main.rs`: this line is a claim about the repository burned
+        # into a published video, and it had already drifted once (it said 1,880 at
+        # 1,882). Changing the count means re-rendering and re-uploading the cut.
+        "Written in Rust. 1,884 tests. No unsafe code.",
         ImageFont.truetype(str(REGULAR), 35),
         WHITE,
     )
