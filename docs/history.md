@@ -218,6 +218,32 @@ took 1.08 s, i.e. **0.90 ms/frame, an 18.6× real-time margin**, so the drops ar
 host-side stalls longer than the pacer's 67 ms catch-up window, not slow emulation.
 The figure is corrected and the cause is still unknown.
 
+**And the drop rate was the wrong number all along.** On 2026-08-29 a windowed session
+finally printed the histogram added to diagnose this — `owed/tick 2 210 433 721 596 69`
+over 2,031 ticks — and the finding was not in the drop count at all: 2,031 ticks served
+5,999 owed frames across 100.6 s, a **mean tick of 49.5 ms** against a 16.768 ms frame.
+The loop was running at about **20 Hz**. Only 1.7% of frames were dropped, because
+catch-up serves up to four and most ticks stayed under the five-frame threshold. Every
+earlier figure — 2–3%, 17.4%, 4.7% — was the tail of that distribution moving around,
+while the distribution itself went unmeasured.
+
+Two things fall out of it, and they are the reason this entry is here rather than in the
+open questions:
+
+- **The instrument was gated on the symptom it was built to look past.** The histogram
+  printed only `if s.dropped > 0`. A host equally slow but *steady* at four frames a
+  tick drops nothing, so the report would have said `frames`, `dropped 0`, and stopped —
+  certifying the bug. This session printed anything only because 69 of its 2,031 ticks
+  happened to cross 83.8 ms. The gate is now "any tick owed more than one frame", and
+  `mean tick` prints beside `worst tick` because no bucket count reads as a rate.
+- **The "emulation is ruled out" claim rested on the wrong code path.** 0.90 ms/frame is
+  `run_frame`; a windowed tick runs each frame through `run_frame_to_breakpoint`, one
+  instruction at a time with a breakpoint check on each. That had never been measured —
+  only proven *equivalent in result*, by
+  `the_stepping_path_reaches_the_same_machine_as_run_frame`, which says nothing about
+  cost. Measured: **0.230 ms/frame stepping against 0.232 tight, 0.99×**, over 14,550
+  instructions per frame. The conclusion held, but by luck rather than by evidence.
+
 **"The README's mutant totals."** The README said 262 mutants in 19 sets, 240 killed.
 Actual: **299 in 21, 273 killed**. Caught by executing `scripts/mutate.py` and counting
 rather than reading the prose. The drift was the key menu — `keys` went 21→31 and
@@ -281,6 +307,13 @@ replaced it with the actual output of `cargo run -p sfemu --release -- --demo 60
 which is reproducible with no ROM set — and which required explaining why `acks 599`
 sits against `vblanks 600` (the last frame's interrupt is still pending, not missed).
 
+A second invented block outlived that fix: the *windowed* report's three extra lines
+(`late ticks`, `worst tick`, `owed/tick`) were an illustration labelled as one, with
+"no real reading exists yet" beside it. The label was honest and the numbers were still
+load-bearing — I had reasoned about which of two causes they would distinguish, using
+figures I had made up. When the real reading arrived on 2026-08-29 it was **neither of
+the two cases I had framed**, and it condemned the instrument itself. See below.
+
 **A tidy property that was false.** I asserted two ROM sets have disjoint file names.
 They do not. The weaker true claim was sufficient for the test's purpose.
 
@@ -306,6 +339,17 @@ Three defenses worked, and they are the transferable part of this project:
    all found by a human at a window, and none of them could have been found any other
    way. This is why the README carries a list of things **only a human can check** —
    currently eight items.
+
+A fourth failure mode showed up last, and it is not on the list above because no amount
+of measuring the stated claim would have caught it: **an instrument gated on the symptom
+it was built to see past.** The tick histogram existed precisely because the drop count
+could not distinguish two causes — and it printed only when the drop count was non-zero.
+So the one host behaviour it would have been most valuable on, a loop uniformly too slow
+to drop anything, was the one it stayed silent for. The reading that exposed this arrived
+by luck: 69 of 2,031 ticks crossed the threshold and opened the gate. The generalisation
+is that a diagnostic's *trigger* deserves the same scepticism as its output, and that
+"the instrument reported nothing" is not the same finding as "there is nothing to
+report".
 
 ---
 

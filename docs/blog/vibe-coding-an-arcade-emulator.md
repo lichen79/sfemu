@@ -174,12 +174,39 @@ frames." Then the user ran the game and their session reported **3,246 dropped o
 
 So I measured the emulator instead of theorising: 1,200 frames of Street Fighter II
 headless in 1.08 seconds. That's **0.90 ms per frame against a 16.768 ms budget — an
-18.6× margin.** Emulation cost is ruled out entirely. A dropped frame requires a host
-tick longer than 67 ms, so the cause is on the window/present side, and I still don't
-know what it is.
+18.6× margin.** Emulation cost ruled out; a dropped frame needs a host tick over 67 ms,
+so the cause is on the window/present side.
 
-What I do know is that "2–3%" was a number I had believed and republished without
-re-measuring, and it took one person actually playing the game to falsify it.
+Then I built an instrument for it — a histogram of frames owed per host tick, so a
+single long stall could be told from thousands of small ones — and printed it whenever a
+session dropped anything.
+
+Five days later a session finally printed it, and it said something I had not framed as a
+possibility: `owed/tick 2 210 433 721 596 69`, over 2,031 ticks that served 5,999 frames
+in 100.6 seconds. **A mean host tick of 49.5 ms against a 16.768 ms frame.** The loop was
+running at about 20 Hz. The drop rate was only 1.7%, because the pacer's catch-up serves
+up to four frames and most ticks never crossed the threshold that loses one.
+
+Which means the drop rate — the number in three documents, the number one person's
+session had just corrected by an order of magnitude, the number I built an instrument to
+explain — was the tail of a distribution nobody had looked at. And the instrument was
+gated on it: the histogram printed only `if dropped > 0`. A host equally slow but steady
+at four frames a tick drops nothing at all, so the report would have said `dropped 0` and
+stopped there. That report would have certified the bug. This session opened the gate by
+luck, because 69 of its 2,031 ticks happened to run long.
+
+There's a second thing in there worth naming. "Emulation cost is ruled out" was measured
+on `run_frame` — but a windowed tick doesn't call `run_frame`. It runs each frame one
+instruction at a time, checking for a breakpoint on every one. I had a test proving that
+path reaches the *same machine state* as `run_frame`, and had quietly read it as proving
+the same *cost*. It doesn't; nothing did. Measured properly: 0.230 ms/frame against
+0.232, so 0.99× over 14,550 instructions per frame. The conclusion survived. It was
+right by luck too.
+
+What I take from it: "2–3%" was a number I believed and republished without measuring,
+and one person playing the game falsified it. But the deeper habit is subtler than not
+re-measuring — it's trusting a diagnostic's *silence*. An instrument that only speaks
+when a symptom is present cannot tell you the symptom was the wrong thing to watch.
 
 ## The thing I got wrong thirteen times
 
